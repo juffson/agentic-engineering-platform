@@ -16,9 +16,9 @@ aep run --task market-volume-dedup-rust --candidate origin/aep-task/market-volum
 
 已有仓库可直接使用原 Git 公共目录中的 SQLite 记忆库、Run 锁和 JSON 证据。历史派发继续使用其固定提交里声明的验收命令。新的行情示例使用独立任务 ID `market-volume-dedup-rust`。
 
-### 用 AEP Studio 查看运行和交接
+### 用 AEP Studio 查看运行、编写交接记忆
 
-macOS 上可用 Rust 桌面端浏览本地执行记录。安装 Xcode 及命令行工具，使用当前稳定版 Rust，在仓库根目录运行：
+macOS 上可用 Rust 桌面端浏览执行记录、写入和修订共享记忆。安装 Xcode 及命令行工具，使用当前稳定版 Rust，在仓库根目录运行：
 
 ```sh
 ./desktop/bundle-macos.sh
@@ -33,7 +33,11 @@ cargo run --locked --manifest-path desktop/Cargo.toml -- --repo /path/to/repo
 
 在「运行记录」筛选待审查或需要处理的 Run。详情列出 Spec、候选提交、验收命令、退出码和审查报告。「Agent 记忆交接」按角色列出读写的记忆 ID。点 ID 查看当时引用的版本，再点「来源 Run」回到写入它的那次运行。「共享记忆」支持搜索正文、查看历史版本和修订链。执行新任务或写入记忆后，点击「刷新」读取最新记录。
 
-桌面端只读取所选克隆的本地数据。新克隆要先执行任务或写入记忆，关联 Worktree 则共享已有的记录。CLI 可独立安装。
+在「共享记忆」点「新建记忆」可写入仓库约定，也可限定到任务与 Spec 或某个候选提交。从运行详情点「为此任务写记忆」会预填任务名和提交。保存时会把 Git 引用解析为固定 SHA。启用 `--shared-memory` 的后续执行会按这些范围和上下文预算选取记录。
+
+在当前记忆的详情点「修订」，可以更正正文，或将已回答的「未决问题」改为「决策」。新版本记为人工写入，继承原范围。历史 Run 仍链接到当时读写的版本。如果两人同时修订同一条记录，先保存的版本生效，另一位的草稿留在编辑器中。
+
+桌面端和 CLI 使用所选克隆的同一个本地 SQLite 库，关联 Worktree 共用记录。CLI 可独立安装。
 
 ### 重复派发与本地恢复
 

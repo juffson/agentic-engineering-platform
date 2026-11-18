@@ -1,5 +1,7 @@
+pub(crate) mod editor;
 use super::*;
 use aep::studio::Run;
+use editor::Start;
 use gpui_kit::component::{Icon, IconName, Sizable, StyledExt, h_flex, input::Input, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 
@@ -312,7 +314,16 @@ impl Studio {
                 evidence = evidence.child(field(label, r.text(key)));
             }
         }
-        let mut handoff = panel().child(heading("Agent 记忆交接"));
+        let mut header = h_flex().justify_between().child(heading("Agent 记忆交接"));
+        if !r.text("task").is_empty() && !r.text("spec_sha").is_empty() {
+            let id = r.id.clone();
+            header = header.child(
+                button("compose-run-note", "为此任务写记忆", false).on_click(cx.listener(
+                    move |this, _, w, cx| this.compose(Start::FromRun(id.clone()), w, cx),
+                )),
+            );
+        }
+        let mut handoff = panel().child(header);
         let mut groups = 0;
         for role in ["implementer", "reviewer"] {
             for (key, verb) in [("memory_inputs", "读取"), ("memory_outputs", "写入")] {
@@ -420,7 +431,14 @@ impl Studio {
             .child(heading(format!("#{id}  {}", kind(string(n, "kind")))).text_2xl())
             .child(
                 panel()
-                    .child(heading("记忆正文"))
+                    .child(h_flex().justify_between().child(heading("记忆正文")).when(
+                        n["successor"].is_null(),
+                        |h| {
+                            h.child(button("revise-note", "修订", false).on_click(cx.listener(
+                                move |this, _, w, cx| this.compose(Start::Revise(id), w, cx),
+                            )))
+                        },
+                    ))
                     .child(t(string(n, "body").to_owned(), FG)),
             )
             .child(meta)
@@ -443,6 +461,9 @@ impl Render for Studio {
                         .on_click(cx.listener(|this, _, w, cx| this.choose_repo(w, cx))),
                 )
                 .children(self.repo_error.iter().map(|e| t(e.clone(), AMBER)));
+        }
+        if let (Some(editor), Some(ws)) = (&self.editor, &self.workspace) {
+            return editor.render(ws, cx);
         }
         let runs = &self.snapshot.runs;
         let notes = &self.snapshot.notes;
@@ -657,10 +678,17 @@ impl Render for Studio {
                 } else if runs_page {
                     "在这个仓库执行 aep run 后刷新。"
                 } else {
-                    "使用 aep memory add 写入约定，或在运行时启用 --shared-memory。"
+                    "点击「新建记忆」写入第一条工程记录。"
                 })),
         };
         let mut main = v_flex().flex_1().min_w_0().h_full();
+        let mut controls = h_flex().gap_2();
+        if !runs_page {
+            controls = controls.child(
+                button("new-note", "新建记忆", true)
+                    .on_click(cx.listener(|this, _, w, cx| this.compose(Start::Blank, w, cx))),
+            );
+        }
         let bar = h_flex()
             .flex_none()
             .px_5()
@@ -670,16 +698,18 @@ impl Render for Studio {
             .border_color(rgb(LINE))
             .child(heading(title).text_2xl())
             .child(
-                button(
-                    "refresh",
-                    if self.loading {
-                        "读取中…"
-                    } else {
-                        "刷新"
-                    },
-                    false,
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                controls.child(
+                    button(
+                        "refresh",
+                        if self.loading {
+                            "读取中…"
+                        } else {
+                            "刷新"
+                        },
+                        false,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                ),
             );
         let stats_bar = h_flex()
             .flex_none()

@@ -3,7 +3,7 @@ name = "aep-studio"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Native desktop inspector for the AEP workspace"
+description = "Native desktop workspace for AEP run evidence and shared memory"
 
 [dependencies]
 aep = { path = ".." }

@@ -1,10 +1,10 @@
 mod agent;
 mod git;
-use aep::memory;
+use aep::memory::{self, Key, Kind};
 mod run;
 
 use anyhow::{Result, ensure};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use std::{path::PathBuf, process::ExitCode};
 
@@ -77,14 +77,6 @@ struct Scope {
     #[arg(long)]
     candidate: Option<String>,
 }
-#[derive(Clone, ValueEnum)]
-#[value(rename_all = "snake_case")]
-enum Kind {
-    Decision,
-    Handoff,
-    OpenQuestion,
-    Review,
-}
 #[derive(Subcommand)]
 enum MemoryAction {
     Get {
@@ -138,7 +130,12 @@ fn app() -> Result<ExitCode> {
             let value = match operation {
                 MemoryAction::Get { id } => db.get(id)?,
                 MemoryAction::List { scope } => {
-                    let key = repo.scope(&scope)?;
+                    let key = Key::resolve(
+                        &repo.root,
+                        scope.task.as_deref(),
+                        scope.spec.as_deref(),
+                        scope.candidate.as_deref(),
+                    )?;
                     json!(db.context(&key, None)?)
                 }
                 MemoryAction::Add {
@@ -147,8 +144,13 @@ fn app() -> Result<ExitCode> {
                     text,
                     replaces,
                 } => {
-                    let key = repo.scope(&scope)?;
-                    json!({"id": db.add(&key,kind.to_possible_value().unwrap().get_name(),&text,replaces)?})
+                    let key = Key::resolve(
+                        &repo.root,
+                        scope.task.as_deref(),
+                        scope.spec.as_deref(),
+                        scope.candidate.as_deref(),
+                    )?;
+                    json!({"id": db.add(&key,kind.as_str(),&text,replaces)?})
                 }
             };
             println!("{}", serde_json::to_string_pretty(&value)?);

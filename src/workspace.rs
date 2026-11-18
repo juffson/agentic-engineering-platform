@@ -23,6 +23,20 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?)
 }
 
+pub fn commit(repo: &Path, rev: &str) -> Result<String> {
+    Ok(git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )?
+    .trim_end()
+    .into())
+}
+
 pub fn ident(id: &str, max: usize) -> Result<()> {
     ensure!(
         !id.is_empty()

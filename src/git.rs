@@ -1,22 +1,8 @@
-use crate::{Scope, memory::Key};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-pub use aep::workspace::{git, ident};
-pub fn commit(repo: &Path, rev: &str) -> Result<String> {
-    Ok(git(
-        repo,
-        &[
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{rev}^{{commit}}"),
-        ],
-    )?
-    .trim_end()
-    .into())
-}
+pub use aep::workspace::{commit, git, ident};
 
 #[derive(Deserialize)]
 pub struct Task {
@@ -35,31 +21,6 @@ impl Repo {
             root: workspace.root,
             data: workspace.data,
         })
-    }
-    pub fn scope(&self, input: &Scope) -> Result<Key> {
-        let task = input.task.as_deref().unwrap_or("");
-        if !task.is_empty() {
-            ident(task, 63)?;
-        }
-        let spec = input
-            .spec
-            .as_ref()
-            .map(|r| commit(&self.root, r))
-            .transpose()?
-            .unwrap_or_default();
-        let candidate = input
-            .candidate
-            .as_ref()
-            .map(|r| commit(&self.root, r))
-            .transpose()?
-            .unwrap_or_default();
-        if !candidate.is_empty() {
-            git(
-                &self.root,
-                &["merge-base", "--is-ancestor", &spec, &candidate],
-            )?;
-        }
-        Ok(Key::new(task, &spec, &candidate))
     }
     pub fn task(&self, sha: &str, name: &str) -> Result<(String, Task)> {
         ident(name, 63)?;

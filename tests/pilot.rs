@@ -353,6 +353,32 @@ printf '%s' '{"structured_output":{"note":"review-284","question":"","report":"d
             .unwrap()
             .contains(handoff)
     );
+    let workspace = aep::workspace::Workspace::open(&linked).unwrap();
+    let mut db = aep::memory::Memory::open(&workspace.data).unwrap();
+    let revised = db
+        .revise(
+            handoff.as_i64().unwrap(),
+            aep::memory::Kind::Handoff,
+            "updated-handoff",
+        )
+        .unwrap();
+    f.script(
+        "claude",
+        r#"prompt=$(cat)
+case "$prompt" in *handoff-719*) exit 1;; esac
+case "$prompt" in *updated-handoff*) ;; *) exit 1;; esac
+echo '{"structured_output":{"note":"seen revision","question":"","report":"review"}}'"#,
+    );
+    let mut check_revised = check;
+    *check_revised.last_mut().unwrap() = "after-revision";
+    ok(f.cmd(&linked, &check_revised).output().unwrap());
+    assert!(
+        f.state("after-revision")["memory_inputs"]["reviewer"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(revised))
+    );
+    assert_eq!(f.state("both"), r);
     let ctx = ok(f.call(&["memory", "list", "--task", "sample", "--spec", &f.base]));
     assert!(ctx.contains("Which deadline?"));
     assert!(!ctx.contains("handoff-719"));
@@ -378,4 +404,18 @@ fn plain_adapters_do_not_open_a_memory_database() {
     assert_eq!(r["review_status"], "findings_recorded");
     assert_eq!(r["approved"], false);
     assert!(!f.repo.join(".git/aep/memory.sqlite3").exists());
+}
+
+#[test]
+fn manual_memory_resolves_refs_and_rejects_a_candidate_behind_the_spec() {
+    use aep::memory::Key;
+    let f = Fixture::new(&["true"]);
+    git(&f.repo, &["commit", "--allow-empty", "-m", "candidate"]);
+    let tip = git(&f.repo, &["rev-parse", "HEAD"]);
+    let key = Key::resolve(&f.repo, Some("sample"), Some("HEAD~1"), Some("HEAD")).unwrap();
+    assert_eq!(key.spec, f.base);
+    assert_eq!(key.candidate, tip);
+    assert!(Key::resolve(&f.repo, Some("sample"), Some("HEAD"), Some("HEAD~1")).is_err());
+    assert!(Key::resolve(&f.repo, None, None, Some("HEAD")).is_err());
+    assert!(Key::resolve(&f.repo, Some("sample"), None, None).is_err());
 }

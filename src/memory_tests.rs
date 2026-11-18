@@ -90,3 +90,46 @@ fn concurrent_updates_share_one_successor() {
     );
     assert_eq!(db.context(&Key::new("", "", ""), None).unwrap().len(), 9);
 }
+
+#[test]
+fn manual_revision_of_an_agent_question_keeps_its_scope_and_provenance_chain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = Memory::open(tmp.path()).unwrap();
+    let k = Key::new("task", "spec", "candidate");
+    let notes = db
+        .publish(
+            "reviewer",
+            "first-run",
+            &k,
+            &json!({"note":"review","question":"Which unit?"}),
+        )
+        .unwrap();
+    let old = notes[1];
+    let revised = db.revise(old, Kind::Decision, "Milliseconds").unwrap();
+    assert!(db.revise(old, Kind::Decision, "Stale answer").is_err());
+    let original = db.get(old).unwrap();
+    let new = db.get(revised).unwrap();
+    assert_eq!(original["run_id"], "first-run");
+    assert_eq!(original["author"], "reviewer");
+    assert_eq!(original["body"], "Which unit?");
+    assert_eq!(new["author"], "manual");
+    assert_eq!(new["replaces"], old);
+    assert_eq!(new["kind"], "decision");
+    assert!(new["run_id"].is_null());
+    for field in ["task", "spec_sha", "scope", "candidate_sha"] {
+        assert_eq!(new[field], original[field]);
+    }
+    let next = db
+        .context(
+            &Key::new("task", "spec", "other-candidate"),
+            Some("next-run"),
+        )
+        .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0]["id"], revised);
+    assert!(
+        db.context(&Key::new("task", "other-spec", ""), None)
+            .unwrap()
+            .is_empty()
+    );
+}
