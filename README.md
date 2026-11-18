@@ -37,6 +37,8 @@ cargo run --locked --manifest-path desktop/Cargo.toml -- --repo /path/to/repo
 
 在当前记忆的详情点「修订」，可以更正正文，或将已回答的「未决问题」改为「决策」。新版本记为人工写入，继承原范围。历史 Run 仍链接到当时读写的版本。如果两人同时修订同一条记录，先保存的版本生效，另一位的草稿留在编辑器中。
 
+记忆详情的「读取记录」列出读取过所打开版本的 Run 和 Agent 角色。点击 Run 可回到对应的执行证据。打开上一版本可查看它自己的读取记录。
+
 桌面端和 CLI 使用所选克隆的同一个本地 SQLite 库，关联 Worktree 共用记录。CLI 可独立安装。
 
 ### 重复派发与本地恢复
@@ -127,7 +129,7 @@ cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
   --scenario conflict --output-dir desktop/target/ui-debug --screenshots
 ```
 
-`handoff` 会在临时仓库中通过 AEP CLI 派发 Rust 小任务，由两个本地替身进程完成实现和审查。审查进程只有在收到实现 Agent 的交接标识后才会返回报告。UI 随后打开这次运行实际生成的 SQLite 记忆与证据，核对两个角色引用同一条记忆，并打开验收日志和审查报告。
+`handoff` 会在临时仓库中通过 AEP CLI 派发 Rust 小任务，由两个本地替身进程完成实现和审查。审查进程只有在收到实现 Agent 的交接标识后才会返回报告。UI 随后打开执行器生成的 SQLite 记忆、验收日志和审查报告。调试流程还会在 Studio 将第一轮的未决问题修订为决策，再运行同一 Spec 的新候选提交。第二轮的两个 Agent 必须收到新决策。每个版本的读取记录都可以跳回对应 Run。
 
 已在本机用模型客户端跑完一次交接时，可以验证那次运行的界面。将 `--run-id` 改为实际运行 ID。
 

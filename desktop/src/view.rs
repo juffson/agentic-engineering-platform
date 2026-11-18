@@ -17,11 +17,12 @@ const MINT: u32 = 0x95dfc4;
 const AMBER: u32 = 0xe8c080;
 const RED: u32 = 0xf29b9c;
 const BLUE: u32 = 0x9bbff4;
+const AGENT_ROLES: [&str; 2] = ["implementer", "reviewer"];
 
 fn t(s: impl Into<SharedString>, color: u32) -> Div {
     div().text_sm().text_color(rgb(color)).child(s.into())
 }
-fn detail_text(id: &'static str, text: &str) -> ObservedElement<Stateful<Div>> {
+fn detail_text(id: impl Into<ElementId>, text: &str) -> ObservedElement<Stateful<Div>> {
     let text = SharedString::from(text.to_owned());
     t(text.clone(), FG)
         .id(id)
@@ -260,8 +261,12 @@ impl Studio {
         if !self.snapshot.runs.iter().any(|r| r.id == id) {
             return t(format!("{id} · 运行记录不可用"), MUTED).into_any_element();
         }
+        self.open_run_button("origin-run".into(), id, cx)
+    }
+
+    fn open_run_button(&self, button_id: SharedString, id: &str, cx: &Context<Self>) -> AnyElement {
         let target = id.to_string();
-        button("origin-run", format!("{id}  ↗"), true)
+        button(button_id, format!("{id}  ↗"), true)
             .on_click(cx.listener(move |this, _, w, cx| {
                 this.run = Some(target.clone());
                 this.navigate(Page::Runs, w, cx);
@@ -337,7 +342,7 @@ impl Studio {
         }
         let mut handoff = panel().child(header);
         let mut groups = 0;
-        for role in ["implementer", "reviewer"] {
+        for role in AGENT_ROLES {
             for (key, verb) in [("memory_inputs", "读取"), ("memory_outputs", "写入")] {
                 if let Some(ids) = r.record[key][role].as_array() {
                     groups += 1;
@@ -391,6 +396,44 @@ impl Studio {
             .child(evidence)
             .child(artifacts)
     }
+
+    fn memory_read_history(&self, id: i64, cx: &Context<Self>) -> Div {
+        let mut history = panel().child(heading("读取记录"));
+        let mut count = 0;
+        for run in &self.snapshot.runs {
+            let readers = AGENT_ROLES
+                .into_iter()
+                .filter(|role| {
+                    run.record["memory_inputs"][role]
+                        .as_array()
+                        .is_some_and(|ids| ids.iter().any(|value| value.as_i64() == Some(id)))
+                })
+                .map(author)
+                .collect::<Vec<_>>();
+            if readers.is_empty() {
+                continue;
+            }
+            count += 1;
+            history = history.child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(self.open_run_button(format!("read-run-{}", run.id).into(), &run.id, cx))
+                    .child(
+                        detail_text(
+                            SharedString::from(format!("read-roles-{}", run.id)),
+                            &readers.join("、"),
+                        )
+                        .text_xs()
+                        .text_color(rgb(MUTED)),
+                    ),
+            );
+        }
+        history.when(count == 0, |panel| {
+            panel.child(caption("此版本暂无读取记录。"))
+        })
+    }
+
     fn memory_detail(&self, n: &Value, cx: &Context<Self>) -> Div {
         let id = n["id"].as_i64().unwrap_or_default();
         let mut meta = panel()
@@ -456,6 +499,7 @@ impl Studio {
                     .child(detail_text("note-body", string(n, "body"))),
             )
             .child(meta)
+            .child(self.memory_read_history(id, cx))
     }
 }
 

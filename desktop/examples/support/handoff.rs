@@ -3,8 +3,11 @@ use anyhow::{Context, Result, ensure};
 use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 pub const RUN: &str = "memory-handoff";
+pub const FOLLOW_UP: &str = "memory-follow-up";
+pub const QUESTION: &str = "Should the conversion saturate?";
+pub const DECISION: &str = "Return the exact widened value.";
 
-pub fn run(root: &Path) -> Result<Workspace> {
+pub fn start(root: &Path) -> Result<Workspace> {
     let repo = root.join("repo");
     let remote = root.join("remote.git");
     let bin = root.join("bin");
@@ -50,11 +53,15 @@ pub fn run(root: &Path) -> Result<Workspace> {
         fs::write(&path, script)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
-    let original_path = env::var_os("PATH").unwrap_or_default();
-    let path = env::join_paths(std::iter::once(bin).chain(env::split_paths(&original_path)))?;
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml");
-    for args in [
-        &["dispatch", "--task", "handoff"][..],
+    aep(root, RUN, &["dispatch", "--task", "handoff"])?;
+    run(root, RUN)?;
+    Workspace::open(&repo)
+}
+
+pub fn run(root: &Path, id: &str) -> Result<()> {
+    aep(
+        root,
+        id,
         &[
             "run",
             "--task",
@@ -65,28 +72,37 @@ pub fn run(root: &Path) -> Result<Workspace> {
             "claude",
             "--shared-memory",
             "--run-id",
-            RUN,
+            id,
             "--timeout",
             "30",
         ],
-    ] {
-        let output = Command::new("cargo")
-            .args(["run", "--quiet", "--locked", "--manifest-path"])
-            .arg(&manifest)
-            .args(["--bin", "aep", "--", "--repo"])
-            .arg(&repo)
-            .args(args)
-            .env("PATH", &path)
-            .env("TMPDIR", root)
-            .output()
-            .with_context(|| format!("run aep {}", args[0]))?;
-        ensure!(
-            output.status.success(),
-            "aep {} failed:\n{}\n{}",
-            args[0],
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Workspace::open(&repo)
+    )
+}
+
+fn aep(root: &Path, id: &str, args: &[&str]) -> Result<()> {
+    let original_path = env::var_os("PATH").unwrap_or_default();
+    let path =
+        env::join_paths(std::iter::once(root.join("bin")).chain(env::split_paths(&original_path)))?;
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml");
+    let output = Command::new("cargo")
+        .args(["run", "--quiet", "--locked", "--manifest-path"])
+        .arg(&manifest)
+        .args(["--bin", "aep", "--", "--repo"])
+        .arg(root.join("repo"))
+        .args(args)
+        .env("PATH", &path)
+        .env("TMPDIR", root)
+        .env("AEP_FIXTURE_RUN", id)
+        .env("AEP_FIXTURE_QUESTION", QUESTION)
+        .env("AEP_FIXTURE_DECISION", DECISION)
+        .output()
+        .with_context(|| format!("run aep {}", args[0]))?;
+    ensure!(
+        output.status.success(),
+        "aep {} failed:\n{}\n{}",
+        args[0],
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }

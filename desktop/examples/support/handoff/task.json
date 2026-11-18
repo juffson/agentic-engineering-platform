@@ -1,5 +1,5 @@
 {
   "title": "Convert seconds to milliseconds",
   "allowed_paths": ["normalize.rs"],
-  "check": ["sh", "-c", "rustc --edition=2024 --test acceptance.rs -o acceptance && ./acceptance"]
+  "check": ["sh", "-c", "trap 'rm -f acceptance' 0; rustc --edition=2024 --test acceptance.rs -o acceptance && ./acceptance"]
 }
