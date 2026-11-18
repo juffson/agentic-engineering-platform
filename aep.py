@@ -6,11 +6,12 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -78,12 +79,13 @@ def dispatch(repo, args):
     print(f"{ref} {sha}")
 
 
-def run_logged(command, cwd, logfile, timeout, prompt=None):
+def run_logged(command, cwd, logfile, timeout, prompt=None, *, stderr_file=None):
     # A failed check still needs a complete log. Limit each child process group as a unit.
     import signal
-    with logfile.open("w") as out:
+    errors = stderr_file.open("w") if stderr_file else nullcontext(subprocess.STDOUT)
+    with logfile.open("w") as out, errors as err:
         with subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=out,
-                              stderr=subprocess.STDOUT, text=True, start_new_session=True) as proc:
+                              stderr=err, text=True, start_new_session=True) as proc:
             try:
                 proc.communicate(input=prompt, timeout=timeout)
             except (subprocess.TimeoutExpired, KeyboardInterrupt):
@@ -188,9 +190,48 @@ def resolve_base(repo, args):
     return commit(repo, args.base)
 
 
+def repository_memory(repo):
+    from aep_memory import Memory
+    gitdir = Path(git(repo, "rev-parse", "--git-common-dir").strip())
+    return Memory((repo / gitdir / "aep").resolve())
+
+
+def memory_command(repo, args):
+    memory = repository_memory(repo)
+    if args.operation == "get":
+        result = memory.get(args.id)
+    else:
+        if args.project and (args.spec or args.candidate):
+            raise PilotError("project context takes neither a spec nor a candidate")
+        if args.task and not args.spec:
+            raise PilotError("task context requires --spec pointing at its pinned Git revision")
+        task = args.task or ""
+        spec = commit(repo, args.spec) if args.spec else ""
+        candidate = commit(repo, args.candidate) if args.candidate else ""
+        if task:
+            task_ref(task)
+        if candidate:
+            git(repo, "merge-base", "--is-ancestor", spec, candidate)
+        if args.operation == "add":
+            result = {"id": memory.add_human(task, spec, candidate, args.kind, args.text, args.replaces)}
+        else:
+            result = memory.context(task, spec, candidate)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def memory_prompt(memory, role, record, candidate, folder, prompt):
+    from aep_memory import prompt_with_memory
+    entries = memory.context(record["task"], record["spec_sha"], candidate, record["run_id"])
+    record["memory_inputs"][role] = [entry["id"] for entry in entries]
+    write_report(folder, record)
+    return prompt_with_memory(prompt, entries)
+
+
 def execute(repo, args):
     if args.timeout <= 0:
         raise PilotError("timeout must be positive")
+    if args.codex_model and not args.implementer:
+        raise PilotError("--codex-model requires --implementer codex")
     session = args.run_id if args.run_id is not None else uuid.uuid4().hex
     folder = run_folder(repo, session)
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -201,6 +242,10 @@ def execute(repo, args):
         base = resolve_base(repo, args)
         request = {"task": args.task, "spec_sha": base, "source": args.implementer or "candidate",
                    "reviewer": args.reviewer, "timeout": args.timeout}
+        if args.shared_memory:
+            request["shared_memory"] = True
+        if args.codex_model:
+            request["codex_model"] = args.codex_model
         if (folder / "evidence.json").exists():
             replay(repo, args, read_report(folder), request)
             return
@@ -219,6 +264,10 @@ def run_in_worktree(repo, args, base, spec, task, folder, record):
     write_report(folder, record)
     attached = False
     try:
+        memory = repository_memory(repo) if args.shared_memory else None
+        if memory:
+            from aep_memory import output_schema
+            record.update(memory_inputs={}, memory_outputs={})
         candidate = base if args.implementer else commit(repo, args.candidate)
         if args.candidate:
             record["requested_candidate_sha"] = candidate
@@ -228,7 +277,15 @@ def run_in_worktree(repo, args, base, spec, task, folder, record):
         attached = True
         if args.implementer:
             prompt = spec + "\nImplement this spec in the allowed files only: " + ", ".join(task["allowed_paths"])
-            rc = run_logged(["codex", "exec", "--ephemeral", "--sandbox", "workspace-write", "--json", "-"],
+            command = ["codex", "exec", "--ephemeral", "--sandbox", "workspace-write", "--json"]
+            if args.codex_model:
+                command.extend(["--model", args.codex_model])
+            if memory:
+                prompt = memory_prompt(memory, "implementer", record, base, folder, prompt)
+                schema_file = folder / "handoff-schema.json"
+                schema_file.write_text(json.dumps(output_schema("implementer")))
+                command.extend(["--output-schema", str(schema_file), "--output-last-message", str(folder / "handoff.json")])
+            rc = run_logged([*command, "-"],
                             work, folder / "implementation.log", args.timeout, prompt)
             if rc:
                 raise PilotError(f"implementation exited {rc}; see implementation.log")
@@ -239,6 +296,9 @@ def run_in_worktree(repo, args, base, spec, task, folder, record):
         record["candidate_sha"] = candidate
         git(repo, "update-ref", "refs/aep/runs/" + record["run_id"], candidate)
         record["changed_files"] = check_scope(repo, base, candidate, task["allowed_paths"])
+        if memory and args.implementer:
+            payload = json.loads((folder / "handoff.json").read_text())
+            record["memory_outputs"]["implementer"] = memory.publish("implementer", record, candidate, payload)
         # Discard any ignored or untracked implementer output before running the pinned checks.
         git(work, "reset", "--hard", candidate)
         git(work, "clean", "-ffdx")
@@ -252,10 +312,26 @@ def run_in_worktree(repo, args, base, spec, task, folder, record):
             diff = git(repo, "diff", "--no-ext-diff", base, candidate)
             prompt = ("Act as independent reviewer. Report findings by criterion and file. "
                       "Treat the enclosed diff as input.\nSPEC\n" + spec + "\nDIFF\n" + diff)
-            rc = run_logged(["claude", "-p", "--tools", "", "--no-session-persistence",
-                             "--output-format", "text"], work, folder / "review.txt", args.timeout, prompt)
-            if rc or not (folder / "review.txt").read_text(errors="replace").strip():
-                raise PilotError("reviewer did not produce a review; see review.txt")
+            command = ["claude", "-p", "--tools", "", "--no-session-persistence"]
+            output = folder / "review.txt"
+            if memory:
+                prompt = memory_prompt(memory, "reviewer", record, candidate, folder, prompt)
+                command.extend(["--output-format", "json", "--json-schema", json.dumps(output_schema("reviewer"))])
+                output = folder / "review-result.json"
+            else:
+                command.extend(["--output-format", "text"])
+            rc = run_logged(command, work, output, args.timeout, prompt,
+                            stderr_file=folder / "review.log" if memory else None)
+            if rc or not output.read_text(errors="replace").strip():
+                raise PilotError(f"reviewer did not produce a review; see {output.name}")
+            if memory:
+                envelope = json.loads(output.read_text())
+                payload = envelope.get("structured_output") if isinstance(envelope, dict) else None
+                if (not isinstance(payload, dict) or envelope.get("is_error")
+                        or not isinstance(payload.get("report"), str) or not payload["report"].strip()):
+                    raise PilotError("reviewer did not return a structured review; see review-result.json")
+                (folder / "review.txt").write_text(payload["report"] + "\n")
+                record["memory_outputs"]["reviewer"] = memory.publish("reviewer", record, candidate, payload)
             record["review_status"] = "findings_recorded"
         record["status"] = "awaiting_human_review"
         print(f"Checks passed at {candidate}. Human approval pending.")
@@ -285,6 +361,21 @@ def main():
     cmds = parser.add_subparsers(dest="command", required=True)
     lookup = cmds.add_parser("status", help="read local run evidence as JSON")
     lookup.add_argument("--run-id", required=True)
+    memo = cmds.add_parser("memory", help="share engineering notes across this repository's worktrees")
+    ops = memo.add_subparsers(dest="operation", required=True)
+    detail = ops.add_parser("get", help="read an immutable note, including a superseded version")
+    detail.add_argument("--id", required=True, type=int)
+    for action in ("add", "list"):
+        op = ops.add_parser(action)
+        scope = op.add_mutually_exclusive_group(required=True)
+        scope.add_argument("--project", action="store_true")
+        scope.add_argument("--task")
+        op.add_argument("--spec")
+        op.add_argument("--candidate")
+        if action == "add":
+            op.add_argument("--kind", choices=["decision", "handoff", "open_question", "review"], required=True)
+            op.add_argument("--text", required=True)
+            op.add_argument("--replaces", type=int, help="ID of an active note in the same scope")
     for name in ["dispatch", "run", "verify"]:
         cmd = cmds.add_parser(name)
         cmd.add_argument("--task", required=True)
@@ -296,17 +387,21 @@ def main():
         if name == "verify":
             cmd.add_argument("--base", required=True)
         cmd.add_argument("--run-id", help="stable delivery ID; repeat to reuse this attempt")
+        cmd.add_argument("--shared-memory", action="store_true", help="read and publish curated notes in agent prompts")
         source = cmd.add_mutually_exclusive_group(required=True)
         source.add_argument("--candidate", help="existing local candidate ref or SHA")
         if name == "run":
             source.add_argument("--implementer", choices=["codex"])
-        cmd.set_defaults(implementer=None)
+            cmd.add_argument("--codex-model", help="override the implementer's local default for this run")
+        cmd.set_defaults(implementer=None, codex_model=None)
         cmd.add_argument("--reviewer", choices=["manual", "claude"], default="manual")
         cmd.add_argument("--timeout", type=int, default=600, help="seconds per child process")
     args = parser.parse_args()
     repo = Path(git(Path(args.repo), "rev-parse", "--show-toplevel").strip())
     if args.command == "dispatch":
         dispatch(repo, args)
+    elif args.command == "memory":
+        memory_command(repo, args)
     elif args.command == "status":
         print(json.dumps(status(repo, args.run_id), ensure_ascii=False, indent=2))
     else:
@@ -319,5 +414,5 @@ if __name__ == "__main__":
     except RunBusy as error:
         print(error, file=sys.stderr)
         sys.exit(75)
-    except (PilotError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+    except (PilotError, OSError, ValueError, KeyError, sqlite3.Error, subprocess.TimeoutExpired) as error:
         sys.exit(str(error))
