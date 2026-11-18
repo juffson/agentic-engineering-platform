@@ -1,7 +1,11 @@
 //! Run Studio's real event handlers in an offscreen GPUI window.
+#[path = "support/handoff.rs"]
+mod handoff_fixture;
+
 use aep::{
     memory::{Key, Kind, Memory},
-    workspace::{Workspace, git},
+    studio::{Artifact, Snapshot, preview},
+    workspace::{Workspace, git, status},
 };
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
@@ -36,6 +40,12 @@ struct Args {
     /// Replay a JSON array of UI steps in a fresh fixture
     #[arg(long, conflicts_with = "scenario")]
     script: Option<PathBuf>,
+    /// Verify a completed handoff in an existing Git repository
+    #[arg(long, requires = "run_id", conflicts_with_all = ["scenario", "script"])]
+    repo: Option<PathBuf>,
+    /// Run to verify in the supplied Git repository
+    #[arg(long, requires = "repo")]
+    run_id: Option<String>,
     /// Write JSON control snapshots at each checkpoint
     #[arg(long)]
     output_dir: Option<PathBuf>,
@@ -112,6 +122,11 @@ impl<'a> Driver<'a> {
         let delta = gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(dy)));
         self.frame(|w, cx| w.scroll(SharedString::from(id.to_owned()), delta, cx))?;
         self.settle()
+    }
+    fn reveal(&mut self, container: &str, target: &str) -> Result<()> {
+        let top = self.element(container)?.bounds().origin.y;
+        let target = self.element(target)?.bounds().origin.y;
+        self.scroll(container, f32::from(top + px(120.) - target))
     }
     fn input(&mut self, text: &str) -> Result<()> {
         self.frame(|w, cx| w.input(text, cx))?;
@@ -331,23 +346,43 @@ fn conflict(ui: &mut Driver, ws: &Workspace) -> Result<()> {
     Ok(())
 }
 
-fn handoff(ui: &mut Driver, ws: &Workspace, sha: &str) -> Result<()> {
-    let mut db = Memory::open(&ws.data)?;
-    let key = Key::new("sample", sha, sha);
-    let body = "Implementer verified the timestamp conversion.";
-    let ids = db.publish(
-        "implementer",
-        "sample-run",
-        &key,
-        &json!({"note":body,"question":""}),
-    )?;
-    let id = ids[0];
-    let file = ws.data.join("runs/sample-run/evidence.json");
-    let mut record = aep::workspace::read(&file)?;
-    record["memory_outputs"] = json!({"implementer":[id]});
-    record["memory_inputs"] = json!({"reviewer":[id]});
-    fs::write(file, serde_json::to_vec(&record)?)?;
-    ui.click("refresh")?;
+fn handoff(ui: &mut Driver, ws: &Workspace, run: &str) -> Result<()> {
+    let record = status(&ws.data, run)?;
+    ensure!(
+        record["status"] == "awaiting_human_review"
+            && record["implementation_source"] == "codex"
+            && record["review_status"] == "findings_recorded"
+            && record["check_exit_code"] == 0
+            && record["approved"] == false,
+        "{run} must have a successful implementation, checks and review awaiting human approval"
+    );
+    let produced = record["memory_outputs"]["implementer"]
+        .as_array()
+        .context("no implementer memory outputs")?;
+    let received = record["memory_inputs"]["reviewer"]
+        .as_array()
+        .context("no reviewer memory inputs")?;
+    let snapshot = Snapshot::load(ws);
+    let note = snapshot
+        .notes
+        .iter()
+        .find(|note| {
+            note["kind"] == "handoff"
+                && note["author"] == "implementer"
+                && note["run_id"] == run
+                && produced.contains(&note["id"])
+                && received.contains(&note["id"])
+        })
+        .context("reviewer did not receive this run's implementer handoff")?;
+    let id = note["id"].as_i64().context("handoff note ID")?;
+    let body = note["body"].as_str().context("handoff note body")?;
+    for key in ["task", "spec_sha", "candidate_sha"] {
+        ensure!(note[key] == record[key], "handoff {key} differs from run");
+    }
+
+    ui.click("search")?;
+    ui.input(run)?;
+    ui.click(&format!("run-{run}"))?;
     ensure!(
         ui.element(&format!("memory_outputs-implementer-{id}"))?
             .visible(),
@@ -366,18 +401,24 @@ fn handoff(ui: &mut Driver, ws: &Workspace, sha: &str) -> Result<()> {
         "origin link did not return to the source run"
     );
     ui.checkpoint("handoff-run")?;
-    let folder = ws.data.join("runs/sample-run");
-    for (file, body) in [
-        ("checks.log", "All checks passed."),
-        ("review.txt", "The reviewer confirmed the conversion."),
-    ] {
-        fs::write(folder.join(file), body)?;
-        ui.scroll("detail-sample-run", -650.)?;
+    let detail = format!("detail-{run}");
+    for artifact in [Artifact::Checks, Artifact::Review] {
+        let file = artifact.filename();
+        let artifact =
+            preview(&ws.data, run, artifact)?.with_context(|| format!("missing {file}"))?;
+        let text = if artifact.truncated {
+            format!("仅显示末尾 48 KiB\n\n{}", artifact.text)
+        } else if artifact.text.trim().is_empty() {
+            "文件为空".to_owned()
+        } else {
+            artifact.text
+        };
+        ui.reveal(&detail, file)?;
         ui.click(file)?;
-        ui.scroll("detail-sample-run", -650.)?;
-        let preview = ui.element("artifact-body")?;
+        ui.reveal(&detail, "artifact-body")?;
+        let actual = ui.element("artifact-body")?;
         ensure!(
-            preview.visible() && preview.label() == Some(body),
+            actual.visible() && actual.label() == Some(text.as_str()),
             "wrong preview for {file}"
         );
     }
@@ -444,8 +485,16 @@ fn with_fixture(
 ) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (ws, sha) = fixture(dir.path())?;
-    let mut ui = Driver::open(&ws, args)?;
-    let result = check(&mut ui, &ws, &sha);
+    inspect(args, &ws, |ui| check(ui, &ws, &sha))
+}
+
+fn inspect(
+    args: &Args,
+    ws: &Workspace,
+    check: impl FnOnce(&mut Driver) -> Result<()>,
+) -> Result<()> {
+    let mut ui = Driver::open(ws, args)?;
+    let result = check(&mut ui);
     if result.is_err()
         && let Err(error) = ui.checkpoint("failure")
     {
@@ -459,7 +508,10 @@ fn main() -> Result<()> {
     if let Some(dir) = &args.output_dir {
         fs::create_dir_all(dir)?;
     }
-    if let Some(path) = &args.script {
+    if let (Some(repo), Some(run)) = (&args.repo, &args.run_id) {
+        let ws = Workspace::open(repo)?;
+        inspect(&args, &ws, |ui| handoff(ui, &ws, run))?;
+    } else if let Some(path) = &args.script {
         let steps: Vec<Step> = serde_json::from_slice(
             &fs::read(path).with_context(|| format!("read {}", path.display()))?,
         )
@@ -471,11 +523,15 @@ fn main() -> Result<()> {
             None => &[Scenario::History, Scenario::Conflict, Scenario::Handoff],
         };
         for scenario in scenarios {
-            with_fixture(&args, |ui, ws, sha| match scenario {
-                Scenario::History => history(ui, ws, sha),
-                Scenario::Conflict => conflict(ui, ws),
-                Scenario::Handoff => handoff(ui, ws, sha),
-            })?;
+            match scenario {
+                Scenario::History => with_fixture(&args, history)?,
+                Scenario::Conflict => with_fixture(&args, |ui, ws, _| conflict(ui, ws))?,
+                Scenario::Handoff => {
+                    let dir = tempfile::tempdir()?;
+                    let ws = handoff_fixture::run(dir.path())?;
+                    inspect(&args, &ws, |ui| handoff(ui, &ws, handoff_fixture::RUN))?;
+                }
+            }
         }
     }
     println!("UI checks passed.");
