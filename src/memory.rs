@@ -79,6 +79,17 @@ impl Key {
         }
     }
 }
+#[derive(Debug)]
+pub struct RevisionConflict;
+
+impl std::fmt::Display for RevisionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("replaced memory must be current and in the same scope")
+    }
+}
+
+impl std::error::Error for RevisionConflict {}
+
 pub struct Memory(Connection);
 fn note(row: &Row<'_>) -> rusqlite::Result<Value> {
     let mut v = json!({"id":row.get::<_,i64>("id")?,"run_id":row.get::<_,Option<String>>("run_id")?,"replaces":row.get::<_,Option<i64>>("replaces")?});
@@ -159,10 +170,7 @@ impl Memory {
                 params![old, k.scope(), k.task, k.spec, k.candidate],
                 |row| row.get(0),
             )?;
-            ensure!(
-                active,
-                "replaced memory must be current and in the same scope"
-            );
+            ensure!(active, RevisionConflict);
         }
         tx.execute(
             "INSERT INTO notes(scope,task,spec_sha,candidate_sha,origin_sha,kind,author,body,created_at,replaces)

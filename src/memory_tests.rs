@@ -106,7 +106,11 @@ fn manual_revision_of_an_agent_question_keeps_its_scope_and_provenance_chain() {
         .unwrap();
     let old = notes[1];
     let revised = db.revise(old, Kind::Decision, "Milliseconds").unwrap();
-    assert!(db.revise(old, Kind::Decision, "Stale answer").is_err());
+    assert!(
+        db.revise(old, Kind::Decision, "Stale answer")
+            .unwrap_err()
+            .is::<RevisionConflict>()
+    );
     let original = db.get(old).unwrap();
     let new = db.get(revised).unwrap();
     assert_eq!(original["run_id"], "first-run");
