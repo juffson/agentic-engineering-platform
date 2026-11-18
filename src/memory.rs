@@ -63,6 +63,26 @@ fn text(s: &str, optional: bool) -> Result<&str> {
     Ok(s)
 }
 impl Memory {
+    /// Browse the workspace without initializing a database or replacing historical notes.
+    pub(crate) fn browse(dir: &Path) -> Result<Vec<Value>> {
+        let path = dir.join("memory.sqlite3");
+        if !path.try_exists()? {
+            return Ok(Vec::new());
+        }
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let mut query = db.prepare(
+            "SELECT n.*, (SELECT id FROM notes s WHERE s.replaces=n.id) AS successor
+             FROM notes n ORDER BY n.id DESC",
+        )?;
+        Ok(query
+            .query_map([], |row| {
+                let mut value = note(row)?;
+                value["successor"] = json!(row.get::<_, Option<i64>>("successor")?);
+                Ok(value)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn open(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let path = dir.join("memory.sqlite3");

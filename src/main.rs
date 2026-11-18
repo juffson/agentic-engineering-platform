@@ -1,6 +1,6 @@
 mod agent;
 mod git;
-mod memory;
+use aep::memory;
 mod run;
 
 use anyhow::{Result, ensure};

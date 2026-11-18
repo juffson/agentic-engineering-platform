@@ -14,6 +14,18 @@ jobs:
       - run: cargo +stable fmt --all -- --check
       - run: cargo +stable clippy --locked --all-targets -- -D warnings
       - run: cargo +stable test --locked --all-targets
+  desktop:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - run: cargo +stable fmt --manifest-path desktop/Cargo.toml -- --check
+      - run: cargo +stable clippy --manifest-path desktop/Cargo.toml --locked --all-targets -- -D warnings
+      - run: RUSTUP_TOOLCHAIN=stable ./desktop/bundle-macos.sh
+      - run: codesign --verify --strict "desktop/target/AEP Studio.app"
   acceptance:
     if: github.event_name == 'pull_request' && github.head_ref == 'pilot/market-volume-dedup-rust'
     runs-on: ubuntu-latest
