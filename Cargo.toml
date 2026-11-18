@@ -1,0 +1,18 @@
+[package]
+name = "aep"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Local execution and shared engineering memory for AEP"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+nix = { version = "0.30", features = ["signal", "process"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }

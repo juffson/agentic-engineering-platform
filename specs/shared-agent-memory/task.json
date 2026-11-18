@@ -1,17 +1,17 @@
 {
   "title": "跨 Agent 传递有版本和来源的工程记忆",
   "allowed_paths": [
-    "aep.py",
-    "aep_memory.py",
+    "src/memory.rs",
+    "src/memory.sql",
+    "src/agent.rs",
+    "src/run.rs",
+    "src/main.rs",
     "README.md"
   ],
   "check": [
-    "python3",
-    "-m",
-    "unittest",
-    "discover",
-    "-s",
-    "tests",
-    "-v"
+    "cargo",
+    "test",
+    "--locked",
+    "--all-targets"
   ]
 }
