@@ -1,0 +1,14 @@
+[
+  {"click":"共享记忆"},
+  {"click":"new-note"},
+  {"input":"Prefer milliseconds."},
+  {"expect_value":{"label":"记忆正文","equals":"Prefer milliseconds."}},
+  {"click":"save-note"},
+  {"present":"note-1"},
+  {"click":"search"},
+  {"input":"no-match"},
+  {"absent":"note-1"},
+  {"press":"cmd-a"},
+  {"input":"milliseconds"},
+  {"present":"note-1"}
+]

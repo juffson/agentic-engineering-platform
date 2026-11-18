@@ -24,6 +24,13 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - run: cargo +stable fmt --manifest-path desktop/Cargo.toml -- --check
       - run: cargo +stable clippy --manifest-path desktop/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Exercise the Studio UI offscreen
+        run: |
+          cargo +stable run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --output-dir "$RUNNER_TEMP/aep-ui"
+          cargo +stable run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --output-dir "$RUNNER_TEMP/aep-ui" --script desktop/examples/memory-search.json
+      - name: Show UI diagnostics on failure
+        if: failure()
+        run: if test -f "$RUNNER_TEMP/aep-ui/failure.json"; then cat "$RUNNER_TEMP/aep-ui/failure.json"; fi
       - run: RUSTUP_TOOLCHAIN=stable ./desktop/bundle-macos.sh
       - run: codesign --verify --strict "desktop/target/AEP Studio.app"
   acceptance:

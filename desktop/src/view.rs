@@ -2,6 +2,7 @@ pub(crate) mod editor;
 use super::*;
 use aep::studio::Run;
 use editor::Start;
+use gpui_kit::base::ObservedElement;
 use gpui_kit::component::{Icon, IconName, Sizable, StyledExt, h_flex, input::Input, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 
@@ -19,6 +20,14 @@ const BLUE: u32 = 0x9bbff4;
 
 fn t(s: impl Into<SharedString>, color: u32) -> Div {
     div().text_sm().text_color(rgb(color)).child(s.into())
+}
+fn detail_text(id: &'static str, text: &str) -> ObservedElement<Stateful<Div>> {
+    let text = SharedString::from(text.to_owned());
+    t(text.clone(), FG)
+        .id(id)
+        .role(Role::Label)
+        .aria_label(text)
+        .test_support()
 }
 fn caption(s: impl Into<SharedString>) -> Div {
     t(s, MUTED).text_xs()
@@ -100,10 +109,11 @@ fn button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     active: bool,
-) -> Stateful<Div> {
+) -> ObservedElement<Stateful<Div>> {
     let label = label.into();
     div()
         .id(id.into())
+        .test_support()
         .role(Role::Button)
         .aria_label(label.clone())
         .tab_stop(true)
@@ -117,10 +127,11 @@ fn button(
         .hover(|s| s.bg(rgb(LINE)))
         .child(label)
 }
-fn item(id: impl Into<SharedString>, active: bool) -> Stateful<Div> {
+fn item(id: impl Into<SharedString>, active: bool) -> ObservedElement<Stateful<Div>> {
     let id = id.into();
     v_flex()
         .id(id.clone())
+        .test_support()
         .role(Role::Button)
         .aria_label(id)
         .tab_stop(true)
@@ -159,10 +170,11 @@ impl Studio {
         name: IconName,
         n: usize,
         cx: &Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> ObservedElement<Stateful<Div>> {
         let on = page == self.page;
         h_flex()
             .id(label)
+            .test_support()
             .role(Role::Button)
             .aria_label(label)
             .tab_stop(true)
@@ -365,9 +377,11 @@ impl Studio {
         if let Some((id, kind, text)) = &self.artifact
             && id == &r.id
         {
-            artifacts = artifacts
-                .child(caption(kind.filename()))
-                .child(t(text.clone(), FG).font_family("Menlo").text_xs());
+            artifacts = artifacts.child(caption(kind.filename())).child(
+                detail_text("artifact-body", text)
+                    .font_family("Menlo")
+                    .text_xs(),
+            );
         }
         v_flex()
             .gap_3()
@@ -439,7 +453,7 @@ impl Studio {
                             )))
                         },
                     ))
-                    .child(t(string(n, "body").to_owned(), FG)),
+                    .child(detail_text("note-body", string(n, "body"))),
             )
             .child(meta)
     }
@@ -752,7 +766,7 @@ impl Render for Studio {
                     .flex_none()
                     .gap_2()
                     .p_3()
-                    .child(Input::new(&self.search))
+                    .child(Input::new(&self.search).id("search"))
                     .child(
                         h_flex()
                             .justify_between()
@@ -769,6 +783,7 @@ impl Render for Studio {
             .child(
                 v_flex()
                     .id(SharedString::from(format!("detail-{detail_id}")))
+                    .test_support()
                     .p_5()
                     .min_w_0()
                     .flex_1()
