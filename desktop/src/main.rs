@@ -17,7 +17,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "Inspect AEP run evidence and shared agent memory")]
+#[command(about = "Inspect AEP run evidence and edit shared agent memory")]
 struct Args {
     /// Git working tree to inspect
     #[arg(long)]
@@ -51,6 +51,7 @@ fn attention(status: &str) -> bool {
 }
 
 struct Studio {
+    editor: Option<view::editor::Editor>,
     workspace: Option<Workspace>,
     snapshot: Snapshot,
     page: Page,
@@ -74,6 +75,7 @@ impl Studio {
             }
         });
         let mut studio = Self {
+            editor: None,
             workspace,
             snapshot: Snapshot::default(),
             page: Page::Runs,

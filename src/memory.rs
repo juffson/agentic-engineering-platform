@@ -1,5 +1,7 @@
-use anyhow::{Result, anyhow, ensure};
+use crate::workspace::{commit, git, ident};
+use anyhow::{Context, Result, anyhow, ensure};
 use chrono::Utc;
+use clap::ValueEnum;
 use rusqlite::{Connection, Row, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
@@ -13,6 +15,25 @@ const SCHEMA: &str = include_str!("memory.sql");
 #[cfg(test)]
 #[path = "memory_tests.rs"]
 mod tests;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum Kind {
+    Decision,
+    Handoff,
+    OpenQuestion,
+    Review,
+}
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Decision => "decision",
+            Self::Handoff => "handoff",
+            Self::OpenQuestion => "open_question",
+            Self::Review => "review",
+        }
+    }
+}
+
 pub struct Key {
     pub task: String,
     pub spec: String,
@@ -25,6 +46,28 @@ impl Key {
             spec: spec.into(),
             candidate: candidate.into(),
         }
+    }
+    pub fn resolve(
+        repo: &Path,
+        task: Option<&str>,
+        spec: Option<&str>,
+        candidate: Option<&str>,
+    ) -> Result<Self> {
+        let (task, spec) = match (task, spec, candidate) {
+            (None, None, None) => return Ok(Self::new("", "", "")),
+            (Some(task), Some(spec), _) => (task, spec),
+            _ => anyhow::bail!("task and spec must be supplied together"),
+        };
+        ident(task, 63)?;
+        let spec = commit(repo, spec).context("resolve spec commit")?;
+        let candidate = candidate
+            .map(|rev| commit(repo, rev).context("resolve candidate commit"))
+            .transpose()?;
+        if let Some(candidate) = &candidate {
+            git(repo, &["merge-base", "--is-ancestor", &spec, candidate])
+                .context("candidate must descend from spec")?;
+        }
+        Ok(Self::new(task, &spec, candidate.as_deref().unwrap_or("")))
     }
     fn scope(&self) -> &str {
         if !self.candidate.is_empty() {
@@ -129,6 +172,24 @@ impl Memory {
         let id = tx.last_insert_rowid();
         tx.commit()?;
         Ok(id)
+    }
+    /// Use the scope recorded on the original note, including when its Git refs have moved.
+    pub fn revise(&mut self, id: i64, kind: Kind, body: &str) -> Result<i64> {
+        let key = self
+            .0
+            .query_row(
+                "SELECT task,spec_sha,candidate_sha FROM notes WHERE id=?",
+                [id],
+                |row| {
+                    Ok(Key {
+                        task: row.get(0)?,
+                        spec: row.get(1)?,
+                        candidate: row.get(2)?,
+                    })
+                },
+            )
+            .context("read original memory")?;
+        self.add(&key, kind.as_str(), body, Some(id))
     }
     pub fn context(&self, k: &Key, run: Option<&str>) -> Result<Vec<Value>> {
         let mut stmt = self.0.prepare(
