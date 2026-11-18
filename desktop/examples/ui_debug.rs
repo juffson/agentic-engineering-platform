@@ -425,6 +425,112 @@ fn handoff(ui: &mut Driver, ws: &Workspace, run: &str) -> Result<()> {
     ui.checkpoint("handoff-review")
 }
 
+fn continuation(ui: &mut Driver, ws: &Workspace, root: &Path) -> Result<()> {
+    use handoff_fixture::{DECISION, FOLLOW_UP, QUESTION, RUN};
+
+    let first = status(&ws.data, RUN)?;
+    let snapshot = Snapshot::load(ws);
+    let original = snapshot
+        .notes
+        .iter()
+        .find(|note| note["run_id"] == RUN && note["kind"] == "open_question")
+        .and_then(|note| note["id"].as_i64())
+        .context("implementer question ID")?;
+    let question_link = format!("memory_inputs-reviewer-{original}");
+    ui.reveal(&format!("detail-{RUN}"), &question_link)?;
+    ui.click(&question_link)?;
+    ensure!(
+        ui.element("note-body")?.label() == Some(QUESTION),
+        "wrong question"
+    );
+    ui.click("revise-note")?;
+    ui.click("决策")?;
+    focus_body(ui)?;
+    ui.replace_focused(DECISION)?;
+    ui.click("save-note")?;
+
+    let revised = Snapshot::load(ws)
+        .notes
+        .into_iter()
+        .find(|note| note["replaces"] == original && note["kind"] == "decision")
+        .context("missing saved decision")?;
+    let decision = revised["id"].as_i64().context("decision ID")?;
+    ensure!(
+        ui.element("note-body")?.label() == Some(DECISION),
+        "wrong decision"
+    );
+    ensure!(
+        ui.absent(&format!("read-run-{RUN}"))?,
+        "first run linked to the new version"
+    );
+
+    handoff_fixture::run(root, FOLLOW_UP)?;
+    let next = status(&ws.data, FOLLOW_UP)?;
+    ensure!(
+        next["spec_sha"] == first["spec_sha"]
+            && next["candidate_sha"] != first["candidate_sha"]
+            && next["status"] == "awaiting_human_review",
+        "follow-up did not complete on a new candidate for the same spec"
+    );
+    let old_outputs = first["memory_outputs"]
+        .as_object()
+        .context("missing first run outputs")?;
+    for role in ["implementer", "reviewer"] {
+        let reads = next["memory_inputs"][role]
+            .as_array()
+            .context("missing follow-up reads")?;
+        ensure!(
+            reads.iter().any(|id| *id == decision)
+                && !old_outputs
+                    .values()
+                    .filter_map(|ids| ids.as_array())
+                    .flatten()
+                    .any(|id| reads.contains(id)),
+            "follow-up {role} read the wrong memory versions"
+        );
+    }
+    ensure!(
+        status(&ws.data, RUN)? == first,
+        "first run evidence changed"
+    );
+
+    ui.click("refresh")?;
+    let reader_link = format!("read-run-{FOLLOW_UP}");
+    ui.reveal(&format!("detail-memory-{decision}"), &reader_link)?;
+    ensure!(
+        ui.element(&format!("read-roles-{FOLLOW_UP}"))?.label() == Some("实现 Agent、审查 Agent"),
+        "decision missing follow-up reader roles"
+    );
+    ui.checkpoint("continuation-decision")?;
+    ui.click(&reader_link)?;
+    let next_link = format!("memory_inputs-reviewer-{decision}");
+    ensure!(
+        ui.element(&next_link)?.visible(),
+        "decision link did not open follow-up run"
+    );
+    ui.click(&next_link)?;
+    let previous_link = format!("replaces-{original}");
+    ui.reveal(&format!("detail-memory-{decision}"), &previous_link)?;
+    ui.click(&previous_link)?;
+    ensure!(
+        ui.element("note-body")?.label() == Some(QUESTION)
+            && ui.absent(&reader_link)?
+            && ui.element(&format!("read-roles-{RUN}"))?.label() == Some("审查 Agent"),
+        "first run no longer linked to its original question"
+    );
+    ui.reveal(
+        &format!("detail-memory-{original}"),
+        &format!("read-run-{RUN}"),
+    )?;
+    ui.checkpoint("continuation-question")?;
+    ui.click(&format!("read-run-{RUN}"))?;
+    ensure!(
+        ui.element(&question_link)?.visible(),
+        "question link did not open first run"
+    );
+    Ok(())
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum Step {
@@ -528,8 +634,11 @@ fn main() -> Result<()> {
                 Scenario::Conflict => with_fixture(&args, |ui, ws, _| conflict(ui, ws))?,
                 Scenario::Handoff => {
                     let dir = tempfile::tempdir()?;
-                    let ws = handoff_fixture::run(dir.path())?;
-                    inspect(&args, &ws, |ui| handoff(ui, &ws, handoff_fixture::RUN))?;
+                    let ws = handoff_fixture::start(dir.path())?;
+                    inspect(&args, &ws, |ui| {
+                        handoff(ui, &ws, handoff_fixture::RUN)?;
+                        continuation(ui, &ws, dir.path())
+                    })?;
                 }
             }
         }
