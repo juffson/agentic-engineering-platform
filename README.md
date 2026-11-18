@@ -46,6 +46,29 @@ python3 aep.py run --task market-volume-dedup --implementer codex --reviewer cla
 
 Codex 在独立 Worktree 生成候选提交。Claude 接收该版本的 Spec 和 Diff，禁用工具，审查文本保存在同一次运行的 `review.txt`。人工在 GitHub 查看 Diff、CI 和审查意见并决定是否批准。选用现有候选提交时可单独加 `--reviewer claude`。默认走人工审查，不会调用模型。协议测试用本地替身验证适配器调用，不消耗模型额度。
 
+### 两个 Agent 如何共享记忆
+
+在一次执行中加上 `--shared-memory`，Codex 会收到相关工程约定，完成修改后留下一条交接摘要和可选的未决问题。Claude 在检查通过后读取同一候选提交的摘要，再写下自己的审查摘要。独立 Run 或关联 Worktree 也可以读取适用的记录。
+
+```sh
+base=$(git rev-parse origin/aep-task/market-volume-dedup)
+python3 aep.py memory add --task market-volume-dedup --spec "$base" --kind decision --text '同一来源的重复事件采用首次记录。'
+python3 aep.py run --task market-volume-dedup --implementer codex --reviewer claude --shared-memory --run-id market-handoff-001
+python3 aep.py status --run-id market-handoff-001
+```
+
+如果本机配置的模型不在当前 Codex 账号的可用列表中，可在上述 `run` 命令加上 `--codex-model <模型名>`。该选择只对这次 Run 生效，并记入执行证据。
+
+| 范围 | 适合记录的内容 | 何时会被选中 |
+| --- | --- | --- |
+| 仓库 | 操作人通过 `memory add --project` 写入的工程约定 | 任一任务可读 |
+| 任务与 Spec | 需求决策、跨轮次仍需回答的问题 | Task 和 Spec 提交都相同 |
+| 候选提交 | 实现交接、审查摘要 | Task、Spec 和候选 SHA 都相同 |
+
+`memory list --task <task> --spec <sha> --candidate <sha>` 展示该版本可用的上下文。Run 报告中的 `memory_inputs`、`memory_outputs` 分别保存每个角色读到和写入的 ID；用 `memory get --id <id>` 可查原文、来源角色、Run 和提交。用 `memory add ... --replaces <id>` 修订当前范围内的记录，被替代版本仍可按 ID 查询。
+
+记忆保存在 Git 公共目录的 `aep/memory.sqlite3`，同一克隆的 Worktree 共用，独立克隆各自保存。自动传递需显式开启，启用后所选文本会作为提示词发送给该角色所用的模型。每条摘要最多 1,000 个字符，每次上下文最多 12 条、8 KiB，优先选本轮交接和当前候选记录。完整日志、原始会话与详细审查报告保存在本次 Run 的本地证据目录。Agent 留言不代表人工批准。
+
 ## 试点边界
 
 - 这版用 Git 远端作为最小控制面，按任务名手动触发本地执行。Python 标准库提供参考实现。独立 Go 控制面、Rust Daemon、设备身份、Lease、断线接管和桌面端仍在路线图中。

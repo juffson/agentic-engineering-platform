@@ -175,6 +175,77 @@ class PilotTest(unittest.TestCase):
         result = self.cli("verify", "--base", self.base, "--candidate", "HEAD", status=1)
         self.assertIn("outside the task", self.evidence(result)["error"])
 
+    def test_shared_memory_handoff_between_processes_and_worktrees(self):
+        linked = self.repo.parent / "review-worker"
+        self.git("worktree", "add", "--detach", str(linked), self.base)
+
+        def memory(where, *args):
+            result = subprocess.run([sys.executable, str(ROOT / "aep.py"), "memory", *args],
+                                    cwd=where, env=self.env, check=True, text=True, capture_output=True)
+            return json.loads(result.stdout)
+
+        project_id = memory(linked, "add", "--project", "--kind", "decision", "--text", "use the stable contract")["id"]
+        stale_id = memory(linked, "add", "--task", "sample", "--spec", self.base, "--kind",
+                          "decision", "--text", "obsolete policy")["id"]
+        memory(self.repo, "add", "--task", "sample", "--spec", self.base, "--kind", "decision",
+               "--text", "current policy", "--replaces", str(stale_id))
+
+        bindir = self.repo.parent / "bin"
+        bindir.mkdir()
+        implement = """import json, pathlib, sys
+prompt = sys.stdin.read()
+assert 'current policy' in prompt and 'use the stable contract' in prompt
+assert 'obsolete policy' not in prompt
+pathlib.Path('result.txt').write_text('ok')
+dest = sys.argv[sys.argv.index('--output-last-message') + 1]
+pathlib.Path(dest).write_text(json.dumps({'note':'handoff-719', 'question':'Which deadline applies?'}))
+print('raw-private-log-canary')
+"""
+        review = """import json, sys
+print('CLI diagnostics', file=sys.stderr)
+prompt = sys.stdin.read()
+assert all(text in prompt for text in ('handoff-719', 'Which deadline applies?', 'current policy'))
+assert all(text not in prompt for text in ('obsolete policy', 'raw-private-log-canary'))
+print(json.dumps({'structured_output': {'note':'review-284', 'question':'', 'report':'Private detailed report'}}))
+"""
+        for name, source in (("codex", implement), ("claude", review)):
+            exe = bindir / name
+            exe.write_text("#!" + sys.executable + "\n" + source)
+            exe.chmod(0o755)
+        self.env["PATH"] = str(bindir) + os.pathsep + self.env["PATH"]
+        args = ["--implementer", "codex", "--reviewer", "claude", "--shared-memory", "--run-id", "handoff"]
+        first = self.evidence(self.cli("run", *args))
+        dev, question = first["memory_outputs"]["implementer"]
+        self.assertIn(project_id, first["memory_inputs"]["implementer"])
+        self.assertIn(dev, first["memory_inputs"]["reviewer"])
+        self.assertIn(question, first["memory_inputs"]["reviewer"])
+        self.assertFalse(first["approved"])
+        self.cli("run", *args)
+        self.assertEqual(self.status("handoff"), first)
+        other_mode = self.cli("run", "--implementer", "codex", "--reviewer", "claude",
+                              "--run-id", "handoff", status=1)
+        self.assertIn("different request", other_mode.stderr)
+        self.assertNotIn("obsolete policy", json.dumps(first))
+
+        sha = first["candidate_sha"]
+        options = ["--task", "sample", "--spec", self.base]
+        same = memory(linked, "list", *options, "--candidate", sha)
+        self.assertEqual(sum(n["id"] == dev for n in same), 1)
+        self.assertIn("review-284", [n["body"] for n in same])
+        self.assertNotIn("Private detailed report", json.dumps(same))
+        self.assertNotIn("raw-private-log-canary", json.dumps(same))
+        next_run = memory(linked, "list", *options)
+        self.assertIn(question, [n["id"] for n in next_run])
+        self.assertNotIn(dev, [n["id"] for n in next_run])
+        self.assertEqual(memory(linked, "get", "--id", str(dev))["origin_sha"], sha)
+
+        again = subprocess.run([sys.executable, str(ROOT / "aep.py"), "verify", *options[:2],
+                                "--base", self.base, "--candidate", sha, "--reviewer", "claude",
+                                "--shared-memory", "--run-id", "independent-review"],
+                               cwd=linked, text=True, capture_output=True, env=self.env)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn(dev, self.evidence(again)["memory_inputs"]["reviewer"])
+
     def test_adapter_contract_with_local_standins(self):
         bindir = self.repo.parent / "bin"
         bindir.mkdir()
@@ -191,4 +262,5 @@ class PilotTest(unittest.TestCase):
         self.assertEqual(report["review_status"], "findings_recorded")
         self.assertFalse(report["approved"])
         self.assertNotEqual(report["candidate_sha"], self.base)
+        self.assertFalse((self.repo / ".git" / "aep" / "memory.sqlite3").exists())
         self.assertEqual((self.repo / "result.txt").read_text(), "old")
