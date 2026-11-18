@@ -16,6 +16,25 @@ aep run --task market-volume-dedup-rust --candidate origin/aep-task/market-volum
 
 已有仓库可直接使用原 Git 公共目录中的 SQLite 记忆库、Run 锁和 JSON 证据。历史派发继续使用其固定提交里声明的验收命令。新的行情示例使用独立任务 ID `market-volume-dedup-rust`。
 
+### 用 AEP Studio 查看运行和交接
+
+macOS 上可用 Rust 桌面端浏览本地执行记录。安装 Xcode 及命令行工具，使用当前稳定版 Rust，在仓库根目录运行：
+
+```sh
+./desktop/bundle-macos.sh
+open "desktop/target/AEP Studio.app"
+```
+
+点击「打开仓库」选择执行过 AEP 的 Git 工作区。也可用命令直接指定仓库：
+
+```sh
+cargo run --locked --manifest-path desktop/Cargo.toml -- --repo /path/to/repo
+```
+
+在「运行记录」筛选待审查或需要处理的 Run。详情列出 Spec、候选提交、验收命令、退出码和审查报告。「Agent 记忆交接」按角色列出读写的记忆 ID。点 ID 查看当时引用的版本，再点「来源 Run」回到写入它的那次运行。「共享记忆」支持搜索正文、查看历史版本和修订链。执行新任务或写入记忆后，点击「刷新」读取最新记录。
+
+桌面端只读取所选克隆的本地数据。新克隆要先执行任务或写入记忆，关联 Worktree 则共享已有的记录。CLI 可独立安装。
+
 ### 重复派发与本地恢复
 
 派发方可以给一次执行指定稳定的 `--run-id`。在同一设备和同一仓库（包括它的其他 Worktree）重送消息时，沿用该 ID。以下示例可执行两次；第二次复用第一次的证据。
@@ -74,7 +93,7 @@ aep status --run-id market-handoff-001
 
 ## 试点边界
 
-- 这版用 Git 远端作为最小控制面，按任务名手动触发本地执行。CLI、共享记忆和任务执行器使用 Rust。独立控制面、后台 Daemon、设备身份、Lease、断线接管和桌面端仍在路线图中。
+- 这版用 Git 远端作为最小控制面，按任务名手动触发本地执行。CLI、共享记忆和任务执行器使用 Rust。独立控制面、后台 Daemon、设备身份、Lease、断线接管和桌面派发仍在路线图中。
 - 只在受信任的仓库运行。Worktree 隔开文件变更，测试命令和待测代码会以本机用户身份执行。选择外部模型客户端前，须确认其环境与数据权限。
 - 同一任务可以有多个 Run。每次都针对固定的版本生成证据，由人显式推送候选提交并建 PR。CI 在 PR 当前提交上独立复验，平台不会代替人批准或合并。
 - 本仓库用作流程试点与基线。业务收益、费用和可靠性由后续真实需求测量。[AEP 架构提案与八周路线图](https://app.notion.com/p/41a9d9f6f60581d08560fa33ed8c4810)

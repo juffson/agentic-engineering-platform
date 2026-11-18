@@ -1,0 +1,16 @@
+[package]
+name = "aep-studio"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Native desktop inspector for the AEP workspace"
+
+[dependencies]
+aep = { path = ".." }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+gpui-kit = "=0.8.1"
+serde_json = "1"
+
+[profile.dev]
+debug = 0

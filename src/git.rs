@@ -1,27 +1,9 @@
 use crate::{Scope, memory::Key};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::path::{Path, PathBuf};
 
-pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .context("start git")?;
-    if !out.status.success() {
-        bail!(
-            "git {}: {}",
-            args[0],
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(out.stdout)?)
-}
+pub use aep::workspace::{git, ident};
 pub fn commit(repo: &Path, rev: &str) -> Result<String> {
     Ok(git(
         repo,
@@ -35,18 +17,7 @@ pub fn commit(repo: &Path, rev: &str) -> Result<String> {
     .trim_end()
     .into())
 }
-pub fn ident(id: &str, max: usize) -> Result<()> {
-    ensure!(
-        !id.is_empty()
-            && id.len() <= max
-            && !id.starts_with('-')
-            && id
-                .bytes()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
-        "invalid identifier: {id}"
-    );
-    Ok(())
-}
+
 #[derive(Deserialize)]
 pub struct Task {
     pub title: Option<String>,
@@ -59,12 +30,11 @@ pub struct Repo {
 }
 impl Repo {
     pub fn open(dir: &Path) -> Result<Self> {
-        let root = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?.trim_end());
-        let data = root
-            .join(git(&root, &["rev-parse", "--git-common-dir"])?.trim_end())
-            .canonicalize()?
-            .join("aep");
-        Ok(Self { root, data })
+        let workspace = aep::workspace::Workspace::open(dir)?;
+        Ok(Self {
+            root: workspace.root,
+            data: workspace.data,
+        })
     }
     pub fn scope(&self, input: &Scope) -> Result<Key> {
         let task = input.task.as_deref().unwrap_or("");

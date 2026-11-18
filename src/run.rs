@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::{
-    fs::{self, DirBuilder, File, OpenOptions, TryLockError},
+    fs::{self, DirBuilder, OpenOptions, TryLockError},
     io::Write,
     os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
@@ -19,11 +19,7 @@ pub enum Base<'a> {
     Remote(&'a str),
     Local(&'a str),
 }
-pub fn read(path: &Path) -> Result<Value> {
-    Ok(serde_json::from_slice(
-        &fs::read(path).with_context(|| format!("read {}", path.display()))?,
-    )?)
-}
+pub use aep::workspace::read;
 pub fn save(folder: &Path, record: &Value) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(folder)?;
     serde_json::to_writer_pretty(&mut file, record)?;
@@ -37,32 +33,7 @@ fn directory(repo: &Repo, id: &str) -> Result<PathBuf> {
     Ok(repo.data.join("runs").join(id))
 }
 pub fn status(repo: &Repo, id: &str) -> Result<Value> {
-    let folder = directory(repo, id)?;
-    ensure!(folder.is_dir(), "run not found: {id}");
-    let lock = folder.join("owner.lock");
-    let path = folder.join("evidence.json");
-    if !lock.exists() {
-        return if path.exists() {
-            read(&path)
-        } else {
-            Ok(json!({"run_id":id,"status":"initializing"}))
-        };
-    }
-    let file = File::open(lock)?;
-    let idle = match file.try_lock_shared() {
-        Ok(()) => true,
-        Err(TryLockError::WouldBlock) => false,
-        Err(TryLockError::Error(e)) => return Err(e.into()),
-    };
-    if !path.exists() {
-        let state = if idle { "unstarted" } else { "initializing" };
-        return Ok(json!({"run_id": id, "status": state}));
-    }
-    let mut record = read(&path)?;
-    if idle && record["status"] == "running" && record.get("request").is_some() {
-        record["status"] = json!("needs_reconciliation");
-    }
-    Ok(record)
+    aep::workspace::status(&repo.data, id)
 }
 fn replay(repo: &Repo, args: &Execution, record: &Value, request: &Value) -> Result<()> {
     ensure!(
