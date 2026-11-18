@@ -1,0 +1,190 @@
+use anyhow::{Result, anyhow, ensure};
+use chrono::Utc;
+use rusqlite::{Connection, Row, TransactionBehavior, params};
+use serde_json::{Value, json};
+use std::{
+    fs::{self, OpenOptions},
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+    time::Duration,
+};
+
+const SCHEMA: &str = include_str!("memory.sql");
+#[cfg(test)]
+#[path = "memory_tests.rs"]
+mod tests;
+pub struct Key {
+    pub task: String,
+    pub spec: String,
+    pub candidate: String,
+}
+impl Key {
+    pub fn new(task: &str, spec: &str, candidate: &str) -> Self {
+        Self {
+            task: task.into(),
+            spec: spec.into(),
+            candidate: candidate.into(),
+        }
+    }
+    fn scope(&self) -> &str {
+        if !self.candidate.is_empty() {
+            "candidate"
+        } else if !self.task.is_empty() {
+            "task"
+        } else {
+            "project"
+        }
+    }
+}
+pub struct Memory(Connection);
+fn note(row: &Row<'_>) -> rusqlite::Result<Value> {
+    let mut v = json!({"id":row.get::<_,i64>("id")?,"run_id":row.get::<_,Option<String>>("run_id")?,"replaces":row.get::<_,Option<i64>>("replaces")?});
+    for col in [
+        "scope",
+        "task",
+        "spec_sha",
+        "candidate_sha",
+        "origin_sha",
+        "kind",
+        "author",
+        "body",
+        "created_at",
+    ] {
+        v[col] = json!(row.get::<_, String>(col)?);
+    }
+    Ok(v)
+}
+fn text(s: &str, optional: bool) -> Result<&str> {
+    let s = s.trim();
+    ensure!(
+        s.chars().count() <= 1000 && (optional || !s.is_empty()),
+        "invalid memory text (limit 1000 characters)"
+    );
+    Ok(s)
+}
+impl Memory {
+    pub fn open(dir: &Path) -> Result<Self> {
+        fs::create_dir_all(dir)?;
+        let path = dir.join("memory.sqlite3");
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?;
+        let db = Connection::open(path)?;
+        db.busy_timeout(Duration::from_secs(10))?;
+        db.execute_batch(SCHEMA)?;
+        Ok(Self(db))
+    }
+    pub fn get(&self, id: i64) -> Result<Value> {
+        Ok(self
+            .0
+            .query_row("SELECT * FROM notes WHERE id=?", [id], note)?)
+    }
+    pub fn add(&mut self, k: &Key, kind: &str, body: &str, replaces: Option<i64>) -> Result<i64> {
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(old) = replaces {
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM notes WHERE id=?1 AND scope=?2 AND task=?3
+                    AND spec_sha=?4 AND candidate_sha=?5
+                    AND NOT EXISTS(SELECT 1 FROM notes WHERE replaces=?1)
+                 )",
+                params![old, k.scope(), k.task, k.spec, k.candidate],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                active,
+                "replaced memory must be current and in the same scope"
+            );
+        }
+        tx.execute(
+            "INSERT INTO notes(scope,task,spec_sha,candidate_sha,origin_sha,kind,author,body,created_at,replaces)
+             VALUES(?1,?2,?3,?4,?4,?5,'manual',?6,?7,?8)",
+            params![k.scope(), k.task, k.spec, k.candidate, kind, text(body,false)?, Utc::now().to_rfc3339(), replaces],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+    pub fn context(&self, k: &Key, run: Option<&str>) -> Result<Vec<Value>> {
+        let mut stmt = self.0.prepare(
+            "SELECT n.* FROM notes n
+             WHERE (scope='project' OR (task=?1 AND spec_sha=?2 AND
+                   (scope='task' OR (scope='candidate' AND candidate_sha=?3))))
+               AND NOT EXISTS(SELECT 1 FROM notes successor WHERE successor.replaces=n.id)
+             ORDER BY CASE WHEN run_id=?4 THEN 0 WHEN scope='candidate' THEN 1
+                           WHEN scope='task' THEN 2 ELSE 3 END, id DESC LIMIT 48",
+        )?;
+        let mut result = Vec::new();
+        let mut bytes = 2;
+        for row in stmt.query_map(params![k.task, k.spec, k.candidate, run], note)? {
+            let v = row?;
+            let added = serde_json::to_vec(&v)?.len() + usize::from(!result.is_empty());
+            if bytes + added <= 8192 {
+                bytes += added;
+                result.push(v);
+                if result.len() == 12 {
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+    pub fn publish(&mut self, role: &str, run: &str, k: &Key, payload: &Value) -> Result<Vec<i64>> {
+        let field = |name: &str| {
+            payload[name]
+                .as_str()
+                .ok_or_else(|| anyhow!("missing string field {name}"))
+        };
+        let summary = text(field("note")?, false)?;
+        let question = text(field("question")?, true)?;
+        let kind = if role == "implementer" {
+            "handoff"
+        } else {
+            "review"
+        };
+        let mut entries = vec![("candidate", kind, k.candidate.as_str(), summary)];
+        if !question.is_empty() {
+            entries.push(("task", "open_question", "", question));
+        }
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM notes WHERE run_id=? AND author=?",
+            params![run, role],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            existing == 0 || existing == entries.len() as i64,
+            "conflicting publication for this run"
+        );
+        let mut ids = Vec::new();
+        for (scope, kind, pin, body) in entries {
+            tx.execute(
+                "INSERT INTO notes(scope,task,spec_sha,candidate_sha,origin_sha,kind,author,run_id,body,created_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,author,kind) DO NOTHING",
+                params![scope, k.task, k.spec, pin, k.candidate, kind, role, run, body, Utc::now().to_rfc3339()],
+            )?;
+            let row = tx.query_row(
+                "SELECT * FROM notes WHERE run_id=? AND author=? AND kind=?",
+                params![run, role, kind],
+                note,
+            )?;
+            ensure!(
+                row["body"] == body
+                    && row["origin_sha"] == k.candidate
+                    && row["task"] == k.task
+                    && row["spec_sha"] == k.spec,
+                "conflicting publication for this run"
+            );
+            ids.push(row["id"].as_i64().unwrap());
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+}

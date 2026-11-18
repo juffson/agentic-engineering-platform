@@ -1,5 +1,16 @@
 {
   "title": "同一次本地派发只执行一次",
-  "allowed_paths": ["aep.py", "README.md"],
-  "check": ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]
+  "allowed_paths": [
+    "src/run.rs",
+    "src/git.rs",
+    "src/main.rs",
+    "README.md"
+  ],
+  "check": [
+    "cargo",
+    "test",
+    "--locked",
+    "--test",
+    "pilot"
+  ]
 }

@@ -1,0 +1,13 @@
+{
+  "title": "单窗口行情聚合按来源和事件标识去重",
+  "allowed_paths": [
+    "examples/marketdata/aggregate.rs"
+  ],
+  "check": [
+    "cargo",
+    "test",
+    "--locked",
+    "--test",
+    "market_volume"
+  ]
+}
