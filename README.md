@@ -127,6 +127,15 @@ cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
   --scenario conflict --output-dir desktop/target/ui-debug --screenshots
 ```
 
+`handoff` 会在临时仓库中通过 AEP CLI 派发 Rust 小任务，由两个本地替身进程完成实现和审查。审查进程只有在收到实现 Agent 的交接标识后才会返回报告。UI 随后打开这次运行实际生成的 SQLite 记忆与证据，核对两个角色引用同一条记忆，并打开验收日志和审查报告。
+
+已在本机用模型客户端跑完一次交接时，可以验证那次运行的界面。将 `--run-id` 改为实际运行 ID。
+
+```sh
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
+  --repo /path/to/repo --run-id market-handoff-001 --output-dir desktop/target/ui-debug
+```
+
 每个检查点输出一份 JSON，包含控件的 ID、标签、值、可见性和窗口坐标。`--screenshots` 使用离屏渲染器生成同名 PNG，需要可用的 Metal 设备。断言失败时命令返回非零退出码。指定输出目录后会尝试写入 `failure.json` 和所选截图。
 
 新交互可以用 JSON 步骤回放。下面的示例从界面创建一条记忆，然后验证搜索结果会随输入变化。
