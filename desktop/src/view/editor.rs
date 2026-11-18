@@ -1,5 +1,5 @@
 use super::*;
-use aep::memory::{Key, Kind, Memory};
+use aep::memory::{Key, Kind, Memory, RevisionConflict};
 use clap::ValueEnum;
 use gpui_kit::component::input::{Textarea, TextareaState};
 
@@ -152,7 +152,12 @@ impl Studio {
                 Err(error) => {
                     if let Some(editor) = this.editor.as_mut() {
                         editor.saving = false;
-                        editor.error = Some(format!("保存失败：{error:#}"));
+                        editor.error = Some(if error.is::<RevisionConflict>() {
+                            "这条记忆已有新版本。请先复制草稿，取消编辑后刷新，再打开当前版本修订。"
+                                .to_owned()
+                        } else {
+                            format!("保存失败：{error:#}")
+                        });
                     }
                     cx.notify();
                 }
@@ -247,7 +252,13 @@ impl Editor {
                     .disabled(self.saving),
             );
         if let Some(err) = &self.error {
-            form = form.child(t(err.clone(), RED));
+            form = form.child(
+                div()
+                    .id("save-error")
+                    .role(Role::Alert)
+                    .aria_label(err.clone())
+                    .child(t(err.clone(), RED)),
+            );
         }
         let controls = h_flex()
             .justify_end()
