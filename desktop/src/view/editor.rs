@@ -255,6 +255,7 @@ impl Editor {
             form = form.child(
                 div()
                     .id("save-error")
+                    .test_support()
                     .role(Role::Alert)
                     .aria_label(err.clone())
                     .child(t(err.clone(), RED)),

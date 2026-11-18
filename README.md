@@ -111,3 +111,29 @@ cargo test --locked --all-targets
 ```
 
 [试点 Spec 与六条验收用例](specs/market-volume-dedup-rust/spec.md) · [任务清单与验收命令](specs/market-volume-dedup-rust/task.json)
+
+### 离屏调试桌面界面
+
+在 macOS 的仓库根目录运行以下命令，即可用生产版 Studio 视图验证记忆修订、并发冲突和 Run 与记忆的双向跳转。每个场景自建临时 Git 仓库，用 GPUI 模拟点击和键盘输入。测试使用本地 SQLite 和合成的运行证据，无需桌面控制权限或模型账号。
+
+```sh
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug
+```
+
+可用 `--scenario history`、`conflict` 或 `handoff` 单独运行。要查看某一步的实际画面，添加输出目录和截图选项。
+
+```sh
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
+  --scenario conflict --output-dir desktop/target/ui-debug --screenshots
+```
+
+每个检查点输出一份 JSON，包含控件的 ID、标签、值、可见性和窗口坐标。`--screenshots` 使用离屏渲染器生成同名 PNG，需要可用的 Metal 设备。断言失败时命令返回非零退出码。指定输出目录后会尝试写入 `failure.json` 和所选截图。
+
+新交互可以用 JSON 步骤回放。下面的示例从界面创建一条记忆，然后验证搜索结果会随输入变化。
+
+```sh
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
+  --script desktop/examples/memory-search.json --output-dir desktop/target/ui-debug
+```
+
+脚本从包含一条 `sample-run` 的新仓库开始。初始状态存为 `script-000.json`，之后每步递增。使用快照中的唯一 ID 做 `click`、`present`、`absent`，或用唯一标签做 `click_label`。此外支持 `input`、`press`、`scroll`（`id` 和像素增量 `dy`）和 `expect_value`（`label` 和 `equals`）。macOS CI 会运行三个内置场景和仓库内的搜索脚本。
