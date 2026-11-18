@@ -131,6 +131,15 @@ cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
 
 `handoff` 会在临时仓库中通过 AEP CLI 派发 Rust 小任务，由两个本地替身进程完成实现和审查。审查进程只有在收到实现 Agent 的交接标识后才会返回报告。UI 随后打开执行器生成的 SQLite 记忆、验收日志和审查报告。调试流程还会在 Studio 将第一轮的未决问题修订为决策，再运行同一 Spec 的新候选提交。第二轮的两个 Agent 必须收到新决策。每个版本的读取记录都可以跳回对应 Run。
 
+要用真实的 Codex 和 Claude 复跑两轮，在已登录两个客户端且支持 Metal 的 Mac 上运行以下命令。命令会使用模型账户额度。可以省略 `--codex-model` 来使用本机 Codex 配置的默认模型。
+
+```sh
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
+  --live-relay --codex-model gpt-6.1-sol --output-dir desktop/target/live-relay
+```
+
+每次运行会为合成 Rust 任务创建临时 Git 仓库，并在指定目录下创建新的 `live-relay-*` 子目录。Studio 将第一轮的问题修订为带唯一标识的决策。命令会核对第二轮实现和审查的输入 ID、两个客户端对该标识的确认，以及两个版本的 Studio 读取记录。成功结果包括 `verification.json`、两轮 Run 的证据和报告、`studio-revision.png` 及新旧版本的截图。失败会返回非零退出码，保留已有证据与截图，并在 `failure.txt` 中记录临时仓库路径。
+
 已在本机用模型客户端跑完一次交接时，可以验证那次运行的界面。将 `--run-id` 改为实际运行 ID。
 
 ```sh

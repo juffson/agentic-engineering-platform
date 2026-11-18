@@ -15,7 +15,8 @@ use gpui_kit::{
     px, size,
     test::{ElementSnapshot, TestEventExt, TestQueryExt, TestWindowExt},
 };
-use serde_json::json;
+use handoff_fixture::Clients;
+use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -52,6 +53,12 @@ struct Args {
     /// Also save PNGs from the platform's offscreen renderer
     #[arg(long, requires = "output_dir")]
     screenshots: bool,
+    /// Run two rounds with real Codex and Claude and capture evidence and PNGs
+    #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo"])]
+    live_relay: bool,
+    /// Override the Codex model for both rounds of the live relay
+    #[arg(long, requires = "live_relay")]
+    codex_model: Option<String>,
 }
 
 struct Driver<'a> {
@@ -347,15 +354,7 @@ fn conflict(ui: &mut Driver, ws: &Workspace) -> Result<()> {
 }
 
 fn handoff(ui: &mut Driver, ws: &Workspace, run: &str) -> Result<()> {
-    let record = status(&ws.data, run)?;
-    ensure!(
-        record["status"] == "awaiting_human_review"
-            && record["implementation_source"] == "codex"
-            && record["review_status"] == "findings_recorded"
-            && record["check_exit_code"] == 0
-            && record["approved"] == false,
-        "{run} must have a successful implementation, checks and review awaiting human approval"
-    );
+    let record = checked_run(ws, run)?;
     let produced = record["memory_outputs"]["implementer"]
         .as_array()
         .context("no implementer memory outputs")?;
@@ -425,28 +424,63 @@ fn handoff(ui: &mut Driver, ws: &Workspace, run: &str) -> Result<()> {
     ui.checkpoint("handoff-review")
 }
 
-fn continuation(ui: &mut Driver, ws: &Workspace, root: &Path) -> Result<()> {
-    use handoff_fixture::{DECISION, FOLLOW_UP, QUESTION, RUN};
+fn checked_run(ws: &Workspace, id: &str) -> Result<Value> {
+    let record = status(&ws.data, id)?;
+    ensure!(
+        record["status"] == "awaiting_human_review"
+            && record["implementation_source"] == "codex"
+            && record["reviewer"] == "claude"
+            && record["review_status"] == "findings_recorded"
+            && record["check_exit_code"] == 0
+            && record["approved"] == false,
+        "{id} must have a successful implementation, checks and review awaiting human approval"
+    );
+    Ok(record)
+}
+
+fn continuation(
+    ui: &mut Driver,
+    ws: &Workspace,
+    root: &Path,
+    clients: Clients<'_>,
+    reference: Option<&str>,
+) -> Result<()> {
+    use handoff_fixture::{DECISION, FOLLOW_UP, RUN};
 
     let first = status(&ws.data, RUN)?;
     let snapshot = Snapshot::load(ws);
-    let original = snapshot
+    let question = snapshot
         .notes
         .iter()
-        .find(|note| note["run_id"] == RUN && note["kind"] == "open_question")
-        .and_then(|note| note["id"].as_i64())
-        .context("implementer question ID")?;
+        .find(|note| {
+            note["run_id"] == RUN
+                && note["kind"] == "open_question"
+                && note["scope"] == "task"
+                && note["author"] == "implementer"
+        })
+        .context("implementer did not leave a task-level question")?;
+    let original = question["id"].as_i64().context("question ID")?;
+    let question_body = question["body"].as_str().context("question body")?;
+    let decision_body = match reference {
+        Some(reference) => format!(
+            "Round future fractional seconds to the nearest millisecond, with ties to even. Decision reference {reference}."
+        ),
+        None => DECISION.into(),
+    };
     let question_link = format!("memory_inputs-reviewer-{original}");
     ui.reveal(&format!("detail-{RUN}"), &question_link)?;
     ui.click(&question_link)?;
     ensure!(
-        ui.element("note-body")?.label() == Some(QUESTION),
+        ui.element("note-body")?.label() == Some(question_body),
         "wrong question"
     );
     ui.click("revise-note")?;
     ui.click("决策")?;
     focus_body(ui)?;
-    ui.replace_focused(DECISION)?;
+    ui.replace_focused(&decision_body)?;
+    if reference.is_some() {
+        ui.checkpoint("studio-revision")?;
+    }
     ui.click("save-note")?;
 
     let revised = Snapshot::load(ws)
@@ -456,7 +490,11 @@ fn continuation(ui: &mut Driver, ws: &Workspace, root: &Path) -> Result<()> {
         .context("missing saved decision")?;
     let decision = revised["id"].as_i64().context("decision ID")?;
     ensure!(
-        ui.element("note-body")?.label() == Some(DECISION),
+        ui.element("note-body")?.label() == Some(decision_body.as_str())
+            && revised["body"] == decision_body
+            && revised["author"] == "manual"
+            && revised["scope"] == question["scope"]
+            && revised["spec_sha"] == question["spec_sha"],
         "wrong decision"
     );
     ensure!(
@@ -464,12 +502,11 @@ fn continuation(ui: &mut Driver, ws: &Workspace, root: &Path) -> Result<()> {
         "first run linked to the new version"
     );
 
-    handoff_fixture::run(root, FOLLOW_UP)?;
-    let next = status(&ws.data, FOLLOW_UP)?;
+    println!("Running {FOLLOW_UP} after Studio saved decision #{decision}");
+    handoff_fixture::run(root, clients, FOLLOW_UP)?;
+    let next = checked_run(ws, FOLLOW_UP)?;
     ensure!(
-        next["spec_sha"] == first["spec_sha"]
-            && next["candidate_sha"] != first["candidate_sha"]
-            && next["status"] == "awaiting_human_review",
+        next["spec_sha"] == first["spec_sha"] && next["candidate_sha"] != first["candidate_sha"],
         "follow-up did not complete on a new candidate for the same spec"
     );
     let old_outputs = first["memory_outputs"]
@@ -493,6 +530,9 @@ fn continuation(ui: &mut Driver, ws: &Workspace, root: &Path) -> Result<()> {
         status(&ws.data, RUN)? == first,
         "first run evidence changed"
     );
+    if let Some(reference) = reference {
+        handoff_fixture::verify_reference(ws, &next, reference)?;
+    }
 
     ui.click("refresh")?;
     let reader_link = format!("read-run-{FOLLOW_UP}");
@@ -505,15 +545,19 @@ fn continuation(ui: &mut Driver, ws: &Workspace, root: &Path) -> Result<()> {
     ui.click(&reader_link)?;
     let next_link = format!("memory_inputs-reviewer-{decision}");
     ensure!(
-        ui.element(&next_link)?.visible(),
+        ui.element(&next_link)?.visible()
+            && ui
+                .element(&format!("memory_inputs-implementer-{decision}"))?
+                .visible(),
         "decision link did not open follow-up run"
     );
+    ui.checkpoint("continuation-run")?;
     ui.click(&next_link)?;
     let previous_link = format!("replaces-{original}");
     ui.reveal(&format!("detail-memory-{decision}"), &previous_link)?;
     ui.click(&previous_link)?;
     ensure!(
-        ui.element("note-body")?.label() == Some(QUESTION)
+        ui.element("note-body")?.label() == Some(question_body)
             && ui.absent(&reader_link)?
             && ui.element(&format!("read-roles-{RUN}"))?.label() == Some("审查 Agent"),
         "first run no longer linked to its original question"
@@ -528,6 +572,27 @@ fn continuation(ui: &mut Driver, ws: &Workspace, root: &Path) -> Result<()> {
         ui.element(&question_link)?.visible(),
         "question link did not open first run"
     );
+    if let Some(reference) = reference {
+        let dir = ui
+            .args
+            .output_dir
+            .as_ref()
+            .context("live relay output directory")?;
+        for (file, evidence) in [
+            ("question.json", question.clone()),
+            ("decision.json", revised),
+            (
+                "verification.json",
+                json!({
+                    "status": "passed", "reference": reference, "question_id": original, "decision_id": decision,
+                    "first_run": RUN, "follow_up_run": FOLLOW_UP, "follow_up_inputs": next["memory_inputs"],
+                    "reference_in_implementer_note": true, "reference_in_reviewer_report": true, "studio_verified": true
+                }),
+            ),
+        ] {
+            fs::write(dir.join(file), serde_json::to_vec_pretty(&evidence)?)?;
+        }
+    }
     Ok(())
 }
 
@@ -609,12 +674,78 @@ fn inspect(
     result
 }
 
+fn relay(args: &Args, clients: Clients<'_>, reference: Option<&str>) -> Result<()> {
+    use handoff_fixture::RUN;
+
+    let dir = tempfile::tempdir()?;
+    let result = (|| {
+        let ws = handoff_fixture::prepare(dir.path(), clients)?;
+        println!("Running {RUN}");
+        let verified = handoff_fixture::run(dir.path(), clients, RUN).and_then(|()| {
+            inspect(args, &ws, |ui| {
+                handoff(ui, &ws, RUN)?;
+                continuation(ui, &ws, dir.path(), clients, reference)
+            })
+        });
+        if reference.is_some() {
+            let output = args
+                .output_dir
+                .as_ref()
+                .context("live relay output directory")?;
+            let exported = handoff_fixture::export_runs(&ws, output);
+            if let Err(error) = &exported {
+                eprintln!("Failed to save run evidence: {error:#}");
+            }
+            verified.and(exported)
+        } else {
+            verified
+        }
+    })();
+    if let Err(error) = &result
+        && let Some(output) = args.output_dir.as_ref().filter(|_| reference.is_some())
+    {
+        let path = dir.keep();
+        let diagnostic = format!(
+            "{error:#}\nSynthetic workspace retained at {}\n",
+            path.display()
+        );
+        eprintln!("{diagnostic}");
+        fs::write(output.join("failure.txt"), diagnostic).context("save live relay diagnostics")?;
+    }
+    result
+}
+
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     if let Some(dir) = &args.output_dir {
         fs::create_dir_all(dir)?;
     }
-    if let (Some(repo), Some(run)) = (&args.repo, &args.run_id) {
+    if args.live_relay {
+        let output = args
+            .output_dir
+            .as_ref()
+            .context("live relay output directory")?;
+        let output = tempfile::Builder::new()
+            .prefix("live-relay-")
+            .tempdir_in(output)?
+            .keep();
+        println!("Live relay evidence: {}", output.display());
+        args.output_dir = Some(output);
+        args.screenshots = true;
+        let token = tempfile::Builder::new()
+            .prefix("decision-")
+            .rand_bytes(16)
+            .tempfile()?;
+        let reference = token
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("decision reference")?;
+        let clients = Clients::Live {
+            model: args.codex_model.as_deref(),
+        };
+        relay(&args, clients, Some(reference))?;
+    } else if let (Some(repo), Some(run)) = (&args.repo, &args.run_id) {
         let ws = Workspace::open(repo)?;
         inspect(&args, &ws, |ui| handoff(ui, &ws, run))?;
     } else if let Some(path) = &args.script {
@@ -632,14 +763,7 @@ fn main() -> Result<()> {
             match scenario {
                 Scenario::History => with_fixture(&args, history)?,
                 Scenario::Conflict => with_fixture(&args, |ui, ws, _| conflict(ui, ws))?,
-                Scenario::Handoff => {
-                    let dir = tempfile::tempdir()?;
-                    let ws = handoff_fixture::start(dir.path())?;
-                    inspect(&args, &ws, |ui| {
-                        handoff(ui, &ws, handoff_fixture::RUN)?;
-                        continuation(ui, &ws, dir.path())
-                    })?;
-                }
+                Scenario::Handoff => relay(&args, Clients::Fixture, None)?,
             }
         }
     }
