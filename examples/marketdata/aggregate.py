@@ -4,8 +4,11 @@
 def aggregate(events):
     """Return the total quantity and accepted event count for the window."""
     quantity = 0
-    count = 0
+    seen = set()
     for event in events:
+        identity = (event["source"], event["event_id"])
+        if identity in seen:
+            continue
+        seen.add(identity)
         quantity += event["quantity"]
-        count += 1
-    return {"quantity": quantity, "count": count}
+    return {"quantity": quantity, "count": len(seen)}
