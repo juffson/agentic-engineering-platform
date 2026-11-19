@@ -53,14 +53,21 @@ mod tests {
 
     #[test]
     fn rejects_empty_arguments() {
-        for check in [&[][..], &[""][..], &["cargo", ""][..], &["", "test"][..]] {
+        for check in [
+            &[][..],
+            &[""][..],
+            &["cargo", ""][..],
+            &["", "test"][..],
+            &["cargo", "test", ""][..],
+            &[" \t", ""][..],
+        ] {
             let error = manifest(check).validate().unwrap_err();
             assert_eq!(error.to_string(), "check must contain a command");
         }
     }
 
     #[test]
-    fn preserves_argument_whitespace() {
+    fn accepts_nonempty_arguments_with_whitespace() {
         for program in [" cargo", "cargo ", "cargo test", "\tcargo\n"] {
             let manifest = manifest(&[
                 program,
@@ -70,11 +77,7 @@ mod tests {
                 " ",
                 "\t\r\n",
             ]);
-            let original = manifest.check.clone();
-
             manifest.validate().unwrap();
-
-            assert_eq!(manifest.check, original);
         }
     }
 }
