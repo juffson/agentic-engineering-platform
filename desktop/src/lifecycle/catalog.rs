@@ -337,7 +337,8 @@ mod tests {
         save(&path, "request.json", &plan)?;
         assert!(load(&unrelated)?.is_empty());
         assert_eq!(load(&ws)?[0].stage, Stage::Preparing);
-        drop(lock);
+        // Parallel tests can briefly inherit the forked descriptor until Git execs.
+        lock.unlock()?;
         assert_eq!(load(&ws)?[0].stage, Stage::PrepareRetry);
         let Plan::New(draft, branch) = request(&path)? else {
             anyhow::bail!("draft lost")
