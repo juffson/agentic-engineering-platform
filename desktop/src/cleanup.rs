@@ -197,7 +197,18 @@ fn sync(ws: &Workspace, runner: &Runner, target: &Target, merged: &str) -> Resul
             git(ws, runner, &["-C", path, "symbolic-ref", "HEAD"])?.trim_end() == branch,
             "目标 Worktree 当前已切换分支"
         );
-        git(ws, runner, &["-C", path, "merge", "--ff-only", &tip])?;
+        git(
+            ws,
+            runner,
+            &[
+                "-C",
+                path,
+                "merge",
+                "--ff-only",
+                "--no-overwrite-ignore",
+                &tip,
+            ],
+        )?;
     } else if local.is_none() {
         git(
             ws,
@@ -263,7 +274,7 @@ fn candidate_branch(ws: &Workspace, runner: &Runner, target: &Target) -> Result<
     if let Some(sha) = local_ref(ws, runner, &tracking)? {
         ensure!(
             sha == target.candidate,
-            "已清理远端；本地候选追踪引用指向其他提交，已保留"
+            "远端已清理。本地候选追踪引用指向其他提交，已保留"
         );
         git(
             ws,
@@ -272,7 +283,7 @@ fn candidate_branch(ws: &Workspace, runner: &Runner, target: &Target) -> Result<
         )?;
     }
     let detail = if local_ref(ws, runner, &branch)?.is_some() {
-        format!("{note}；用户本地同名分支仍可继续使用")
+        format!("{note}。用户本地同名分支仍可继续使用")
     } else {
         note.to_owned()
     };
@@ -307,13 +318,16 @@ fn temporary(
     let canonical = if exists {
         Some(path.canonicalize()?)
     } else {
-        None
+        path.parent()
+            .zip(path.file_name())
+            .and_then(|(parent, name)| parent.canonicalize().ok().map(|parent| parent.join(name)))
     };
     let registered = trees.iter().find(|tree| {
         tree.path == path
-            || canonical
-                .as_ref()
-                .is_some_and(|expected| tree.path.canonicalize().ok().as_ref() == Some(expected))
+            || canonical.as_ref().is_some_and(|expected| {
+                &tree.path == expected
+                    || (exists && tree.path.canonicalize().ok().as_ref() == Some(expected))
+            })
     });
     let Some(tree) = registered else {
         ensure!(!exists, "未找到该 Run 的 Git Worktree，目录已保留");
@@ -326,7 +340,7 @@ fn temporary(
         ) && record["finished_at"].as_str().is_some(),
         "Run 尚未确认结束，已保留工作区"
     );
-    if let Some(canonical) = canonical {
+    if exists && let Some(canonical) = canonical {
         ensure!(
             fs::symlink_metadata(path)?.is_dir(),
             "工作区路径发生变化，已保留"
