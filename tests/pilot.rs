@@ -189,7 +189,9 @@ fn busy_and_interrupted_attempts_do_not_restart() {
             assert!(Instant::now() < until);
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(f.state("locked")["status"], "running");
+        let running = f.state("locked");
+        assert_eq!(running["status"], "running");
+        assert_eq!(running["phase"], "checking");
         assert_eq!(f.call(&args).status.code(), Some(75));
         if crash {
             child.kill().unwrap();

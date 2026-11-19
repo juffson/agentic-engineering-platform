@@ -31,8 +31,14 @@ enum Action {
         args: Execution,
         #[arg(long, default_value = "origin")]
         remote: String,
+        /// Use this pinned Spec commit for an already dispatched task.
+        #[arg(long, conflicts_with = "remote")]
+        base: Option<String>,
         #[arg(long, value_parser=["codex"], conflicts_with="candidate", required_unless_present="candidate")]
         implementer: Option<String>,
+        /// Start Codex from an existing candidate descended from the Spec.
+        #[arg(long, requires = "implementer")]
+        resume_from: Option<String>,
         #[arg(long, requires = "implementer")]
         codex_model: Option<String>,
     },
@@ -61,6 +67,9 @@ struct Execution {
     run_id: Option<String>,
     #[arg(long)]
     shared_memory: bool,
+    /// Require this current memory version in each model client's context.
+    #[arg(long, requires = "shared_memory")]
+    require_memory: Option<i64>,
     #[arg(long, default_value="manual", value_parser=["manual","claude"])]
     reviewer: String,
     #[arg(long, default_value_t=600, value_parser=clap::value_parser!(u64).range(1..))]
@@ -104,15 +113,21 @@ fn app() -> Result<ExitCode> {
     match cli.command {
         Action::Dispatch { task, rev, remote } => repo.dispatch(&task, &rev, &remote)?,
         Action::Run {
-            args,
+            mut args,
             remote,
+            base,
             implementer,
+            resume_from,
             codex_model,
         } => {
+            if resume_from.is_some() {
+                args.candidate = resume_from;
+            }
             return run::execute(
                 &repo,
                 &args,
-                run::Base::Remote(&remote),
+                base.as_deref()
+                    .map_or(run::Base::Remote(&remote), run::Base::Local),
                 implementer.as_deref(),
                 codex_model.as_deref(),
             );

@@ -60,6 +60,16 @@ fn scoped_context_revisions_and_budget() {
     let list = db.context(&code, Some("run")).unwrap();
     assert!(list.len() <= 12 && serde_json::to_vec(&list).unwrap().len() <= 8192);
     assert_eq!(list[0]["run_id"], "run");
+    let required = db
+        .context_with_required(&code, Some("run"), Some(new))
+        .unwrap();
+    assert_eq!(required[0]["id"], new);
+    assert!(required.len() <= 12 && serde_json::to_vec(&required).unwrap().len() <= 8192);
+    assert!(db.context_with_required(&code, None, Some(old)).is_err());
+    assert!(
+        db.context_with_required(&Key::new("task", "other", "code"), None, Some(ids[0]))
+            .is_err()
+    );
 }
 #[test]
 fn concurrent_updates_share_one_successor() {

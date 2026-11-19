@@ -109,12 +109,19 @@ pub fn execute(
         Base::Local(rev) => commit(&repo.root, rev)?,
     };
     let source = implementer.unwrap_or("candidate");
+    ensure!(
+        args.require_memory.is_none() || implementer.is_some() || args.reviewer == "claude",
+        "required memory needs a model client"
+    );
     let mut request = json!({
         "task": args.task, "spec_sha": base, "source": source,
         "reviewer": args.reviewer, "timeout": args.timeout
     });
     if args.shared_memory {
         request["shared_memory"] = json!(true);
+    }
+    if let Some(id) = args.require_memory {
+        request["require_memory"] = json!(id);
     }
     if let Some(m) = model {
         request["codex_model"] = json!(m);
@@ -133,7 +140,7 @@ pub fn execute(
         "run_id": id, "task": args.task, "spec_sha": base, "request": request,
         "started_at": Utc::now().to_rfc3339(), "status": "running", "implementation_source": source,
         "requested_candidate_ref": args.candidate, "reviewer": args.reviewer,
-        "review_status": "pending", "approved": false, "worktree": work
+        "review_status": "pending", "approved": false, "worktree": work, "phase": "preparing"
     });
     save(&folder, &record)?;
     let mut attached = false;
@@ -151,6 +158,7 @@ pub fn execute(
             timeout: args.timeout,
             run: &id,
             memory,
+            require_memory: args.require_memory,
         };
         let initial = if let Some(rev) = &args.candidate {
             let sha = commit(&repo.root, rev)?;
@@ -174,6 +182,8 @@ pub fn execute(
         attached = true;
         let key = Key::new(&args.task, &base, &initial);
         if implementer.is_some() {
+            record["phase"] = json!("implementing");
+            save(&folder, &record)?;
             agents.implement(&key, &spec, &task.allowed_paths, model, &mut record)?;
             git(&work, &["add", "-A"])?;
             if !git(&work, &["diff", "--cached", "--name-only"])?.is_empty() {
@@ -203,8 +213,11 @@ pub fn execute(
         }
         if args.reviewer == "claude" {
             let diff = git(&repo.root, &["diff", "--no-ext-diff", &base, &head])?;
+            record["phase"] = json!("reviewing");
+            save(&folder, &record)?;
             agents.review(&key, &spec, &diff, &mut record)?;
         }
+        record["phase"] = json!("complete");
         record["status"] = json!("awaiting_human_review");
         println!("Checks passed at {head}. Human approval pending.");
         Ok(())
@@ -238,6 +251,7 @@ pub fn execute(
     Ok(ExitCode::SUCCESS)
 }
 fn verify_task(agents: &Agents<'_>, task: &Task, record: &mut Value) -> Result<()> {
+    record["phase"] = json!("checking");
     record["check"] = json!(task.check);
     save(agents.folder, record)?;
     let rc = agent::logged(

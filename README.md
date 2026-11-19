@@ -41,6 +41,15 @@ cargo run --locked --manifest-path desktop/Cargo.toml -- --repo /path/to/repo
 
 桌面端和 CLI 使用所选克隆的同一个本地 SQLite 库，关联 Worktree 共用记录。CLI 可独立安装。
 
+### 在 Studio 发起两轮接力
+
+使用上面的打包版 Studio。先在本机登录 Codex CLI 和 Claude Code，并用 `aep dispatch` 将任务派发到仓库的 `origin`。从源码启动 Studio 时，可将同版本的 `aep` 放入 `PATH`，或将 `AEP_STUDIO_RUNNER` 设为该执行器的绝对路径。
+
+1. 打开仓库，进入「两轮接力」，选中已派发任务并点击「发起第一轮」。可填写 Codex 模型，留空使用客户端默认配置。
+2. 第一轮验收和审查完成后，点击未决问题旁的「修订为决策」，编辑并保存。若两个 Agent 都未留下问题，可新建任务决策，或选用当前 Spec 已有的决策。
+3. 点击「用此决策发起第二轮」。第二轮从第一轮候选提交继续，沿用同一个 Spec SHA。执行器会把选中的决策版本优先放入两个 Agent 的上下文。如果该版本已被替换或不再适用，本轮会报告具体原因。
+4. 接力页自动刷新准备、实现、验收和审查进度。每轮的「执行证据」可打开提交、验收日志、审查报告和记忆读写 ID。失败时可以查看原因和日志，并按轮重试。重试保留之前的尝试，重新启动 Studio 后可从「接力记录」继续查看。两轮完成后候选仍等待人工审查。
+
 ### 重复派发与本地恢复
 
 派发方可以给一次执行指定稳定的 `--run-id`。在同一设备和同一仓库（包括它的其他 Worktree）重送消息时，沿用该 ID。以下示例可执行两次；第二次复用第一次的证据。
@@ -99,7 +108,7 @@ aep status --run-id market-handoff-001
 
 ## 试点边界
 
-- 这版用 Git 远端作为最小控制面，按任务名手动触发本地执行。CLI、共享记忆和任务执行器使用 Rust。独立控制面、后台 Daemon、设备身份、Lease、断线接管和桌面派发仍在路线图中。
+- 这版用 Git 远端作为最小控制面。可从 CLI 或 Studio 发起已派发任务。CLI、共享记忆和任务执行器使用 Rust。独立控制面、后台 Daemon、设备身份、Lease 和跨设备接管仍在路线图中。
 - 只在受信任的仓库运行。Worktree 隔开文件变更，测试命令和待测代码会以本机用户身份执行。选择外部模型客户端前，须确认其环境与数据权限。
 - 同一任务可以有多个 Run。每次都针对固定的版本生成证据，由人显式推送候选提交并建 PR。CI 在 PR 当前提交上独立复验，平台不会代替人批准或合并。
 - 本仓库用作流程试点与基线。业务收益、费用和可靠性由后续真实需求测量。[AEP 架构提案与八周路线图](https://app.notion.com/p/41a9d9f6f60581d08560fa33ed8c4810)
@@ -122,7 +131,7 @@ cargo test --locked --all-targets
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug
 ```
 
-可用 `--scenario history`、`conflict` 或 `handoff` 单独运行。要查看某一步的实际画面，添加输出目录和截图选项。
+可用 `--scenario history`、`conflict`、`handoff` 或 `studio-relay` 单独运行。后者从 Studio 选任务发起两轮，并回归失败重试、重新打开、修订和证据跳转。要查看某一步的实际画面，添加输出目录和截图选项。
 
 ```sh
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
@@ -163,4 +172,4 @@ cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
   --script desktop/examples/memory-search.json --output-dir desktop/target/ui-debug
 ```
 
-脚本从包含一条 `sample-run` 的新仓库开始。初始状态存为 `script-000.json`，之后每步递增。使用快照中的唯一 ID 做 `click`、`present`、`absent`，或用唯一标签做 `click_label`。此外支持 `input`、`press`、`scroll`（`id` 和像素增量 `dy`）和 `expect_value`（`label` 和 `equals`）。macOS CI 会运行三个内置场景和仓库内的搜索脚本。
+脚本从包含一条 `sample-run` 的新仓库开始。初始状态存为 `script-000.json`，之后每步递增。使用快照中的唯一 ID 做 `click`、`present`、`absent`，或用唯一标签做 `click_label`。此外支持 `input`、`press`、`scroll`（`id` 和像素增量 `dy`）和 `expect_value`（`label` 和 `equals`）。macOS CI 会运行四个内置场景和仓库内的搜索脚本。

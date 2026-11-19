@@ -77,12 +77,16 @@ impl Snapshot {
 pub enum Artifact {
     Checks,
     Review,
+    Implementation,
+    ReviewDiagnostics,
 }
 impl Artifact {
     pub fn filename(self) -> &'static str {
         match self {
             Self::Checks => "checks.log",
             Self::Review => "review.txt",
+            Self::Implementation => "implementation.log",
+            Self::ReviewDiagnostics => "review.log",
         }
     }
 }
@@ -90,7 +94,7 @@ pub struct Preview {
     pub text: String,
     pub truncated: bool,
 }
-/// Only the two named text artifacts are exposed; large logs show their most recent output.
+/// Only named text artifacts are exposed; large logs show their most recent output.
 pub fn preview(data: &Path, id: &str, artifact: Artifact) -> Result<Option<Preview>> {
     const LIMIT: u64 = 48 * 1024;
     ident(id, 64)?;

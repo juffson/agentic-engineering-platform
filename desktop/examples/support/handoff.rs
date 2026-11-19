@@ -178,3 +178,38 @@ pub fn export_runs(ws: &Workspace, dest: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+pub fn studio_runner(root: &Path) -> Result<aep_studio::Runner> {
+    let bin = root.join("bin");
+    for (name, script) in [
+        ("codex", include_str!("handoff/studio-codex.sh")),
+        ("claude", include_str!("handoff/studio-claude.sh")),
+    ] {
+        let path = bin.join(name);
+        fs::write(&path, script)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let target = source.join("target");
+    let output = Command::new("cargo")
+        .current_dir(&source)
+        .args([
+            "build",
+            "--locked",
+            "--quiet",
+            "--bin",
+            "aep",
+            "--target-dir",
+        ])
+        .arg(&target)
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "build AEP runner: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(aep_studio::Runner {
+        binary: Some(target.join("debug/aep")),
+        client_bin: Some(bin),
+    })
+}

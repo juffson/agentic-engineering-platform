@@ -23,6 +23,7 @@ pub(super) enum Start {
     Blank,
     FromRun(String),
     Revise(i64),
+    Resolve(i64),
 }
 
 pub(crate) struct Editor {
@@ -39,6 +40,7 @@ pub(crate) struct Editor {
 
 impl Studio {
     pub(super) fn compose(&mut self, start: Start, window: &mut Window, cx: &mut Context<Self>) {
+        let resolving = matches!(start, Start::Resolve(_));
         let (record, replaces, scope) = match start {
             Start::Blank => (&Value::Null, None, Scope::Project),
             Start::FromRun(id) => {
@@ -47,7 +49,7 @@ impl Studio {
                 };
                 (&run.record, None, Scope::Task)
             }
-            Start::Revise(id) => {
+            Start::Revise(id) | Start::Resolve(id) => {
                 let Some(note) = self
                     .snapshot
                     .notes
@@ -83,7 +85,11 @@ impl Studio {
         self.editor = Some(Editor {
             replaces,
             scope,
-            kind: Kind::from_str(string(record, "kind"), false).unwrap_or(Kind::Decision),
+            kind: if resolving {
+                Kind::Decision
+            } else {
+                Kind::from_str(string(record, "kind"), false).unwrap_or(Kind::Decision)
+            },
             task,
             spec,
             candidate,
@@ -144,7 +150,9 @@ impl Studio {
                 Ok(id) => {
                     this.editor = None;
                     this.note = Some(id);
-                    this.navigate(Page::Memory, w, cx);
+                    if this.page != Page::Relay {
+                        this.navigate(Page::Memory, w, cx);
+                    }
                     // Supersede any snapshot that started before the transaction committed.
                     this.loading = false;
                     this.reload(cx);
