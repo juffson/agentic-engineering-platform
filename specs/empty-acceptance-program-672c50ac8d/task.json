@@ -1,0 +1,13 @@
+{
+  "title": "Report missing acceptance executable",
+  "allowed_paths": [
+    "src/task.rs"
+  ],
+  "check": [
+    "cargo",
+    "test",
+    "--locked",
+    "--lib",
+    "task::tests"
+  ]
+}
