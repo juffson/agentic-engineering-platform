@@ -1,0 +1,14 @@
+{
+  "title": "Align truncated log previews to UTF-8",
+  "allowed_paths": [
+    "src/studio.rs",
+    "src/studio_tests.rs"
+  ],
+  "check": [
+    "cargo",
+    "test",
+    "--locked",
+    "--lib",
+    "studio::tests"
+  ]
+}
