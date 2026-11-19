@@ -91,6 +91,8 @@ impl std::fmt::Display for RevisionConflict {
 impl std::error::Error for RevisionConflict {}
 
 pub struct Memory(Connection);
+pub const TEXT_LIMIT: usize = 1000;
+
 fn note(row: &Row<'_>) -> rusqlite::Result<Value> {
     let mut v = json!({"id":row.get::<_,i64>("id")?,"run_id":row.get::<_,Option<String>>("run_id")?,"replaces":row.get::<_,Option<i64>>("replaces")?});
     for col in [
@@ -111,8 +113,8 @@ fn note(row: &Row<'_>) -> rusqlite::Result<Value> {
 fn text(s: &str, optional: bool) -> Result<&str> {
     let s = s.trim();
     ensure!(
-        s.chars().count() <= 1000 && (optional || !s.is_empty()),
-        "invalid memory text (limit 1000 characters)"
+        s.chars().count() <= TEXT_LIMIT && (optional || !s.is_empty()),
+        "invalid memory text (limit {TEXT_LIMIT} characters)"
     );
     Ok(s)
 }

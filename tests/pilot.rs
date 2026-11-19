@@ -301,11 +301,20 @@ printf '%s' '{"note":"handoff-719","question":"Which deadline?"}' > "$2"
 printf ok > result.txt
 echo log-only-canary"#,
     );
-    f.script("claude",r#"prompt=$(cat)
+    let long_review_note = "阅".repeat(aep::memory::TEXT_LIMIT + 1);
+    let review = json!({"structured_output":{
+        "note":long_review_note,"question":"","report":"detailed report"
+    }});
+    f.script(
+        "claude",
+        &format!(
+            r#"prompt=$(cat)
 case "$prompt" in *"handoff-719"*) ;; *) exit 1;; esac
 case "$prompt" in *log-only-canary*) exit 1;; esac
 echo diagnostics >&2
-printf '%s' '{"structured_output":{"note":"review-284","question":"","report":"detailed report"}}'"#);
+printf '%s' '{review}'"#
+        ),
+    );
     let args = [
         "run",
         "--task",
@@ -325,6 +334,22 @@ printf '%s' '{"structured_output":{"note":"review-284","question":"","report":"d
     let sha = r["candidate_sha"].as_str().unwrap();
     let handoff = &r["memory_outputs"]["implementer"][0];
     assert_eq!(r["review_status"], "findings_recorded");
+    let reviewer_note = r["memory_outputs"]["reviewer"][0].as_i64().unwrap();
+    let data = f.repo.join(".git/aep");
+    let db = aep::memory::Memory::open(&data).unwrap();
+    assert_eq!(
+        db.get(reviewer_note).unwrap()["body"],
+        format!("{}…", "阅".repeat(aep::memory::TEXT_LIMIT - 1))
+    );
+    let review_folder = data.join("runs/both");
+    assert_eq!(
+        fs::read_to_string(review_folder.join("review.txt")).unwrap(),
+        "detailed report\n"
+    );
+    assert_eq!(
+        aep::workspace::read(&review_folder.join("review-result.json")).unwrap(),
+        review
+    );
     assert_eq!(r["request"]["codex_model"], "demo-model");
     assert!(
         r["memory_inputs"]["reviewer"]

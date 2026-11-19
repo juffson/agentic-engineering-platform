@@ -1,15 +1,9 @@
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+pub use aep::task::TaskManifest as Task;
 pub use aep::workspace::{commit, git, ident};
 
-#[derive(Deserialize)]
-pub struct Task {
-    pub title: Option<String>,
-    pub allowed_paths: Vec<String>,
-    pub check: Vec<String>,
-}
 pub struct Repo {
     pub root: PathBuf,
     pub data: PathBuf,
@@ -28,18 +22,7 @@ impl Repo {
         let spec = git(&self.root, &["show", &format!("{path}/spec.md")])?;
         let task: Task =
             serde_json::from_str(&git(&self.root, &["show", &format!("{path}/task.json")])?)?;
-        ensure!(
-            !task.allowed_paths.is_empty()
-                && task
-                    .allowed_paths
-                    .iter()
-                    .all(|s| s.split('/').all(|p| !matches!(p, "" | "." | ".." | ".git"))),
-            "invalid allowed_paths"
-        );
-        ensure!(
-            !task.check.is_empty() && task.check.iter().all(|s| !s.is_empty()),
-            "check must contain a command"
-        );
+        task.validate()?;
         Ok((spec, task))
     }
     fn remote_tip(&self, remote: &str, r: &str) -> Result<Option<String>> {

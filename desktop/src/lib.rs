@@ -80,6 +80,7 @@ struct Studio {
     review: Option<view::human_review::State>,
     pull_request: Option<view::github_page::State>,
     lifecycle: Option<lifecycle::Fixture>,
+    task_authoring: Option<view::task_authoring::Authoring>,
     lifecycle_preparing: bool,
     lifecycle_loading: bool,
     lifecycle_choices: Option<lifecycle::Choices>,
@@ -133,6 +134,7 @@ impl Studio {
             review: None,
             pull_request: None,
             lifecycle,
+            task_authoring: None,
             lifecycle_preparing: false,
             lifecycle_loading: false,
             lifecycle_choices: None,
@@ -226,6 +228,7 @@ impl Studio {
     ) {
         self.workspace_generation += 1;
         self.lifecycle = lifecycle::load(&ws);
+        self.task_authoring = None;
         self.lifecycle_doc = None;
         self.lifecycle_error = None;
         self.lifecycle_preparing = false;
@@ -337,6 +340,24 @@ impl Studio {
             }
         })
         .detach();
+    }
+
+    fn start_relay(&mut self, task: relay::Task, cx: &mut Context<Self>) {
+        if self.relay_launching {
+            return;
+        }
+        let id = self
+            .lifecycle
+            .as_ref()
+            .filter(|session| {
+                session.authored && session.task == task.name && session.spec == task.sha
+            })
+            .map_or_else(relay::new_id, lifecycle::Fixture::authored_relay_id);
+        self.relay_id = Some(id.clone());
+        self.relay_task = None;
+        self.submit_relay(cx, move |ws, runner, model| {
+            relay::start(ws, runner, id, task, model)
+        });
     }
 
     fn submit_relay(

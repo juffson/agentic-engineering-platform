@@ -2,7 +2,7 @@ mod github;
 use aep::workspace::{Workspace, git, read};
 use anyhow::{Context, Result, ensure};
 use github::command;
-pub(crate) use github::{Branch, Choices, choices};
+pub(crate) use github::{Branch, Choices, Draft, Plan, choices};
 pub use github::{Fixture, remote_ref};
 use serde::Serialize;
 use serde_json::Value;
@@ -47,6 +47,9 @@ pub fn archive(root: &Path, out: &Path) -> Result<()> {
     let mut index = String::from("# Studio live lifecycle evidence\n\n");
     for (file, label) in [
         ("verification.json", "Verification"),
+        ("spec.md", "Task Spec"),
+        ("task.json", "Task manifest"),
+        ("dispatch.json", "Dispatch receipt"),
         ("failure.txt", "Failure"),
         ("relay-verification.json", "Relay and memory reads"),
         ("reviewed.diff", "Reviewed diff"),
@@ -438,6 +441,7 @@ mod tests {
             source: PathBuf::new(),
             studio: true,
             real_task: false,
+            authored: false,
             repo: "user/project".into(),
             task: "studio-lifecycle-abc".into(),
             base: "test/studio-lifecycle-abc".into(),

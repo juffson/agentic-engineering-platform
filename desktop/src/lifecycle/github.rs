@@ -1,4 +1,7 @@
-use aep::workspace::{Workspace, commit, git, validate_task_target};
+use aep::{
+    task::TaskManifest,
+    workspace::{Workspace, commit, git, ident, validate_task_target},
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,6 +23,8 @@ pub struct Fixture {
     pub studio: bool,
     #[serde(default)]
     pub real_task: bool,
+    #[serde(default)]
+    pub authored: bool,
     pub repo: String,
     pub task: String,
     pub base: String,
@@ -32,6 +37,69 @@ pub struct Fixture {
 pub(crate) struct Branch {
     pub name: String,
     pub sha: String,
+}
+
+pub(crate) struct Draft {
+    pub name: String,
+    pub spec: String,
+    pub manifest: TaskManifest,
+}
+
+impl Draft {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ident(&self.name, 63).context("任务 ID 只支持小写字母、数字和连字符，最多 63 个字符")?;
+        ensure!(!self.spec.trim().is_empty(), "请填写 Spec");
+        self.manifest
+            .validate()
+            .context("请检查允许修改的文件和验收命令")
+    }
+
+    fn commit(&self, ws: &Workspace, branch: &Branch) -> Result<String> {
+        let reference = format!("refs/heads/aep-task/{}", self.name);
+        ensure!(
+            remote_ref(ws, &reference)?.is_empty(),
+            "任务 ID 已经派发，请使用新的 ID"
+        );
+        git(&ws.root, &["switch", "--detach"])?;
+        let specs = ws.root.join("specs");
+        match fs::symlink_metadata(&specs) {
+            Ok(metadata) => ensure!(metadata.is_dir(), "specs 必须是仓库内的普通目录"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&specs)?,
+            Err(error) => return Err(error.into()),
+        }
+        let dir = specs.join(&self.name);
+        fs::create_dir(&dir).context("所选目标已包含这个任务目录，或无法创建目录")?;
+        fs::write(dir.join("spec.md"), &self.spec)?;
+        save(&dir, "task.json", &self.manifest)?;
+        git(&ws.root, &["add", "--", &format!("specs/{}", self.name)])?;
+        git(
+            &ws.root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "-m",
+                &format!("Specify {}", self.name),
+            ],
+        )?;
+        let spec = commit(&ws.root, "HEAD")?;
+        git(&ws.root, &["update-ref", "refs/aep/lifecycle/spec", &spec])?;
+        git(&ws.root, &["switch", "--no-guess", "--", &branch.name])?;
+        Ok(spec)
+    }
+}
+
+pub(crate) enum Plan {
+    Synthetic,
+    Existing(relay::Task, Branch),
+    New(Draft, Branch),
+}
+
+enum TaskSource {
+    Existing(relay::Task),
+    New(Draft),
 }
 
 pub(crate) struct Choices {
@@ -90,6 +158,10 @@ fn gh(cwd: &Path, args: &[&str]) -> Result<Value> {
 }
 
 impl Fixture {
+    pub(crate) fn authored_relay_id(&self) -> String {
+        format!("relay-{}", self.spec.chars().take(32).collect::<String>())
+    }
+
     pub fn prepare(
         out: &Path,
         root: &Path,
@@ -100,15 +172,22 @@ impl Fixture {
         Self::prepare_session(out, root, source, runner, studio, None)
     }
 
-    pub(crate) fn prepare_task(
+    pub(crate) fn prepare_studio(
         out: &Path,
         root: &Path,
         source: &Path,
         runner: &Runner,
-        task: relay::Task,
-        branch: Branch,
+        plan: Plan,
     ) -> Result<(Self, Workspace)> {
-        Self::prepare_session(out, root, source, runner, true, Some((task, branch)))
+        let selected = match plan {
+            Plan::Synthetic => None,
+            Plan::Existing(task, branch) => Some((TaskSource::Existing(task), branch)),
+            Plan::New(draft, branch) => {
+                draft.validate()?;
+                Some((TaskSource::New(draft), branch))
+            }
+        };
+        Self::prepare_session(out, root, source, runner, true, selected)
     }
 
     fn prepare_session(
@@ -117,7 +196,7 @@ impl Fixture {
         source: &Path,
         runner: &Runner,
         studio: bool,
-        selected: Option<(relay::Task, Branch)>,
+        selected: Option<(TaskSource, Branch)>,
     ) -> Result<(Self, Workspace)> {
         let source_ws = Workspace::open(source)?;
         if selected.is_some() {
@@ -201,26 +280,36 @@ impl Fixture {
                 base_sha == branch.sha,
                 "目标分支已更新，请刷新任务和分支后重选"
             );
-            let reference = format!("refs/heads/aep-task/{}", task.name);
-            let pinned = "refs/aep/lifecycle/spec";
-            git(
-                &ws.root,
-                &[
-                    "fetch",
-                    "--no-tags",
-                    "origin",
-                    &format!("{reference}:{pinned}"),
-                ],
-            )?;
-            let spec = commit(&ws.root, pinned)?;
-            ensure!(spec == task.sha, "任务派发版本已变化，请刷新后重选");
-            validate_task_target(&ws.root, &base_sha, &spec, &task.name)?;
+            let (task, spec, authored) = match task {
+                TaskSource::Existing(task) => {
+                    let reference = format!("refs/heads/aep-task/{}", task.name);
+                    let pinned = "refs/aep/lifecycle/spec";
+                    git(
+                        &ws.root,
+                        &[
+                            "fetch",
+                            "--no-tags",
+                            "origin",
+                            &format!("{reference}:{pinned}"),
+                        ],
+                    )?;
+                    let spec = commit(&ws.root, pinned)?;
+                    ensure!(spec == task.sha, "任务派发版本已变化，请刷新后重选");
+                    (task.name, spec, false)
+                }
+                TaskSource::New(draft) => {
+                    let spec = draft.commit(&ws, &branch)?;
+                    (draft.name, spec, true)
+                }
+            };
+            validate_task_target(&ws.root, &base_sha, &spec, &task)?;
             let fixture = Self {
                 source,
                 studio,
                 real_task: true,
+                authored,
                 repo,
-                task: task.name,
+                task,
                 base: branch.name,
                 base_sha,
                 spec,
@@ -277,6 +366,7 @@ impl Fixture {
             source,
             studio,
             real_task: false,
+            authored: false,
             repo,
             task,
             base,
@@ -310,6 +400,41 @@ impl Fixture {
             &["dispatch", "--task", &fixture.task, "--rev", &fixture.spec],
         )?;
         Ok((fixture, ws))
+    }
+
+    pub(crate) fn dispatch_authored(&self, ws: &Workspace, runner: &Runner) -> Result<()> {
+        ensure!(
+            self.real_task && self.authored,
+            "仅可直接派发此处准备的新任务"
+        );
+        let repo = publish::repository(ws, runner)?;
+        ensure!(self.repo.eq_ignore_ascii_case(&repo), "GitHub 仓库已变化");
+        ensure!(
+            remote_ref(ws, &format!("refs/heads/{}", self.base))? == self.base_sha,
+            "目标分支已更新，请从当前提交重新准备任务"
+        );
+        validate_task_target(&ws.root, &self.base_sha, &self.spec, &self.task)?;
+        let binary = runner.binary()?;
+        command(
+            binary.to_str().context("runner path")?,
+            &ws.root,
+            &["dispatch", "--task", &self.task, "--rev", &self.spec],
+        )?;
+        let reference = format!("refs/heads/aep-task/{}", self.task);
+        ensure!(
+            remote_ref(ws, &reference)? == self.spec,
+            "GitHub 派发引用与确认的 Spec 不一致"
+        );
+        let out = super::output(ws).context("missing lifecycle evidence path")?;
+        save(
+            &out,
+            "dispatch.json",
+            &json!({
+                "repo": self.repo, "task": self.task, "ref": reference, "spec_sha": self.spec,
+                "target": self.base, "target_sha": self.base_sha,
+            "relay": self.authored_relay_id(),
+            }),
+        )
     }
 
     pub(crate) fn verify_ci(
@@ -575,6 +700,78 @@ fn ready_checks(pr: &Value) -> Result<Option<&[Value]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_task_keeps_checkout_and_remote_at_their_original_state() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let repo = root.path().join("repo");
+        let remote = root.path().join("remote");
+        fs::create_dir(&repo)?;
+        fs::create_dir(&remote)?;
+        git(&remote, &["init", "--bare", "-q", "--template="])?;
+        git(&repo, &["init", "-qb", "main", "--template="])?;
+        git(&repo, &["config", "user.name", "AEP Test"])?;
+        git(&repo, &["config", "user.email", "aep@example.invalid"])?;
+        git(
+            &repo,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "base",
+            ],
+        )?;
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().context("remote")?,
+            ],
+        )?;
+        let ws = Workspace::open(&repo)?;
+        let branch = Branch {
+            name: "main".into(),
+            sha: commit(&repo, "HEAD")?,
+        };
+        let mut draft = Draft {
+            name: "target-errors".into(),
+            spec: "# Fix target errors\n".into(),
+            manifest: TaskManifest {
+                title: None,
+                allowed_paths: vec!["../outside".into()],
+                check: vec![
+                    "cargo".into(),
+                    "test".into(),
+                    "--test".into(),
+                    "name with spaces".into(),
+                ],
+            },
+        };
+        assert!(draft.validate().is_err());
+        draft.manifest.allowed_paths = vec!["src/workspace.rs".into()];
+        draft.validate()?;
+        let sha = draft.commit(&ws, &branch)?;
+        validate_task_target(&repo, &branch.sha, &sha, &draft.name)?;
+        let manifest: TaskManifest = serde_json::from_str(&git(
+            &repo,
+            &["show", &format!("{sha}:specs/target-errors/task.json")],
+        )?)?;
+        assert_eq!(manifest.check, draft.manifest.check);
+        assert_eq!(commit(&repo, "HEAD")?, branch.sha);
+        assert_eq!(
+            git(&repo, &["symbolic-ref", "--short", "HEAD"])?.trim(),
+            "main"
+        );
+        assert!(git(&repo, &["status", "--porcelain"])?.is_empty());
+        assert!(remote_ref(&ws, "refs/heads/aep-task/target-errors")?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn ci_requires_the_successful_acceptance_check_and_a_mergeable_pr() {
