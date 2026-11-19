@@ -1,4 +1,5 @@
 pub(crate) mod editor;
+pub(crate) mod github_page;
 pub(crate) mod human_review;
 mod relay_page;
 use super::*;
@@ -544,6 +545,9 @@ impl Render for Studio {
         }
         if self.page == Page::Review {
             return self.human_review_page(cx);
+        }
+        if self.page == Page::PullRequest {
+            return self.github_pr_page(cx);
         }
         let runs = &self.snapshot.runs;
         let notes = &self.snapshot.notes;

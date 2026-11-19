@@ -1,3 +1,4 @@
+mod github_pr;
 mod publish;
 mod relay;
 mod view;
@@ -24,6 +25,7 @@ enum Page {
     Memory,
     Relay,
     Review,
+    PullRequest,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Filter {
@@ -73,6 +75,7 @@ struct Studio {
     relay_polling: bool,
     workspace_generation: u64,
     review: Option<view::human_review::State>,
+    pull_request: Option<view::github_page::State>,
 }
 
 impl Studio {
@@ -116,6 +119,7 @@ impl Studio {
             relay_polling: false,
             workspace_generation: 0,
             review: None,
+            pull_request: None,
         };
         studio.reload(cx);
         studio
@@ -191,6 +195,7 @@ impl Studio {
                     this.tasks_loaded = false;
                     this.relay_launching = false;
                     this.review = None;
+                    this.pull_request = None;
                     this.relay_model
                         .update(cx, |input, cx| input.set_value("", window, cx));
                     this.loading = false;
