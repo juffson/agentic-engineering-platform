@@ -51,6 +51,8 @@ pub(crate) struct Attempt {
     pub publication: Option<crate::publish::Publication>,
     #[serde(skip)]
     pub merge: Option<crate::github_pr::MergeReceipt>,
+    #[serde(skip)]
+    pub cleanup: Option<crate::cleanup::Receipt>,
 }
 impl Attempt {
     pub fn merged(&self) -> bool {
@@ -62,6 +64,16 @@ impl Attempt {
                             .pr
                             .as_ref()
                             .is_some_and(|pr| pr.number == merge.number)
+                })
+        })
+    }
+
+    pub fn finalized(&self) -> bool {
+        self.cleanup.as_ref().is_some_and(|receipt| {
+            receipt.complete()
+                && self.publication.as_ref().is_some_and(|saved| {
+                    saved.target.candidate == receipt.candidate
+                        && saved.pr.as_ref().is_some_and(|pr| pr.number == receipt.pr)
                 })
         })
     }
@@ -217,6 +229,7 @@ fn read_relay(ws: &Workspace, path: &Path) -> Result<Relay> {
                 if attempt.round == Round::Second {
                     attempt.publication = crate::publish::load(&run)?;
                     attempt.merge = crate::github_pr::read_receipt(&run)?;
+                    attempt.cleanup = crate::cleanup::read(&run)?;
                 }
                 continue;
             }
@@ -364,6 +377,7 @@ fn launch(
         diagnostics: None,
         publication: None,
         merge: None,
+        cleanup: None,
     });
     save(path, relay)?;
     let mut log = File::create(path.join(format!("{run_id}.log")))?;

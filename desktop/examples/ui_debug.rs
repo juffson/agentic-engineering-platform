@@ -608,6 +608,7 @@ fn studio_relay(args: &Args) -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let ws = handoff_fixture::prepare(fixture.path(), Clients::Fixture)?;
     let runner = handoff_fixture::studio_runner(fixture.path())?;
+    git(&ws.root, &["branch", "-M", "main"])?;
     git(&ws.root, &["push", "origin", "HEAD:refs/heads/main"])?;
     let mut ui = Driver::open_with_runner(&ws, args, runner.clone())?;
     let result = (|| {
@@ -645,9 +646,6 @@ fn studio_relay(args: &Args) -> Result<()> {
             failure["check_exit_code"] != 0 && failure["memory_outputs"] == json!({}),
             "the failed attempt lost its evidence or published memory"
         );
-        if let Some(worktree) = failure["recovery_worktree"].as_str() {
-            git(&ws.root, &["worktree", "remove", "--force", worktree])?;
-        }
         let first_run = checked_run(&ws, first)?;
         let question = first_run["memory_outputs"]["implementer"][1]
             .as_i64()
@@ -926,7 +924,7 @@ fn verify_github_merge(
     let receipt = aep::workspace::read(&ws.data.join("runs").join(second).join("merge.json"))?;
     ensure!(
         receipt["head"] == record["candidate_sha"]
-            && receipt["merged_sha"] == record["candidate_sha"]
+            && receipt["merged_sha"] == fs::read_to_string(fixture.join("merged-sha"))?.trim()
             && receipt["confirmed_by"] == "aep-reviewer",
         "merge receipt does not match the confirmed head"
     );
@@ -943,6 +941,130 @@ fn verify_github_merge(
             && ui.absent("github-merge-now")?
             && fs::read_to_string(fixture.join("pr-merges"))? == "PUT\n",
         "reopening a merged PR submitted another merge"
+    );
+    verify_post_merge_cleanup(ui, ws, fixture, second, record)?;
+    Ok(())
+}
+
+fn verify_post_merge_cleanup(
+    ui: &mut Driver,
+    ws: &Workspace,
+    fixture: &Path,
+    second: &str,
+    record: &Value,
+) -> Result<()> {
+    let folder = ws.data.join("runs").join(second);
+    let merge = fs::read(folder.join("merge.json"))?;
+    let merged = aep::workspace::read(&folder.join("merge.json"))?;
+    let merge_sha = merged["merged_sha"].as_str().context("merge SHA")?;
+    let candidate = record["candidate_sha"].as_str().context("candidate SHA")?;
+    let head = format!("aep/pr/handoff/{second}");
+    let head_ref = format!("refs/heads/{head}");
+    let remote = fixture.join("remote.git");
+    let relay_dir = fs::read_dir(ws.data.join("relays"))?
+        .next()
+        .context("relay")??;
+    let relay = aep::workspace::read(&relay_dir.path().join("relay.json"))?;
+    let failed = relay["attempts"][0]["id"]
+        .as_str()
+        .context("failed attempt")?;
+    let first = relay["attempts"][1]["id"].as_str().context("first run")?;
+    let failure = status(&ws.data, failed)?;
+    let scratch = PathBuf::from(
+        failure["recovery_worktree"]
+            .as_str()
+            .context("failed worktree")?,
+    );
+    let before = [status(&ws.data, first)?, status(&ws.data, second)?, failure];
+    let memory = fs::read(ws.data.join("memory.sqlite3"))?;
+    let original_tip = git(&ws.root, &["rev-parse", "HEAD"])?;
+    ensure!(
+        scratch.is_dir() && original_tip.trim() != merge_sha,
+        "cleanup fixture is already clean"
+    );
+
+    let untracked = ws.root.join("keep-local.txt");
+    fs::write(&untracked, "unsaved local work")?;
+    ui.reveal("github-merge-card", "github-finish-merge")?;
+    ui.click("github-finish-merge")?;
+    ensure!(
+        ui.element("github-cleanup-target")?
+            .label()
+            .is_some_and(|text| text.contains("未跟踪"))
+            && git(&ws.root, &["rev-parse", "HEAD"])? == original_tip
+            && git(&remote, &["rev-parse", &head_ref])?.trim() == candidate,
+        "a dirty local checkout did not block destructive steps"
+    );
+    ui.checkpoint("studio-post-merge-blocked")?;
+    fs::remove_file(untracked)?;
+
+    let user_file = scratch.join("keep-worktree.txt");
+    fs::write(&user_file, "preserve uncommitted worktree content")?;
+    git(&remote, &["update-ref", &head_ref, merge_sha, candidate])?;
+    ui.reveal("github-merge-card", "github-finish-merge")?;
+    ui.click("github-finish-merge")?;
+    ensure!(
+        ui.element("github-cleanup-branch")?
+            .label()
+            .is_some_and(|text| text.contains("其他提交"))
+            && ui
+                .element("github-cleanup-worktree-0")?
+                .label()
+                .is_some_and(|text| text.contains("未跟踪"))
+            && user_file.is_file()
+            && git(&ws.root, &["rev-parse", "HEAD"])?.trim() == merge_sha
+            && git(&remote, &["rev-parse", &head_ref])?.trim() == merge_sha,
+        "changed refs or dirty Worktrees were not preserved"
+    );
+    fs::remove_file(user_file)?;
+    git(&remote, &["update-ref", &head_ref, candidate, merge_sha])?;
+    git(&ws.root, &["branch", "--", &head, candidate])?;
+    let unrelated = fixture.join("aep-work-unrelated");
+    git(
+        &ws.root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            unrelated.to_str().context("unrelated worktree")?,
+            candidate,
+        ],
+    )?;
+    ui.reveal("github-merge-card", "github-finish-merge")?;
+    ui.click("github-finish-merge")?;
+    ui.reveal("github-merge-card", "github-cleanup-complete")?;
+    ensure!(
+        ui.element("github-cleanup-complete")?.visible()
+            && !scratch.exists()
+            && unrelated.is_dir()
+            && git(&ws.root, &["ls-remote", "--refs", "origin", &head_ref])?.is_empty()
+            && git(&ws.root, &["rev-parse", &head_ref])?.trim() == candidate,
+        "cleanup removed user branches or left the generated branch or worktree"
+    );
+    ensure!(
+        before
+            == [
+                status(&ws.data, first)?,
+                status(&ws.data, second)?,
+                status(&ws.data, failed)?
+            ]
+            && memory == fs::read(ws.data.join("memory.sqlite3"))?
+            && merge == fs::read(folder.join("merge.json"))?
+            && git(&ws.root, &["rev-parse", &format!("refs/aep/runs/{second}")])?.trim()
+                == candidate,
+        "post-merge cleanup changed historical evidence, memory or the merge receipt"
+    );
+    ui.checkpoint("studio-post-merge-complete")?;
+    ui.click("github-back-to-relay")?;
+    ensure!(
+        ui.element("relay-second-progress")?.label() == Some("合并与收尾已完成"),
+        "relay did not retain the cleanup receipt"
+    );
+    ui.reveal("relay-detail", "relay-pr-progress")?;
+    ui.click("relay-pr-progress")?;
+    ensure!(
+        ui.element("github-cleanup-complete").is_ok() && ui.absent("github-finish-merge")?,
+        "reopening the PR did not show the completed cleanup"
     );
     Ok(())
 }

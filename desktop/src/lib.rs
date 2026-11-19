@@ -1,3 +1,4 @@
+mod cleanup;
 mod github_pr;
 mod publish;
 mod relay;
