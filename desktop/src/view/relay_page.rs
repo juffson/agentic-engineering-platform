@@ -324,7 +324,19 @@ impl Studio {
             );
         }
         if relay::passed(relay.run(Round::Second, &self.snapshot)) {
-            return div();
+            let Some(run) = relay
+                .latest(Round::Second)
+                .map(|attempt| attempt.id.clone())
+            else {
+                return div();
+            };
+            return panel().child(heading("最终人工审查")).child(
+                button("open-human-review", "查看 Diff 与创建 PR", true).on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        this.open_human_review(id.clone(), run.clone(), window, cx)
+                    },
+                )),
+            );
         }
         let questions = relay.questions(&self.snapshot);
         let decisions = relay.decisions(&self.snapshot);

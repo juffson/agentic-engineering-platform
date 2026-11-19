@@ -34,7 +34,10 @@ jobs:
       - run: RUSTUP_TOOLCHAIN=stable ./desktop/bundle-macos.sh
       - run: codesign --verify --strict "desktop/target/AEP Studio.app"
   acceptance:
-    if: github.event_name == 'pull_request' && github.head_ref == 'pilot/market-volume-dedup-rust'
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.head_ref == 'pilot/market-volume-dedup-rust' ||
+       (startsWith(github.head_ref, 'aep/pr/') && github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -46,7 +49,23 @@ jobs:
         env:
           TARGET_SHA: ${{ github.event.pull_request.base.sha }}
           CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
+          case "$HEAD_REF" in
+            aep/pr/*/*)
+              suffix=${HEAD_REF#aep/pr/}
+              task=${suffix%%/*}
+              [[ "$task" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]
+              approved_spec=$(printf '%s\n' "$PR_BODY" | sed -nE 's/^- Spec: .([a-f0-9]{40}|[a-f0-9]{64}).$/\1/p')
+              approved_head=$(printf '%s\n' "$PR_BODY" | sed -nE 's/^- Candidate: .([a-f0-9]{40}|[a-f0-9]{64}).$/\1/p')
+              [[ "$approved_head" == "$CANDIDATE_SHA" ]]
+              base="refs/remotes/origin/aep-task/$task"
+              [[ "$approved_spec" == "$(git rev-parse --verify "$base^{commit}")" ]]
+              ;;
+            *) task=market-volume-dedup-rust
+               base=refs/remotes/origin/aep-task/market-volume-dedup-rust ;;
+          esac
           git worktree add --detach "$RUNNER_TEMP/trusted" "$TARGET_SHA"
           cargo build --locked --manifest-path "$RUNNER_TEMP/trusted/Cargo.toml" --target-dir "$RUNNER_TEMP/aep-bin"
-          "$RUNNER_TEMP/aep-bin/debug/aep" verify --task market-volume-dedup-rust --base refs/remotes/origin/aep-task/market-volume-dedup-rust --candidate "$CANDIDATE_SHA"
+          "$RUNNER_TEMP/aep-bin/debug/aep" verify --task "$task" --base "$base" --candidate "$CANDIDATE_SHA"

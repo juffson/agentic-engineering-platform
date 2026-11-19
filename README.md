@@ -50,6 +50,14 @@ cargo run --locked --manifest-path desktop/Cargo.toml -- --repo /path/to/repo
 3. 点击「用此决策发起第二轮」。第二轮从第一轮候选提交继续，沿用同一个 Spec SHA。执行器会把选中的决策版本优先放入两个 Agent 的上下文。如果该版本已被替换或不再适用，本轮会报告具体原因。
 4. 接力页自动刷新准备、实现、验收和审查进度。每轮的「执行证据」可打开提交、验收日志、审查报告和记忆读写 ID。失败时可以查看原因和日志，并按轮重试。重试保留之前的尝试，重新启动 Studio 后可从「接力记录」继续查看。两轮完成后候选仍等待人工审查。
 
+### 人工审查并创建 GitHub PR
+
+第二轮通过后，点「查看 Diff 与创建 PR」。确认 `origin` 的取回与推送地址指向同一个 GitHub 仓库，并在本机使用 `gh auth login` 登录有推送和建 PR 权限的账号。
+
+在「最终 Diff」「验收日志」和「审查报告」之间切换即可核对候选。最终 Diff 使用 GitHub 默认分支与候选的合并基点，右侧显示仓库、目标分支和两个固定 SHA。核对后勾选确认并点击「确认并创建 GitHub PR」。目标分支更新时，重新加载 Diff 再确认。
+
+Studio 将候选推送到 `aep/pr/<task>/<run-id>`，并保存确认账号、候选 SHA 和 PR 链接。推送成功而建 PR 失败时，可重开该审查页后重试。Studio 会复用匹配的远端提交，并检查该分支是否已有 PR。GitHub CI 使用已派发的 Spec 和 PR 当前提交独立验收。后续 GitHub 审查与合并由维护者处理。
+
 ### 重复派发与本地恢复
 
 派发方可以给一次执行指定稳定的 `--run-id`。在同一设备和同一仓库（包括它的其他 Worktree）重送消息时，沿用该 ID。以下示例可执行两次；第二次复用第一次的证据。
@@ -110,7 +118,7 @@ aep status --run-id market-handoff-001
 
 - 这版用 Git 远端作为最小控制面。可从 CLI 或 Studio 发起已派发任务。CLI、共享记忆和任务执行器使用 Rust。独立控制面、后台 Daemon、设备身份、Lease 和跨设备接管仍在路线图中。
 - 只在受信任的仓库运行。Worktree 隔开文件变更，测试命令和待测代码会以本机用户身份执行。选择外部模型客户端前，须确认其环境与数据权限。
-- 同一任务可以有多个 Run。每次都针对固定的版本生成证据，由人显式推送候选提交并建 PR。CI 在 PR 当前提交上独立复验，平台不会代替人批准或合并。
+- 同一任务可以有多个 Run。每次都针对固定版本生成证据。用户可以在 Studio 核对证据并确认发布候选，CI 在 PR 当前提交上独立复验。
 - 本仓库用作流程试点与基线。业务收益、费用和可靠性由后续真实需求测量。[AEP 架构提案与八周路线图](https://app.notion.com/p/41a9d9f6f60581d08560fa33ed8c4810)
 
 ## 开发验证
@@ -131,7 +139,7 @@ cargo test --locked --all-targets
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug
 ```
 
-可用 `--scenario history`、`conflict`、`handoff` 或 `studio-relay` 单独运行。后者从 Studio 选任务发起两轮，并回归失败重试、重新打开、修订和证据跳转。要查看某一步的实际画面，添加输出目录和截图选项。
+可用 `--scenario history`、`conflict`、`handoff` 或 `studio-relay` 单独运行。后者从 Studio 选任务发起两轮，并回归失败重试、修订、证据跳转、人工确认和 GitHub PR 发布恢复。要查看某一步的实际画面，添加输出目录和截图选项。
 
 ```sh
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \

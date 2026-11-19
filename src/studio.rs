@@ -97,6 +97,21 @@ pub struct Preview {
 /// Only named text artifacts are exposed; large logs show their most recent output.
 pub fn preview(data: &Path, id: &str, artifact: Artifact) -> Result<Option<Preview>> {
     const LIMIT: u64 = 48 * 1024;
+    let Some(mut file) = artifact_file(data, id, artifact)? else {
+        return Ok(None);
+    };
+    let len = file.metadata()?.len();
+    let truncated = len > LIMIT;
+    file.seek(SeekFrom::Start(len.saturating_sub(LIMIT)))?;
+    let mut bytes = Vec::new();
+    file.take(LIMIT).read_to_end(&mut bytes)?;
+    Ok(Some(Preview {
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated,
+    }))
+}
+
+pub fn artifact_file(data: &Path, id: &str, artifact: Artifact) -> Result<Option<File>> {
     ident(id, 64)?;
     let dir = data.join("runs").join(id);
     let path = dir.join(artifact.filename());
@@ -107,16 +122,9 @@ pub fn preview(data: &Path, id: &str, artifact: Artifact) -> Result<Option<Previ
         fs::symlink_metadata(&dir)?.is_dir() && fs::symlink_metadata(&path)?.is_file(),
         "无效的产物路径"
     );
-    let mut file = File::open(&path).with_context(|| format!("open {}", artifact.filename()))?;
-    let len = file.metadata()?.len();
-    let truncated = len > LIMIT;
-    file.seek(SeekFrom::Start(len.saturating_sub(LIMIT)))?;
-    let mut bytes = Vec::new();
-    file.take(LIMIT).read_to_end(&mut bytes)?;
-    Ok(Some(Preview {
-        text: String::from_utf8_lossy(&bytes).into_owned(),
-        truncated,
-    }))
+    Ok(Some(File::open(&path).with_context(|| {
+        format!("open {}", artifact.filename())
+    })?))
 }
 
 #[cfg(test)]
