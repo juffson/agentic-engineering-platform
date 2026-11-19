@@ -1,4 +1,4 @@
-use aep::workspace::{Workspace, commit, git};
+use aep::workspace::{Workspace, commit, git, validate_task_target};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -11,19 +11,61 @@ use std::{
 };
 
 use super::{field, save};
-use crate::Runner;
+use crate::{Runner, publish, relay};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Fixture {
     pub source: PathBuf,
     #[serde(default)]
     pub studio: bool,
+    #[serde(default)]
+    pub real_task: bool,
     pub repo: String,
     pub task: String,
     pub base: String,
     pub base_sha: String,
     pub spec: String,
     pub actor: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct Branch {
+    pub name: String,
+    pub sha: String,
+}
+
+pub(crate) struct Choices {
+    pub tasks: Vec<relay::Task>,
+    pub branches: Vec<Branch>,
+    pub task: Option<relay::Task>,
+    pub branch: Option<Branch>,
+}
+
+pub(crate) fn choices(ws: &Workspace, runner: &Runner) -> Result<Choices> {
+    publish::repository(ws, runner)?;
+    let output = String::from_utf8(command(
+        "git",
+        &ws.root,
+        &["ls-remote", "--refs", "--heads", "origin"],
+    )?)?;
+    let tasks = relay::tasks_from_heads(&output);
+    let branches = output
+        .lines()
+        .filter_map(|line| {
+            let (sha, reference) = line.split_once('\t')?;
+            let name = reference.strip_prefix("refs/heads/")?;
+            (!name.starts_with("aep-task/") && !name.starts_with("aep/pr/")).then(|| Branch {
+                name: name.to_owned(),
+                sha: sha.to_owned(),
+            })
+        })
+        .collect();
+    Ok(Choices {
+        tasks,
+        branches,
+        task: None,
+        branch: None,
+    })
 }
 
 pub(super) fn command(program: &str, cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -55,7 +97,33 @@ impl Fixture {
         runner: &Runner,
         studio: bool,
     ) -> Result<(Self, Workspace)> {
-        let source = Workspace::open(source)?.root;
+        Self::prepare_session(out, root, source, runner, studio, None)
+    }
+
+    pub(crate) fn prepare_task(
+        out: &Path,
+        root: &Path,
+        source: &Path,
+        runner: &Runner,
+        task: relay::Task,
+        branch: Branch,
+    ) -> Result<(Self, Workspace)> {
+        Self::prepare_session(out, root, source, runner, true, Some((task, branch)))
+    }
+
+    fn prepare_session(
+        out: &Path,
+        root: &Path,
+        source: &Path,
+        runner: &Runner,
+        studio: bool,
+        selected: Option<(relay::Task, Branch)>,
+    ) -> Result<(Self, Workspace)> {
+        let source_ws = Workspace::open(source)?;
+        if selected.is_some() {
+            publish::repository(&source_ws, runner)?;
+        }
+        let source = source_ws.root;
         let binary = runner.binary()?;
         let origin = git(&source, &["remote", "get-url", "origin"])?;
         let origin = origin.trim();
@@ -81,6 +149,9 @@ impl Fixture {
         )?;
         let repo = field(&remote, "nameWithOwner")?.to_owned();
         let default_branch = field(&remote["defaultBranchRef"], "name")?;
+        let clone_branch = selected
+            .as_ref()
+            .map_or(default_branch, |(_, branch)| &branch.name);
         ensure!(
             matches!(
                 remote["viewerPermission"].as_str(),
@@ -105,7 +176,7 @@ impl Fixture {
                 "--no-tags",
                 "--single-branch",
                 "--branch",
-                default_branch,
+                clone_branch,
                 "--",
                 origin,
                 checkout.to_str().context("checkout path")?,
@@ -113,15 +184,54 @@ impl Fixture {
         )?;
         let ws = Workspace::open(&checkout)?;
         let base_sha = commit(&ws.root, "HEAD")?;
-        ensure!(
-            ws.root.join(".github/workflows/pilot.yml").is_file(),
-            "the GitHub default branch must contain the AEP pilot workflow"
-        );
+        if selected.is_none() {
+            ensure!(
+                ws.root.join(".github/workflows/pilot.yml").is_file(),
+                "the GitHub default branch must contain the AEP pilot workflow"
+            );
+        }
 
         for key in ["user.name", "user.email"] {
             let value = git(&source, &["config", "--get", key])
                 .with_context(|| format!("configure Git {key} for the fixture commit"))?;
             git(&ws.root, &["config", "--local", key, value.trim_end()])?;
+        }
+        if let Some((task, branch)) = selected {
+            ensure!(
+                base_sha == branch.sha,
+                "目标分支已更新，请刷新任务和分支后重选"
+            );
+            let reference = format!("refs/heads/aep-task/{}", task.name);
+            let pinned = "refs/aep/lifecycle/spec";
+            git(
+                &ws.root,
+                &[
+                    "fetch",
+                    "--no-tags",
+                    "origin",
+                    &format!("{reference}:{pinned}"),
+                ],
+            )?;
+            let spec = commit(&ws.root, pinned)?;
+            ensure!(spec == task.sha, "任务派发版本已变化，请刷新后重选");
+            validate_task_target(&ws.root, &base_sha, &spec, &task.name)?;
+            let fixture = Self {
+                source,
+                studio,
+                real_task: true,
+                repo,
+                task: task.name,
+                base: branch.name,
+                base_sha,
+                spec,
+                actor,
+            };
+            for file in ["spec.md", "task.json"] {
+                let location = format!("{}:specs/{}/{file}", fixture.spec, fixture.task);
+                fs::write(out.join(file), git(&ws.root, &["show", &location])?)?;
+            }
+            save(out, "fixture.json", &fixture)?;
+            return Ok((fixture, ws));
         }
         git(&ws.root, &["switch", "--detach"])?;
         let task = format!("studio-lifecycle-{}", uuid::Uuid::new_v4().simple());
@@ -166,6 +276,7 @@ impl Fixture {
         let fixture = Self {
             source,
             studio,
+            real_task: false,
             repo,
             task,
             base,
@@ -215,8 +326,11 @@ impl Fixture {
             pr["state"] == "OPEN" && pr["baseRefOid"] == self.base_sha,
             "隔离 PR 已关闭或目标提交已变化"
         );
-        let acceptance =
-            ci_ready(&pr)?.context("等待本次隔离测试的 GitHub 独立验收和其他检查完成")?;
+        if self.real_task && !ws.root.join(".github/workflows/pilot.yml").is_file() {
+            ready_checks(&pr)?.context("等待当前 PR 的 GitHub 检查通过")?;
+            return Ok(());
+        }
+        let acceptance = ci_ready(&pr)?.context("等待当前 PR 的 GitHub 独立验收和其他检查完成")?;
         self.checked_workflow(ws, out, head, acceptance)
     }
 
@@ -416,10 +530,19 @@ pub fn remote_ref(ws: &Workspace, reference: &str) -> Result<String> {
 }
 
 fn ci_ready(pr: &Value) -> Result<Option<&Value>> {
+    Ok(ready_checks(pr)?.and_then(|checks| {
+        checks
+            .iter()
+            .find(|c| c["name"] == "acceptance" && c["conclusion"] == "SUCCESS")
+    }))
+}
+
+fn ready_checks(pr: &Value) -> Result<Option<&[Value]>> {
     let checks = pr["statusCheckRollup"]
         .as_array()
         .context("missing CI status")?;
     let mut all_passed = true;
+    let mut passed = false;
     for check in checks {
         let conclusion = match check["__typename"].as_str() {
             Some("CheckRun") if check["status"] == "COMPLETED" => check["conclusion"].as_str(),
@@ -427,7 +550,8 @@ fn ci_ready(pr: &Value) -> Result<Option<&Value>> {
             _ => None,
         };
         match conclusion {
-            Some("SUCCESS" | "SKIPPED" | "NEUTRAL") => {}
+            Some("SUCCESS") => passed = true,
+            Some("SKIPPED" | "NEUTRAL") => {}
             None | Some("" | "PENDING" | "EXPECTED") => all_passed = false,
             Some(failure) => bail!(
                 "GitHub CI failed for {}: {failure}",
@@ -439,14 +563,13 @@ fn ci_ready(pr: &Value) -> Result<Option<&Value>> {
         }
     }
     if !all_passed
+        || !passed
         || pr["mergeable"] != "MERGEABLE"
         || !matches!(pr["mergeStateStatus"].as_str(), Some("CLEAN" | "HAS_HOOKS"))
     {
         return Ok(None);
     }
-    Ok(checks
-        .iter()
-        .find(|c| c["name"] == "acceptance" && c["conclusion"] == "SUCCESS"))
+    Ok(Some(checks))
 }
 
 #[cfg(test)]

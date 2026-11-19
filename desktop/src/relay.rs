@@ -187,6 +187,10 @@ pub(crate) fn tasks(ws: &Workspace) -> Result<Vec<Task>> {
         ws,
         &["ls-remote", "--refs", "origin", "refs/heads/aep-task/*"],
     )?;
+    Ok(tasks_from_heads(&output))
+}
+
+pub(crate) fn tasks_from_heads(output: &str) -> Vec<Task> {
     let mut tasks: Vec<_> = output
         .lines()
         .filter_map(|line| {
@@ -200,7 +204,7 @@ pub(crate) fn tasks(ws: &Workspace) -> Result<Vec<Task>> {
         })
         .collect();
     tasks.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(tasks)
+    tasks
 }
 
 fn folder(ws: &Workspace, id: &str) -> Result<PathBuf> {

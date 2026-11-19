@@ -2,6 +2,7 @@ mod github;
 use aep::workspace::{Workspace, git, read};
 use anyhow::{Context, Result, ensure};
 use github::command;
+pub(crate) use github::{Branch, Choices, choices};
 pub use github::{Fixture, remote_ref};
 use serde::Serialize;
 use serde_json::Value;
@@ -180,15 +181,16 @@ pub(crate) fn load_session(root: &Path) -> Option<Fixture> {
     let path = root.join("evidence/fixture.json");
     let test: Fixture = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     (test.studio
-        && test.task.starts_with("studio-lifecycle-")
-        && test.base == format!("test/{}", test.task))
+        && (test.real_task
+            || (test.task.starts_with("studio-lifecycle-")
+                && test.base == format!("test/{}", test.task))))
     .then_some(test)
 }
 
 impl Fixture {
     pub(crate) fn guard(&self, target: &publish::Target) -> Result<()> {
         ensure!(
-            self.base == format!("test/{}", self.task)
+            (self.real_task || self.base == format!("test/{}", self.task))
                 && self.task == target.task
                 && self.spec == target.spec
                 && self.base == target.base
@@ -231,11 +233,15 @@ impl Fixture {
             .iter()
             .find(|n| n["id"] == decision_id && n["kind"] == "decision" && n["author"] == "manual")
             .context("missing manual decision")?;
+        ensure!(
+            decision["task"] == self.task
+                && decision["spec_sha"] == self.spec
+                && decision["scope"] == "task",
+            "人工决策与本次任务不匹配"
+        );
         let mut parent = decision;
-        let question = loop {
-            let previous = parent["replaces"]
-                .as_i64()
-                .context("需通过 Studio 将第一轮的问题修订为决策")?;
+        let mut question = None;
+        while let Some(previous) = parent["replaces"].as_i64() {
             ensure!(
                 Some(previous) < parent["id"].as_i64(),
                 "invalid revision chain"
@@ -246,43 +252,59 @@ impl Fixture {
                 .find(|n| n["id"] == previous)
                 .context("missing earlier memory version")?;
             if parent["kind"] == "open_question" && parent["run_id"] == first.id {
-                break parent;
+                question = Some(parent);
+                break;
             }
-        };
+        }
+        ensure!(
+            self.real_task || question.is_some(),
+            "需通过 Studio 将第一轮的问题修订为决策"
+        );
         for role in ["implementer", "reviewer"] {
             let inputs = next["memory_inputs"][role]
                 .as_array()
                 .context("missing shared memory inputs")?;
             ensure!(
-                inputs.contains(&json!(decision_id)) && !inputs.contains(&question["id"]),
+                inputs.contains(&json!(decision_id))
+                    && question.is_none_or(|q| !inputs.contains(&q["id"])),
                 "{role} 未读取修订后的决策"
             );
         }
-        let (_, reference) = field(decision, "body")?
-            .rsplit_once("Decision reference ")
-            .context("决策缺少 Studio 核验标识")?;
-        let reference = reference.trim_end_matches('.');
-        ensure!(
-            reference.starts_with("decision-") && reference.len() == 41,
-            "invalid decision reference"
-        );
-        verify_reference(ws, &second.id, &next, reference)?;
-        let names = git(
-            &ws.root,
-            &[
-                "diff",
-                "--name-only",
-                "--no-renames",
-                &self.base_sha,
-                &target.candidate,
-            ],
-        )?;
-        let expected = ["acceptance.rs", "normalize.rs", "spec.md", "task.json"]
-            .map(|file| format!("specs/{}/{file}", self.task));
-        ensure!(
-            names.lines().eq(expected.iter().map(String::as_str)),
-            "最终 Diff 包含测试任务之外的文件"
-        );
+        let reference = if self.real_task {
+            aep::workspace::validate_task_target(&ws.root, &self.base_sha, &self.spec, &self.task)?;
+            ensure!(
+                target.merge_base == self.base_sha,
+                "候选与已选择的目标分支不兼容"
+            );
+            None
+        } else {
+            let (_, reference) = field(decision, "body")?
+                .rsplit_once("Decision reference ")
+                .context("决策缺少 Studio 核验标识")?;
+            let reference = reference.trim_end_matches('.');
+            ensure!(
+                reference.starts_with("decision-") && reference.len() == 41,
+                "invalid decision reference"
+            );
+            verify_reference(ws, &second.id, &next, reference)?;
+            let names = git(
+                &ws.root,
+                &[
+                    "diff",
+                    "--name-only",
+                    "--no-renames",
+                    &self.base_sha,
+                    &target.candidate,
+                ],
+            )?;
+            let expected = ["acceptance.rs", "normalize.rs", "spec.md", "task.json"]
+                .map(|file| format!("specs/{}/{file}", self.task));
+            ensure!(
+                names.lines().eq(expected.iter().map(String::as_str)),
+                "最终 Diff 包含测试任务之外的文件"
+            );
+            Some(reference)
+        };
         fs::write(
             out.join("reviewed.diff"),
             git(
@@ -298,13 +320,15 @@ impl Fixture {
                 ],
             )?,
         )?;
-        save(&out, "question.json", question)?;
+        if let Some(question) = question {
+            save(&out, "question.json", question)?;
+        }
         save(&out, "decision.json", decision)?;
         save(
             &out,
             "relay-verification.json",
             &json!({"first_run":first.id,"second_run":second.id,
-            "candidate":target.candidate,"spec_sha":self.spec,"decision":decision_id,"question":question["id"],
+            "candidate":target.candidate,"spec_sha":self.spec,"decision":decision_id,"question":question.map(|q|&q["id"]),
             "reference":reference,"memory_inputs":next["memory_inputs"]}),
         )
     }
@@ -340,13 +364,30 @@ impl Fixture {
             return Ok(receipt);
         }
         let merged = self.pr(ws, receipt.pr, &target.candidate, &target.run)?;
+        let synced_tip = commit(&ws.root, "HEAD")?;
+        if self.real_task {
+            git(
+                &ws.root,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &receipt.merged_sha,
+                    &synced_tip,
+                ],
+            )
+            .context("本地同步后的目标没有包含本次合并")?;
+        } else {
+            ensure!(
+                synced_tip == receipt.merged_sha
+                    && remote_ref(ws, &format!("refs/heads/{}", self.base))? == receipt.merged_sha,
+                "隔离验证分支与合并提交不一致"
+            );
+        }
         ensure!(
             merged["state"] == "MERGED"
                 && merged["mergeCommit"]["oid"] == receipt.merged_sha
-                && commit(&ws.root, "HEAD")? == receipt.merged_sha
-                && remote_ref(ws, &format!("refs/heads/{}", self.base))? == receipt.merged_sha
                 && remote_ref(ws, &format!("refs/heads/{}", target.head))?.is_empty(),
-            "隔离分支或候选清理与 GitHub 合并记录不一致"
+            "候选清理与 GitHub 合并记录不一致"
         );
         for id in [first, &target.run] {
             let record = status(&ws.data, id)?;
@@ -366,15 +407,18 @@ impl Fixture {
                 path.display()
             );
         }
-        self.retire_dispatch(ws)?;
+        if !self.real_task {
+            self.retire_dispatch(ws)?;
+        }
         save(&out, "github-merged.json", &merged)?;
         save(
             &out,
             "verification.json",
             &json!({"status":"passed","target":self.base,"pr":receipt.pr,
-            "url":merged["url"],"candidate":target.candidate,"merge_sha":receipt.merged_sha,
+            "url":merged["url"],"candidate":target.candidate,"merge_sha":receipt.merged_sha,"synced_target_sha":synced_tip,
             "local_target_synced":true,"candidate_branch_removed":true,"run_worktrees_removed":true,
-            "evidence_memory_and_receipts_preserved":true,"temporary_task_dispatch_removed":true}),
+            "evidence_memory_and_receipts_preserved":true,
+            "temporary_task_dispatch_removed":!self.real_task,"real_task":self.real_task}),
         )?;
         Ok(receipt)
     }
@@ -393,6 +437,7 @@ mod tests {
         let fixture = Fixture {
             source: PathBuf::new(),
             studio: true,
+            real_task: false,
             repo: "user/project".into(),
             task: "studio-lifecycle-abc".into(),
             base: "test/studio-lifecycle-abc".into(),
@@ -418,5 +463,14 @@ mod tests {
         target.base = fixture.base.clone();
         target.base_sha = "moved".into();
         assert!(fixture.guard(&target).is_err());
+
+        let mut real = fixture;
+        real.real_task = true;
+        real.base = "release/stable".into();
+        target.base = real.base.clone();
+        target.base_sha = real.base_sha.clone();
+        assert!(real.guard(&target).is_ok());
+        target.spec = "another-spec".into();
+        assert!(real.guard(&target).is_err());
     }
 }

@@ -198,11 +198,15 @@ cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
 
 ### 用真实客户端验证 Studio 到 GitHub 的完整流程
 
-在 Studio 打开 AEP 仓库后，进入「隔离全流程」，点击「启动隔离测试」。准备完成后，在接力页发起第一轮、修订记忆并继续第二轮。最终审查页会锁定本次的隔离目标，仍需在 Studio 分别确认发布与合并。合并后点击「同步目标分支并清理」，Studio 会校验并归档证据，在结果页预览日志和截图，也可在 Finder 中定位归档。返回原仓库后，可以从「隔离全流程」重新打开历史测试。
+在 Studio 进入「隔离全流程」，选择仓库、已派发任务和 GitHub 目标分支，再点「启动真实任务」。Studio 固定任务与目标提交，在独立克隆运行。Spec 必须基于所选目标提交，预置文件限于自己的 `specs/<task>/` 目录。派发分支或目标版本变动时，按界面提示刷新或从新目标重新派发。
+
+准备完成后，发起第一轮，修订任务记忆并继续第二轮。最终审查页锁定所选目标，仍需在 Studio 分别确认发布与合并。合并后点「同步目标分支并清理」，Studio 会同步会话内的本地目标、清理候选并归档证据。真实任务保留派发引用。在结果页可直接看日志和截图，在 Finder 定位归档，或回到原仓库重新打开历史会话。
+
+点「启动合成验证」可按原流程新建测试任务和隔离目标分支。
 
 Studio 截图只渲染自己的窗口画面，使用 Metal。此流程使用已登录的 Codex、Claude 和 GitHub CLI 账号。通过 Finder 启动 Studio 时，客户端也可放在常用的 `~/.local/bin`、`~/.cargo/bin` 或 Homebrew 的安装目录。
 
-也可在支持 Metal 的 macOS 终端、仓库根目录运行。需要 Rust、Git、已登录的 Codex CLI 和 Claude Code，以及对 `origin` 有推送、创建和合并 PR 权限的 GitHub CLI 账号。两种入口都要求目标仓库的默认分支包含 AEP pilot 工作流。
+也可在支持 Metal 的 macOS 终端、仓库根目录运行合成验证。需要 Rust、Git、已登录的 Codex CLI 和 Claude Code，以及对 `origin` 有推送、创建和合并 PR 权限的 GitHub CLI 账号。合成验证需要 AEP pilot 工作流。真实任务会核验所选仓库的 PR 检查，配置了 AEP pilot 工作流时还会核验独立验收。
 
 ```sh
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --live-lifecycle

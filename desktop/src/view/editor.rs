@@ -108,7 +108,10 @@ impl Studio {
             return;
         }
         let mut body = editor.body.read(cx).value().trim().to_owned();
-        if self.lifecycle.is_some()
+        if self
+            .lifecycle
+            .as_ref()
+            .is_some_and(|session| !session.real_task)
             && editor.kind == Kind::Decision
             && editor.replaces.is_some()
             && !body.is_empty()

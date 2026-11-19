@@ -7,7 +7,48 @@ use std::{
 };
 
 impl Studio {
-    fn start_lifecycle(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn load_lifecycle_choices(&mut self, cx: &mut Context<Self>) {
+        if self.lifecycle.is_some() || self.lifecycle_loading || self.lifecycle_preparing {
+            return;
+        }
+        let Some(ws) = self.workspace.clone() else {
+            return;
+        };
+        let runner = self.runner.clone();
+        let generation = self.workspace_generation;
+        self.lifecycle_loading = true;
+        self.lifecycle_error = None;
+        self.lifecycle_choices = None;
+        let job = cx
+            .background_executor()
+            .spawn(async move { lifecycle::choices(&ws, &runner) });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            let _ = this.update(cx, |this, cx| {
+                if generation != this.workspace_generation {
+                    return;
+                }
+                this.lifecycle_loading = false;
+                match result {
+                    Ok(choices) => this.lifecycle_choices = Some(choices),
+                    Err(error) => {
+                        this.lifecycle_error =
+                            Some(format!("读取 GitHub 任务与分支失败：{error:#}"))
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn start_lifecycle(
+        &mut self,
+        selected: Option<(relay::Task, lifecycle::Branch)>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.lifecycle_preparing || self.lifecycle.is_some() {
             return;
         }
@@ -15,6 +56,7 @@ impl Studio {
             return;
         };
         let runner = self.runner.clone();
+        let generation = self.workspace_generation;
         self.lifecycle_preparing = true;
         self.lifecycle_error = None;
         let job = cx.background_executor().spawn(async move {
@@ -26,7 +68,17 @@ impl Studio {
                 .keep();
             let out = root.join("evidence");
             fs::create_dir(&out)?;
-            let result = lifecycle::Fixture::prepare(&out, &root, &source.root, &runner, true);
+            let result = match selected {
+                Some((task, branch)) => lifecycle::Fixture::prepare_task(
+                    &out,
+                    &root,
+                    &source.root,
+                    &runner,
+                    task,
+                    branch,
+                ),
+                None => lifecycle::Fixture::prepare(&out, &root, &source.root, &runner, true),
+            };
             if let Err(error) = &result {
                 fs::write(out.join("failure.txt"), format!("{error:#}\n"))?;
             }
@@ -35,6 +87,9 @@ impl Studio {
         cx.spawn_in(window, async move |this, cx| {
             let result = job.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                if generation != this.workspace_generation {
+                    return;
+                }
                 this.lifecycle_preparing = false;
                 match result {
                     Ok((fixture, ws)) => {
@@ -186,8 +241,9 @@ impl Studio {
             let relay_id = self.relays.first().map(|relay| relay.id.clone());
             body = body.child(
                 panel()
-                    .child(field("测试仓库", &test.repo))
-                    .child(field("隔离目标", &test.base))
+                    .child(field("仓库", &test.repo))
+                    .child(field("任务", &test.task))
+                    .child(field("目标分支", &test.base))
                     .child(detail_text(
                         "lifecycle-status",
                         if complete {
@@ -321,10 +377,7 @@ impl Studio {
             }
             body = body.child(h_flex().items_start().gap_3().child(list).child(document));
         } else if let Some(ws) = &self.workspace {
-            body = body.child(panel()
-                .child(caption("使用当前仓库的 GitHub origin 准备独立克隆和合成 Rust 任务。运行会使用本机 Codex、Claude 和 GitHub 账号。"))
-                .child(button("lifecycle-start", if self.lifecycle_preparing { "正在创建隔离测试…" } else { "启动隔离测试" }, true)
-                    .on_click(cx.listener(|this, _, w, cx| this.start_lifecycle(w, cx)))));
+            body = body.child(self.lifecycle_setup(ws, cx));
             let mut sessions = fs::read_dir(ws.data.join("lifecycle"))
                 .into_iter()
                 .flatten()
@@ -335,18 +388,25 @@ impl Studio {
                 let path = session.join("workspace/repo");
                 if let Some(test) = lifecycle::load_session(&session) {
                     body = body.child(
-                        button(format!("lifecycle-history-{}", test.task), test.base, false)
-                            .on_click(cx.listener(move |this, _, w, cx| {
-                                if !this.lifecycle_preparing && !this.lifecycle_packaging {
-                                    match Workspace::open(&path) {
-                                        Ok(ws) => this.set_workspace(ws, Page::Lifecycle, w, cx),
-                                        Err(error) => {
-                                            this.lifecycle_error = Some(format!("{error:#}"));
-                                            cx.notify();
-                                        }
+                        button(
+                            format!(
+                                "lifecycle-history-{}",
+                                session.file_name().unwrap_or_default().to_string_lossy()
+                            ),
+                            format!("{} → {}", test.task, test.base),
+                            false,
+                        )
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            if !this.lifecycle_preparing && !this.lifecycle_packaging {
+                                match Workspace::open(&path) {
+                                    Ok(ws) => this.set_workspace(ws, Page::Lifecycle, w, cx),
+                                    Err(error) => {
+                                        this.lifecycle_error = Some(format!("{error:#}"));
+                                        cx.notify();
                                     }
                                 }
-                            })),
+                            }
+                        })),
                     );
                 } else if let Ok(log) = fs::read_to_string(session.join("evidence/failure.txt")) {
                     body = body.child(caption(log));
@@ -394,4 +454,129 @@ fn evidence_label(relative: &str) -> String {
     };
     let attempt = run.rsplit('-').next().unwrap_or_default();
     format!("{label} #{attempt} · {file}")
+}
+
+impl Studio {
+    fn lifecycle_setup(&self, ws: &Workspace, cx: &Context<Self>) -> Div {
+        let mut form = panel()
+            .child(heading("真实任务"))
+            .child(caption(ws.root.display().to_string()))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        button("lifecycle-choose-repo", "选择仓库…", false)
+                            .on_click(cx.listener(|this, _, w, cx| this.choose_repo(w, cx))),
+                    )
+                    .child(
+                        button(
+                            "lifecycle-load-choices",
+                            if self.lifecycle_loading {
+                                "正在读取…"
+                            } else {
+                                "刷新任务与分支"
+                            },
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.load_lifecycle_choices(cx))),
+                    ),
+            );
+        if let Some(choices) = &self.lifecycle_choices {
+            let tasks = v_flex()
+                .id("lifecycle-task-choices")
+                .test_support()
+                .overflow_y_scroll()
+                .h(px(145.))
+                .gap_1()
+                .children(choices.tasks.iter().map(|task| {
+                    let current = choices
+                        .task
+                        .as_ref()
+                        .is_some_and(|chosen| chosen.name == task.name);
+                    let task = task.clone();
+                    button(
+                        format!("lifecycle-task-{}", task.name),
+                        task.name.clone(),
+                        current,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(choices) = this.lifecycle_choices.as_mut() {
+                            choices.task = Some(task.clone());
+                        }
+                        cx.notify();
+                    }))
+                }));
+            let branches = v_flex()
+                .id("lifecycle-branch-choices")
+                .test_support()
+                .overflow_y_scroll()
+                .h(px(145.))
+                .gap_1()
+                .children(choices.branches.iter().map(|branch| {
+                    let current = choices
+                        .branch
+                        .as_ref()
+                        .is_some_and(|chosen| chosen.name == branch.name);
+                    let branch = branch.clone();
+                    button(
+                        format!("lifecycle-branch-{}", branch.name),
+                        branch.name.clone(),
+                        current,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(choices) = this.lifecycle_choices.as_mut() {
+                            choices.branch = Some(branch.clone());
+                        }
+                        cx.notify();
+                    }))
+                }));
+            form = form.child(
+                h_flex()
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(caption("已派发任务"))
+                            .child(tasks),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(caption("GitHub 目标分支"))
+                            .child(branches),
+                    ),
+            );
+            if let (Some(task), Some(branch)) = (&choices.task, &choices.branch) {
+                let selected = (task.clone(), branch.clone());
+                form = form
+                    .child(detail_text(
+                        "lifecycle-selection",
+                        &format!("{} → {}", task.name, branch.name),
+                    ))
+                    .when(!self.lifecycle_preparing, |form| {
+                        form.child(
+                            button("lifecycle-start-task", "启动真实任务", true).on_click(
+                                cx.listener(move |this, _, w, cx| {
+                                    this.start_lifecycle(Some(selected.clone()), w, cx)
+                                }),
+                            ),
+                        )
+                    });
+            }
+            if choices.tasks.is_empty() {
+                form = form.child(caption("仓库暂无已派发任务。"));
+            }
+        }
+        if self.lifecycle_preparing {
+            return form.child(caption("正在准备隔离工作区…"));
+        }
+        form.child(
+            button("lifecycle-start", "启动合成验证", false)
+                .on_click(cx.listener(|this, _, w, cx| this.start_lifecycle(None, w, cx))),
+        )
+    }
 }
