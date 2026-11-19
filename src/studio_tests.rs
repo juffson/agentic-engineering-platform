@@ -76,3 +76,44 @@ fn log_preview_is_bounded_and_rejects_indirect_paths() {
     assert!(preview(&ws.data, "one", Artifact::Review).is_err());
     assert!(preview(&ws.data, "../one", Artifact::Review).is_err());
 }
+
+#[test]
+fn truncated_log_preview_skips_only_leading_utf8_continuation_bytes() {
+    const LIMIT: usize = 48 * 1024;
+    let root = tempfile::tempdir().unwrap();
+    let ws = workspace(root.path());
+    let dir = ws.data.join("runs/one");
+    fs::create_dir_all(&dir).unwrap();
+    let split_character = "🦀";
+    let following_character = "界";
+    for split in 1..split_character.len() {
+        let padding = LIMIT - (split_character.len() - split) - following_character.len() - 2;
+        let mut bytes = format!("{split_character}{following_character}").into_bytes();
+        bytes.extend_from_slice(b"\xff\x80");
+        bytes.extend_from_slice("a".repeat(padding).as_bytes());
+        fs::write(dir.join("checks.log"), bytes).unwrap();
+
+        let p = preview(&ws.data, "one", Artifact::Checks).unwrap().unwrap();
+        assert!(p.truncated);
+        assert_eq!(
+            p.text,
+            format!(
+                "{following_character}\u{fffd}\u{fffd}{}",
+                "a".repeat(padding)
+            )
+        );
+    }
+}
+
+#[test]
+fn small_log_preview_preserves_lossy_utf8_decoding() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = workspace(root.path());
+    let dir = ws.data.join("runs/one");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("checks.log"), b"\x80\xe7\x95\x8c\xff").unwrap();
+
+    let p = preview(&ws.data, "one", Artifact::Checks).unwrap().unwrap();
+    assert!(!p.truncated);
+    assert_eq!(p.text, "\u{fffd}界\u{fffd}");
+}

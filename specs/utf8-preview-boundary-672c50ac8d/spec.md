@@ -1,0 +1,5 @@
+# Keep Studio log previews aligned on UTF-8 boundaries
+
+The bounded preview in src/studio.rs may begin in the middle of a UTF-8 character when it reads the last 48 KiB. Skip only leading UTF-8 continuation bytes (10xxxxxx) when the file was truncated, and keep replacement behavior for malformed bytes later in the preview. Preserve the existing truncation flag, byte limit, refusal of indirect paths, and regular small-file behavior. Add focused test coverage in src/studio_tests.rs with a valid multi-byte character split at the tail boundary and a valid character immediately after. Edit only src/studio.rs and src/studio_tests.rs. Run cargo test --locked --lib studio::tests and keep rustfmt clean.
+
+For the shared-memory handoff, when there is no manual decision, save exactly this unresolved question in the structured question field: "Should a truncated preview discard the partial leading character?" In round two quote the human decision reference verbatim in Codex's structured note and Claude's review report, leave the question field empty, and keep that reference out of code. Keep memory summaries concise.

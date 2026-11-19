@@ -105,8 +105,16 @@ pub fn preview(data: &Path, id: &str, artifact: Artifact) -> Result<Option<Previ
     file.seek(SeekFrom::Start(len.saturating_sub(LIMIT)))?;
     let mut bytes = Vec::new();
     file.take(LIMIT).read_to_end(&mut bytes)?;
+    let start = if truncated {
+        bytes
+            .iter()
+            .take_while(|byte| **byte & 0b1100_0000 == 0b1000_0000)
+            .count()
+    } else {
+        0
+    };
     Ok(Some(Preview {
-        text: String::from_utf8_lossy(&bytes).into_owned(),
+        text: String::from_utf8_lossy(&bytes[start..]).into_owned(),
         truncated,
     }))
 }
