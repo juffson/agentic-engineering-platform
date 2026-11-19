@@ -1,0 +1,13 @@
+{
+  "title": "Reject NUL in acceptance argv",
+  "allowed_paths": [
+    "src/task.rs"
+  ],
+  "check": [
+    "cargo",
+    "test",
+    "--locked",
+    "--lib",
+    "task::tests"
+  ]
+}
