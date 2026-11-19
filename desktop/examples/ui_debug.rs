@@ -771,6 +771,35 @@ fn verify_publication(
 
     git(
         &ws.root,
+        &["push", "origin", "HEAD:refs/heads/review-sandbox"],
+    )?;
+    ui.click("acknowledge-review")?;
+    ui.click("review-target-input")?;
+    ui.input("review-sandbox")?;
+    ensure!(
+        ui.absent("publish-confirmed")? && ui.absent("acknowledge-review")?,
+        "editing the PR target kept an old confirmation"
+    );
+    ui.click("load-pr-target")?;
+    ensure!(
+        ui.element("review-target-branch")?.label() == Some("review-sandbox")
+            && ui.absent("publish-confirmed")?,
+        "the new review did not bind the requested branch"
+    );
+    ui.click("review-target-input")?;
+    ui.frame(|window, cx| {
+        window.press("cmd-a", cx);
+        window.press("backspace", cx);
+    })?;
+    ui.settle()?;
+    ui.click("load-pr-target")?;
+    ensure!(
+        ui.element("review-target-branch")?.label() == Some("main"),
+        "empty review target did not load the GitHub default"
+    );
+
+    git(
+        &ws.root,
         &["commit", "--allow-empty", "-m", "Advance target"],
     )?;
     git(&ws.root, &["push", "origin", "HEAD:refs/heads/main"])?;

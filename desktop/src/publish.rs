@@ -215,7 +215,13 @@ fn artifact(ws: &Workspace, id: &str, kind: Artifact) -> Result<Vec<String>> {
     Ok(pages(&String::from_utf8_lossy(&contents)))
 }
 
-pub(crate) fn prepare(ws: &Workspace, runner: &Runner, relay: &str, id: &str) -> Result<Review> {
+pub(crate) fn prepare(
+    ws: &Workspace,
+    runner: &Runner,
+    relay: &str,
+    id: &str,
+    requested_base: &str,
+) -> Result<Review> {
     let run = candidate(ws, relay, id)?;
     let path = ws.data.join("runs").join(id);
     let publication = load(&path)?;
@@ -233,8 +239,12 @@ pub(crate) fn prepare(ws: &Workspace, runner: &Runner, relay: &str, id: &str) ->
         publication.target.clone()
     } else {
         let repo = repository(ws, runner)?;
-        let info = github(ws, runner, &[&format!("repos/{repo}")])?;
-        let base = field(&info, "default_branch")?;
+        let base = if requested_base.is_empty() {
+            let info = github(ws, runner, &[&format!("repos/{repo}")])?;
+            field(&info, "default_branch")?.to_owned()
+        } else {
+            requested_base.to_owned()
+        };
         let base_ref = format!("refs/heads/{base}");
         git(ws, runner, &["check-ref-format", &base_ref])?;
         let local_ref = format!("refs/aep/publish/{id}/preview");
@@ -258,7 +268,7 @@ pub(crate) fn prepare(ws: &Workspace, runner: &Runner, relay: &str, id: &str) ->
             run: id.into(),
             task: task.into(),
             repo,
-            base: base.into(),
+            base,
             base_sha,
             merge_base,
             candidate: sha.into(),

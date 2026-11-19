@@ -34,6 +34,15 @@ pub(crate) struct State {
     loading: bool,
     sending: bool,
     error: Option<String>,
+    target_branch: Entity<InputState>,
+    loaded_for: String,
+    _target_subscription: Subscription,
+}
+
+impl State {
+    fn target_current(&self, cx: &App) -> bool {
+        self.target_branch.read(cx).value().trim() == self.loaded_for
+    }
 }
 
 impl Studio {
@@ -44,14 +53,22 @@ impl Studio {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .review
-            .as_ref()
-            .is_some_and(|state| state.run == run && (state.sending || state.loading))
-        {
+        if self.review.as_ref().is_some_and(|state| state.run == run) {
             self.navigate(Page::Review, window, cx);
+            self.load_human_review(cx);
             return;
         }
+        let target_branch =
+            cx.new(|cx| InputState::new(window, cx).placeholder("留空使用 GitHub 默认分支"));
+        let target_subscription =
+            cx.subscribe(&target_branch, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Some(state) = &mut this.review
+                {
+                    state.confirmed = false;
+                    cx.notify();
+                }
+            });
         self.review = Some(State {
             relay,
             run,
@@ -62,6 +79,9 @@ impl Studio {
             loading: false,
             sending: false,
             error: None,
+            target_branch,
+            loaded_for: String::new(),
+            _target_subscription: target_subscription,
         });
         self.navigate(Page::Review, window, cx);
         self.load_human_review(cx);
@@ -80,6 +100,8 @@ impl Studio {
         state.review = None;
         state.page = 0;
         state.tab = Tab::Diff;
+        state.loaded_for = state.target_branch.read(cx).value().trim().to_owned();
+        let target_branch = state.loaded_for.clone();
         let relay = state.relay.clone();
         let run = state.run.clone();
         let runner = self.runner.clone();
@@ -87,7 +109,7 @@ impl Studio {
         let requested_run = run.clone();
         let task = cx
             .background_executor()
-            .spawn(async move { publish::prepare(&ws, &runner, &relay, &run) });
+            .spawn(async move { publish::prepare(&ws, &runner, &relay, &run, &target_branch) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -120,6 +142,7 @@ impl Studio {
         let Some(review) = &state.review else { return };
         if state.sending
             || !state.confirmed
+            || !state.target_current(cx)
             || review
                 .publication
                 .as_ref()
@@ -192,6 +215,33 @@ impl Studio {
         let Some(state) = &self.review else {
             return main;
         };
+        if state
+            .review
+            .as_ref()
+            .and_then(|review| review.publication.as_ref())
+            .is_none_or(|publication| publication.pr.is_none())
+        {
+            main = main.child(
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .px_5()
+                    .py_2()
+                    .child(caption("目标分支"))
+                    .child(
+                        v_flex().w(px(350.)).child(
+                            Input::new(&state.target_branch)
+                                .id("review-target-input")
+                                .aria_label("PR 目标分支")
+                                .disabled(state.loading || state.sending),
+                        ),
+                    )
+                    .child(
+                        button("load-pr-target", "加载目标 Diff", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.load_human_review(cx))),
+                    ),
+            );
+        }
         if let Some(error) = &state.error {
             main = main.child(
                 detail_text("publish-error", error)
@@ -322,7 +372,17 @@ impl Studio {
             .gap_3()
             .child(heading("发布到 GitHub"))
             .child(field("仓库", &target.repo))
-            .child(field("目标分支", &target.base))
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap_3()
+                    .child(caption("目标分支").w(px(74.)).flex_none())
+                    .child(
+                        detail_text("review-target-branch", &target.base)
+                            .min_w_0()
+                            .flex_1(),
+                    ),
+            )
             .child(field("目标 SHA", &target.base_sha))
             .child(field("候选 SHA", &target.candidate))
             .child(field("候选分支", &target.head));
@@ -362,6 +422,8 @@ impl Studio {
             );
         } else if state.sending {
             confirm = confirm.child(chip("正在推送候选并创建 PR", MINT));
+        } else if !state.target_current(cx) {
+            confirm = confirm.child(caption("请先加载所选目标的 Diff。"));
         } else {
             confirm = confirm.child(
                 button(
