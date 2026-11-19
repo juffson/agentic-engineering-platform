@@ -1,0 +1,11 @@
+{
+  "title": "Synthetic Studio publish smoke test",
+  "allowed_paths": [
+    "studio-smoke-normalize.rs"
+  ],
+  "check": [
+    "sh",
+    "-c",
+    "trap 'rm -f studio-smoke-check' 0; rustc --edition=2024 --test studio-smoke-acceptance.rs -o studio-smoke-check && ./studio-smoke-check"
+  ]
+}
