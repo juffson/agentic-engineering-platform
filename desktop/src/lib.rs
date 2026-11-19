@@ -1,4 +1,6 @@
+mod relay;
 mod view;
+pub use relay::Runner;
 
 use aep::{
     studio::{Artifact, Snapshot, preview},
@@ -13,11 +15,13 @@ use gpui_kit::{
     *,
 };
 use serde_json::Value;
+use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Runs,
     Memory,
+    Relay,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Filter {
@@ -54,10 +58,27 @@ struct Studio {
     loading: bool,
     generation: u64,
     repo_error: Option<String>,
+    runner: Runner,
+    relays: Vec<relay::Relay>,
+    relay_id: Option<String>,
+    relay_tasks: Vec<relay::Task>,
+    relay_task: Option<String>,
+    relay_model: Entity<InputState>,
+    relay_error: Option<String>,
+    tasks_loading: bool,
+    tasks_loaded: bool,
+    relay_launching: bool,
+    relay_polling: bool,
+    workspace_generation: u64,
 }
 
 impl Studio {
-    fn new(workspace: Option<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workspace: Option<Workspace>,
+        runner: Runner,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索 ID、任务或内容"));
         let sub = cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -78,6 +99,19 @@ impl Studio {
             loading: false,
             generation: 0,
             repo_error: None,
+            runner,
+            relays: Vec::new(),
+            relay_id: None,
+            relay_tasks: Vec::new(),
+            relay_task: None,
+            relay_model: cx
+                .new(|cx| InputState::new(window, cx).placeholder("由 Codex 本机配置决定")),
+            relay_error: None,
+            tasks_loading: false,
+            tasks_loaded: false,
+            relay_launching: false,
+            relay_polling: false,
+            workspace_generation: 0,
         };
         studio.reload(cx);
         studio
@@ -93,18 +127,25 @@ impl Studio {
         self.loading = true;
         self.generation += 1;
         let generation = self.generation;
-        let task = cx
-            .background_executor()
-            .spawn(async move { Snapshot::load(&ws) });
+        let task = cx.background_executor().spawn(async move {
+            let relays = relay::load(&ws);
+            (Snapshot::load(&ws), relays)
+        });
         cx.spawn(async move |this, cx| {
-            let snapshot = task.await;
+            let (snapshot, relays) = task.await;
             let _ = this.update(cx, |this, cx| {
                 if generation != this.generation {
                     return;
                 }
                 this.snapshot = snapshot;
+                match relays {
+                    Ok(relays) => this.relays = relays,
+                    Err(error) => this.snapshot.issues.push(format!("两轮接力：{error:#}")),
+                }
                 this.loading = false;
-                this.artifact = None;
+                if this.relays.iter().any(|relay| relay.active(&this.snapshot)) {
+                    this.poll_relays(cx);
+                }
                 cx.notify();
             });
         })
@@ -131,11 +172,22 @@ impl Studio {
             let _ = this.update_in(cx, |this, window, cx| match selection {
                 Ok(None) => (),
                 Ok(Some(ws)) => {
+                    this.workspace_generation += 1;
                     this.workspace = Some(ws);
                     this.snapshot = Snapshot::default();
                     this.run = None;
                     this.note = None;
                     this.repo_error = None;
+                    this.relays.clear();
+                    this.relay_id = None;
+                    this.relay_tasks.clear();
+                    this.relay_task = None;
+                    this.relay_error = None;
+                    this.tasks_loading = false;
+                    this.tasks_loaded = false;
+                    this.relay_launching = false;
+                    this.relay_model
+                        .update(cx, |input, cx| input.set_value("", window, cx));
                     this.loading = false;
                     this.navigate(Page::Runs, window, cx);
                     this.reload(cx);
@@ -155,6 +207,110 @@ impl Studio {
         self.artifact = None;
         self.search
             .update(cx, |input, cx| input.set_value("", window, cx));
+        if page == Page::Relay {
+            self.reload(cx);
+            if !self.tasks_loaded {
+                self.load_relay_tasks(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn load_relay_tasks(&mut self, cx: &mut Context<Self>) {
+        if self.tasks_loading {
+            return;
+        }
+        let Some(ws) = self.workspace.clone() else {
+            return;
+        };
+        self.tasks_loading = true;
+        self.relay_error = None;
+        let generation = self.workspace_generation;
+        let work = cx
+            .background_executor()
+            .spawn(async move { relay::tasks(&ws) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.workspace_generation != generation {
+                    return;
+                }
+                this.tasks_loading = false;
+                this.tasks_loaded = true;
+                match result {
+                    Ok(tasks) => this.relay_tasks = tasks,
+                    Err(error) => this.relay_error = Some(format!("读取派发任务失败：{error:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn poll_relays(&mut self, cx: &mut Context<Self>) {
+        if self.relay_polling {
+            return;
+        }
+        self.relay_polling = true;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(Duration::from_millis(800)).await;
+                let keep_waiting = this
+                    .update(cx, |this, cx| {
+                        let active = this.relay_launching
+                            || this.relays.iter().any(|relay| relay.active(&this.snapshot));
+                        if active {
+                            this.reload(cx);
+                        } else {
+                            this.relay_polling = false;
+                        }
+                        active
+                    })
+                    .unwrap_or(false);
+                if !keep_waiting {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn submit_relay(
+        &mut self,
+        cx: &mut Context<Self>,
+        run: impl FnOnce(&Workspace, &Runner, String) -> Result<()> + Send + 'static,
+    ) {
+        if self.relay_launching {
+            return;
+        }
+        let Some(ws) = self.workspace.clone() else {
+            return;
+        };
+        let runner = self.runner.clone();
+        let model = self.relay_model.read(cx).value().trim().to_owned();
+        let generation = self.workspace_generation;
+        self.relay_launching = true;
+        self.relay_error = None;
+        self.poll_relays(cx);
+        let job = cx
+            .background_executor()
+            .spawn(async move { run(&ws, &runner, model) });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.workspace_generation != generation {
+                    return;
+                }
+                this.relay_launching = false;
+                this.relay_error = result.err().map(|error| format!("{error:#}"));
+                // Supersede any poll that began before the child completed.
+                this.loading = false;
+                this.reload(cx);
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -183,9 +339,18 @@ pub fn open_studio(
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
+    open_studio_with_runner(ws, Runner::default(), options, cx)
+}
+
+pub fn open_studio_with_runner(
+    ws: Option<Workspace>,
+    runner: Runner,
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
     let (window, _) = gpui_kit::open_window(options, cx, move |window, cx| {
         window.set_window_title("AEP Studio");
-        cx.new(|cx| Studio::new(ws, window, cx))
+        cx.new(|cx| Studio::new(ws, runner, window, cx))
     })?;
     Ok(window)
 }

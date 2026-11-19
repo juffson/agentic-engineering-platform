@@ -200,17 +200,26 @@ impl Memory {
         self.add(&key, kind.as_str(), body, Some(id))
     }
     pub fn context(&self, k: &Key, run: Option<&str>) -> Result<Vec<Value>> {
+        self.context_with_required(k, run, None)
+    }
+
+    pub fn context_with_required(
+        &self,
+        k: &Key,
+        run: Option<&str>,
+        required: Option<i64>,
+    ) -> Result<Vec<Value>> {
         let mut stmt = self.0.prepare(
             "SELECT n.* FROM notes n
              WHERE (scope='project' OR (task=?1 AND spec_sha=?2 AND
                    (scope='task' OR (scope='candidate' AND candidate_sha=?3))))
                AND NOT EXISTS(SELECT 1 FROM notes successor WHERE successor.replaces=n.id)
-             ORDER BY CASE WHEN run_id=?4 THEN 0 WHEN scope='candidate' THEN 1
+             ORDER BY CASE WHEN id=?5 THEN -1 WHEN run_id=?4 THEN 0 WHEN scope='candidate' THEN 1
                            WHEN scope='task' THEN 2 ELSE 3 END, id DESC LIMIT 48",
         )?;
         let mut result = Vec::new();
         let mut bytes = 2;
-        for row in stmt.query_map(params![k.task, k.spec, k.candidate, run], note)? {
+        for row in stmt.query_map(params![k.task, k.spec, k.candidate, run, required], note)? {
             let v = row?;
             let added = serde_json::to_vec(&v)?.len() + usize::from(!result.is_empty());
             if bytes + added <= 8192 {
@@ -220,6 +229,12 @@ impl Memory {
                     break;
                 }
             }
+        }
+        if let Some(id) = required {
+            ensure!(
+                result.first().is_some_and(|note| note["id"] == id),
+                "required memory #{id} is no longer current or does not apply to this candidate"
+            );
         }
         Ok(result)
     }

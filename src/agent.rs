@@ -81,6 +81,7 @@ pub struct Agents<'a> {
     pub timeout: u64,
     pub run: &'a str,
     pub memory: Option<Memory>,
+    pub require_memory: Option<i64>,
 }
 impl Agents<'_> {
     fn prompt(
@@ -91,7 +92,7 @@ impl Agents<'_> {
         record: &mut Value,
     ) -> Result<String> {
         if let Some(db) = &self.memory {
-            let entries = db.context(key, Some(self.run))?;
+            let entries = db.context_with_required(key, Some(self.run), self.require_memory)?;
             record["memory_inputs"][role] =
                 json!(entries.iter().map(|n| &n["id"]).collect::<Vec<_>>());
             save(self.folder, record)?;

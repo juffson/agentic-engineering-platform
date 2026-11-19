@@ -28,6 +28,7 @@ enum Scenario {
     History,
     Conflict,
     Handoff,
+    StudioRelay,
 }
 
 #[derive(Parser)]
@@ -69,6 +70,14 @@ struct Driver<'a> {
 
 impl<'a> Driver<'a> {
     fn open(ws: &Workspace, args: &'a Args) -> Result<Self> {
+        Self::open_with_runner(ws, args, aep_studio::Runner::default())
+    }
+
+    fn open_with_runner(
+        ws: &Workspace,
+        args: &'a Args,
+        runner: aep_studio::Runner,
+    ) -> Result<Self> {
         let text = gpui_kit::platform::current_platform(true).text_system();
         let mut cx = if args.screenshots {
             HeadlessAppContext::with_platform(
@@ -81,8 +90,9 @@ impl<'a> Driver<'a> {
         };
         cx.update(aep_studio::init);
         let window = cx.update(|cx| {
-            aep_studio::open_studio(
+            aep_studio::open_studio_with_runner(
                 Some(ws.clone()),
+                runner,
                 WindowOptions {
                     show: false,
                     focus: false,
@@ -594,6 +604,133 @@ fn continuation(
     Ok(None)
 }
 
+fn studio_relay(args: &Args) -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let ws = handoff_fixture::prepare(fixture.path(), Clients::Fixture)?;
+    let runner = handoff_fixture::studio_runner(fixture.path())?;
+    let mut ui = Driver::open_with_runner(&ws, args, runner.clone())?;
+    let result = (|| {
+        ui.click("两轮接力")?;
+        ui.click("relay-task-handoff")?;
+        let fail = fixture.path().join("bin/fail-check");
+        fs::write(&fail, [])?;
+        ui.click("start-relay")?;
+        ensure!(
+            ui.element("relay-first-failure")?
+                .label()
+                .is_some_and(|error| error.contains("check failed")),
+            "the failed first round did not show its cause"
+        );
+        ensure!(
+            ui.absent("relay-resolve-1")?,
+            "a rejected candidate published memory"
+        );
+        ui.checkpoint("studio-relay-failed")?;
+        fs::remove_file(&fail)?;
+        ui.reveal("relay-detail", "retry-relay-first")?;
+        ui.click("retry-relay-first")?;
+        let store = ws.data.join("relays");
+        let entry = fs::read_dir(store)?.next().context("no saved relay")??;
+        let state = aep::workspace::read(&entry.path().join("relay.json"))?;
+        let id = state["id"].as_str().context("relay ID")?;
+        let failed = state["attempts"][0]["id"]
+            .as_str()
+            .context("failed run ID")?;
+        let first = state["attempts"][1]["id"]
+            .as_str()
+            .context("first run ID")?;
+        let failure = status(&ws.data, failed)?;
+        ensure!(
+            failure["check_exit_code"] != 0 && failure["memory_outputs"] == json!({}),
+            "the failed attempt lost its evidence or published memory"
+        );
+        if let Some(worktree) = failure["recovery_worktree"].as_str() {
+            git(&ws.root, &["worktree", "remove", "--force", worktree])?;
+        }
+        let first_run = checked_run(&ws, first)?;
+        let question = first_run["memory_outputs"]["implementer"][1]
+            .as_i64()
+            .context("first question")?;
+
+        let mut ui = Driver::open_with_runner(&ws, args, runner)?;
+        ui.click("两轮接力")?;
+        ui.click(id)?;
+        ensure!(
+            ui.element("relay-first-evidence")?.visible(),
+            "first run evidence is missing after reopening Studio"
+        );
+        let resolve = format!("relay-resolve-{question}");
+        ui.reveal("relay-detail", &resolve)?;
+        ui.click(&resolve)?;
+        ensure!(
+            ui.by_label("记忆正文")?
+                .value()
+                .is_some_and(|body| body.contains("rounding rule")),
+            "Studio did not open the first question"
+        );
+        ui.replace_focused(handoff_fixture::DECISION)?;
+        ui.click("save-note")?;
+        let decision = Snapshot::load(&ws)
+            .notes
+            .into_iter()
+            .find(|note| note["replaces"] == question)
+            .context("decision after revision")?;
+        ensure!(
+            decision["kind"] == "decision",
+            "revision did not become a decision"
+        );
+        let decision = decision["id"].as_i64().context("decision ID")?;
+        let advance = format!("relay-continue-{decision}");
+        ui.reveal("relay-detail", &advance)?;
+        ui.checkpoint("studio-relay-decision")?;
+        ui.click(&advance)?;
+        let state = aep::workspace::read(&entry.path().join("relay.json"))?;
+        let second = state["attempts"][2]["id"]
+            .as_str()
+            .context("second run ID")?;
+        let second_run = checked_run(&ws, second)?;
+        ensure!(
+            first_run["spec_sha"] == second_run["spec_sha"]
+                && first_run["candidate_sha"] == second_run["requested_candidate_sha"]
+                && second_run["candidate_sha"] != first_run["candidate_sha"]
+                && second_run["request"]["require_memory"] == decision,
+            "second round was not launched with the first candidate and selected decision"
+        );
+        for role in ["implementer", "reviewer"] {
+            let reads = second_run["memory_inputs"][role]
+                .as_array()
+                .context("second round memory inputs")?;
+            ensure!(
+                reads.iter().any(|note| *note == decision)
+                    && reads.iter().all(|note| *note != question),
+                "{role} did not receive the revised decision"
+            );
+        }
+        ui.reveal("relay-detail", "relay-second-evidence")?;
+        ui.checkpoint("studio-relay-complete")?;
+        ui.click("relay-second-evidence")?;
+        let link = format!("memory_inputs-reviewer-{decision}");
+        ui.click(&link)?;
+        ensure!(
+            ui.element("note-body")?.label() == Some(handoff_fixture::DECISION),
+            "second round evidence linked to the wrong memory"
+        );
+        ui.click("两轮接力")?;
+        ui.reveal("relay-detail", "relay-first-evidence")?;
+        ui.click("relay-first-evidence")?;
+        ensure!(
+            ui.element(&format!("memory_outputs-implementer-{question}"))?
+                .visible(),
+            "first run evidence no longer links to its question"
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = ui.checkpoint("failure");
+    }
+    result
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum Step {
@@ -768,13 +905,19 @@ fn main() -> Result<()> {
     } else {
         let scenarios = match &args.scenario {
             Some(s) => std::slice::from_ref(s),
-            None => &[Scenario::History, Scenario::Conflict, Scenario::Handoff],
+            None => &[
+                Scenario::History,
+                Scenario::Conflict,
+                Scenario::Handoff,
+                Scenario::StudioRelay,
+            ],
         };
         for scenario in scenarios {
             match scenario {
                 Scenario::History => with_fixture(&args, history)?,
                 Scenario::Conflict => with_fixture(&args, |ui, ws, _| conflict(ui, ws))?,
                 Scenario::Handoff => relay(&args, Clients::Fixture, None)?,
+                Scenario::StudioRelay => studio_relay(&args)?,
             }
         }
     }

@@ -1,4 +1,5 @@
 pub(crate) mod editor;
+mod relay_page;
 use super::*;
 use aep::studio::Run;
 use editor::Start;
@@ -241,6 +242,13 @@ impl Studio {
                 self.snapshot.notes.len(),
                 cx,
             ))
+            .child(self.nav(
+                Page::Relay,
+                "两轮接力",
+                IconName::Play,
+                self.relays.len(),
+                cx,
+            ))
             .child(div().flex_1())
             .child(
                 v_flex()
@@ -364,10 +372,17 @@ impl Studio {
             handoff = handoff.child(caption("此次运行没有记录 Agent 的记忆读写。"));
         }
         let mut buttons = h_flex().gap_2();
-        for (kind, title) in [
+        let mut available = vec![
             (Artifact::Checks, "验收日志"),
             (Artifact::Review, "审查报告"),
-        ] {
+        ];
+        if attention(r.text("status")) {
+            available.extend([
+                (Artifact::Implementation, "实现日志"),
+                (Artifact::ReviewDiagnostics, "审查诊断"),
+            ]);
+        }
+        for (kind, title) in available {
             let id = r.id.clone();
             let active = self
                 .artifact
@@ -522,6 +537,9 @@ impl Render for Studio {
         }
         if let (Some(editor), Some(ws)) = (&self.editor, &self.workspace) {
             return editor.render(ws, cx);
+        }
+        if self.page == Page::Relay {
+            return self.relay_page(cx);
         }
         let runs = &self.snapshot.runs;
         let notes = &self.snapshot.notes;
