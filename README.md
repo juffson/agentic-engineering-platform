@@ -195,3 +195,21 @@ cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
 ```
 
 脚本从包含一条 `sample-run` 的新仓库开始。初始状态存为 `script-000.json`，之后每步递增。使用快照中的唯一 ID 做 `click`、`present`、`absent`，或用唯一标签做 `click_label`。此外支持 `input`、`press`、`scroll`（`id` 和像素增量 `dy`）和 `expect_value`（`label` 和 `equals`）。macOS CI 会运行四个内置场景和仓库内的搜索脚本。
+
+### 用真实客户端验证 Studio 到 GitHub 的完整流程
+
+在支持 Metal 的 macOS 终端、仓库根目录运行。需要 Rust、Git、已登录的 Codex CLI 和 Claude Code，以及对 `origin` 有推送、创建和合并 PR 权限的 GitHub CLI 账号。目标仓库的默认分支需要包含 AEP pilot 工作流。
+
+```sh
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --live-lifecycle
+```
+
+命令为每次测试创建独立克隆、合成 Rust 任务和唯一的 `test/studio-lifecycle-*` 目标分支。Studio UI Debug 通过生产界面的控件选任务、发起两轮、保存修订并执行发布和合并。流程会在三个操作人步骤暂停。
+
+1. 第一轮将未决问题交给操作人。输入舍入规则，或按 Enter 接受示例。命令将决策填入 Studio 的修订表单并保存，然后发起第二轮。
+2. 查看终端给出的最终 Diff、验收日志、Claude 报告和 Studio 截图。输入 `publish` 后，命令操作 Studio 的发布确认，向该次隔离目标创建 GitHub PR。
+3. 等同一候选 SHA 的 GitHub 检查和独立验收通过。核对 Studio 的检查和审查页截图后输入 `merge`，命令操作 Studio 的合并确认，再点击收尾。
+
+成功时会核对第二轮两个真实 Agent 的决策输入 ID 和各自输出中的唯一标识、GitHub 合并提交、目标分支同步、候选分支与临时 Worktree 的清理，并逐字节比较收尾前后的两轮证据、共享记忆及确认凭据。隔离目标会留在 GitHub 供检查，该次任务派发引用会在收尾后回收。
+
+终端会输出结果目录。默认在 `desktop/target/live-lifecycle`，也可加 `--output-dir <路径>` 和 `--codex-model <模型名>`。打开结果目录内的 `evidence/index.md` 可查看各步 PNG、控件快照和日志。`evidence.tar.gz` 保存同一批证据，`workspace/repo` 可用 Studio 重新打开。运行失败或拒绝确认会返回非零退出码，保留已有证据、失败原因和测试引用以便排查。
