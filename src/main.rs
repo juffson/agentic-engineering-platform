@@ -1,4 +1,5 @@
 mod agent;
+mod control;
 mod git;
 use aep::memory::{self, Key, Kind};
 mod run;
@@ -18,6 +19,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    Control(control::Control),
     Dispatch {
         #[arg(long)]
         task: String,
@@ -109,8 +111,16 @@ enum MemoryAction {
 }
 fn app() -> Result<ExitCode> {
     let cli = Cli::parse();
+    let action = match cli.command {
+        Action::Control(request) => {
+            control::execute(&cli.repo, request)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        action => action,
+    };
     let repo = git::Repo::open(&cli.repo)?;
-    match cli.command {
+    match action {
+        Action::Control(_) => unreachable!(),
         Action::Dispatch { task, rev, remote } => repo.dispatch(&task, &rev, &remote)?,
         Action::Run {
             mut args,

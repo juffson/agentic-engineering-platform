@@ -6,7 +6,7 @@ publish = false
 description = "Native desktop workspace for AEP run evidence and shared memory"
 
 [dependencies]
-aep = { path = ".." }
+aep = { path = "..", default-features = false }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 gpui-kit = { version = "=0.8.1", features = ["test-support"] }

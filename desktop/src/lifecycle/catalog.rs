@@ -323,6 +323,8 @@ mod tests {
                     title: None,
                     allowed_paths: vec!["src/lib.rs".into()],
                     check: vec!["cargo".into(), "test".into()],
+                    criteria: vec![],
+                    checks: vec![],
                 },
             },
             Branch {

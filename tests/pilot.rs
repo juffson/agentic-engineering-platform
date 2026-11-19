@@ -576,3 +576,314 @@ fn manual_memory_resolves_refs_and_rejects_a_candidate_behind_the_spec() {
     assert!(Key::resolve(&f.repo, None, None, Some("HEAD")).is_err());
     assert!(Key::resolve(&f.repo, Some("sample"), None, None).is_err());
 }
+
+#[test]
+fn acceptance_plan_records_criteria_failures_and_checks_not_run() {
+    let f = Fixture::new(&["true"]);
+    let manifest = f.repo.join("specs/sample/task.json");
+    fs::write(&manifest, json!({
+        "title": "Implement",
+        "allowed_paths": ["result.txt"],
+        "check": ["true"],
+        "criteria": ["AC-1"],
+        "checks": [
+            {"id":"integration","criteria":["AC-2"],"command":["sh","-c","echo failing-extra; exit 5"]},
+            {"id":"later","criteria":["AC-3"],"command":["true"]}
+        ]
+    }).to_string()).unwrap();
+    git(
+        &f.repo,
+        &["commit", "-am", "Pin multiple acceptance checks"],
+    );
+    let result = f.call(&[
+        "verify",
+        "--task",
+        "sample",
+        "--base",
+        "HEAD",
+        "--candidate",
+        "HEAD",
+        "--run-id",
+        "criteria",
+    ]);
+    assert!(!result.status.success());
+    let state = f.state("criteria");
+    assert_eq!(state["check_exit_code"], 5);
+    assert_eq!(state["acceptance"][0]["criteria"], json!(["AC-1"]));
+    assert_eq!(state["acceptance"][0]["status"], "passed");
+    assert_eq!(state["acceptance"][1]["exit_code"], 5);
+    assert_eq!(state["acceptance"][2]["status"], "not_run");
+    let log = fs::read_to_string(f.repo.join(".git/aep/runs/criteria/checks.log")).unwrap();
+    assert!(log.contains("failing-extra"));
+}
+
+#[test]
+fn explicit_review_blocker_keeps_a_passing_candidate_out_of_delivery() {
+    let f = Fixture::new(&["true"]);
+    let manifest = f.repo.join("specs/sample/task.json");
+    fs::write(
+        &manifest,
+        json!({
+            "allowed_paths":["result.txt"], "check":["true"], "criteria":["AC-1"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    git(&f.repo, &["commit", "-am", "Pin criterion"]);
+    f.script("claude", r#"printf '%s' '{"structured_output":{"note":"","question":"","report":"Missing requirement", "blocking_findings":[{"criterion":"AC-1","file":"result.txt","line":1,"reason":"missing result"}]}}'"#);
+    let result = f.call(&[
+        "verify",
+        "--task",
+        "sample",
+        "--base",
+        "HEAD",
+        "--candidate",
+        "HEAD",
+        "--run-id",
+        "blocked",
+        "--reviewer",
+        "claude",
+    ]);
+    assert!(!result.status.success());
+    let state = f.state("blocked");
+    assert_eq!(state["check_exit_code"], 0);
+    assert_eq!(state["status"], "failed");
+    assert_eq!(state["review_status"], "changes_requested");
+    assert_eq!(state["blocking_findings"][0]["criterion"], "AC-1");
+}
+
+#[test]
+fn control_worker_recovers_after_restart_and_delivery_recovers_a_lost_receipt() {
+    use std::io::{BufRead, BufReader};
+
+    struct Server(std::process::Child);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let f = Fixture::new(&[
+        "sh",
+        "-c",
+        r#"touch "$FIXTURE/checking"; while [ ! -f "$FIXTURE/release" ]; do sleep 0.1; done; grep -qx ok result.txt"#,
+    ]);
+    let origin = "https://github.com/example/pilot.git";
+    git(&f.repo, &["push", "origin", "main"]);
+    git(&f.repo, &["remote", "set-url", "origin", origin]);
+    let local = f.root.join("remote");
+    git(
+        &f.repo,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", local.display()),
+            origin,
+        ],
+    );
+    f.script(
+        "git",
+        &format!(
+            r#"case "$*" in
+"remote get-url origin"|"remote get-url --push --all origin") echo "{origin}" ;;
+*) exec /usr/bin/git "$@" ;;
+esac"#
+        ),
+    );
+    f.script(
+        "codex",
+        r#"
+if [ "$1" = --version ]; then echo codex-test; exit; fi
+test -z "${AEP_CONTROL_OPERATOR_TOKEN:-}${AEP_CONTROL_DEVICE_TOKEN:-}"
+echo started >> "$FIXTURE/starts"
+echo sensitive-local-log-canary
+while [ "$1" != --output-last-message ]; do shift; done
+printf '%s' '{"note":"changed result","question":""}' > "$2"
+printf ok > result.txt
+"#,
+    );
+    f.script(
+        "claude",
+        r#"
+if [ "$1" = --version ]; then echo claude-test; exit; fi
+test -z "${AEP_CONTROL_OPERATOR_TOKEN:-}${AEP_CONTROL_DEVICE_TOKEN:-}"
+cat >/dev/null
+printf '%s' '{"structured_output":{"note":"reviewed","question":"","report":"No blockers"}}'
+"#,
+    );
+    f.script("gh", r#"
+case "$*" in
+*" api user"*|*"github.com user"*) echo '{"login":"operator"}' ;;
+*"--method POST"*)
+    test ! -f "$FIXTURE/pull.json"
+    git rev-parse refs/heads/main > "$FIXTURE/base"
+    head=$(git ls-remote --heads origin 'aep/pr/*' | cut -f1)
+    base=$(cat "$FIXTURE/base")
+    printf '{"number":123,"state":"open","head":{"sha":"%s"},"base":{"ref":"main","sha":"%s"}}\n' "$head" "$base" > "$FIXTURE/pull.json"
+    exit 1 ;;
+*"--method GET"*)
+    if [ -f "$FIXTURE/pull.json" ]; then printf '['; cat "$FIXTURE/pull.json"; printf ']'; else echo '[]'; fi ;;
+*) exit 2 ;;
+esac
+"#);
+
+    let operator = "operator-token-test-000000000000000000000";
+    let device = "device-token-test-000000000000000000000";
+    let configured = |args: &[&str]| {
+        let mut command = f.cmd(&f.repo, args);
+        command
+            .env("AEP_CONTROL_OPERATOR_TOKEN", operator)
+            .env("AEP_CONTROL_DEVICE_TOKEN", device);
+        command
+    };
+    let store = f.root.join("control.json");
+    let mut controller = Server(
+        configured(&[
+            "control",
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+            "--state",
+            store.to_str().unwrap(),
+            "--device",
+            "test-device",
+            "--lease-seconds",
+            "40",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    );
+    let mut line = String::new();
+    BufReader::new(controller.0.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let address = line.split_whitespace().last().unwrap();
+    let endpoint = format!("http://{address}");
+    let call = |action: &[&str]| {
+        let mut args = vec!["control", "--url", endpoint.as_str()];
+        args.extend(action);
+        serde_json::from_str::<Value>(&ok(configured(&args).output().unwrap())).unwrap()
+    };
+    assert!(
+        !configured(&["control", "--url", &endpoint, "status"])
+            .env("AEP_CONTROL_OPERATOR_TOKEN", device)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let submit = [
+        "submit",
+        "--ticket",
+        "test",
+        "--task",
+        "sample",
+        "--spec",
+        &f.base,
+        "--target",
+        "main",
+        "--baseline",
+        &f.base,
+        "--timeout",
+        "30",
+    ];
+    let job = call(&submit);
+    assert_eq!(call(&submit), job);
+    let run = job["data"]["id"].as_str().unwrap();
+    let worker = ["control", "--url", &endpoint, "worker", "--once"];
+    let mut first = configured(&worker).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !f.root.join("checking").is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "worker never reached independent checks"
+        );
+        thread::sleep(Duration::from_millis(15));
+    }
+    first.kill().unwrap();
+    first.wait().unwrap();
+    let restarted = configured(&worker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fs::write(f.root.join("release"), "").unwrap();
+    ok(restarted.wait_with_output().unwrap());
+    assert_eq!(
+        fs::read_to_string(f.root.join("starts")).unwrap(),
+        "started\n"
+    );
+    let snapshot = call(&["status"]);
+    let attempt = &snapshot["data"]["attempts"][0];
+    assert_eq!(attempt["stage"], "awaiting_approval");
+    assert_eq!(attempt["profile"]["codex"], "codex-test");
+    assert!(attempt.get("fence").is_none());
+    assert_eq!(
+        attempt["events"].as_array().unwrap().last().unwrap()["progress"]["outcome"],
+        "passed"
+    );
+    assert!(
+        !fs::read_to_string(&store)
+            .unwrap()
+            .contains("sensitive-local-log-canary")
+    );
+
+    let candidate = f.state(run)["candidate_sha"].as_str().unwrap().to_owned();
+    let confirmed = [
+        "--ticket",
+        "test",
+        "--run",
+        run,
+        "--spec",
+        &f.base,
+        "--candidate",
+        &candidate,
+    ];
+    let args = || {
+        let mut result = vec!["publish"];
+        result.extend(confirmed);
+        result
+    };
+    let mut before_approval = vec!["control", "--url", &endpoint];
+    before_approval.extend(args());
+    assert!(
+        !configured(&before_approval)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut approving = vec!["approve"];
+    approving.extend(confirmed);
+    let approval = call(&approving);
+    assert_eq!(approval["data"]["stage"], "approved");
+    assert_eq!(
+        approval["data"]["approval"]["report_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    let log = f.repo.join(".git/aep/runs").join(run).join("checks.log");
+    let original = fs::read(&log).unwrap();
+    fs::write(&log, "changed after approval").unwrap();
+    assert!(
+        !configured(&before_approval)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(!f.root.join("pull.json").exists());
+    fs::write(&log, original).unwrap();
+    let publication = call(&args());
+    assert_eq!(publication["data"]["pull_request"], 123);
+    assert_eq!(call(&args()), publication);
+    assert_eq!(
+        git(&f.repo, &["ls-remote", "--heads", "origin", "aep/pr/*"])
+            .lines()
+            .count(),
+        1
+    );
+}

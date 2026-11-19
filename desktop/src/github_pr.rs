@@ -584,6 +584,7 @@ pub(crate) fn merge(
     if let Some(reason) = current.blocker(target) {
         anyhow::bail!("{reason}");
     }
+    aep::delivery::check_spec(ws, &runner.path()?, target)?;
     if current.base != target.base_sha {
         let compare = github(
             ws,

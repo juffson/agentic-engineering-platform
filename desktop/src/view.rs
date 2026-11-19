@@ -361,6 +361,28 @@ impl Studio {
         if let Some(code) = r.record["check_exit_code"].as_i64() {
             evidence = evidence.child(field("退出码", &code.to_string()));
         }
+        if let Some(checks) = r.record["acceptance"].as_array() {
+            for check in checks {
+                let id = check["id"].as_str().unwrap_or("验收检查");
+                let criteria = check["criteria"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("、");
+                let status = match check["status"].as_str() {
+                    Some("passed") => "已通过",
+                    Some("failed") => "失败",
+                    Some("cancelled") => "已取消",
+                    _ => "未执行",
+                };
+                if !criteria.is_empty() {
+                    evidence =
+                        evidence.child(field("验收项", &format!("{id} · {criteria} · {status}")));
+                }
+            }
+        }
         for (label, key) in [("开始时间", "started_at"), ("结束时间", "finished_at")] {
             if !r.text(key).is_empty() {
                 evidence = evidence.child(field(label, r.text(key)));

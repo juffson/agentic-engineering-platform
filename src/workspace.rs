@@ -11,6 +11,8 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
         .arg("-C")
         .arg(repo)
         .args(args)
+        .env_remove(crate::CONTROL_OPERATOR_TOKEN)
+        .env_remove(crate::CONTROL_DEVICE_TOKEN)
         .output()
         .context("start git")?;
     if !out.status.success() {

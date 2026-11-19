@@ -24,6 +24,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - run: cargo +stable fmt --manifest-path desktop/Cargo.toml -- --check
       - run: cargo +stable clippy --manifest-path desktop/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo +stable test --locked --manifest-path desktop/Cargo.toml --lib
       - name: Exercise the Studio UI offscreen
         run: |
           cargo +stable run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --output-dir "$RUNNER_TEMP/aep-ui"

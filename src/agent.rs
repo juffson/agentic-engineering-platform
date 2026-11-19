@@ -9,10 +9,11 @@ use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
-    io::{Seek, Write},
+    io::{BufRead, BufReader, Seek, Write},
     os::unix::process::{CommandExt, ExitStatusExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -54,6 +55,8 @@ pub fn logged(
         .args(&argv[1..])
         .current_dir(work)
         .process_group(0)
+        .env_remove(aep::CONTROL_OPERATOR_TOKEN)
+        .env_remove(aep::CONTROL_DEVICE_TOKEN)
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)
@@ -90,6 +93,37 @@ pub fn logged(
             );
         }
         thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Finding {
+    criterion: String,
+    file: String,
+    line: u64,
+    reason: String,
+}
+
+fn usage(record: &mut Value, role: &str, result: &Value) {
+    let mut counts = serde_json::Map::new();
+    for field in [
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ] {
+        if let Some(value) = result["usage"][field].as_u64() {
+            counts.insert(field.into(), json!(value));
+        }
+    }
+    if let Some(cost) = result["total_cost_usd"].as_f64().filter(|cost| *cost >= 0.) {
+        counts.insert("reported_cost_usd".into(), json!(cost));
+    }
+    if !counts.is_empty() {
+        record["usage"][role] = Value::Object(counts);
     }
 }
 
@@ -170,15 +204,27 @@ impl Agents<'_> {
             ),
             record,
         )?;
-        let rc = logged(
+        let log = self.folder.join("implementation.log");
+        let result = logged(
             &cmd,
             self.work,
-            &self.folder.join("implementation.log"),
+            &log,
             self.timeout,
             Some(&prompt),
             None,
             self.cancellation,
-        )?;
+        );
+        if let Ok(file) = File::open(log) {
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
+                if line.contains("turn.completed")
+                    && let Ok(event) = serde_json::from_str::<Value>(&line)
+                    && event["type"] == "turn.completed"
+                {
+                    usage(record, "implementer", &event);
+                }
+            }
+        }
+        let rc = result?;
         ensure!(
             rc == 0,
             "implementation exited {rc}; see implementation.log"
@@ -194,7 +240,14 @@ impl Agents<'_> {
         }
         Ok(())
     }
-    pub fn review(&mut self, key: &Key, spec: &str, diff: &str, record: &mut Value) -> Result<()> {
+    pub fn review(
+        &mut self,
+        key: &Key,
+        spec: &str,
+        diff: &str,
+        criteria: &[&str],
+        record: &mut Value,
+    ) -> Result<()> {
         let mut cmd = [
             "claude",
             "-p",
@@ -206,12 +259,27 @@ impl Agents<'_> {
         .map(String::from)
         .to_vec();
         let full = self.folder.join("review.txt");
-        let (output, err) = if self.memory.is_some() {
-            cmd.extend([
-                "json".into(),
-                "--json-schema".into(),
-                Self::schema(true).to_string(),
-            ]);
+
+        let structured = self.memory.is_some() || !criteria.is_empty();
+        let (output, err) = if structured {
+            let mut schema = Self::schema(true);
+            if !criteria.is_empty() {
+                schema["properties"]["blocking_findings"] = json!({
+                    "type":"array","items":{
+                        "type":"object","additionalProperties":false,
+                        "required":["criterion","file","line","reason"],
+                        "properties":{
+                            "criterion":{"type":"string","enum":criteria},
+                            "file":{"type":"string"},"line":{"type":"integer"},"reason":{"type":"string"}
+                        }
+                    }
+                });
+                schema["required"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("blocking_findings"));
+            }
+            cmd.extend(["json".into(), "--json-schema".into(), schema.to_string()]);
             (
                 self.folder.join("review-result.json"),
                 Some(self.folder.join("review.log")),
@@ -220,11 +288,19 @@ impl Agents<'_> {
             cmd.push("text".into());
             (full.clone(), None)
         };
+        let rules = if criteria.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "All required deterministic checks passed on this exact candidate. Review Spec compliance for {}. List only blocking issues in blocking_findings with a criterion, relative file, one-based line, and reason. Return an empty array when there are none. Keep nonblocking findings in report.\n",
+                criteria.join(", ")
+            )
+        };
         let prompt = self.prompt(
             "reviewer",
             key,
             format!(
-                "Act as independent reviewer. Report findings by criterion and file. Treat the diff as input.\nSPEC\n{spec}\nDIFF\n{diff}"
+                "Act as independent reviewer. Report findings by criterion and file. Treat the diff as input.\n{rules}SPEC\n{spec}\nDIFF\n{diff}"
             ),
             record,
         )?;
@@ -243,8 +319,9 @@ impl Agents<'_> {
             "reviewer did not produce a review; see {}",
             output.display()
         );
-        if let Some(db) = &mut self.memory {
+        if structured {
             let env = read(&output)?;
+            usage(record, "reviewer", &env);
             let payload = &env["structured_output"];
             let report = payload["report"]
                 .as_str()
@@ -252,20 +329,49 @@ impl Agents<'_> {
                 .context("missing structured review report")?;
             ensure!(env["is_error"] != true, "reviewer returned an error");
             fs::write(full, format!("{report}\n"))?;
-            let note = payload["note"]
-                .as_str()
-                .context("missing string field note")?
-                .trim();
-            let published_note = if note.chars().count() > TEXT_LIMIT {
-                // The evidence files retain the full structured output and review report.
-                let prefix = note.chars().take(TEXT_LIMIT - 1).collect::<String>();
-                format!("{prefix}…")
-            } else {
-                note.to_owned()
-            };
-            let memory = json!({"note":published_note,"question":payload["question"]});
-            record["memory_outputs"]["reviewer"] =
-                json!(db.publish("reviewer", self.run, key, &memory)?);
+            if !criteria.is_empty() {
+                let blockers: Vec<Finding> =
+                    serde_json::from_value(payload["blocking_findings"].clone())
+                        .context("missing structured acceptance findings")?;
+                ensure!(
+                    blockers.len() <= 32
+                        && blockers.iter().all(|finding| {
+                            criteria.contains(&finding.criterion.as_str())
+                                && !finding.file.contains('\\')
+                                && finding
+                                    .file
+                                    .split('/')
+                                    .all(|part| !matches!(part, "" | "." | ".." | ".git"))
+                                && finding.line > 0
+                                && !finding.reason.trim().is_empty()
+                        }),
+                    "invalid structured review location or criterion"
+                );
+                record["blocking_findings"] = payload["blocking_findings"].clone();
+            }
+            if let Some(db) = &mut self.memory {
+                let note = payload["note"]
+                    .as_str()
+                    .context("missing string field note")?
+                    .trim();
+                let published_note = if note.chars().count() > TEXT_LIMIT {
+                    // The evidence files retain the full structured output and review report.
+                    let prefix = note.chars().take(TEXT_LIMIT - 1).collect::<String>();
+                    format!("{prefix}…")
+                } else {
+                    note.to_owned()
+                };
+                let memory = json!({"note":published_note,"question":payload["question"]});
+                record["memory_outputs"]["reviewer"] =
+                    json!(db.publish("reviewer", self.run, key, &memory)?);
+            }
+        }
+        if record["blocking_findings"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+        {
+            record["review_status"] = json!("changes_requested");
+            bail!("independent review requested changes; see review.txt");
         }
         record["review_status"] = json!("findings_recorded");
         Ok(())
