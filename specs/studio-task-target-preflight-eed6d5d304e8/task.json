@@ -1,0 +1,11 @@
+{
+  "title": "Studio real task target preflight",
+  "allowed_paths": [
+    "src/workspace.rs"
+  ],
+  "check": [
+    "sh",
+    "-c",
+    "set -eu; test ! -e tests/studio_target_preflight_acceptance.rs; cp specs/studio-task-target-preflight-eed6d5d304e8/preflight.rs tests/studio_target_preflight_acceptance.rs; trap 'unlink tests/studio_target_preflight_acceptance.rs' EXIT; cargo test --locked --test studio_target_preflight_acceptance"
+  ]
+}
