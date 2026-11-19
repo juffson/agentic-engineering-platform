@@ -1,0 +1,11 @@
+{
+  "title": "Studio live lifecycle test",
+  "allowed_paths": [
+    "specs/studio-lifecycle-5be51865965c44f1b3107153d5e81cab/normalize.rs"
+  ],
+  "check": [
+    "sh",
+    "-c",
+    "set -e; binary=$(mktemp); trap 'rm -- \"$binary\"' EXIT; rustc --edition=2024 --test specs/studio-lifecycle-5be51865965c44f1b3107153d5e81cab/acceptance.rs -o \"$binary\"; \"$binary\""
+  ]
+}
