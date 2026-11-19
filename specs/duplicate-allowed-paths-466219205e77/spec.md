@@ -1,0 +1,5 @@
+# Report duplicate paths in task manifests
+
+Update src/task.rs so TaskManifest::validate rejects an allowlist with the same repository-relative path more than once. Include the duplicated path in the diagnostic. Compare paths exactly, including case. Keep the existing validation for empty and invalid paths and for missing acceptance commands. Use the existing standard library and keep the change confined to src/task.rs. Add focused unit coverage in that file for a duplicate, distinct valid paths, and same spelling with different case. Run cargo test --locked --lib task::tests and ensure rustfmt passes.
+
+For the two-agent handoff, when no manual decision is present, Codex should write this question in the structured question field: "Should duplicate-path validation be case-sensitive?" Do not copy the question into the code. In round two, quote the human decision reference verbatim in the Codex note and Claude report, and leave the question field empty. Preserve concise shared-memory notes.

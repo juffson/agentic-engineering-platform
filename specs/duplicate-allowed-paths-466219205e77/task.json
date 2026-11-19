@@ -1,0 +1,13 @@
+{
+  "title": "Report duplicate allowed paths",
+  "allowed_paths": [
+    "src/task.rs"
+  ],
+  "check": [
+    "cargo",
+    "test",
+    "--locked",
+    "--lib",
+    "task::tests"
+  ]
+}
