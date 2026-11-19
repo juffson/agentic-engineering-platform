@@ -5,6 +5,7 @@ mod lifecycle_page;
 mod relay_page;
 mod repository_tasks;
 pub(crate) mod task_authoring;
+mod task_queue;
 use super::*;
 use aep::studio::Run;
 use editor::Start;
@@ -257,6 +258,23 @@ impl Studio {
                 cx,
             ))
             .child(self.nav(Page::Lifecycle, "隔离全流程", IconName::Play, 0, cx))
+            .when(
+                self.lifecycle
+                    .as_ref()
+                    .is_some_and(|fixture| fixture.real_task),
+                |rail| {
+                    rail.child(button("queue-return-repo", "返回仓库任务", false).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            if !this.lifecycle_preparing
+                                && !this.lifecycle_packaging
+                                && let Some(source) = this.queue_source.clone()
+                            {
+                                this.set_workspace(source, Page::Lifecycle, window, cx);
+                            }
+                        }),
+                    ))
+                },
+            )
             .child(div().flex_1())
             .child(
                 v_flex()

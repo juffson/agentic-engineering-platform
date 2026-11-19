@@ -318,18 +318,122 @@ fn save(path: &Path, relay: &Relay) -> Result<()> {
     Ok(())
 }
 
-fn lock(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path.join("owner.lock"))?;
-    file.try_lock().context("此接力正在执行")?;
-    Ok(file)
-}
-
 pub(crate) fn new_id() -> String {
     format!("relay-{}", uuid::Uuid::new_v4().simple())
+}
+
+pub(crate) struct Lease {
+    id: String,
+    path: PathBuf,
+    owner: File,
+}
+
+impl Lease {
+    pub fn acquire(ws: &Workspace, id: &str) -> Result<Option<Self>> {
+        let path = folder(ws, id)?;
+        fs::create_dir_all(&path)?;
+        let owner = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.join("owner.lock"))?;
+        match owner.try_lock() {
+            Ok(()) => Ok(Some(Self {
+                id: id.into(),
+                path,
+                owner,
+            })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    fn read(&self) -> Result<Option<Relay>> {
+        match File::open(self.path.join("relay.json")) {
+            Ok(file) => {
+                let relay: Relay = serde_json::from_reader(file)?;
+                ensure!(relay.id == self.id, "接力 ID 与持久记录不一致");
+                Ok(Some(relay))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn planned_run(&self, round: Round) -> Result<String> {
+        let count = self.read()?.map_or(0, |relay| relay.attempts.len());
+        Ok(attempt_id(&self.id, round, count))
+    }
+
+    pub fn has_attempt(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .read()?
+            .is_some_and(|relay| relay.attempts.iter().any(|attempt| attempt.id == id)))
+    }
+
+    pub fn start(&self, ws: &Workspace, runner: &Runner, task: Task, model: String) -> Result<()> {
+        ensure!(self.read()?.is_none(), "此接力已存在");
+        let mut relay = Relay {
+            id: self.id.clone(),
+            task,
+            model,
+            attempts: Vec::new(),
+            busy: false,
+        };
+        launch(
+            ws,
+            runner,
+            &self.owner,
+            &mut relay,
+            Round::First,
+            None,
+            None,
+        )
+    }
+
+    pub fn advance(
+        &self,
+        ws: &Workspace,
+        runner: &Runner,
+        round: Round,
+        decision: Option<i64>,
+        model: String,
+    ) -> Result<()> {
+        let mut relay = self.read()?.context("找不到接力记录")?;
+        let snapshot = Snapshot::load(ws);
+        ensure!(!relay.active(&snapshot), "此接力正在执行");
+        ensure!(!passed(relay.run(round, &snapshot)), "此轮已完成");
+        let resume = if round == Round::Second {
+            let first = relay.run(Round::First, &snapshot);
+            ensure!(passed(first), "第一轮尚未通过");
+            let decision = decision.context("请选择任务决策")?;
+            ensure!(
+                relay
+                    .decisions(&snapshot)
+                    .iter()
+                    .any(|note| note["id"] == decision),
+                "请选择当前任务的有效决策"
+            );
+            Some(
+                first
+                    .context("缺少第一轮证据")?
+                    .text("candidate_sha")
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        relay.model = model;
+        launch(
+            ws,
+            runner,
+            &self.owner,
+            &mut relay,
+            round,
+            decision,
+            resume.as_deref(),
+        )
+    }
 }
 
 pub(crate) fn start(
@@ -339,18 +443,9 @@ pub(crate) fn start(
     task: Task,
     model: String,
 ) -> Result<()> {
-    let path = folder(ws, &id)?;
-    fs::create_dir_all(&path)?;
-    let owner = lock(&path)?;
-    ensure!(!path.join("relay.json").exists(), "此接力已存在");
-    let mut relay = Relay {
-        id,
-        task,
-        model,
-        attempts: Vec::new(),
-        busy: false,
-    };
-    launch(ws, runner, &owner, &mut relay, Round::First, None, None)
+    Lease::acquire(ws, &id)?
+        .context("此接力正在执行")?
+        .start(ws, runner, task, model)
 }
 
 pub(crate) fn advance(
@@ -361,42 +456,13 @@ pub(crate) fn advance(
     decision: Option<i64>,
     model: String,
 ) -> Result<()> {
-    let path = folder(ws, id)?;
-    let owner = lock(&path)?;
-    let mut relay: Relay = serde_json::from_reader(File::open(path.join("relay.json"))?)?;
-    let snapshot = Snapshot::load(ws);
-    ensure!(!relay.active(&snapshot), "此接力正在执行");
-    ensure!(!passed(relay.run(round, &snapshot)), "此轮已完成");
-    let resume = if round == Round::Second {
-        let first = relay.run(Round::First, &snapshot);
-        ensure!(passed(first), "第一轮尚未通过");
-        let decision = decision.context("请选择任务决策")?;
-        ensure!(
-            relay
-                .decisions(&snapshot)
-                .iter()
-                .any(|note| note["id"] == decision),
-            "请选择当前任务的有效决策"
-        );
-        Some(
-            first
-                .context("缺少第一轮证据")?
-                .text("candidate_sha")
-                .to_owned(),
-        )
-    } else {
-        None
-    };
-    relay.model = model;
-    launch(
-        ws,
-        runner,
-        &owner,
-        &mut relay,
-        round,
-        decision,
-        resume.as_deref(),
-    )
+    Lease::acquire(ws, id)?
+        .context("此接力正在执行")?
+        .advance(ws, runner, round, decision, model)
+}
+
+fn attempt_id(relay: &str, round: Round, completed: usize) -> String {
+    format!("{}-{}-{}", relay, round.suffix(), completed + 1)
 }
 
 fn launch(
@@ -409,12 +475,7 @@ fn launch(
     resume: Option<&str>,
 ) -> Result<()> {
     let path = folder(ws, &relay.id)?;
-    let run_id = format!(
-        "{}-{}-{}",
-        relay.id,
-        round.suffix(),
-        relay.attempts.len() + 1
-    );
+    let run_id = attempt_id(&relay.id, round, relay.attempts.len());
     relay.attempts.push(Attempt {
         id: run_id.clone(),
         round,
@@ -536,26 +597,30 @@ mod tests {
     #[test]
     fn executor_holds_the_relay_lease_after_studio_drops_it() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let owner = lock(dir.path())?;
+        let ws = Workspace {
+            root: dir.path().into(),
+            data: dir.path().into(),
+        };
+        let lease = Lease::acquire(&ws, "test")?.context("initial lease")?;
         let child = Command::new("sh")
             .args([
                 "-c",
                 "echo ready; while [ ! -f finish ]; do sleep 0.01; done",
             ])
             .current_dir(dir.path())
-            .stdin(Stdio::from(owner.try_clone()?))
+            .stdin(Stdio::from(lease.owner.try_clone()?))
             .stdout(Stdio::piped())
             .spawn()?;
         let mut child = child;
         let mut ready = String::new();
         BufReader::new(child.stdout.take().context("child stdout")?).read_line(&mut ready)?;
-        drop(owner);
-        let held = lock(dir.path()).is_err();
+        drop(lease);
+        let held = Lease::acquire(&ws, "test")?.is_none();
         File::create(dir.path().join("finish"))?;
         assert!(child.wait()?.success());
         assert_eq!(ready.trim(), "ready");
         assert!(held, "the child released the relay lease too early");
-        assert!(lock(dir.path()).is_ok());
+        assert!(Lease::acquire(&ws, "test")?.is_some());
         Ok(())
     }
 }

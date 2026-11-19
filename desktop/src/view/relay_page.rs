@@ -1,5 +1,8 @@
 use super::*;
-use crate::relay::{self, Relay, Round};
+use crate::{
+    relay::{self, Relay, Round},
+    task_queue::{Action, State},
+};
 
 impl Studio {
     pub(super) fn relay_page(&self, cx: &Context<Self>) -> Div {
@@ -128,7 +131,20 @@ impl Studio {
             .min_h_0()
             .p_5()
             .gap_3();
-        if let Some(error) = &self.relay_error {
+        let pending = self
+            .current_queue_job()
+            .is_some_and(|job| job.state.active());
+        if let Some(job) = self.current_queue_job() {
+            if pending {
+                detail = detail.child(
+                    detail_text("relay-queue-state", &self.job_label(job)).text_color(rgb(BLUE)),
+                );
+            } else if let State::Failed(error) = &job.state {
+                detail =
+                    detail.child(detail_text("relay-queue-failure", error).text_color(rgb(RED)));
+            }
+        }
+        if let Some(error) = self.relay_error.as_ref().or(self.queue_error.as_ref()) {
             detail = detail.child(detail_text("relay-error", error).text_color(rgb(RED)));
         }
         for error in &self.snapshot.issues {
@@ -140,7 +156,7 @@ impl Studio {
                 .child(field("Spec SHA", &relay.task.sha))
                 .child(self.relay_round(relay, Round::First, cx))
                 .child(self.relay_round(relay, Round::Second, cx));
-            if !relay.active(&self.snapshot) && !self.relay_launching {
+            if !relay.active(&self.snapshot) && !self.relay_launching && !pending {
                 detail = detail.child(self.relay_controls(relay, cx));
             }
         } else if let Some(task) = task {
@@ -155,7 +171,7 @@ impl Studio {
                             "Codex 实现，Claude 审查。运行会使用本机的模型账户和任务验收命令。",
                         ))
                         .child(self.relay_model_input())
-                        .when(!self.relay_launching, |card| {
+                        .when(!self.relay_launching && !pending, |card| {
                             card.child(button("start-relay", "发起第一轮", true).on_click(
                                 cx.listener(move |this, _, _, cx| {
                                     this.start_relay(task.clone(), cx);
@@ -365,10 +381,7 @@ impl Studio {
             return panel().child(self.relay_model_input()).child(
                 button("retry-relay-first", "重试第一轮", true).on_click(cx.listener(
                     move |this, _, _, cx| {
-                        let id = id.clone();
-                        this.submit_relay(cx, move |ws, runner, model| {
-                            relay::advance(ws, runner, &id, Round::First, None, model)
-                        });
+                        this.advance_relay(id.clone(), Action::RetryFirst, cx);
                     },
                 )),
             );
@@ -466,17 +479,7 @@ impl Studio {
                     .child(
                         button(format!("relay-continue-{decision}"), action, true).on_click(
                             cx.listener(move |this, _, _, cx| {
-                                let id = id.clone();
-                                this.submit_relay(cx, move |ws, runner, model| {
-                                    relay::advance(
-                                        ws,
-                                        runner,
-                                        &id,
-                                        Round::Second,
-                                        Some(decision),
-                                        model,
-                                    )
-                                });
+                                this.advance_relay(id.clone(), Action::Second { decision }, cx);
                             }),
                         ),
                     ),

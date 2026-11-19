@@ -4,6 +4,7 @@ pub mod lifecycle;
 mod publish;
 mod recent;
 mod relay;
+mod task_queue;
 mod view;
 pub use relay::Runner;
 
@@ -93,6 +94,12 @@ struct Studio {
     task_sessions: Vec<lifecycle::catalog::Entry>,
     task_sessions_loading: bool,
     task_sessions_error: Option<String>,
+    queue_source: Option<Workspace>,
+    task_queue: task_queue::Queue,
+    queue_polling: bool,
+    queue_driving: bool,
+    queue_generation: u64,
+    queue_error: Option<String>,
 }
 
 impl Studio {
@@ -152,11 +159,18 @@ impl Studio {
             task_sessions: Vec::new(),
             task_sessions_loading: false,
             task_sessions_error: None,
+            queue_source: None,
+            task_queue: task_queue::Queue::default(),
+            queue_polling: false,
+            queue_driving: false,
+            queue_generation: 0,
+            queue_error: None,
         };
         if studio.remember_repository && studio.workspace.is_some() {
             studio.remember_workspace();
             studio.navigate(Page::Lifecycle, window, cx);
         }
+        studio.attach_task_queue(cx);
         studio.reload(cx);
         studio
     }
@@ -274,6 +288,7 @@ impl Studio {
         self.relay_model
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.loading = false;
+        self.attach_task_queue(cx);
         self.navigate(page, window, cx);
         self.reload(cx);
     }
@@ -381,17 +396,33 @@ impl Studio {
         if self.relay_launching {
             return;
         }
-        let id = self
-            .lifecycle
-            .as_ref()
-            .filter(|session| {
-                session.authored && session.task == task.name && session.spec == task.sha
-            })
-            .map_or_else(relay::new_id, lifecycle::Fixture::authored_relay_id);
+        if let Some(session) = self.lifecycle.as_ref().filter(|session| session.real_task) {
+            self.enqueue_round(session.initial_relay_id(), task_queue::Action::Start, cx);
+            return;
+        }
+        let id = relay::new_id();
         self.relay_id = Some(id.clone());
         self.relay_task = None;
         self.submit_relay(cx, move |ws, runner, model| {
             relay::start(ws, runner, id, task, model)
+        });
+    }
+
+    fn advance_relay(&mut self, id: String, action: task_queue::Action, cx: &mut Context<Self>) {
+        if self
+            .lifecycle
+            .as_ref()
+            .is_some_and(|session| session.real_task)
+        {
+            self.enqueue_round(id, action, cx);
+            return;
+        }
+        let decision = match action {
+            task_queue::Action::Second { decision } => Some(decision),
+            _ => None,
+        };
+        self.submit_relay(cx, move |ws, runner, model| {
+            relay::advance(ws, runner, &id, action.round(), decision, model)
         });
     }
 
