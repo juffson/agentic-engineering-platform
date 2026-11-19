@@ -8,6 +8,22 @@ enum Tab {
     Report,
 }
 
+fn diff_tone(line: &str) -> u32 {
+    if line.starts_with("diff --git")
+        || line.starts_with("@@")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+    {
+        BLUE
+    } else if line.starts_with('+') {
+        MINT
+    } else if line.starts_with('-') {
+        RED
+    } else {
+        FG
+    }
+}
+
 pub(crate) struct State {
     relay: String,
     run: String,
@@ -216,6 +232,7 @@ impl Studio {
             Tab::Report => &review.report,
         };
         let mut contents = v_flex()
+            .h_full()
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -253,6 +270,31 @@ impl Studio {
             .get(state.page)
             .filter(|text| !text.trim().is_empty())
             .map_or("文件为空", String::as_str);
+        let text = if state.tab == Tab::Diff {
+            v_flex()
+                .id("review-content")
+                .role(Role::Label)
+                .aria_label(SharedString::from(body.to_owned()))
+                .test_support()
+                .font_family("Menlo")
+                .children(body.lines().map(|line| {
+                    t(
+                        if line.is_empty() {
+                            " ".to_owned()
+                        } else {
+                            line.to_owned()
+                        },
+                        diff_tone(line),
+                    )
+                    .text_xs()
+                }))
+                .into_any_element()
+        } else {
+            detail_text("review-content", body)
+                .font_family("Menlo")
+                .text_xs()
+                .into_any_element()
+        };
         contents = contents.child(
             v_flex()
                 .id(("review-document", state.page * 3 + state.tab as usize))
@@ -262,17 +304,15 @@ impl Studio {
                 .bg(rgb(PANEL))
                 .rounded_md()
                 .p_3()
-                .child(
-                    detail_text("review-content", body)
-                        .font_family("Menlo")
-                        .text_xs(),
-                ),
+                .child(text),
         );
 
         let target = &review.target;
         let mut confirm = v_flex()
             .id("review-destination")
             .overflow_y_scroll()
+            .h_full()
+            .min_h_0()
             .w(px(290.))
             .flex_none()
             .border_l_1()
@@ -350,6 +390,7 @@ impl Studio {
         }
         main.child(
             h_flex()
+                .items_start()
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
