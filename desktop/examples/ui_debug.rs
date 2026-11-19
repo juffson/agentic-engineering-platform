@@ -976,6 +976,18 @@ fn verify_post_merge_cleanup(
             .context("failed worktree")?,
     );
     let before = [status(&ws.data, first)?, status(&ws.data, second)?, failure];
+    let missing = before[0]["worktree"]
+        .as_str()
+        .context("first round worktree")?
+        .to_owned();
+    let first_sha = before[0]["candidate_sha"]
+        .as_str()
+        .context("first candidate")?;
+    git(
+        &ws.root,
+        &["worktree", "add", "--detach", &missing, first_sha],
+    )?;
+    fs::remove_dir_all(&missing)?;
     let memory = fs::read(ws.data.join("memory.sqlite3"))?;
     let original_tip = git(&ws.root, &["rev-parse", "HEAD"])?;
     ensure!(
@@ -1036,6 +1048,12 @@ fn verify_post_merge_cleanup(
     ensure!(
         ui.element("github-cleanup-complete")?.visible()
             && !scratch.exists()
+            && !git(&ws.root, &["worktree", "list", "--porcelain"])?.contains(
+                Path::new(&missing)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("missing worktree name")?
+            )
             && unrelated.is_dir()
             && git(&ws.root, &["ls-remote", "--refs", "origin", &head_ref])?.is_empty()
             && git(&ws.root, &["rev-parse", &head_ref])?.trim() == candidate,
