@@ -54,7 +54,7 @@ cargo run --locked --manifest-path desktop/Cargo.toml -- --repo /path/to/repo
 
 第二轮通过后，点「查看 Diff 与创建 PR」。确认 `origin` 的取回与推送地址指向同一个 GitHub 仓库，并在本机使用 `gh auth login` 登录有推送和建 PR 权限的账号。
 
-在「最终 Diff」「验收日志」和「审查报告」之间切换即可核对候选。最终 Diff 使用 GitHub 默认分支与候选的合并基点，右侧显示仓库、目标分支和两个固定 SHA。核对后勾选确认并点击「确认并创建 GitHub PR」。目标分支更新时，重新加载 Diff 再确认。
+在「最终 Diff」「验收日志」和「审查报告」之间切换即可核对候选。默认使用 GitHub 默认分支，也可以填写现有目标分支并点「加载目标 Diff」。Diff 使用所选分支与候选的合并基点，右侧显示仓库、目标分支和两个固定 SHA。核对后勾选确认并点击「确认并创建 GitHub PR」。修改目标名称或发现远端目标已更新时，重新加载 Diff 再确认。
 
 Studio 将候选推送到 `aep/pr/<task>/<run-id>`，并保存确认账号、候选 SHA 和 PR 链接。推送成功而建 PR 失败时，可重开该审查页后重试。Studio 会复用匹配的远端提交，并检查该分支是否已有 PR。GitHub CI 使用已派发的 Spec 和 PR 当前提交独立验收。
 
