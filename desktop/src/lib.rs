@@ -1,3 +1,4 @@
+mod publish;
 mod relay;
 mod view;
 pub use relay::Runner;
@@ -22,6 +23,7 @@ enum Page {
     Runs,
     Memory,
     Relay,
+    Review,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Filter {
@@ -70,6 +72,7 @@ struct Studio {
     relay_launching: bool,
     relay_polling: bool,
     workspace_generation: u64,
+    review: Option<view::human_review::State>,
 }
 
 impl Studio {
@@ -112,6 +115,7 @@ impl Studio {
             relay_launching: false,
             relay_polling: false,
             workspace_generation: 0,
+            review: None,
         };
         studio.reload(cx);
         studio
@@ -186,6 +190,7 @@ impl Studio {
                     this.tasks_loading = false;
                     this.tasks_loaded = false;
                     this.relay_launching = false;
+                    this.review = None;
                     this.relay_model
                         .update(cx, |input, cx| input.set_value("", window, cx));
                     this.loading = false;

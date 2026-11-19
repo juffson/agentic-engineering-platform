@@ -608,6 +608,7 @@ fn studio_relay(args: &Args) -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let ws = handoff_fixture::prepare(fixture.path(), Clients::Fixture)?;
     let runner = handoff_fixture::studio_runner(fixture.path())?;
+    git(&ws.root, &["push", "origin", "HEAD:refs/heads/main"])?;
     let mut ui = Driver::open_with_runner(&ws, args, runner.clone())?;
     let result = (|| {
         ui.click("两轮接力")?;
@@ -652,7 +653,7 @@ fn studio_relay(args: &Args) -> Result<()> {
             .as_i64()
             .context("first question")?;
 
-        let mut ui = Driver::open_with_runner(&ws, args, runner)?;
+        ui = Driver::open_with_runner(&ws, args, runner)?;
         ui.click("两轮接力")?;
         ui.click(id)?;
         ensure!(
@@ -723,12 +724,123 @@ fn studio_relay(args: &Args) -> Result<()> {
                 .visible(),
             "first run evidence no longer links to its question"
         );
+        verify_publication(&mut ui, &ws, fixture.path(), second, &second_run)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = ui.checkpoint("failure");
     }
     result
+}
+
+fn verify_publication(
+    ui: &mut Driver,
+    ws: &Workspace,
+    fixture: &Path,
+    second: &str,
+    record: &Value,
+) -> Result<()> {
+    let reference = format!("refs/heads/aep/pr/handoff/{second}");
+    ui.click("两轮接力")?;
+    ui.reveal("relay-detail", "open-human-review")?;
+    ui.click("open-human-review")?;
+    ensure!(
+        ui.element("review-content")?
+            .label()
+            .is_some_and(|s| { s.contains("diff --git a/normalize.rs") && s.contains("* 1000") }),
+        "final review did not show the candidate diff"
+    );
+    ui.click("review-checks")?;
+    ensure!(
+        ui.element("review-content")?
+            .label()
+            .is_some_and(|s| s.contains("test result: ok")),
+        "final review did not show the acceptance log"
+    );
+    ui.click("review-report")?;
+    ensure!(
+        ui.element("review-content")?.label() == Some("Reviewed and verified the conversion.\n"),
+        "final review did not show Claude's report"
+    );
+    ui.click("review-diff")?;
+    ensure!(
+        ui.absent("publish-confirmed")?
+            && git(&ws.root, &["ls-remote", "--refs", "origin", &reference])?.is_empty()
+            && !fixture.join("pr-posts").exists(),
+        "opening final review mutated GitHub"
+    );
+    ui.checkpoint("studio-review-ready")?;
+
+    git(
+        &ws.root,
+        &["commit", "--allow-empty", "-m", "Advance target"],
+    )?;
+    git(&ws.root, &["push", "origin", "HEAD:refs/heads/main"])?;
+    ui.click("acknowledge-review")?;
+    ui.click("publish-confirmed")?;
+    ensure!(
+        ui.element("publish-error")?
+            .label()
+            .is_some_and(|s| s.contains("目标分支已更新"))
+            && git(&ws.root, &["ls-remote", "--refs", "origin", &reference])?.is_empty(),
+        "the stale review pushed a candidate"
+    );
+
+    ui.click("refresh-human-review")?;
+    ensure!(
+        ui.absent("publish-confirmed")?,
+        "reloaded review reused stale confirmation"
+    );
+    let fail = fixture.join("bin/fail-pr");
+    fs::write(&fail, [])?;
+    ui.click("acknowledge-review")?;
+    ui.click("publish-confirmed")?;
+    ensure!(
+        ui.element("publish-receipt-error")?
+            .label()
+            .is_some_and(|s| s.contains("simulated GitHub outage")),
+        "PR creation failure was not displayed"
+    );
+    let publication = ws.data.join("runs").join(second).join("publication.json");
+    let pushed = aep::workspace::read(&publication)?;
+    ensure!(
+        pushed["pushed"] == true && pushed["pr"].is_null(),
+        "partial publication was not saved"
+    );
+    fs::remove_file(fail)?;
+    ui.click("back-to-relay")?;
+    ui.reveal("relay-detail", "open-human-review")?;
+    ui.click("open-human-review")?;
+    ensure!(
+        ui.absent("publish-confirmed")?,
+        "reopening the review bypassed human confirmation"
+    );
+    ui.click("acknowledge-review")?;
+    ui.click("publish-confirmed")?;
+    ensure!(
+        ui.element("open-created-pr")?.visible(),
+        "created PR link is missing"
+    );
+    let saved = aep::workspace::read(&publication)?;
+    ensure!(
+        saved["pr"]["number"] == 17
+            && saved["pr"]["head_sha"] == record["candidate_sha"]
+            && saved["confirmed_by"] == "aep-reviewer"
+            && saved["error"].is_null()
+            && status(&ws.data, second)? == *record,
+        "the saved PR does not match the confirmed run"
+    );
+    ui.checkpoint("studio-review-published")?;
+    ui.click("back-to-relay")?;
+    ui.reveal("relay-detail", "open-human-review")?;
+    ui.click("open-human-review")?;
+    ensure!(
+        ui.element("open-created-pr")?.visible()
+            && ui.absent("publish-confirmed")?
+            && fs::read_to_string(fixture.join("pr-posts"))? == "POST\nPOST\n",
+        "reopening the published run tried to create another PR"
+    );
+    Ok(())
 }
 
 #[derive(Debug, serde::Deserialize)]

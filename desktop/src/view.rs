@@ -1,4 +1,5 @@
 pub(crate) mod editor;
+pub(crate) mod human_review;
 mod relay_page;
 use super::*;
 use aep::studio::Run;
@@ -540,6 +541,9 @@ impl Render for Studio {
         }
         if self.page == Page::Relay {
             return self.relay_page(cx);
+        }
+        if self.page == Page::Review {
+            return self.human_review_page(cx);
         }
         let runs = &self.snapshot.runs;
         let notes = &self.snapshot.notes;

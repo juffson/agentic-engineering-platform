@@ -178,6 +178,10 @@ fn folder(ws: &Workspace, id: &str) -> Result<PathBuf> {
     Ok(ws.data.join("relays").join(id))
 }
 
+pub(crate) fn load_one(ws: &Workspace, id: &str) -> Result<Relay> {
+    read_relay(ws, &folder(ws, id)?)
+}
+
 fn read_relay(ws: &Workspace, path: &Path) -> Result<Relay> {
     let file = File::open(path.join("relay.json"))?;
     let mut relay: Relay = serde_json::from_reader(file)?;
@@ -412,7 +416,7 @@ fn launch(
 }
 
 impl Runner {
-    fn path(&self) -> Result<std::ffi::OsString> {
+    pub(crate) fn path(&self) -> Result<std::ffi::OsString> {
         let original = env::var_os("PATH").unwrap_or_default();
         let home = env::home_dir()
             .into_iter()
