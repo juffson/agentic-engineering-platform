@@ -401,7 +401,12 @@ impl Studio {
         let questions = relay.questions(&self.snapshot);
         let decisions = relay.decisions(&self.snapshot);
         let mut card = panel().child(heading("交接决策"));
-        if self.lifecycle.is_some() && questions.is_empty() {
+        if self
+            .lifecycle
+            .as_ref()
+            .is_some_and(|session| !session.real_task)
+            && questions.is_empty()
+        {
             return card.child(t(
                 "第一轮没有写入未决问题。可查看本轮证据，或从原仓库启动新的隔离测试。",
                 RED,

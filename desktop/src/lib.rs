@@ -81,6 +81,8 @@ struct Studio {
     pull_request: Option<view::github_page::State>,
     lifecycle: Option<lifecycle::Fixture>,
     lifecycle_preparing: bool,
+    lifecycle_loading: bool,
+    lifecycle_choices: Option<lifecycle::Choices>,
     lifecycle_packaging: bool,
     lifecycle_error: Option<String>,
     lifecycle_doc: Option<PathBuf>,
@@ -132,6 +134,8 @@ impl Studio {
             pull_request: None,
             lifecycle,
             lifecycle_preparing: false,
+            lifecycle_loading: false,
+            lifecycle_choices: None,
             lifecycle_packaging: false,
             lifecycle_error: None,
             lifecycle_doc: None,
@@ -181,6 +185,11 @@ impl Studio {
         if self.lifecycle_preparing || self.lifecycle_packaging {
             return;
         }
+        let page = if self.page == Page::Lifecycle {
+            Page::Lifecycle
+        } else {
+            Page::Runs
+        };
         let dialog = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -198,7 +207,7 @@ impl Studio {
             .await;
             let _ = this.update_in(cx, |this, window, cx| match selection {
                 Ok(None) => (),
-                Ok(Some(ws)) => this.set_workspace(ws, Page::Runs, window, cx),
+                Ok(Some(ws)) => this.set_workspace(ws, page, window, cx),
                 Err(error) => {
                     this.repo_error = Some(format!("打开仓库失败：{error:#}"));
                     cx.notify();
@@ -219,6 +228,9 @@ impl Studio {
         self.lifecycle = lifecycle::load(&ws);
         self.lifecycle_doc = None;
         self.lifecycle_error = None;
+        self.lifecycle_preparing = false;
+        self.lifecycle_loading = false;
+        self.lifecycle_choices = None;
         self.lifecycle_shots.clear();
         self.workspace = Some(ws);
         self.snapshot = Snapshot::default();
@@ -254,6 +266,9 @@ impl Studio {
             if !self.tasks_loaded {
                 self.load_relay_tasks(cx);
             }
+        }
+        if page == Page::Lifecycle && self.lifecycle_choices.is_none() {
+            self.load_lifecycle_choices(cx);
         }
         cx.notify();
     }
