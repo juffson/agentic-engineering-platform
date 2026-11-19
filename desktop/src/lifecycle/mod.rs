@@ -1,3 +1,4 @@
+pub(crate) mod catalog;
 mod github;
 use aep::workspace::{Workspace, git, read};
 use anyhow::{Context, Result, ensure};
@@ -53,6 +54,7 @@ pub fn archive(root: &Path, out: &Path) -> Result<()> {
         ("failure.txt", "Failure"),
         ("relay-verification.json", "Relay and memory reads"),
         ("reviewed.diff", "Reviewed diff"),
+        ("github-progress.json", "Last recorded GitHub status"),
         ("github-ci.json", "GitHub checks"),
         ("github-actions.json", "GitHub Actions jobs"),
         ("github-acceptance.log", "GitHub acceptance log"),
@@ -429,6 +431,23 @@ impl Fixture {
 
 pub(crate) fn output(ws: &Workspace) -> Option<PathBuf> {
     Some(root(ws)?.join("evidence"))
+}
+
+pub(crate) fn record_failure<T>(ws: &Workspace, name: &str, result: Result<T>) -> Result<T> {
+    if load(ws).is_some()
+        && let Some(dir) = output(ws)
+    {
+        let path = dir.join(name);
+        match &result {
+            Ok(_) => {
+                let _ = fs::remove_file(path);
+            }
+            Err(error) => {
+                let _ = fs::write(path, format!("{error:#}\n"));
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]

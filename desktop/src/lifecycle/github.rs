@@ -33,12 +33,13 @@ pub struct Fixture {
     pub actor: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Branch {
     pub name: String,
     pub sha: String,
 }
 
+#[derive(Deserialize, Serialize)]
 pub(crate) struct Draft {
     pub name: String,
     pub spec: String,
@@ -91,6 +92,7 @@ impl Draft {
     }
 }
 
+#[derive(Deserialize, Serialize)]
 pub(crate) enum Plan {
     Synthetic,
     Existing(relay::Task, Branch),

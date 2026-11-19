@@ -2,6 +2,7 @@ mod cleanup;
 mod github_pr;
 pub mod lifecycle;
 mod publish;
+mod recent;
 mod relay;
 mod view;
 pub use relay::Runner;
@@ -77,6 +78,7 @@ struct Studio {
     relay_launching: bool,
     relay_polling: bool,
     workspace_generation: u64,
+    remember_repository: bool,
     review: Option<view::human_review::State>,
     pull_request: Option<view::github_page::State>,
     lifecycle: Option<lifecycle::Fixture>,
@@ -88,12 +90,16 @@ struct Studio {
     lifecycle_error: Option<String>,
     lifecycle_doc: Option<PathBuf>,
     lifecycle_shots: HashSet<&'static str>,
+    task_sessions: Vec<lifecycle::catalog::Entry>,
+    task_sessions_loading: bool,
+    task_sessions_error: Option<String>,
 }
 
 impl Studio {
     fn new(
         workspace: Option<Workspace>,
         runner: Runner,
+        remember_repository: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -131,6 +137,7 @@ impl Studio {
             relay_launching: false,
             relay_polling: false,
             workspace_generation: 0,
+            remember_repository,
             review: None,
             pull_request: None,
             lifecycle,
@@ -142,7 +149,14 @@ impl Studio {
             lifecycle_error: None,
             lifecycle_doc: None,
             lifecycle_shots: HashSet::new(),
+            task_sessions: Vec::new(),
+            task_sessions_loading: false,
+            task_sessions_error: None,
         };
+        if studio.remember_repository && studio.workspace.is_some() {
+            studio.remember_workspace();
+            studio.navigate(Page::Lifecycle, window, cx);
+        }
         studio.reload(cx);
         studio
     }
@@ -235,12 +249,18 @@ impl Studio {
         self.lifecycle_loading = false;
         self.lifecycle_choices = None;
         self.lifecycle_shots.clear();
+        self.task_sessions.clear();
+        self.task_sessions_loading = false;
+        self.task_sessions_error = None;
         self.workspace = Some(ws);
         self.snapshot = Snapshot::default();
         self.editor = None;
         self.run = None;
         self.note = None;
         self.repo_error = None;
+        if self.remember_repository {
+            self.remember_workspace();
+        }
         self.relays.clear();
         self.relay_id = None;
         self.relay_tasks.clear();
@@ -258,6 +278,18 @@ impl Studio {
         self.reload(cx);
     }
 
+    fn remember_workspace(&mut self) {
+        if let Some(ws) = &self.workspace {
+            let path = self
+                .lifecycle
+                .as_ref()
+                .map_or(&ws.root, |fixture| &fixture.source);
+            if let Err(error) = recent::remember(path) {
+                self.repo_error = Some(format!("保存上次仓库失败：{error:#}"));
+            }
+        }
+    }
+
     fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         self.page = page;
         self.filter = Filter::All;
@@ -272,6 +304,9 @@ impl Studio {
         }
         if page == Page::Lifecycle && self.lifecycle_choices.is_none() {
             self.load_lifecycle_choices(cx);
+        }
+        if page == Page::Lifecycle {
+            self.load_task_sessions(cx);
         }
         cx.notify();
     }
@@ -422,7 +457,10 @@ pub fn open_studio(
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
-    open_studio_with_runner(ws, Runner::default(), options, cx)
+    let ws = ws
+        .or_else(recent::restore)
+        .or_else(|| Workspace::open(std::path::Path::new(".")).ok());
+    open_window(ws, Runner::default(), true, options, cx)
 }
 
 pub fn open_studio_with_runner(
@@ -431,9 +469,19 @@ pub fn open_studio_with_runner(
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
+    open_window(ws, runner, false, options, cx)
+}
+
+fn open_window(
+    ws: Option<Workspace>,
+    runner: Runner,
+    remember_repository: bool,
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
     let (window, _) = gpui_kit::open_window(options, cx, move |window, cx| {
         window.set_window_title("AEP Studio");
-        cx.new(|cx| Studio::new(ws, runner, window, cx))
+        cx.new(|cx| Studio::new(ws, runner, remember_repository, window, cx))
     })?;
     Ok(window)
 }

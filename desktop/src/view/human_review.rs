@@ -1,5 +1,8 @@
 use super::*;
-use crate::publish::{self, Review};
+use crate::{
+    lifecycle,
+    publish::{self, Review},
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -186,10 +189,13 @@ impl Studio {
         let generation = self.workspace_generation;
         let lifecycle = self.lifecycle.clone();
         let job = cx.background_executor().spawn(async move {
-            if let Some(test) = lifecycle {
-                test.guard(&target)?;
-            }
-            publish::publish(&ws, &runner, target)
+            let result = (|| {
+                if let Some(test) = lifecycle {
+                    test.guard(&target)?;
+                }
+                publish::publish(&ws, &runner, target)
+            })();
+            lifecycle::record_failure(&ws, "publish-error.txt", result)
         });
         cx.spawn(async move |this, cx| {
             let result = job.await;

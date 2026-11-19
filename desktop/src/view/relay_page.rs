@@ -1,17 +1,6 @@
 use super::*;
 use crate::relay::{self, Relay, Round};
 
-fn phase(name: &str) -> &str {
-    match name {
-        "preparing" => "准备工作区",
-        "implementing" => "Codex 实现",
-        "checking" => "运行验收",
-        "reviewing" => "Claude 审查",
-        "complete" => "等待人工审查",
-        _ => "启动执行器",
-    }
-}
-
 impl Studio {
     pub(super) fn relay_page(&self, cx: &Context<Self>) -> Div {
         let picked = self
@@ -255,7 +244,10 @@ impl Studio {
             Some("awaiting_human_review") => ("验收和审查已完成，待人工审查", MINT),
             Some("failed") => ("运行失败", RED),
             Some("needs_reconciliation") => ("运行中断，需核对", RED),
-            Some("running" | "initializing") => (phase(run.map_or("", |r| r.text("phase"))), MINT),
+            Some("running" | "initializing") => (
+                relay::phase_label(run.map_or("", |r| r.text("phase"))),
+                MINT,
+            ),
             _ if relay.busy => ("准备派发版本并启动执行器", MINT),
             _ => ("启动失败或已中断", RED),
         };
@@ -299,7 +291,11 @@ impl Studio {
             }
         }
         if let Some(run) = run {
-            let error = run.text("error");
+            let detail = self
+                .workspace
+                .as_ref()
+                .and_then(|ws| relay::implementation_failure(ws, run));
+            let error = detail.as_deref().unwrap_or_else(|| run.text("error"));
             if !error.is_empty() {
                 card = card.child(
                     detail_text(SharedString::from(format!("relay-{key}-failure")), error)

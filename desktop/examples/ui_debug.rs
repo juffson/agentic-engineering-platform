@@ -912,6 +912,14 @@ fn verify_github_merge(
         "missing GitHub annotation or failure log"
     );
     ui.checkpoint("studio-github-ci-failed")?;
+    ui.reveal("github-merge-card", "github-retry-checks")?;
+    ui.click("github-retry-checks")?;
+    ensure!(
+        fs::read_to_string(fixture.join("ci-reruns"))? == "rerun\n"
+            && ui.element("github-merge-blocker")?.label() == Some("GitHub 检查仍在运行")
+            && ui.absent("github-confirm-merge")?,
+        "retry did not submit the saved candidate's failed Actions run"
+    );
     ui.click("github-review-tab")?;
     ensure!(
         ui.element("github-note-0")?.label() == Some("Please keep the overflow regression test.")

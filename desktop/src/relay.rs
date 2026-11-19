@@ -1,5 +1,5 @@
 use aep::{
-    studio::{Run, Snapshot},
+    studio::{Artifact, Run, Snapshot, preview},
     workspace::{Workspace, commit, ident, status},
 };
 use anyhow::{Context, Result, ensure};
@@ -26,10 +26,21 @@ pub(crate) struct Task {
     pub sha: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Round {
     First,
     Second,
+}
+
+pub(crate) fn phase_label(name: &str) -> &'static str {
+    match name {
+        "preparing" => "准备工作区",
+        "implementing" => "Codex 实现",
+        "checking" => "运行验收",
+        "reviewing" => "Claude 审查",
+        "complete" => "等待人工审查",
+        _ => "启动执行器",
+    }
 }
 impl Round {
     fn suffix(self) -> &'static str {
@@ -164,6 +175,35 @@ pub(crate) fn passed(run: Option<&Run>) -> bool {
             && run.record["check_exit_code"] == 0
             && run.text("review_status") == "findings_recorded"
     })
+}
+
+pub(crate) fn implementation_failure(ws: &Workspace, run: &Run) -> Option<String> {
+    if run.text("phase") != "implementing" || run.text("status") != "failed" {
+        return None;
+    }
+    let log = preview(&ws.data, &run.id, Artifact::Implementation).ok()??;
+    for line in log.text.lines().rev() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let text = match event["type"].as_str() {
+            Some("turn.failed") => event["error"]["message"].as_str(),
+            Some("error") => event["message"].as_str(),
+            _ => None,
+        };
+        if let Some(text) = text {
+            let decoded = serde_json::from_str::<Value>(text).ok();
+            let text = decoded
+                .as_ref()
+                .and_then(|value| value["error"]["message"].as_str())
+                .unwrap_or(text);
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(text.chars().take(500).collect());
+            }
+        }
+    }
+    None
 }
 
 fn git_quiet(ws: &Workspace, args: &[&str]) -> Result<String> {
@@ -301,7 +341,7 @@ pub(crate) fn start(
 ) -> Result<()> {
     let path = folder(ws, &id)?;
     fs::create_dir_all(&path)?;
-    let _lock = lock(&path)?;
+    let owner = lock(&path)?;
     ensure!(!path.join("relay.json").exists(), "此接力已存在");
     let mut relay = Relay {
         id,
@@ -310,7 +350,7 @@ pub(crate) fn start(
         attempts: Vec::new(),
         busy: false,
     };
-    launch(ws, runner, &path, &mut relay, Round::First, None, None)
+    launch(ws, runner, &owner, &mut relay, Round::First, None, None)
 }
 
 pub(crate) fn advance(
@@ -322,7 +362,7 @@ pub(crate) fn advance(
     model: String,
 ) -> Result<()> {
     let path = folder(ws, id)?;
-    let _lock = lock(&path)?;
+    let owner = lock(&path)?;
     let mut relay: Relay = serde_json::from_reader(File::open(path.join("relay.json"))?)?;
     let snapshot = Snapshot::load(ws);
     ensure!(!relay.active(&snapshot), "此接力正在执行");
@@ -351,7 +391,7 @@ pub(crate) fn advance(
     launch(
         ws,
         runner,
-        &path,
+        &owner,
         &mut relay,
         round,
         decision,
@@ -362,12 +402,13 @@ pub(crate) fn advance(
 fn launch(
     ws: &Workspace,
     runner: &Runner,
-    path: &Path,
+    owner: &File,
     relay: &mut Relay,
     round: Round,
     decision: Option<i64>,
     resume: Option<&str>,
 ) -> Result<()> {
+    let path = folder(ws, &relay.id)?;
     let run_id = format!(
         "{}-{}-{}",
         relay.id,
@@ -383,7 +424,7 @@ fn launch(
         merge: None,
         cleanup: None,
     });
-    save(path, relay)?;
+    save(&path, relay)?;
     let mut log = File::create(path.join(format!("{run_id}.log")))?;
     let result = (|| {
         if round == Round::First {
@@ -421,7 +462,8 @@ fn launch(
             .env("PATH", runner.path()?)
             .env("GIT_TERMINAL_PROMPT", "0")
             .process_group(0)
-            .stdin(Stdio::null())
+            // AEP does not read stdin. Keep the relay lease in the child if Studio exits.
+            .stdin(Stdio::from(owner.try_clone()?))
             .stdout(log.try_clone()?)
             .stderr(log.try_clone()?);
         if !relay.model.is_empty() {
@@ -483,5 +525,37 @@ impl Runner {
             .map(|path| path.join("aep"))
             .find(|path| path.is_file())
             .context("找不到 AEP 执行器。请使用打包版 Studio，或设置 AEP_STUDIO_RUNNER")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn executor_holds_the_relay_lease_after_studio_drops_it() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = lock(dir.path())?;
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "echo ready; while [ ! -f finish ]; do sleep 0.01; done",
+            ])
+            .current_dir(dir.path())
+            .stdin(Stdio::from(owner.try_clone()?))
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let mut child = child;
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().context("child stdout")?).read_line(&mut ready)?;
+        drop(owner);
+        let held = lock(dir.path()).is_err();
+        File::create(dir.path().join("finish"))?;
+        assert!(child.wait()?.success());
+        assert_eq!(ready.trim(), "ready");
+        assert!(held, "the child released the relay lease too early");
+        assert!(lock(dir.path()).is_ok());
+        Ok(())
     }
 }
