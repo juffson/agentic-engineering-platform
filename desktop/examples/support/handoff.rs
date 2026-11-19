@@ -102,8 +102,7 @@ fn aep(root: &Path, clients: Clients<'_>, id: &str, args: &[&str]) -> Result<()>
         .arg(&manifest)
         .args(["--bin", "aep", "--", "--repo"])
         .arg(root.join("repo"))
-        .args(args)
-        .env("TMPDIR", root);
+        .args(args);
     if matches!(clients, Clients::Fixture) {
         let original_path = env::var_os("PATH").unwrap_or_default();
         let path = env::join_paths(
@@ -111,6 +110,7 @@ fn aep(root: &Path, clients: Clients<'_>, id: &str, args: &[&str]) -> Result<()>
         )?;
         command
             .env("PATH", path)
+            .env("TMPDIR", root)
             .env("AEP_FIXTURE_RUN", id)
             .env("AEP_FIXTURE_QUESTION", QUESTION)
             .env("AEP_FIXTURE_DECISION", DECISION);

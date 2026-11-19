@@ -385,6 +385,77 @@ echo '{"structured_output":{"note":"seen revision","question":"","report":"revie
     assert!(!ctx.contains("log-only-canary"));
 }
 #[test]
+fn failed_checks_and_invalid_handoffs_stay_out_of_shared_context() {
+    let f = Fixture::new(&["grep", "-qx", "ok", "result.txt"]);
+    f.script(
+        "claude",
+        r#"prompt=$(cat)
+case "$prompt" in *"verified-handoff"*) ;; *) exit 1;; esac
+case "$prompt" in *"failed-run-question"*|*"invalid-handoff"*) exit 1;; esac
+echo '{"structured_output":{"note":"verified-review","question":"","report":"review"}}'"#,
+    );
+    for (id, source, handoff, check_exit) in [
+        (
+            "failed-check",
+            "wrong",
+            r#"{"note":"failed-handoff","question":"failed-run-question"}"#,
+            1,
+        ),
+        (
+            "invalid-handoff",
+            "ok",
+            r#"{"note":"invalid-handoff","question":42}"#,
+            0,
+        ),
+        (
+            "next-run",
+            "ok",
+            r#"{"note":"verified-handoff","question":""}"#,
+            0,
+        ),
+    ] {
+        f.script(
+            "codex",
+            &format!(
+                r#"prompt=$(cat)
+case "$prompt" in *"failed-run-question"*|*"invalid-handoff"*) exit 1;; esac
+while [ "$1" != --output-last-message ]; do shift; done
+printf '%s' '{handoff}' > "$2"
+printf '%s\n' '{source}' > result.txt"#
+            ),
+        );
+        let output = f.call(&[
+            "run",
+            "--task",
+            "sample",
+            "--implementer",
+            "codex",
+            "--reviewer",
+            "claude",
+            "--shared-memory",
+            "--run-id",
+            id,
+        ]);
+        let record = f.state(id);
+        assert_eq!(record["check_exit_code"], check_exit);
+        if id == "next-run" {
+            ok(output);
+            let handoff = &record["memory_outputs"]["implementer"][0];
+            assert!(handoff.is_number());
+            assert_eq!(record["memory_inputs"]["reviewer"], json!([handoff]));
+            assert_eq!(record["review_status"], "findings_recorded");
+        } else {
+            assert!(!output.status.success());
+            assert_eq!(record["status"], "failed");
+            assert_eq!(record["memory_outputs"], json!({}));
+            assert!(record["memory_inputs"]["reviewer"].is_null());
+            let ws = aep::workspace::Workspace::open(&f.repo).unwrap();
+            assert!(aep::studio::Snapshot::load(&ws).notes.is_empty());
+        }
+    }
+}
+
+#[test]
 fn plain_adapters_do_not_open_a_memory_database() {
     let f = Fixture::new(&["grep", "-qx", "ok", "result.txt"]);
     f.script("codex", "cat >/dev/null; printf ok >result.txt");

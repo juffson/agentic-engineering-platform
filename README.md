@@ -76,7 +76,7 @@ Codex 在独立 Worktree 生成候选提交。Claude 接收该版本的 Spec 和
 
 ### 两个 Agent 如何共享记忆
 
-在一次执行中加上 `--shared-memory`，Codex 会收到相关工程约定，完成修改后留下一条交接摘要和可选的未决问题。Claude 在检查通过后读取同一候选提交的摘要，再写下自己的审查摘要。独立 Run 或关联 Worktree 也可以读取适用的记录。
+在一次执行中加上 `--shared-memory`，Codex 会收到相关工程约定，完成修改后产出交接摘要和可选的未决问题。候选提交验收通过后才会发布这两条内容。Claude 随后读取同一候选提交的摘要，再写下自己的审查摘要。验收失败时，可在该 Run 的证据目录里查看原始交接。独立 Run 或关联 Worktree 也可以读取适用的已发布记录。
 
 ```sh
 base=$(git rev-parse origin/aep-task/market-volume-dedup-rust)
@@ -138,7 +138,14 @@ cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
   --live-relay --codex-model gpt-6.1-sol --output-dir desktop/target/live-relay
 ```
 
-每次运行会为合成 Rust 任务创建临时 Git 仓库，并在指定目录下创建新的 `live-relay-*` 子目录。Studio 将第一轮的问题修订为带唯一标识的决策。命令会核对第二轮实现和审查的输入 ID、两个客户端对该标识的确认，以及两个版本的 Studio 读取记录。成功结果包括 `verification.json`、两轮 Run 的证据和报告、`studio-revision.png` 及新旧版本的截图。失败会返回非零退出码，保留已有证据与截图，并在 `failure.txt` 中记录临时仓库路径。
+每次运行会在指定目录下创建新的 `live-relay-*` 子目录。Studio 将第一轮的问题修订为带唯一标识的决策。命令会核对第二轮实现和审查的输入 ID、两个客户端对该标识的确认，以及两个版本的 Studio 读取记录。成功结果包括 `verification.json`、两轮 Run 的证据和报告、`studio-revision.png` 及新旧版本的截图。失败会返回非零退出码，保留已有证据与截图，并将原因写入 `failure.txt`。
+
+结果目录里的 `workspace/repo` 保存了合成 Git 仓库、两个候选提交、SQLite 记忆和原始 Run 证据。可在 Studio 点「打开仓库」选择这个目录，继续查看两轮证据。终端会打印完整路径，也可传给以下命令。
+
+```sh
+cargo run --locked --manifest-path desktop/Cargo.toml -- \
+  --repo /path/to/live-relay-result/workspace/repo
+```
 
 已在本机用模型客户端跑完一次交接时，可以验证那次运行的界面。将 `--run-id` 改为实际运行 ID。
 
