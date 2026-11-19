@@ -40,6 +40,21 @@ pub(crate) struct State {
 }
 
 impl State {
+    pub(super) fn checkpoint(&self) -> Option<&'static str> {
+        let review = self.review.as_ref()?;
+        if review.publication.as_ref().is_some_and(|p| p.pr.is_some()) {
+            return Some("10-pr-created");
+        }
+        if self.confirmed {
+            return Some("09-publish-confirmed");
+        }
+        Some(match self.tab {
+            Tab::Diff => "06-final-diff",
+            Tab::Checks => "07-acceptance",
+            Tab::Report => "08-claude-review",
+        })
+    }
+
     fn target_current(&self, cx: &App) -> bool {
         self.target_branch.read(cx).value().trim() == self.loaded_for
     }
@@ -58,8 +73,16 @@ impl Studio {
             self.load_human_review(cx);
             return;
         }
-        let target_branch =
-            cx.new(|cx| InputState::new(window, cx).placeholder("留空使用 GitHub 默认分支"));
+        let base = self
+            .lifecycle
+            .as_ref()
+            .map(|test| test.base.clone())
+            .unwrap_or_default();
+        let target_branch = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("留空使用 GitHub 默认分支")
+                .default_value(base)
+        });
         let target_subscription =
             cx.subscribe(&target_branch, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change)
@@ -107,9 +130,14 @@ impl Studio {
         let runner = self.runner.clone();
         let generation = self.workspace_generation;
         let requested_run = run.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { publish::prepare(&ws, &runner, &relay, &run, &target_branch) });
+        let lifecycle = self.lifecycle.clone();
+        let task = cx.background_executor().spawn(async move {
+            let review = publish::prepare(&ws, &runner, &relay, &run, &target_branch)?;
+            if let Some(test) = lifecycle {
+                test.review(&ws, &review.target)?;
+            }
+            Ok::<_, anyhow::Error>(review)
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -156,9 +184,13 @@ impl Studio {
         let target = review.target.clone();
         let requested_run = target.run.clone();
         let generation = self.workspace_generation;
-        let job = cx
-            .background_executor()
-            .spawn(async move { publish::publish(&ws, &runner, target) });
+        let lifecycle = self.lifecycle.clone();
+        let job = cx.background_executor().spawn(async move {
+            if let Some(test) = lifecycle {
+                test.guard(&target)?;
+            }
+            publish::publish(&ws, &runner, target)
+        });
         cx.spawn(async move |this, cx| {
             let result = job.await;
             let _ = this.update(cx, |this, cx| {
@@ -215,11 +247,12 @@ impl Studio {
         let Some(state) = &self.review else {
             return main;
         };
-        if state
-            .review
-            .as_ref()
-            .and_then(|review| review.publication.as_ref())
-            .is_none_or(|publication| publication.pr.is_none())
+        if self.lifecycle.is_none()
+            && state
+                .review
+                .as_ref()
+                .and_then(|review| review.publication.as_ref())
+                .is_none_or(|publication| publication.pr.is_none())
         {
             main = main.child(
                 h_flex()

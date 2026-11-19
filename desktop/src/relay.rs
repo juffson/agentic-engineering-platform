@@ -464,7 +464,7 @@ impl Runner {
         )?)
     }
 
-    fn binary(&self) -> Result<PathBuf> {
+    pub(crate) fn binary(&self) -> Result<PathBuf> {
         if let Some(binary) = &self.binary {
             return Ok(binary.clone());
         }

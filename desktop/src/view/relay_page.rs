@@ -55,7 +55,8 @@ impl Studio {
         if self.relay_tasks.is_empty() && !self.tasks_loading {
             list = list.child(caption("可从 origin 上已派发的任务发起接力。"));
         }
-        for task in &self.relay_tasks {
+        let completed_setup = self.lifecycle.is_some() && !self.relays.is_empty();
+        for task in self.relay_tasks.iter().filter(|_| !completed_setup) {
             let name = task.name.clone();
             list = list.child(
                 item(
@@ -400,6 +401,12 @@ impl Studio {
         let questions = relay.questions(&self.snapshot);
         let decisions = relay.decisions(&self.snapshot);
         let mut card = panel().child(heading("交接决策"));
+        if self.lifecycle.is_some() && questions.is_empty() {
+            return card.child(t(
+                "第一轮没有写入未决问题。可查看本轮证据，或从原仓库启动新的隔离测试。",
+                RED,
+            ));
+        }
         if questions.is_empty() {
             let run = relay
                 .latest(Round::First)

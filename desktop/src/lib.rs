@@ -1,5 +1,6 @@
 mod cleanup;
 mod github_pr;
+pub mod lifecycle;
 mod publish;
 mod relay;
 mod view;
@@ -18,7 +19,7 @@ use gpui_kit::{
     *,
 };
 use serde_json::Value;
-use std::time::Duration;
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -27,6 +28,7 @@ enum Page {
     Relay,
     Review,
     PullRequest,
+    Lifecycle,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Filter {
@@ -77,6 +79,12 @@ struct Studio {
     workspace_generation: u64,
     review: Option<view::human_review::State>,
     pull_request: Option<view::github_page::State>,
+    lifecycle: Option<lifecycle::Fixture>,
+    lifecycle_preparing: bool,
+    lifecycle_packaging: bool,
+    lifecycle_error: Option<String>,
+    lifecycle_doc: Option<PathBuf>,
+    lifecycle_shots: HashSet<&'static str>,
 }
 
 impl Studio {
@@ -92,6 +100,7 @@ impl Studio {
                 cx.notify();
             }
         });
+        let lifecycle = workspace.as_ref().and_then(lifecycle::load);
         let mut studio = Self {
             editor: None,
             workspace,
@@ -121,6 +130,12 @@ impl Studio {
             workspace_generation: 0,
             review: None,
             pull_request: None,
+            lifecycle,
+            lifecycle_preparing: false,
+            lifecycle_packaging: false,
+            lifecycle_error: None,
+            lifecycle_doc: None,
+            lifecycle_shots: HashSet::new(),
         };
         studio.reload(cx);
         studio
@@ -163,6 +178,9 @@ impl Studio {
     }
 
     fn choose_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lifecycle_preparing || self.lifecycle_packaging {
+            return;
+        }
         let dialog = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -180,29 +198,7 @@ impl Studio {
             .await;
             let _ = this.update_in(cx, |this, window, cx| match selection {
                 Ok(None) => (),
-                Ok(Some(ws)) => {
-                    this.workspace_generation += 1;
-                    this.workspace = Some(ws);
-                    this.snapshot = Snapshot::default();
-                    this.run = None;
-                    this.note = None;
-                    this.repo_error = None;
-                    this.relays.clear();
-                    this.relay_id = None;
-                    this.relay_tasks.clear();
-                    this.relay_task = None;
-                    this.relay_error = None;
-                    this.tasks_loading = false;
-                    this.tasks_loaded = false;
-                    this.relay_launching = false;
-                    this.review = None;
-                    this.pull_request = None;
-                    this.relay_model
-                        .update(cx, |input, cx| input.set_value("", window, cx));
-                    this.loading = false;
-                    this.navigate(Page::Runs, window, cx);
-                    this.reload(cx);
-                }
+                Ok(Some(ws)) => this.set_workspace(ws, Page::Runs, window, cx),
                 Err(error) => {
                     this.repo_error = Some(format!("打开仓库失败：{error:#}"));
                     cx.notify();
@@ -210,6 +206,41 @@ impl Studio {
             });
         })
         .detach();
+    }
+
+    fn set_workspace(
+        &mut self,
+        ws: Workspace,
+        page: Page,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace_generation += 1;
+        self.lifecycle = lifecycle::load(&ws);
+        self.lifecycle_doc = None;
+        self.lifecycle_error = None;
+        self.lifecycle_shots.clear();
+        self.workspace = Some(ws);
+        self.snapshot = Snapshot::default();
+        self.editor = None;
+        self.run = None;
+        self.note = None;
+        self.repo_error = None;
+        self.relays.clear();
+        self.relay_id = None;
+        self.relay_tasks.clear();
+        self.relay_task = None;
+        self.relay_error = None;
+        self.tasks_loading = false;
+        self.tasks_loaded = false;
+        self.relay_launching = false;
+        self.review = None;
+        self.pull_request = None;
+        self.relay_model
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.loading = false;
+        self.navigate(page, window, cx);
+        self.reload(cx);
     }
 
     fn navigate(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
@@ -249,7 +280,12 @@ impl Studio {
                 this.tasks_loading = false;
                 this.tasks_loaded = true;
                 match result {
-                    Ok(tasks) => this.relay_tasks = tasks,
+                    Ok(mut tasks) => {
+                        if let Some(test) = &this.lifecycle {
+                            tasks.retain(|task| task.name == test.task && task.sha == test.spec);
+                        }
+                        this.relay_tasks = tasks;
+                    }
                     Err(error) => this.relay_error = Some(format!("读取派发任务失败：{error:#}")),
                 }
                 cx.notify();

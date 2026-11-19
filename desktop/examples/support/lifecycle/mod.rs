@@ -1,13 +1,13 @@
-mod github;
-
 use super::{Args, Driver, checked_run, handoff_fixture};
 use aep::{
     studio::Snapshot,
     workspace::{Workspace, commit, git, read, status},
 };
+use aep_studio::{
+    Runner,
+    lifecycle::{Fixture, archive, field, remote_ref, save},
+};
 use anyhow::{Context, Result, ensure};
-use github::{Fixture, command, remote_ref};
-use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -39,12 +39,13 @@ pub(super) fn run(mut args: Args) -> Result<()> {
     args.screenshots = true;
     let result = (|| {
         let binary = handoff_fixture::build_runner()?;
-        let (fixture, ws) = Fixture::prepare(&out, &root, &binary)?;
-        println!("Isolated GitHub target: {}/{}", fixture.repo, fixture.base);
-        let runner = aep_studio::Runner {
+        let runner = Runner {
             binary: Some(binary),
             client_bin: None,
         };
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let (fixture, ws) = Fixture::prepare(&out, &root, &source, &runner, false)?;
+        println!("Isolated GitHub target: {}/{}", fixture.repo, fixture.base);
         let mut ui = Driver::open_with_runner(&ws, &args, runner)?;
         let result = exercise(&mut ui, &ws, &fixture, &out, args.codex_model.as_deref());
         if result.is_err() {
@@ -490,83 +491,5 @@ fn confirm(message: &str, word: &str) -> Result<()> {
         prompt(&format!("Type {word} to confirm: "))? == word,
         "operator declined {word}"
     );
-    Ok(())
-}
-
-fn archive(root: &Path, out: &Path) -> Result<()> {
-    let repo = root.join("workspace/repo");
-    if repo.join(".git").is_dir() {
-        let ws = Workspace::open(&repo)?;
-        let runs = ws.data.join("runs");
-        if runs.is_dir() {
-            let ids = fs::read_dir(runs)?
-                .map(|entry| {
-                    let name = entry?.file_name();
-                    name.into_string()
-                        .map_err(|_| anyhow::anyhow!("invalid Run directory"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            handoff_fixture::export_runs(&ws, &out.join("runs"), ids.iter().map(String::as_str))?;
-        }
-        let relays = ws.data.join("relays");
-        if relays.is_dir() {
-            for entry in fs::read_dir(relays)? {
-                let source = entry?.path().join("relay.json");
-                if source.is_file() {
-                    fs::copy(source, out.join("relay.json"))?;
-                }
-            }
-        }
-        let memory = ws.data.join("memory.sqlite3");
-        if memory.is_file() {
-            fs::copy(memory, out.join("memory.sqlite3"))?;
-        }
-    }
-    let mut shots = fs::read_dir(out)?
-        .filter_map(|entry| {
-            let path = entry.ok()?.file_name().into_string().ok()?;
-            path.ends_with(".png").then_some(path)
-        })
-        .collect::<Vec<_>>();
-    shots.sort();
-    let mut index = String::from("# Studio live lifecycle evidence\n\n");
-    for (file, label) in [
-        ("verification.json", "Verification"),
-        ("failure.txt", "Failure"),
-        ("relay-verification.json", "Relay and memory reads"),
-        ("reviewed.diff", "Reviewed diff"),
-        ("github-ci.json", "GitHub checks"),
-        ("github-actions.json", "GitHub Actions jobs"),
-        ("github-acceptance.log", "GitHub acceptance log"),
-        ("github-merged.json", "GitHub merge"),
-        ("runs", "Execution evidence and Studio receipts"),
-    ] {
-        if out.join(file).exists() {
-            index.push_str(&format!("- [{label}]({file})\n"));
-        }
-    }
-    index.push_str("\n## Studio screenshots\n\n");
-    for file in shots {
-        index.push_str(&format!(
-            "- [{file}]({file}) · [controls]({}.json)\n",
-            file.trim_end_matches(".png")
-        ));
-    }
-    fs::write(out.join("index.md"), index)?;
-    command("tar", root, &["-czf", "evidence.tar.gz", "evidence"])?;
-    println!("Evidence index: {}", out.join("index.md").display());
-    Ok(())
-}
-
-fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
-    value[key]
-        .as_str()
-        .with_context(|| format!("missing {key}"))
-}
-
-fn save(out: &Path, name: &str, data: &impl Serialize) -> Result<()> {
-    let mut file = tempfile::NamedTempFile::new_in(out)?;
-    serde_json::to_writer_pretty(&mut file, data)?;
-    file.persist(out.join(name))?;
     Ok(())
 }
