@@ -43,9 +43,9 @@ impl Studio {
         cx.notify();
     }
 
-    fn start_lifecycle(
+    pub(super) fn start_lifecycle(
         &mut self,
-        selected: Option<(relay::Task, lifecycle::Branch)>,
+        plan: lifecycle::Plan,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -68,17 +68,8 @@ impl Studio {
                 .keep();
             let out = root.join("evidence");
             fs::create_dir(&out)?;
-            let result = match selected {
-                Some((task, branch)) => lifecycle::Fixture::prepare_task(
-                    &out,
-                    &root,
-                    &source.root,
-                    &runner,
-                    task,
-                    branch,
-                ),
-                None => lifecycle::Fixture::prepare(&out, &root, &source.root, &runner, true),
-            };
+            let result =
+                lifecycle::Fixture::prepare_studio(&out, &root, &source.root, &runner, plan);
             if let Err(error) = &result {
                 fs::write(out.join("failure.txt"), format!("{error:#}\n"))?;
             }
@@ -93,14 +84,56 @@ impl Studio {
                 this.lifecycle_preparing = false;
                 match result {
                     Ok((fixture, ws)) => {
-                        this.set_workspace(ws, Page::Relay, window, cx);
-                        this.relay_task = Some(fixture.task.clone());
-                        this.relay_tasks = vec![crate::relay::Task {
-                            name: fixture.task,
-                            sha: fixture.spec,
-                        }];
+                        if fixture.authored {
+                            this.set_workspace(ws, Page::Lifecycle, window, cx);
+                        } else {
+                            this.set_workspace(ws, Page::Relay, window, cx);
+                            this.relay_task = Some(fixture.task.clone());
+                            this.relay_tasks = vec![relay::Task {
+                                name: fixture.task,
+                                sha: fixture.spec,
+                            }];
+                        }
                     }
                     Err(error) => this.lifecycle_error = Some(format!("准备失败：{error:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn dispatch_and_start(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.lifecycle_preparing || self.relay_launching || !self.relays.is_empty() {
+            return;
+        }
+        let (Some(ws), Some(fixture)) = (self.workspace.clone(), self.lifecycle.clone()) else {
+            return;
+        };
+        let (runner, generation) = (self.runner.clone(), self.workspace_generation);
+        self.lifecycle_preparing = true;
+        self.lifecycle_error = None;
+        let task = relay::Task {
+            name: fixture.task.clone(),
+            sha: fixture.spec.clone(),
+        };
+        let dispatch = cx
+            .background_executor()
+            .spawn(async move { fixture.dispatch_authored(&ws, &runner) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = dispatch.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if generation != this.workspace_generation {
+                    return;
+                }
+                this.lifecycle_preparing = false;
+                match result {
+                    Ok(()) => {
+                        this.navigate(Page::Relay, window, cx);
+                        this.start_relay(task, cx);
+                    }
+                    Err(error) => this.lifecycle_error = Some(format!("派发失败：{error:#}")),
                 }
                 cx.notify();
             });
@@ -174,6 +207,13 @@ impl Studio {
                     .as_ref()
                     .and_then(github_page::State::checkpoint),
                 Page::Lifecycle if self.verified() => Some("14-completed"),
+                Page::Lifecycle
+                    if self.lifecycle.as_ref().is_some_and(|run| run.authored)
+                        && self.relays.is_empty()
+                        && !self.lifecycle_preparing =>
+                {
+                    Some("00-task-prepared")
+                }
                 _ => None,
             }
         };
@@ -232,47 +272,73 @@ impl Studio {
         if let Some(error) = &self.lifecycle_error {
             body = body.child(detail_text("lifecycle-error", error).text_color(rgb(RED)));
         }
-        if let Some(test) = &self.lifecycle {
+        if let (Some(authoring), Some(ws)) = (&self.task_authoring, &self.workspace) {
+            body = body.child(authoring.render(ws, self.lifecycle_preparing, cx));
+        } else if let Some(test) = &self.lifecycle {
             let ws = self.workspace.as_ref().unwrap();
             let root = lifecycle::root(ws).unwrap();
             let out = root.join("evidence");
             let archive = root.join("evidence.tar.gz");
             let complete = self.verified();
             let relay_id = self.relays.first().map(|relay| relay.id.clone());
+            let pending = test.authored && self.relays.is_empty() && !self.relay_launching;
+            let dispatched = out.join("dispatch.json").is_file();
             body = body.child(
                 panel()
                     .child(field("仓库", &test.repo))
                     .child(field("任务", &test.task))
                     .child(field("目标分支", &test.base))
+                    .when(pending, |card| {
+                        card.child(field("目标提交", &test.base_sha))
+                            .child(field("Spec SHA", &test.spec))
+                    })
                     .child(detail_text(
                         "lifecycle-status",
                         if complete {
                             "全流程已核验"
+                        } else if pending && dispatched {
+                            "已派发，等待启动第一轮"
+                        } else if pending {
+                            "已准备 Spec，待派发"
                         } else {
                             "进行中"
                         },
                     ))
+                    .when(pending, |card| {
+                        card.child(self.relay_model_input())
+                            .child(if self.lifecycle_preparing {
+                                caption("正在向 GitHub 派发…")
+                            } else {
+                                div().child(
+                                    button("dispatch-task-and-start", "派发并启动全流程", true)
+                                        .on_click(cx.listener(|this, _, w, cx| {
+                                            this.dispatch_and_start(w, cx)
+                                        })),
+                                )
+                            })
+                    })
                     .child(
                         h_flex()
                             .gap_2()
                             .flex_wrap()
-                            .child(
-                                button("lifecycle-open-relay", "查看接力与日志", true).on_click(
-                                    cx.listener(move |this, _, w, cx| {
-                                        this.relay_id = relay_id.clone();
-                                        if this.relay_id.is_none() {
-                                            this.relay_task = this
-                                                .lifecycle
-                                                .as_ref()
-                                                .map(|test| test.task.clone());
-                                        }
-                                        this.navigate(Page::Relay, w, cx);
-                                    }),
-                                ),
-                            )
+                            .when(!pending, |row| {
+                                row.child(
+                                    button("lifecycle-open-relay", "查看接力与日志", true)
+                                        .on_click(cx.listener(move |this, _, w, cx| {
+                                            this.relay_id = relay_id.clone();
+                                            if this.relay_id.is_none() {
+                                                this.relay_task = this
+                                                    .lifecycle
+                                                    .as_ref()
+                                                    .map(|test| test.task.clone());
+                                            }
+                                            this.navigate(Page::Relay, w, cx);
+                                        })),
+                                )
+                            })
                             .child(button("lifecycle-return", "返回原仓库", false).on_click(
                                 cx.listener(|this, _, w, cx| {
-                                    if this.lifecycle_packaging {
+                                    if this.lifecycle_packaging || this.lifecycle_preparing {
                                         return;
                                     }
                                     if let Some(test) = &this.lifecycle {
@@ -561,7 +627,14 @@ impl Studio {
                         form.child(
                             button("lifecycle-start-task", "启动真实任务", true).on_click(
                                 cx.listener(move |this, _, w, cx| {
-                                    this.start_lifecycle(Some(selected.clone()), w, cx)
+                                    this.start_lifecycle(
+                                        lifecycle::Plan::Existing(
+                                            selected.0.clone(),
+                                            selected.1.clone(),
+                                        ),
+                                        w,
+                                        cx,
+                                    )
                                 }),
                             ),
                         )
@@ -570,13 +643,22 @@ impl Studio {
             if choices.tasks.is_empty() {
                 form = form.child(caption("仓库暂无已派发任务。"));
             }
+            if let Some(branch) = &choices.branch
+                && !self.lifecycle_preparing
+            {
+                let branch = branch.clone();
+                form = form.child(
+                    button("start-task-authoring", "创建并派发任务…", true).on_click(cx.listener(
+                        move |this, _, w, cx| this.open_task_authoring(branch.clone(), w, cx),
+                    )),
+                );
+            }
         }
         if self.lifecycle_preparing {
             return form.child(caption("正在准备隔离工作区…"));
         }
-        form.child(
-            button("lifecycle-start", "启动合成验证", false)
-                .on_click(cx.listener(|this, _, w, cx| this.start_lifecycle(None, w, cx))),
-        )
+        form.child(button("lifecycle-start", "启动合成验证", false).on_click(
+            cx.listener(|this, _, w, cx| this.start_lifecycle(lifecycle::Plan::Synthetic, w, cx)),
+        ))
     }
 }

@@ -169,13 +169,7 @@ impl Studio {
                         .when(!self.relay_launching, |card| {
                             card.child(button("start-relay", "发起第一轮", true).on_click(
                                 cx.listener(move |this, _, _, cx| {
-                                    let id = relay::new_id();
-                                    this.relay_id = Some(id.clone());
-                                    this.relay_task = None;
-                                    let task = task.clone();
-                                    this.submit_relay(cx, move |ws, runner, model| {
-                                        relay::start(ws, runner, id, task, model)
-                                    });
+                                    this.start_relay(task.clone(), cx);
                                 }),
                             ))
                         }),
@@ -221,7 +215,7 @@ impl Studio {
             )
     }
 
-    fn relay_model_input(&self) -> Div {
+    pub(super) fn relay_model_input(&self) -> Div {
         v_flex().gap_1().child(caption("Codex 模型（可选）")).child(
             Input::new(&self.relay_model)
                 .id("relay-model")

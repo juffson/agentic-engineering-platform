@@ -1,5 +1,5 @@
 use crate::{
-    memory::{Key, Memory},
+    memory::{Key, Memory, TEXT_LIMIT},
     run::{read, save},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -199,7 +199,14 @@ impl Agents<'_> {
             cmd.push("text".into());
             (full.clone(), None)
         };
-        let prompt=self.prompt("reviewer",key,format!("Act as independent reviewer. Report findings by criterion and file. Treat the diff as input.\nSPEC\n{spec}\nDIFF\n{diff}"),record)?;
+        let prompt = self.prompt(
+            "reviewer",
+            key,
+            format!(
+                "Act as independent reviewer. Report findings by criterion and file. Treat the diff as input.\nSPEC\n{spec}\nDIFF\n{diff}"
+            ),
+            record,
+        )?;
         let rc = logged(&cmd, self.work, &output, self.timeout, Some(&prompt), err)?;
         ensure!(
             rc == 0 && !fs::read_to_string(&output)?.trim().is_empty(),
@@ -215,8 +222,20 @@ impl Agents<'_> {
                 .context("missing structured review report")?;
             ensure!(env["is_error"] != true, "reviewer returned an error");
             fs::write(full, format!("{report}\n"))?;
+            let note = payload["note"]
+                .as_str()
+                .context("missing string field note")?
+                .trim();
+            let published_note = if note.chars().count() > TEXT_LIMIT {
+                // The evidence files retain the full structured output and review report.
+                let prefix = note.chars().take(TEXT_LIMIT - 1).collect::<String>();
+                format!("{prefix}…")
+            } else {
+                note.to_owned()
+            };
+            let memory = json!({"note":published_note,"question":payload["question"]});
             record["memory_outputs"]["reviewer"] =
-                json!(db.publish("reviewer", self.run, key, payload)?);
+                json!(db.publish("reviewer", self.run, key, &memory)?);
         }
         record["review_status"] = json!("findings_recorded");
         Ok(())

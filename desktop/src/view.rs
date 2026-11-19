@@ -3,6 +3,7 @@ pub(crate) mod github_page;
 pub(crate) mod human_review;
 mod lifecycle_page;
 mod relay_page;
+pub(crate) mod task_authoring;
 use super::*;
 use aep::studio::Run;
 use editor::Start;
