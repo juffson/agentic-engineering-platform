@@ -1,0 +1,14 @@
+{
+  "title": "Improve Studio target preflight diagnostics",
+  "allowed_paths": [
+    "src/workspace.rs",
+    "tests/studio_task_target.rs"
+  ],
+  "check": [
+    "cargo",
+    "test",
+    "--locked",
+    "--test",
+    "studio_task_target"
+  ]
+}
