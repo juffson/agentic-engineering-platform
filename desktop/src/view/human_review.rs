@@ -342,6 +342,16 @@ impl Studio {
             .and_then(|saved| saved.pr.as_ref())
         {
             let url = pr.url(target);
+            let publication = review.publication.clone();
+            confirm = confirm.child(
+                button("track-created-pr", "查看 GitHub CI 与审查", true).on_click(cx.listener(
+                    move |this, _, w, cx| {
+                        if let Some(publication) = publication.clone() {
+                            this.open_github_pr(publication, w, cx);
+                        }
+                    },
+                )),
+            );
             confirm = confirm.child(
                 button(
                     "open-created-pr",

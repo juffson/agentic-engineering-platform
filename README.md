@@ -56,7 +56,13 @@ cargo run --locked --manifest-path desktop/Cargo.toml -- --repo /path/to/repo
 
 在「最终 Diff」「验收日志」和「审查报告」之间切换即可核对候选。最终 Diff 使用 GitHub 默认分支与候选的合并基点，右侧显示仓库、目标分支和两个固定 SHA。核对后勾选确认并点击「确认并创建 GitHub PR」。目标分支更新时，重新加载 Diff 再确认。
 
-Studio 将候选推送到 `aep/pr/<task>/<run-id>`，并保存确认账号、候选 SHA 和 PR 链接。推送成功而建 PR 失败时，可重开该审查页后重试。Studio 会复用匹配的远端提交，并检查该分支是否已有 PR。GitHub CI 使用已派发的 Spec 和 PR 当前提交独立验收。后续 GitHub 审查与合并由维护者处理。
+Studio 将候选推送到 `aep/pr/<task>/<run-id>`，并保存确认账号、候选 SHA 和 PR 链接。推送成功而建 PR 失败时，可重开该审查页后重试。Studio 会复用匹配的远端提交，并检查该分支是否已有 PR。GitHub CI 使用已派发的 Spec 和 PR 当前提交独立验收。
+
+### 在 Studio 跟踪 GitHub PR 并确认合并
+
+创建 PR 后，从接力页或发布页点「查看 GitHub CI 与审查」。页面会自动刷新，也可以手动刷新。「CI 检查」显示当前 PR head 的检查状态。失败时打开原因，可查看 GitHub 提供的摘要、注释及 Actions 日志末尾。「审查意见」显示近期审查、普通评论和行内意见，可跳到 GitHub 查看完整上下文。
+
+检查通过且 GitHub 允许合并后，核对当前检查和审查意见，勾选确认并点击「确认合并」。Studio 会重新读取 GitHub 状态，并向 GitHub 提交匹配人审候选 SHA 的合并请求。状态或提交变化时，刷新后重新确认；分支保护和权限由 GitHub 执行。完成后可查看合并提交、账号和时间，本地 Run 的 `merge.json` 保存确认记录。
 
 ### 重复派发与本地恢复
 
@@ -139,7 +145,7 @@ cargo test --locked --all-targets
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug
 ```
 
-可用 `--scenario history`、`conflict`、`handoff` 或 `studio-relay` 单独运行。后者从 Studio 选任务发起两轮，并回归失败重试、修订、证据跳转、人工确认和 GitHub PR 发布恢复。要查看某一步的实际画面，添加输出目录和截图选项。
+可用 `--scenario history`、`conflict`、`handoff` 或 `studio-relay` 单独运行。后者从 Studio 选任务发起两轮，并回归失败重试、修订、证据跳转、PR 发布恢复、CI 失败诊断、审查意见和人审合并。要查看某一步的实际画面，添加输出目录和截图选项。
 
 ```sh
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \

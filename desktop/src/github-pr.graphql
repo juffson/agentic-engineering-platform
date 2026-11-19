@@ -1,0 +1,74 @@
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    viewerPermission
+    mergeCommitAllowed
+    squashMergeAllowed
+    rebaseMergeAllowed
+    pullRequest(number: $number) {
+      title
+      state
+      isDraft
+      mergeable
+      mergeStateStatus
+      reviewDecision
+      headRefOid
+      baseRefOid
+      baseRefName
+      headRefName
+      mergeCommit { oid }
+      mergedAt
+      mergedBy { login }
+      commits(last: 1) {
+        nodes {
+          commit {
+            oid
+            statusCheckRollup {
+              contexts(first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    id
+                    databaseId
+                    name
+                    status
+                    conclusion
+                    detailsUrl
+                    checkSuite { workflowRun { workflow { name } } }
+                  }
+                  ... on StatusContext {
+                    id
+                    context
+                    state
+                    description
+                    targetUrl
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      reviews(last: 30) {
+        totalCount
+        nodes { id body state submittedAt url author { login } }
+      }
+      comments(last: 30) {
+        totalCount
+        nodes { id body createdAt url author { login } }
+      }
+      reviewThreads(last: 30) {
+        totalCount
+        nodes {
+          isResolved
+          path
+          line
+          comments(last: 10) {
+            totalCount
+            nodes { id body createdAt url author { login } }
+          }
+        }
+      }
+    }
+  }
+}

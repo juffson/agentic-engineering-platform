@@ -49,6 +49,22 @@ pub(crate) struct Attempt {
     pub diagnostics: Option<String>,
     #[serde(skip)]
     pub publication: Option<crate::publish::Publication>,
+    #[serde(skip)]
+    pub merge: Option<crate::github_pr::MergeReceipt>,
+}
+impl Attempt {
+    pub fn merged(&self) -> bool {
+        self.merge.as_ref().is_some_and(|merge| {
+            merge.merged_sha.is_some()
+                && self.publication.as_ref().is_some_and(|saved| {
+                    saved.target.candidate == merge.head
+                        && saved
+                            .pr
+                            .as_ref()
+                            .is_some_and(|pr| pr.number == merge.number)
+                })
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -200,6 +216,7 @@ fn read_relay(ws: &Workspace, path: &Path) -> Result<Relay> {
             if run.join("evidence.json").exists() {
                 if attempt.round == Round::Second {
                     attempt.publication = crate::publish::load(&run)?;
+                    attempt.merge = crate::github_pr::read_receipt(&run)?;
                 }
                 continue;
             }
@@ -346,6 +363,7 @@ fn launch(
         decision,
         diagnostics: None,
         publication: None,
+        merge: None,
     });
     save(path, relay)?;
     let mut log = File::create(path.join(format!("{run_id}.log")))?;

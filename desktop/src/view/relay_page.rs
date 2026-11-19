@@ -84,6 +84,11 @@ impl Studio {
                 ("运行中", MINT)
             } else if relay
                 .latest(Round::Second)
+                .is_some_and(|attempt| attempt.merged())
+            {
+                ("PR 已合并", MINT)
+            } else if relay
+                .latest(Round::Second)
                 .and_then(|attempt| attempt.publication.as_ref())
                 .is_some_and(|saved| saved.pr.is_some())
             {
@@ -228,6 +233,7 @@ impl Studio {
         };
         let run = relay.run(round, &self.snapshot);
         let (progress, tone) = match run.map(|run| run.text("status")) {
+            Some("awaiting_human_review") if attempt.merged() => ("GitHub PR 已合并", MINT),
             Some("awaiting_human_review")
                 if attempt
                     .publication
@@ -269,6 +275,14 @@ impl Studio {
         if let Some(saved) = &attempt.publication {
             if let Some(pr) = &saved.pr {
                 let url = pr.url(&saved.target);
+                let publication = saved.clone();
+                card = card.child(
+                    button("relay-pr-progress", "查看 GitHub CI 与审查", true).on_click(
+                        cx.listener(move |this, _, w, cx| {
+                            this.open_github_pr(publication.clone(), w, cx)
+                        }),
+                    ),
+                );
                 card = card.child(
                     button(
                         "relay-created-pr",

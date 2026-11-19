@@ -844,6 +844,106 @@ fn verify_publication(
             && fs::read_to_string(fixture.join("pr-posts"))? == "POST\nPOST\n",
         "reopening the published run tried to create another PR"
     );
+    verify_github_merge(ui, ws, fixture, second, record)?;
+    Ok(())
+}
+
+fn verify_github_merge(
+    ui: &mut Driver,
+    ws: &Workspace,
+    fixture: &Path,
+    second: &str,
+    record: &Value,
+) -> Result<()> {
+    ui.click("track-created-pr")?;
+    ensure!(
+        ui.element("github-merge-blocker")?.label() == Some("GitHub 检查仍在运行")
+            && ui.absent("github-confirm-merge")?,
+        "running CI exposed merge"
+    );
+    let mode = fixture.join("ci-state");
+    fs::write(&mode, "failed")?;
+    ui.click("refresh-github-pr")?;
+    ensure!(
+        ui.absent("github-confirm-merge")?,
+        "failed CI exposed merge"
+    );
+    ui.click("github-failure-0")?;
+    ensure!(
+        ui.element("github-check-diagnostic")?
+            .label()
+            .is_some_and(|text| {
+                text.contains("Test expected a widened result.")
+                    && text.contains("assertion failed: upper bound")
+            }),
+        "missing GitHub annotation or failure log"
+    );
+    ui.checkpoint("studio-github-ci-failed")?;
+    ui.click("github-review-tab")?;
+    ensure!(
+        ui.element("github-note-0")?.label() == Some("Please keep the overflow regression test.")
+            && ui.element("github-note-1")?.label() == Some("Review fixture comment."),
+        "GitHub review or discussion is missing"
+    );
+    fs::write(&mode, "changes")?;
+    ui.click("refresh-github-pr")?;
+    ensure!(
+        ui.element("github-merge-blocker")?.label() == Some("GitHub 仍要求审查或修改"),
+        "required changes did not block merge"
+    );
+
+    fs::write(&mode, "passed")?;
+    ui.click("refresh-github-pr")?;
+    ensure!(
+        ui.element("github-confirm-merge")?.visible()
+            && ui.absent("github-merge-now")?
+            && !fixture.join("pr-merges").exists(),
+        "checks alone caused merge"
+    );
+    ui.click("github-confirm-merge")?;
+    fs::write(&mode, "pending")?;
+    ui.click("github-merge-now")?;
+    ensure!(
+        ui.element("github-pr-error")?
+            .label()
+            .is_some_and(|text| text.contains("请刷新后重新确认"))
+            && !fixture.join("pr-merges").exists(),
+        "a stale confirmation sent a merge"
+    );
+    fs::write(&mode, "passed")?;
+    ui.click("refresh-github-pr")?;
+    ensure!(
+        ui.absent("github-merge-now")?,
+        "refresh reused a stale approval"
+    );
+    ui.checkpoint("studio-github-merge-ready")?;
+    ui.click("github-confirm-merge")?;
+    ui.click("github-merge-now")?;
+    ensure!(
+        ui.element("github-merged")?.visible(),
+        "missing merge result"
+    );
+    let receipt = aep::workspace::read(&ws.data.join("runs").join(second).join("merge.json"))?;
+    ensure!(
+        receipt["head"] == record["candidate_sha"]
+            && receipt["merged_sha"] == record["candidate_sha"]
+            && receipt["confirmed_by"] == "aep-reviewer",
+        "merge receipt does not match the confirmed head"
+    );
+    ui.checkpoint("studio-github-merged")?;
+    ui.click("github-back-to-relay")?;
+    ensure!(
+        ui.element("relay-second-progress")?.label() == Some("GitHub PR 已合并"),
+        "relay did not show the merged state"
+    );
+    ui.reveal("relay-detail", "relay-pr-progress")?;
+    ui.click("relay-pr-progress")?;
+    ensure!(
+        ui.element("github-merged")?.visible()
+            && ui.absent("github-merge-now")?
+            && fs::read_to_string(fixture.join("pr-merges"))? == "PUT\n",
+        "reopening a merged PR submitted another merge"
+    );
     Ok(())
 }
 

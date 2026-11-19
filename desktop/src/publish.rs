@@ -63,7 +63,12 @@ pub(crate) struct Review {
     pub publication: Option<Publication>,
 }
 
-fn command(ws: &Workspace, runner: &Runner, program: &str, args: &[&str]) -> Result<Vec<u8>> {
+pub(crate) fn command(
+    ws: &Workspace,
+    runner: &Runner,
+    program: &str,
+    args: &[&str],
+) -> Result<Vec<u8>> {
     let output = Command::new(program)
         .current_dir(&ws.root)
         .args(args)
@@ -85,7 +90,7 @@ fn git(ws: &Workspace, runner: &Runner, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&command(ws, runner, "git", args)?).into_owned())
 }
 
-fn github(ws: &Workspace, runner: &Runner, args: &[&str]) -> Result<Value> {
+pub(crate) fn github(ws: &Workspace, runner: &Runner, args: &[&str]) -> Result<Value> {
     let mut command_args = vec!["api", "--hostname", "github.com"];
     command_args.extend(args);
     Ok(serde_json::from_slice(&command(
@@ -120,7 +125,7 @@ fn slug(remote: &str) -> Result<String> {
     Ok(path.to_ascii_lowercase())
 }
 
-fn repository(ws: &Workspace, runner: &Runner) -> Result<String> {
+pub(crate) fn repository(ws: &Workspace, runner: &Runner) -> Result<String> {
     let fetch = git(ws, runner, &["remote", "get-url", "origin"])?;
     let pushed = git(
         ws,
@@ -162,7 +167,7 @@ fn candidate(ws: &Workspace, relay_id: &str, id: &str) -> Result<Value> {
     Ok(record)
 }
 
-fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+pub(crate) fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]
         .as_str()
         .filter(|s| !s.is_empty())
