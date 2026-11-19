@@ -2,8 +2,10 @@ use crate::{
     memory::{Key, Memory, TEXT_LIMIT},
     run::{read, save},
 };
+use aep::cancel::Cancellation;
 use anyhow::{Context, Result, bail, ensure};
 use nix::{
+    errno::Errno,
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
@@ -31,7 +33,9 @@ pub fn logged(
     timeout: u64,
     prompt: Option<&str>,
     err: Option<PathBuf>,
+    cancellation: &Cancellation,
 ) -> Result<i32> {
+    cancellation.check()?;
     let stdout = File::create(log)?;
     let stderr = match err {
         Some(path) => File::create(path)?,
@@ -57,6 +61,20 @@ pub fn logged(
         .with_context(|| format!("start {}", argv[0]))?;
     let start = Instant::now();
     loop {
+        if let Err(error) = cancellation.check() {
+            let group = Pid::from_raw(child.id() as i32);
+            // Keep the child unreaped until the group is stopped so its ID cannot be reused.
+            let _ = killpg(group, Signal::SIGTERM);
+            thread::sleep(Duration::from_millis(150));
+            match killpg(group, Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => (),
+                Err(group_error) => child.kill().with_context(|| {
+                    format!("stop cancelled command after group error: {group_error}")
+                })?,
+            }
+            child.wait()?;
+            return Err(error);
+        }
         if let Some(status) = child.try_wait()? {
             return Ok(status
                 .code()
@@ -82,6 +100,7 @@ pub struct Agents<'a> {
     pub run: &'a str,
     pub memory: Option<Memory>,
     pub require_memory: Option<i64>,
+    pub cancellation: &'a Cancellation,
 }
 impl Agents<'_> {
     fn prompt(
@@ -158,6 +177,7 @@ impl Agents<'_> {
             self.timeout,
             Some(&prompt),
             None,
+            self.cancellation,
         )?;
         ensure!(
             rc == 0,
@@ -166,6 +186,7 @@ impl Agents<'_> {
         Ok(())
     }
     pub fn handoff(&mut self, key: &Key, record: &mut Value) -> Result<()> {
+        self.cancellation.check()?;
         if let Some(db) = &mut self.memory {
             let payload = read(&self.folder.join("handoff.json"))?;
             record["memory_outputs"]["implementer"] =
@@ -207,7 +228,16 @@ impl Agents<'_> {
             ),
             record,
         )?;
-        let rc = logged(&cmd, self.work, &output, self.timeout, Some(&prompt), err)?;
+        let rc = logged(
+            &cmd,
+            self.work,
+            &output,
+            self.timeout,
+            Some(&prompt),
+            err,
+            self.cancellation,
+        )?;
+        self.cancellation.check()?;
         ensure!(
             rc == 0 && !fs::read_to_string(&output)?.trim().is_empty(),
             "reviewer did not produce a review; see {}",

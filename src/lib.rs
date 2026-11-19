@@ -1,4 +1,5 @@
 //! Shared workspace, run evidence, and engineering memory for AEP.
+pub mod cancel;
 pub mod memory;
 pub mod studio;
 pub mod task;

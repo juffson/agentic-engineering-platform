@@ -50,7 +50,10 @@ fn pending(status: &str) -> bool {
     status == "awaiting_human_review"
 }
 fn attention(status: &str) -> bool {
-    matches!(status, "failed" | "needs_reconciliation" | "unstarted")
+    matches!(
+        status,
+        "failed" | "cancelled" | "needs_reconciliation" | "unstarted"
+    )
 }
 
 struct Studio {
@@ -100,6 +103,7 @@ struct Studio {
     queue_driving: bool,
     queue_generation: u64,
     queue_error: Option<String>,
+    queue_cancel_confirm: Option<(uuid::Uuid, task_queue::State)>,
 }
 
 impl Studio {
@@ -165,6 +169,7 @@ impl Studio {
             queue_driving: false,
             queue_generation: 0,
             queue_error: None,
+            queue_cancel_confirm: None,
         };
         if studio.remember_repository && studio.workspace.is_some() {
             studio.remember_workspace();
@@ -263,6 +268,7 @@ impl Studio {
         self.lifecycle_loading = false;
         self.lifecycle_choices = None;
         self.lifecycle_shots.clear();
+        self.queue_cancel_confirm = None;
         self.task_sessions.clear();
         self.task_sessions_loading = false;
         self.task_sessions_error = None;

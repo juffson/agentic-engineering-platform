@@ -1,4 +1,5 @@
 use aep::{
+    cancel::{Cancellation, Cancelled},
     studio::{Artifact, Run, Snapshot, preview},
     workspace::{Workspace, commit, ident, status},
 };
@@ -476,6 +477,8 @@ fn launch(
 ) -> Result<()> {
     let path = folder(ws, &relay.id)?;
     let run_id = attempt_id(&relay.id, round, relay.attempts.len());
+    let cancellation = Cancellation::new(&ws.data, &run_id)?;
+    cancellation.check()?;
     relay.attempts.push(Attempt {
         id: run_id.clone(),
         round,
@@ -501,6 +504,7 @@ fn launch(
                 "任务的派发版本已变化，请刷新任务列表"
             );
         }
+        cancellation.check()?;
         let program = runner.binary()?;
         let mut command = Command::new(program);
         command
@@ -539,6 +543,9 @@ fn launch(
         let exit = command.status().context("无法启动 AEP 执行器")?;
         if !exit.success() {
             let evidence = status(&ws.data, &run_id).unwrap_or_default();
+            if evidence["status"] == "cancelled" {
+                return Err(Cancelled.into());
+            }
             anyhow::bail!(
                 "{}",
                 evidence["error"]

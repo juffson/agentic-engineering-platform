@@ -2,7 +2,10 @@ use crate::{
     Runner, lifecycle,
     relay::{Lease, Round, Task},
 };
-use aep::workspace::{Workspace, status};
+use aep::{
+    cancel::{Cancellation, Cancelled},
+    workspace::{Workspace, status},
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -42,19 +45,25 @@ impl Action {
 pub(crate) enum State {
     Waiting,
     Running,
+    Cancelling,
+    Cancelled,
     Passed,
     Failed(String),
 }
 
 impl State {
     pub fn active(&self) -> bool {
-        matches!(self, Self::Waiting | Self::Running)
+        self == &Self::Waiting || self.occupies_slot()
+    }
+
+    fn occupies_slot(&self) -> bool {
+        matches!(self, Self::Running | Self::Cancelling)
     }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct Job {
-    id: uuid::Uuid,
+    pub id: uuid::Uuid,
     pub session: String,
     task: String,
     spec: String,
@@ -66,12 +75,20 @@ pub(crate) struct Job {
     enqueued_at_ms: u128,
     started_at_ms: Option<u128>,
     finished_at_ms: Option<u128>,
+    #[serde(default)]
+    priority: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancelled_at_ms: Option<u128>,
 }
 
 impl Job {
     fn finish(&mut self, result: Result<()>) {
         self.state = match result {
             Ok(()) => State::Passed,
+            Err(error) if error.is::<Cancelled>() => {
+                self.cancelled_at_ms.get_or_insert_with(now);
+                State::Cancelled
+            }
             Err(error) => State::Failed(format!("{error:#}")),
         };
         self.finished_at_ms = Some(now());
@@ -81,6 +98,8 @@ impl Job {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct Queue {
     pub limit: usize,
+    #[serde(default)]
+    pub paused: bool,
     jobs: Vec<Job>,
 }
 
@@ -88,6 +107,7 @@ impl Default for Queue {
     fn default() -> Self {
         Self {
             limit: 1,
+            paused: false,
             jobs: Vec::new(),
         }
     }
@@ -126,16 +146,30 @@ impl Queue {
     pub fn running(&self) -> usize {
         self.jobs
             .iter()
-            .filter(|job| job.state == State::Running)
+            .filter(|job| job.state.occupies_slot())
             .count()
     }
 
     pub fn position(&self, job: &Job) -> Option<usize> {
-        self.jobs
-            .iter()
-            .filter(|entry| entry.state == State::Waiting)
-            .position(|entry| entry.id == job.id)
+        self.waiting()
+            .into_iter()
+            .position(|index| self.jobs[index].id == job.id)
             .map(|index| index + 1)
+    }
+
+    fn priority(&self, index: usize) -> usize {
+        self.jobs[index].priority.unwrap_or(index)
+    }
+
+    fn waiting(&self) -> Vec<usize> {
+        let mut ordered = self
+            .jobs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, job)| (job.state == State::Waiting).then_some(index))
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|index| (self.priority(*index), *index));
+        ordered
     }
 }
 
@@ -169,6 +203,66 @@ pub(crate) fn set_limit(source: &Workspace, limit: usize) -> Result<()> {
     save(source, &queue)
 }
 
+pub(crate) fn set_paused(source: &Workspace, paused: bool) -> Result<()> {
+    let _lock = lock(source)?;
+    let mut queue = Queue::read(source)?;
+    queue.paused = paused;
+    save(source, &queue)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Direction {
+    Earlier,
+    Later,
+}
+
+pub(crate) fn move_waiting(source: &Workspace, id: uuid::Uuid, direction: Direction) -> Result<()> {
+    let _lock = lock(source)?;
+    let mut queue = Queue::read(source)?;
+    let waiting = queue.waiting();
+    let position = waiting
+        .iter()
+        .position(|index| queue.jobs[*index].id == id)
+        .context("只可调整仍在等待的队列项")?;
+    let adjacent = match direction {
+        Direction::Earlier => position.checked_sub(1).and_then(|index| waiting.get(index)),
+        Direction::Later => waiting.get(position + 1),
+    }
+    .context("没有相邻的排队项")?;
+    let index = waiting[position];
+    let current_priority = queue.priority(index);
+    queue.jobs[index].priority = Some(queue.priority(*adjacent));
+    queue.jobs[*adjacent].priority = Some(current_priority);
+    save(source, &queue)
+}
+
+pub(crate) fn cancel(source: &Workspace, id: uuid::Uuid, expected: State) -> Result<()> {
+    let _lock = lock(source)?;
+    let mut queue = Queue::read(source)?;
+    let job = queue
+        .jobs
+        .iter_mut()
+        .find(|job| job.id == id)
+        .context("找不到队列项")?;
+    if matches!(job.state, State::Cancelling | State::Cancelled) {
+        return Ok(());
+    }
+    ensure!(job.state == expected, "本轮状态已变化，请刷新后确认");
+    match job.state {
+        State::Waiting => job.finish(Err(Cancelled.into())),
+        State::Running => {
+            let (ws, _) = open_checkout(source, job)?;
+            let attempt = job.attempt.as_deref().context("缺少本轮运行 ID")?;
+            let cancellation = Cancellation::new(&ws.data, attempt)?;
+            ensure!(cancellation.request()?, "本轮已结束，请刷新任务状态");
+            job.cancelled_at_ms = Some(now());
+            job.state = State::Cancelling;
+        }
+        _ => anyhow::bail!("本轮已结束，请刷新任务状态"),
+    }
+    save(source, &queue)
+}
+
 pub(crate) fn enqueue(
     source: &Workspace,
     ws: &Workspace,
@@ -196,6 +290,7 @@ pub(crate) fn enqueue(
             .any(|job| job.session == session && job.state.active()),
         "此任务已在队列中或正在运行"
     );
+    let priority = queue.jobs.len();
     queue.jobs.push(Job {
         id: uuid::Uuid::new_v4(),
         session: session.into(),
@@ -209,6 +304,8 @@ pub(crate) fn enqueue(
         enqueued_at_ms: now(),
         started_at_ms: None,
         finished_at_ms: None,
+        priority: Some(priority),
+        cancelled_at_ms: None,
     });
     save(source, &queue)
 }
@@ -219,7 +316,7 @@ struct Checkout {
     lease: Lease,
 }
 
-fn claim(source: &Workspace, job: &Job) -> Result<Option<Checkout>> {
+fn open_checkout(source: &Workspace, job: &Job) -> Result<(Workspace, lifecycle::Fixture)> {
     ensure!(
         job.session.starts_with("studio-")
             && job.session.len() > "studio-".len()
@@ -241,6 +338,11 @@ fn claim(source: &Workspace, job: &Job) -> Result<Option<Checkout>> {
         lifecycle::root(&ws) == Some(root.as_path()),
         "任务工作区已变化"
     );
+    Ok((ws, fixture))
+}
+
+fn claim(source: &Workspace, job: &Job) -> Result<Option<Checkout>> {
+    let (ws, fixture) = open_checkout(source, job)?;
     let Some(lease) = Lease::acquire(&ws, &job.relay)? else {
         return Ok(None);
     };
@@ -249,6 +351,14 @@ fn claim(source: &Workspace, job: &Job) -> Result<Option<Checkout>> {
 
 fn reconcile(job: &mut Job, checkout: &Checkout) -> Result<()> {
     let attempt = job.attempt.as_deref().context("排队任务缺少运行 ID")?;
+    let record = status(&checkout.ws.data, attempt).unwrap_or_default();
+    if record["status"] == "cancelled"
+        || (Cancellation::new(&checkout.ws.data, attempt)?.requested()?
+            && record["status"] != "awaiting_human_review")
+    {
+        job.finish(Err(Cancelled.into()));
+        return Ok(());
+    }
     if !checkout.lease.has_attempt(attempt)? {
         // Studio exited before the relay recorded a run. Dispatch can reuse the pinned Spec.
         job.state = State::Waiting;
@@ -256,7 +366,6 @@ fn reconcile(job: &mut Job, checkout: &Checkout) -> Result<()> {
         job.attempt = None;
         return Ok(());
     }
-    let record = status(&checkout.ws.data, attempt).unwrap_or_default();
     let result = if record["status"] == "awaiting_human_review"
         && record["check_exit_code"] == 0
         && record["review_status"] == "findings_recorded"
@@ -276,11 +385,15 @@ fn reconcile(job: &mut Job, checkout: &Checkout) -> Result<()> {
 
 fn run(checkout: &Checkout, runner: &Runner, job: &Job) -> Result<()> {
     let Checkout { ws, fixture, lease } = checkout;
+    let attempt = job.attempt.as_deref().context("排队任务缺少运行 ID")?;
+    let cancellation = Cancellation::new(&ws.data, attempt)?;
+    cancellation.check()?;
     match job.action {
         Action::Start => {
             if fixture.authored {
                 fixture.dispatch_authored(ws, runner)?;
             }
+            cancellation.check()?;
             lease.start(
                 ws,
                 runner,
@@ -304,8 +417,14 @@ fn finish(source: &Workspace, id: uuid::Uuid, result: Result<()>) -> Result<()> 
     if let Some(job) = queue
         .jobs
         .iter_mut()
-        .find(|job| job.id == id && job.state == State::Running)
+        .find(|job| job.id == id && job.state.occupies_slot())
     {
+        let result = if job.state == State::Cancelling && result.is_err() {
+            // A cancellation can arrive during dispatch, before a Run exists to record it.
+            Err(Cancelled.into())
+        } else {
+            result
+        };
         job.finish(result);
         save(source, &queue)?;
     }
@@ -317,7 +436,7 @@ fn reconcile_running(source: &Workspace, queue: &mut Queue) -> bool {
     for job in queue
         .jobs
         .iter_mut()
-        .filter(|job| job.state == State::Running)
+        .filter(|job| job.state.occupies_slot())
     {
         let result = match claim(source, job) {
             Ok(Some(checkout)) => reconcile(job, &checkout),
@@ -333,21 +452,22 @@ fn reconcile_running(source: &Workspace, queue: &mut Queue) -> bool {
 }
 
 fn claim_waiting(source: &Workspace, queue: &mut Queue) -> (bool, Vec<(Job, Checkout)>) {
+    if queue.paused {
+        return (false, Vec::new());
+    }
     let free = queue.limit.saturating_sub(queue.running());
     let mut ready = Vec::new();
     let mut changed = false;
-    for job in queue
-        .jobs
-        .iter_mut()
-        .filter(|job| job.state == State::Waiting)
-    {
+    for index in queue.waiting() {
         if ready.len() == free {
             break;
         }
+        let job = &mut queue.jobs[index];
         let result = claim(source, job).and_then(|checkout| {
             checkout
                 .map(|checkout| {
                     let attempt = checkout.lease.planned_run(job.action.round())?;
+                    Cancellation::new(&checkout.ws.data, &attempt)?.clear_unlaunched()?;
                     Ok::<_, anyhow::Error>((checkout, attempt))
                 })
                 .transpose()
@@ -565,6 +685,8 @@ mod tests {
             }),
         )?;
         save(&source, &queue)?;
+        assert!(cancel(&source, job.id, State::Running).is_err());
+        assert!(!Cancellation::new(&checkout.ws.data, attempt)?.requested()?);
         drop(first);
 
         let mut reopened = Queue::read(&source)?;
@@ -576,6 +698,114 @@ mod tests {
             reopened.latest(&a).unwrap().attempt,
             queue.latest(&a).unwrap().attempt
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pause_reorder_and_waiting_cancellation_survive_reopen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = repository(dir.path())?;
+        let a = add(&source, "studio-a")?;
+        let b = add(&source, "studio-b")?;
+        let c = add(&source, "studio-c")?;
+        let original = Queue::read(&source)?;
+        let a_id = original.latest(&a).unwrap().id;
+        let b_id = original.latest(&b).unwrap().id;
+        let c_id = original.latest(&c).unwrap().id;
+        let mut legacy = serde_json::to_value(original)?;
+        legacy.as_object_mut().unwrap().remove("paused");
+        for job in legacy["jobs"].as_array_mut().unwrap() {
+            job.as_object_mut().unwrap().remove("priority");
+        }
+        lifecycle::save(&source.data, FILE, &legacy)?;
+        assert!(!Queue::read(&source)?.paused);
+
+        set_paused(&source, true)?;
+        move_waiting(&source, c_id, Direction::Earlier)?;
+        move_waiting(&source, a_id, Direction::Later)?;
+        cancel(&source, b_id, State::Waiting)?;
+        let mut reopened = Queue::read(&source)?;
+        assert!(reopened.paused);
+        let cancelled = reopened.latest(&b).unwrap();
+        assert_eq!(cancelled.state, State::Cancelled);
+        assert!(cancelled.attempt.is_none());
+        assert!(cancelled.cancelled_at_ms.is_some());
+        assert!(!checkout_data(&b)?.join("run-control").exists());
+        assert!(move_waiting(&source, b_id, Direction::Earlier).is_err());
+        assert_eq!(reopened.position(reopened.latest(&c).unwrap()), Some(1));
+        assert_eq!(reopened.position(reopened.latest(&a).unwrap()), Some(2));
+        assert!(claim_waiting(&source, &mut reopened).1.is_empty());
+
+        set_paused(&source, false)?;
+        let mut reopened = Queue::read(&source)?;
+        assert_eq!(claim_waiting(&source, &mut reopened).1[0].0.id, c_id);
+        Ok(())
+    }
+
+    fn checkout_data(session: &Path) -> Result<PathBuf> {
+        Ok(Workspace::open(&session.join("workspace/repo"))?.data)
+    }
+
+    #[test]
+    fn cancelling_keeps_the_slot_until_the_lease_is_released() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = repository(dir.path())?;
+        let a = add(&source, "studio-a")?;
+        let b = add(&source, "studio-b")?;
+        let mut queue = Queue::read(&source)?;
+        let (_, first) = claim_waiting(&source, &mut queue);
+        let (job, checkout) = &first[0];
+        let cancelled_id = job.id;
+        let attempt = job.attempt.as_deref().unwrap().to_owned();
+        let marker = Cancellation::new(&checkout.ws.data, &attempt)?;
+        save(&source, &queue)?;
+        assert!(cancel(&source, cancelled_id, State::Waiting).is_err());
+        assert!(!marker.requested()?);
+        cancel(&source, cancelled_id, State::Running)?;
+
+        let mut reopened = Queue::read(&source)?;
+        assert_eq!(reopened.latest(&a).unwrap().state, State::Cancelling);
+        assert_eq!(reopened.running(), 1);
+        assert!(marker.requested()?);
+        assert!(!checkout_data(&b)?.join("run-control").exists());
+        assert!(!reconcile_running(&source, &mut reopened));
+        assert!(claim_waiting(&source, &mut reopened).1.is_empty());
+        drop(first);
+
+        set_paused(&source, true)?;
+        let mut reopened = Queue::read(&source)?;
+        assert!(reconcile_running(&source, &mut reopened));
+        let cancelled = reopened.latest(&a).unwrap();
+        assert_eq!(cancelled.id, cancelled_id);
+        assert_eq!(cancelled.state, State::Cancelled);
+        assert_eq!(cancelled.attempt.as_deref(), Some(attempt.as_str()));
+        assert!(cancelled.finished_at_ms.is_some());
+        assert!(claim_waiting(&source, &mut reopened).1.is_empty());
+        save(&source, &reopened)?;
+
+        let ws = Workspace::open(&a.join("workspace/repo"))?;
+        let fixture = lifecycle::load_session(&a).context("missing task fixture")?;
+        enqueue(
+            &source,
+            &ws,
+            &fixture,
+            "relay-studio-a".into(),
+            Action::Start,
+            String::new(),
+        )?;
+        set_paused(&source, false)?;
+        let mut reopened = Queue::read(&source)?;
+        let (_, survivor) = claim_waiting(&source, &mut reopened);
+        assert_eq!(survivor[0].0.id, reopened.latest(&b).unwrap().id);
+        set_limit(&source, 2)?;
+        reopened.limit = Queue::read(&source)?.limit;
+        let (_, explicit_retry) = claim_waiting(&source, &mut reopened);
+        assert_eq!(
+            explicit_retry[0].0.attempt.as_deref(),
+            Some(attempt.as_str())
+        );
+        assert!(!marker.requested()?);
+        assert_eq!(reopened.jobs[0].state, State::Cancelled);
         Ok(())
     }
 }

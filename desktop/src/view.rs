@@ -50,6 +50,7 @@ fn status(s: &str) -> (&str, u32) {
     match s {
         "awaiting_human_review" => ("待人工审查", AMBER),
         "failed" => ("失败", RED),
+        "cancelled" => ("已取消", AMBER),
         "needs_reconciliation" => ("需核对", RED),
         "unstarted" => ("未启动", AMBER),
         "running" => ("运行中", MINT),

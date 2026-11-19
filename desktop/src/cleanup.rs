@@ -314,6 +314,13 @@ fn temporary(
         "工作区归属无法确认"
     );
     let exists = path.try_exists()?;
+    if record["status"] == "cancelled" && record["finished_at"].is_string() {
+        return Ok(if exists {
+            format!("已保留取消轮次的工作区 {}", path.display())
+        } else {
+            "取消轮次的工作区已清理".into()
+        });
+    }
     let trees = worktrees(ws, runner)?;
     let canonical = if exists {
         Some(path.canonicalize()?)

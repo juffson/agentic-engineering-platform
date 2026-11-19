@@ -238,6 +238,65 @@ fn timeout_stops_the_check_process_group() {
 }
 
 #[test]
+fn cancellation_stops_only_the_selected_run_and_keeps_its_evidence() {
+    let f = Fixture::new(&["true"]);
+    f.script(
+        "codex",
+        r#"echo 'partial implementation'
+echo active > "$FIXTURE/started"
+(sleep 2; touch "$FIXTURE/escaped") & wait"#,
+    );
+    let args = [
+        "run",
+        "--task",
+        "sample",
+        "--implementer",
+        "codex",
+        "--run-id",
+        "stopped",
+        "--timeout",
+        "10",
+    ];
+    let child = f.cmd(&f.repo, &args).stdout(Stdio::null()).spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !f.root.join("started").exists() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let data = f.repo.join(".git/aep");
+    let cancellation = aep::cancel::Cancellation::new(&data, "stopped").unwrap();
+    assert!(cancellation.request().unwrap());
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let record = f.state("stopped");
+    assert_eq!(record["status"], "cancelled");
+    assert_eq!(record["phase"], "implementing");
+    assert!(record["finished_at"].is_string());
+    assert!(Path::new(record["recovery_worktree"].as_str().unwrap()).is_dir());
+    let logs = data.join("runs/stopped");
+    assert!(
+        fs::read_to_string(logs.join("implementation.log"))
+            .unwrap()
+            .contains("partial implementation")
+    );
+    assert!(!logs.join("checks.log").exists());
+    assert!(!cancellation.request().unwrap());
+
+    ok(f.call(&[
+        "run",
+        "--task",
+        "sample",
+        "--candidate",
+        "HEAD",
+        "--run-id",
+        "survivor",
+    ]));
+    assert_eq!(f.state("survivor")["status"], "awaiting_human_review");
+    thread::sleep(Duration::from_secs(2));
+    assert!(!f.root.join("escaped").exists());
+}
+
+#[test]
 fn old_evidence_is_read_only_and_ids_are_validated() {
     let f = Fixture::new(&["true"]);
     let dir = f.repo.join(".git/aep/runs/legacy");

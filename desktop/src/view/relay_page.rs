@@ -136,9 +136,12 @@ impl Studio {
             .is_some_and(|job| job.state.active());
         if let Some(job) = self.current_queue_job() {
             if pending {
-                detail = detail.child(
-                    detail_text("relay-queue-state", &self.job_label(job)).text_color(rgb(BLUE)),
-                );
+                detail = detail
+                    .child(
+                        detail_text("relay-queue-state", &self.job_label(job))
+                            .text_color(rgb(BLUE)),
+                    )
+                    .child(self.queue_controls(job, cx));
             } else if let State::Failed(error) = &job.state {
                 detail =
                     detail.child(detail_text("relay-queue-failure", error).text_color(rgb(RED)));
@@ -259,6 +262,7 @@ impl Studio {
             }
             Some("awaiting_human_review") => ("验收和审查已完成，待人工审查", MINT),
             Some("failed") => ("运行失败", RED),
+            Some("cancelled") => ("本轮已取消", AMBER),
             Some("needs_reconciliation") => ("运行中断，需核对", RED),
             Some("running" | "initializing") => (
                 relay::phase_label(run.map_or("", |r| r.text("phase"))),
