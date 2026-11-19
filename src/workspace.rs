@@ -50,6 +50,34 @@ pub fn ident(id: &str, max: usize) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_task_target(repo: &Path, target: &str, spec: &str, task: &str) -> Result<()> {
+    ident(task, 63)?;
+    let remedy = format!(
+        "create a new task version from selected target {target}, commit its requirements under \
+         specs/<new-task>/, and dispatch it with \
+         `aep dispatch --task <new-task> --rev <new-spec-sha>`"
+    );
+    git(repo, &["merge-base", "--is-ancestor", target, spec]).with_context(|| {
+        format!(
+            "cannot use task {task} at pinned Spec {spec}: selected target {target} must be an \
+             ancestor of the Spec; {remedy}"
+        )
+    })?;
+    let diff = git(
+        repo,
+        &["diff", "--no-renames", "--name-only", "-z", target, spec],
+    )?;
+    let prefix = format!("specs/{task}/");
+    for path in diff.split_terminator('\0') {
+        ensure!(
+            path.starts_with(&prefix),
+            "pinned Spec {spec} changes {path:?} outside {prefix} relative to selected target \
+             {target}; {remedy}"
+        );
+    }
+    Ok(())
+}
+
 pub fn read(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(
         &fs::read(path).with_context(|| format!("read {}", path.display()))?,
