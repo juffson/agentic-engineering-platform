@@ -4,12 +4,13 @@ use crate::{
     git::{Repo, Task, commit, git, ident},
     memory::{Key, Memory},
 };
+use aep::cancel::{Cancellation, Cancelled};
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::{
-    fs::{self, DirBuilder, OpenOptions, TryLockError},
-    io::Write,
+    fs::{self, DirBuilder, File, OpenOptions, TryLockError},
+    io::{self, Write},
     os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -86,6 +87,7 @@ pub fn execute(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let folder = directory(repo, &id)?;
+    let cancellation = Cancellation::new(&repo.data, &id)?;
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -145,6 +147,7 @@ pub fn execute(
     save(&folder, &record)?;
     let mut attached = false;
     let result = (|| -> Result<()> {
+        cancellation.check()?;
         let memory = if args.shared_memory {
             record["memory_inputs"] = json!({});
             record["memory_outputs"] = json!({});
@@ -159,6 +162,7 @@ pub fn execute(
             run: &id,
             memory,
             require_memory: args.require_memory,
+            cancellation: &cancellation,
         };
         let initial = if let Some(rev) = &args.candidate {
             let sha = commit(&repo.root, rev)?;
@@ -180,11 +184,13 @@ pub fn execute(
             ],
         )?;
         attached = true;
+        cancellation.check()?;
         let key = Key::new(&args.task, &base, &initial);
         if implementer.is_some() {
             record["phase"] = json!("implementing");
             save(&folder, &record)?;
             agents.implement(&key, &spec, &task.allowed_paths, model, &mut record)?;
+            cancellation.check()?;
             git(&work, &["add", "-A"])?;
             if !git(&work, &["diff", "--cached", "--name-only"])?.is_empty() {
                 let title = task
@@ -194,6 +200,7 @@ pub fn execute(
                 git(&work, &["commit", "-m", title])?;
             }
         }
+        cancellation.check()?;
         let head = commit(&work, "HEAD")?;
         record["candidate_sha"] = json!(head);
         git(
@@ -206,6 +213,7 @@ pub fn execute(
         git(&work, &["reset", "--hard", &head])?;
         git(&work, &["clean", "-ffdx"])?;
         verify_task(&agents, &task, &mut record)?;
+        cancellation.check()?;
         if implementer.is_some() && args.shared_memory {
             // Publish cross-run context only after the candidate has passed its checks.
             agents.handoff(&key, &mut record)?;
@@ -215,22 +223,34 @@ pub fn execute(
             let diff = git(&repo.root, &["diff", "--no-ext-diff", &base, &head])?;
             record["phase"] = json!("reviewing");
             save(&folder, &record)?;
-            agents.review(&key, &spec, &diff, &mut record)?;
+            agents.review(&key, &spec, &diff, &task.criterion_ids(), &mut record)?;
         }
-        record["phase"] = json!("complete");
-        record["status"] = json!("awaiting_human_review");
-        println!("Checks passed at {head}. Human approval pending.");
         Ok(())
     })();
+    // A stop request and completion are ordered by the same per-run lock.
+    let terminal = cancellation.lock()?;
+    let result = cancellation.check().and(result);
     if let Err(e) = &result {
-        record["status"] = json!("failed");
+        record["status"] = json!(if e.is::<Cancelled>() {
+            "cancelled"
+        } else {
+            "failed"
+        });
         record["error"] = json!(format!("{e:#}"));
         if attached {
             record["recovery_worktree"] = json!(work);
         }
+    } else {
+        record["phase"] = json!("complete");
+        record["status"] = json!("awaiting_human_review");
+        println!(
+            "Checks passed at {}. Human approval pending.",
+            record["candidate_sha"].as_str().unwrap_or("?")
+        );
     }
     record["finished_at"] = json!(Utc::now().to_rfc3339());
     save(&folder, &record)?;
+    drop(terminal);
     let cleanup = if !attached {
         fs::remove_dir(&work).map_err(anyhow::Error::from)
     } else if result.is_ok() {
@@ -253,16 +273,62 @@ pub fn execute(
 fn verify_task(agents: &Agents<'_>, task: &Task, record: &mut Value) -> Result<()> {
     record["phase"] = json!("checking");
     record["check"] = json!(task.check);
+    let plan = std::iter::once(("primary", task.criteria.as_slice(), task.check.as_slice()))
+        .chain(task.checks.iter().map(|check| {
+            (
+                check.id.as_str(),
+                check.criteria.as_slice(),
+                check.command.as_slice(),
+            )
+        }))
+        .collect::<Vec<_>>();
+    record["acceptance"] = json!(plan.iter().map(|(id, criteria, command)|
+        json!({"id": id, "criteria": criteria, "command": command, "status": "not_run"})
+    ).collect::<Vec<_>>());
     save(agents.folder, record)?;
-    let rc = agent::logged(
-        &task.check,
-        agents.work,
-        &agents.folder.join("checks.log"),
-        agents.timeout,
-        None,
-        None,
-    )?;
-    record["check_exit_code"] = json!(rc);
-    ensure!(rc == 0, "check failed ({rc}): {}", task.check.join(" "));
+    let combined = agents.folder.join("checks.log");
+    for (index, (id, _, command)) in plan.into_iter().enumerate() {
+        let individual = (index > 0)
+            .then(|| tempfile::NamedTempFile::new_in(agents.folder))
+            .transpose()?;
+        let log = individual
+            .as_ref()
+            .map_or(combined.as_path(), |file| file.path());
+        let result = agent::logged(
+            command,
+            agents.work,
+            log,
+            agents.timeout,
+            None,
+            None,
+            agents.cancellation,
+        );
+        if index > 0 && log.is_file() {
+            let mut output = OpenOptions::new().append(true).open(&combined)?;
+            writeln!(output, "\n--- {id} ---")?;
+            io::copy(&mut File::open(log)?, &mut output)?;
+        }
+        let step = &mut record["acceptance"][index];
+        if log.is_file() {
+            step["log"] = json!("checks.log");
+        }
+        match result {
+            Ok(code) => {
+                step["exit_code"] = json!(code);
+                step["status"] = json!(if code == 0 { "passed" } else { "failed" });
+                record["check_exit_code"] = json!(code);
+                save(agents.folder, record)?;
+                ensure!(code == 0, "check failed ({code}): {}", command.join(" "));
+            }
+            Err(error) => {
+                step["status"] = json!(if error.is::<Cancelled>() {
+                    "cancelled"
+                } else {
+                    "failed"
+                });
+                return Err(error);
+            }
+        }
+    }
     Ok(())
 }

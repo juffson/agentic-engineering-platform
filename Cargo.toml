@@ -5,14 +5,27 @@ edition = "2024"
 rust-version = "1.89"
 description = "Local execution and shared engineering memory for AEP"
 
+[[bin]]
+name = "aep"
+required-features = ["control"]
+
+[features]
+default = ["control"]
+control = ["dep:axum", "dep:reqwest", "dep:sha2", "dep:subtle", "dep:tokio"]
+
 [dependencies]
 anyhow = "1"
+axum = { version = "0.8", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 nix = { version = "0.30", features = ["signal", "process"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "blocking", "json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2", optional = true }
 tempfile = "3"
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net"] }
 uuid = { version = "1", features = ["v4"] }

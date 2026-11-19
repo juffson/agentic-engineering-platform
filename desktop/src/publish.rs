@@ -13,37 +13,10 @@ use std::{
     fs::{File, OpenOptions},
     io::Read,
     path::Path,
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct Target {
-    pub relay: String,
-    pub run: String,
-    pub task: String,
-    pub repo: String,
-    pub base: String,
-    pub base_sha: String,
-    pub merge_base: String,
-    pub candidate: String,
-    pub spec: String,
-    pub head: String,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub(crate) struct Pull {
-    pub number: u64,
-    pub state: String,
-    pub head_sha: String,
-    pub base: String,
-    pub base_sha: String,
-}
-impl Pull {
-    pub fn url(&self, target: &Target) -> String {
-        format!("https://github.com/{}/pull/{}", target.repo, self.number)
-    }
-}
+pub(crate) use aep::delivery::{Pull, Target};
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Publication {
@@ -69,21 +42,7 @@ pub(crate) fn command(
     program: &str,
     args: &[&str],
 ) -> Result<Vec<u8>> {
-    let output = Command::new(program)
-        .current_dir(&ws.root)
-        .args(args)
-        .env("PATH", runner.path()?)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GH_PROMPT_DISABLED", "1")
-        .output()
-        .with_context(|| format!("启动 {program}"))?;
-    ensure!(
-        output.status.success(),
-        "{program} {}: {}",
-        args[0],
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(output.stdout)
+    aep::delivery::command(ws, &runner.path()?, program, args)
 }
 
 fn git(ws: &Workspace, runner: &Runner, args: &[&str]) -> Result<String> {
@@ -91,54 +50,11 @@ fn git(ws: &Workspace, runner: &Runner, args: &[&str]) -> Result<String> {
 }
 
 pub(crate) fn github(ws: &Workspace, runner: &Runner, args: &[&str]) -> Result<Value> {
-    let mut command_args = vec!["api", "--hostname", "github.com"];
-    command_args.extend(args);
-    Ok(serde_json::from_slice(&command(
-        ws,
-        runner,
-        "gh",
-        &command_args,
-    )?)?)
-}
-
-fn slug(remote: &str) -> Result<String> {
-    let path = [
-        "https://github.com/",
-        "git@github.com:",
-        "ssh://git@github.com/",
-    ]
-    .iter()
-    .find_map(|prefix| remote.strip_prefix(prefix))
-    .context("origin 需要指向 github.com 上的仓库")?;
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let (owner, repo) = path.split_once('/').context("GitHub 仓库地址无效")?;
-    ensure!(
-        [owner, repo].iter().all(|part| {
-            !part.is_empty()
-                && !matches!(*part, "." | "..")
-                && part
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
-        }),
-        "GitHub 仓库地址无效"
-    );
-    Ok(path.to_ascii_lowercase())
+    aep::delivery::github(ws, &runner.path()?, args)
 }
 
 pub(crate) fn repository(ws: &Workspace, runner: &Runner) -> Result<String> {
-    let fetch = git(ws, runner, &["remote", "get-url", "origin"])?;
-    let pushed = git(
-        ws,
-        runner,
-        &["remote", "get-url", "--push", "--all", "origin"],
-    )?;
-    ensure!(pushed.lines().count() == 1, "origin 必须只有一个推送地址");
-    let repo = slug(fetch.trim())?;
-    ensure!(
-        slug(pushed.trim())? == repo,
-        "origin 的取回和推送地址指向不同的仓库"
-    );
-    Ok(repo)
+    aep::delivery::repository(ws, &runner.path()?)
 }
 
 fn candidate(ws: &Workspace, relay_id: &str, id: &str) -> Result<Value> {
@@ -307,124 +223,19 @@ pub(crate) fn remote_sha(
     runner: &Runner,
     reference: &str,
 ) -> Result<Option<String>> {
-    let output = git(ws, runner, &["ls-remote", "--refs", "origin", reference])?;
-    Ok(output
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .find(|(_, name)| *name == reference)
-        .map(|(sha, _)| sha.to_owned()))
+    aep::delivery::remote_sha(ws, &runner.path()?, reference)
 }
 
 fn check_base(ws: &Workspace, runner: &Runner, target: &Target) -> Result<()> {
-    ensure!(
-        remote_sha(ws, runner, &format!("refs/heads/{}", target.base))?.as_deref()
-            == Some(&target.base_sha),
-        "GitHub 目标分支已更新，请重新加载 Diff 并确认"
-    );
-    Ok(())
-}
-
-fn parse_pull(value: &Value) -> Result<Pull> {
-    Ok(Pull {
-        number: value["number"].as_u64().context("GitHub PR 编号缺失")?,
-        state: field(value, "state")?.into(),
-        head_sha: field(&value["head"], "sha")?.into(),
-        base: field(&value["base"], "ref")?.into(),
-        base_sha: field(&value["base"], "sha")?.into(),
-    })
-}
-
-fn existing(ws: &Workspace, runner: &Runner, target: &Target) -> Result<Option<Pull>> {
-    let owner = target
-        .repo
-        .split_once('/')
-        .context("GitHub 仓库地址无效")?
-        .0;
-    let endpoint = format!("repos/{}/pulls", target.repo);
-    let prs = github(
-        ws,
-        runner,
-        &[
-            &endpoint,
-            "--method",
-            "GET",
-            "-f",
-            "state=all",
-            "-f",
-            &format!("head={owner}:{}", target.head),
-        ],
-    )?;
-    prs.as_array()
-        .context("GitHub PR 列表无效")?
-        .first()
-        .map(parse_pull)
-        .transpose()
-}
-
-fn create(ws: &Workspace, runner: &Runner, target: &Target) -> Result<Pull> {
-    let body = format!(
-        "AEP Studio local review confirmed for the exact candidate.\n\n- Task: `{}`\n- Run: `{}`\n- Spec: `{}`\n- Candidate: `{}`\n- Local acceptance: passed\n",
-        target.task, target.run, target.spec, target.candidate
-    );
-    match github(
-        ws,
-        runner,
-        &[
-            &format!("repos/{}/pulls", target.repo),
-            "--method",
-            "POST",
-            "-f",
-            &format!("title=AEP: {}", target.task),
-            "-f",
-            &format!("base={}", target.base),
-            "-f",
-            &format!("head={}", target.head),
-            "-f",
-            &format!("body={body}"),
-        ],
-    ) {
-        Ok(value) => parse_pull(&value),
-        Err(error) => existing(ws, runner, target)?.ok_or(error),
-    }
+    aep::delivery::check_base(ws, &runner.path()?, target)
 }
 
 fn submit(ws: &Workspace, runner: &Runner, path: &Path, item: &mut Publication) -> Result<()> {
-    let target = &item.target;
-    check_base(ws, runner, target)?;
-    let reference = format!("refs/heads/{}", target.head);
-    let remote = remote_sha(ws, runner, &reference)?;
-    if let Some(remote) = remote {
-        ensure!(remote == target.candidate, "远端候选分支已指向另一提交");
-    } else {
-        ensure!(
-            existing(ws, runner, target)?.is_none(),
-            "该候选分支已有 PR，请在 GitHub 查看"
-        );
-        git(
-            ws,
-            runner,
-            &[
-                "push",
-                "--porcelain",
-                "--no-follow-tags",
-                "--recurse-submodules=no",
-                &format!("--force-with-lease={reference}:"),
-                "origin",
-                &format!("{}:{reference}", target.candidate),
-            ],
-        )?;
-    }
-    item.pushed = true;
-    save(path, item)?;
-    check_base(ws, runner, target)?;
-    ensure!(
-        remote_sha(ws, runner, &reference)?.as_deref() == Some(&target.candidate),
-        "远端候选分支已更新，请核对再发布"
-    );
-    let pull = match existing(ws, runner, target)? {
-        Some(pr) => pr,
-        None => create(ws, runner, target)?,
-    };
+    let target = item.target.clone();
+    let pull = aep::delivery::submit(ws, &runner.path()?, &target, || {
+        item.pushed = true;
+        save(path, item)
+    })?;
     let matches = pull.head_sha == target.candidate
         && pull.base == target.base
         && pull.base_sha == target.base_sha

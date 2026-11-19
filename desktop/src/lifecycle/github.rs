@@ -753,6 +753,8 @@ mod tests {
                     "--test".into(),
                     "name with spaces".into(),
                 ],
+                criteria: vec![],
+                checks: vec![],
             },
         };
         assert!(draft.validate().is_err());

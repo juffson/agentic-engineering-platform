@@ -83,6 +83,13 @@ impl Studio {
                 match result {
                     Ok((ws, fixture, progress)) => {
                         this.set_workspace(ws, Page::Lifecycle, window, cx);
+                        if this
+                            .current_queue_job()
+                            .is_some_and(|job| job.state == State::Cancelled)
+                        {
+                            cx.notify();
+                            return;
+                        }
                         match progress.stage {
                             Stage::Prepared | Stage::Dispatched => {
                                 this.lifecycle_error = progress.detail
@@ -180,12 +187,21 @@ impl Studio {
             .overflow_y_scroll()
             .h(px((self.task_sessions.len() as f32 * 90.).min(225.)))
             .gap_1();
-        for entry in &self.task_sessions {
+        let mut entries = self.task_sessions.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| match self.task_queue.latest(&entry.path) {
+            Some(job) if matches!(job.state, State::Running | State::Cancelling) => (0, 0),
+            Some(job) if job.state == State::Waiting => {
+                (1, self.task_queue.position(job).unwrap_or(0))
+            }
+            _ => (2, 0),
+        });
+        for entry in entries {
             let stage = entry.stage;
             let id = entry.path.file_name().unwrap_or_default().to_string_lossy();
             let path = entry.path.clone();
             let job = self.task_queue.latest(&entry.path);
             let queued = job.is_some_and(|job| job.state.active());
+            let cancelled = job.is_some_and(|job| job.state == State::Cancelled);
             let failure = job.and_then(|job| match &job.state {
                 State::Failed(error) => Some(error),
                 _ => None,
@@ -196,9 +212,10 @@ impl Studio {
                 entry.detail.clone().or_else(|| failure.cloned())
             };
             let label = job
-                .filter(|job| job.state.active() || failure.is_some())
+                .filter(|job| job.state.active() || failure.is_some() || cancelled)
                 .map_or_else(|| stage.label().to_owned(), |job| self.job_label(job));
             let action = match stage {
+                _ if cancelled => "查看取消证据",
                 Stage::PrepareRetry => "重试准备任务",
                 Stage::Retry(_) | Stage::PublishRetry | Stage::ChecksFailed => "查看失败并重试",
                 Stage::Archived => "查看归档",
@@ -209,6 +226,8 @@ impl Studio {
                 BLUE
             } else if failure.is_some() {
                 RED
+            } else if cancelled {
+                AMBER
             } else {
                 match stage {
                     Stage::Archived => MINT,
@@ -246,6 +265,9 @@ impl Studio {
                         detail_text(format!("task-session-detail-{id}"), &detail)
                             .text_color(rgb(color)),
                     )
+                })
+                .when_some(job.filter(|job| job.state.active()), |row, job| {
+                    row.child(self.queue_controls(job, cx))
                 })
                 .when(
                     !matches!(stage, Stage::Preparing | Stage::Unavailable),

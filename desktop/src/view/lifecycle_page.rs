@@ -272,9 +272,10 @@ impl Studio {
             let dispatched = out.join("dispatch.json").is_file();
             let job = self.current_queue_job();
             let active = job.is_some_and(|job| job.state.active());
+            let cancelled = job.is_some_and(|job| job.state == crate::task_queue::State::Cancelled);
             let label = if complete {
                 "全流程已核验".to_owned()
-            } else if let Some(job) = job.filter(|job| job.state.active()) {
+            } else if let Some(job) = job.filter(|job| job.state.active() || cancelled) {
                 self.job_label(job)
             } else if pending && dispatched {
                 "已派发，等待启动第一轮".to_owned()
@@ -293,6 +294,9 @@ impl Studio {
                             .child(field("Spec SHA", &test.spec))
                     })
                     .child(detail_text("lifecycle-status", &label))
+                    .when_some(job.filter(|job| job.state.active()), |card, job| {
+                        card.child(self.queue_controls(job, cx))
+                    })
                     .when_some(
                         job.and_then(|job| match &job.state {
                             crate::task_queue::State::Failed(error) => Some(error),
@@ -362,6 +366,14 @@ impl Studio {
                                 row.child(button("lifecycle-repack", "更新归档", false).on_click(
                                     cx.listener(|this, _, _, cx| this.pack_lifecycle(cx)),
                                 ))
+                            })
+                            .when(cancelled && !self.lifecycle_packaging, |row| {
+                                row.child(
+                                    button("lifecycle-archive-cancelled", "归档取消证据", true)
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.pack_lifecycle(cx)),
+                                        ),
+                                )
                             }),
                     ),
             );

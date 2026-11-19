@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     lifecycle,
-    task_queue::{self, Action, Job, State},
+    task_queue::{self, Action, Direction, Job, State},
 };
 
 impl Studio {
@@ -19,6 +19,7 @@ impl Studio {
             self.task_queue = task_queue::Queue::default();
             self.queue_driving = false;
             self.queue_error = None;
+            self.queue_cancel_confirm = None;
             self.queue_generation += 1;
         }
         self.queue_source = source;
@@ -140,14 +141,18 @@ impl Studio {
         cx.notify();
     }
 
-    fn set_parallelism(&mut self, limit: usize, cx: &mut Context<Self>) {
+    fn change_queue(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&Workspace) -> Result<()> + Send + 'static,
+    ) {
         let Some(source) = self.queue_source.clone() else {
             return;
         };
         let generation = self.queue_generation;
         self.queue_error = None;
         let save = cx.background_executor().spawn(async move {
-            task_queue::set_limit(&source, limit)?;
+            change(&source)?;
             task_queue::Queue::read(&source)
         });
         cx.spawn(async move |this, cx| {
@@ -158,7 +163,7 @@ impl Studio {
                 }
                 match result {
                     Ok(queue) => this.task_queue = queue,
-                    Err(error) => this.queue_error = Some(format!("保存并发数失败：{error:#}")),
+                    Err(error) => this.queue_error = Some(format!("更新队列失败：{error:#}")),
                 }
                 this.drive_task_queue(cx);
                 cx.notify();
@@ -180,9 +185,76 @@ impl Studio {
                 self.task_queue.position(job).unwrap_or_default()
             ),
             State::Running => format!("{round}运行中"),
+            State::Cancelling => format!("{round}正在取消"),
+            State::Cancelled => format!("{round}已取消"),
             State::Passed => format!("{round}已完成"),
             State::Failed(_) => format!("{round}执行失败"),
         }
+    }
+
+    pub(super) fn queue_controls(&self, job: &Job, cx: &Context<Self>) -> Div {
+        let id = job.id;
+        let mut line = h_flex().flex_wrap().items_center().gap_2();
+        if let Some(position) = self.task_queue.position(job) {
+            if position > 1 {
+                line = line.child(
+                    button(format!("queue-earlier-{id}"), "前移", false).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.change_queue(cx, move |ws| {
+                                task_queue::move_waiting(ws, id, Direction::Earlier)
+                            });
+                        },
+                    )),
+                );
+            }
+            if position < self.task_queue.pending() {
+                line = line.child(button(format!("queue-later-{id}"), "后移", false).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.change_queue(cx, move |ws| {
+                            task_queue::move_waiting(ws, id, Direction::Later)
+                        });
+                    }),
+                ));
+            }
+        }
+        if !matches!(job.state, State::Waiting | State::Running) {
+            return line;
+        }
+        let state = job.state.clone();
+        if self.queue_cancel_confirm.as_ref() == Some(&(id, state.clone())) {
+            return line
+                .child(caption(if job.state == State::Running {
+                    "停止本轮执行，保留已有日志和工作区。"
+                } else {
+                    "从等待队列中取消本轮。"
+                }))
+                .child(
+                    button(format!("queue-confirm-cancel-{id}"), "确认取消", true).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.queue_cancel_confirm = None;
+                            let expected = state.clone();
+                            this.change_queue(cx, move |ws| task_queue::cancel(ws, id, expected));
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .child(
+                    button(format!("queue-keep-{id}"), "返回", false).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.queue_cancel_confirm = None;
+                            cx.notify();
+                        },
+                    )),
+                );
+        }
+        line.child(
+            button(format!("queue-cancel-{id}"), "取消本轮", false).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.queue_cancel_confirm = Some((id, state.clone()));
+                    cx.notify();
+                },
+            )),
+        )
     }
 
     pub(super) fn queue_settings(&self, cx: &Context<Self>) -> Div {
@@ -194,9 +266,26 @@ impl Studio {
                     limit.to_string(),
                     limit == self.task_queue.limit,
                 )
-                .on_click(cx.listener(move |this, _, _, cx| this.set_parallelism(limit, cx))),
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.change_queue(cx, move |ws| task_queue::set_limit(ws, limit))
+                })),
             );
         }
+        let paused = self.task_queue.paused;
+        actions = actions.child(
+            button(
+                "queue-toggle-pause",
+                if paused {
+                    "恢复派发"
+                } else {
+                    "暂停派发"
+                },
+                paused,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.change_queue(cx, move |ws| task_queue::set_paused(ws, !paused));
+            })),
+        );
         panel()
             .gap_2()
             .child(
@@ -211,9 +300,10 @@ impl Studio {
             .child(detail_text(
                 "task-queue-summary",
                 &format!(
-                    "{} 个运行中 · {} 个排队",
+                    "{} 个运行中 · {} 个排队{}",
                     self.task_queue.running(),
-                    self.task_queue.pending()
+                    self.task_queue.pending(),
+                    if paused { " · 派发已暂停" } else { "" }
                 ),
             ))
     }

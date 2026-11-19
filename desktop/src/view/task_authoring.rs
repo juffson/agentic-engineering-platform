@@ -1,6 +1,6 @@
 use super::*;
 use crate::lifecycle;
-use aep::task::TaskManifest;
+use aep::task::{Check, TaskManifest};
 use anyhow::Context as _;
 use gpui_kit::component::input::{Textarea, TextareaState};
 
@@ -15,8 +15,29 @@ pub(crate) struct Authoring {
 
 impl Authoring {
     fn draft(&self, cx: &App) -> Result<lifecycle::Draft> {
-        let check = serde_json::from_str::<Vec<String>>(&self.check.read(cx).value())
-            .context("验收命令必须是 JSON 字符串数组，例如 [\"cargo\",\"test\",\"--locked\"]")?;
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Acceptance {
+            Command(Vec<String>),
+            Plan {
+                check: Vec<String>,
+                #[serde(default)]
+                criteria: Vec<String>,
+                #[serde(default)]
+                checks: Vec<Check>,
+            },
+        }
+        let (check, criteria, checks) =
+            match serde_json::from_str::<Acceptance>(&self.check.read(cx).value())
+                .context("请填写验收命令数组或包含 check、criteria 和 checks 的验收对象")?
+            {
+                Acceptance::Command(check) => (check, Vec::new(), Vec::new()),
+                Acceptance::Plan {
+                    check,
+                    criteria,
+                    checks,
+                } => (check, criteria, checks),
+            };
         let title = self.title.read(cx).value().trim().to_owned();
         let draft = lifecycle::Draft {
             name: self.task.read(cx).value().trim().to_owned(),
@@ -33,6 +54,8 @@ impl Authoring {
                     .map(str::to_owned)
                     .collect(),
                 check,
+                criteria,
+                checks,
             },
         };
         draft.validate()?;
@@ -52,17 +75,40 @@ impl Authoring {
             .child(field("仓库", &ws.root.display().to_string()))
             .child(field("目标分支", &self.branch.name))
             .child(field("目标提交", &self.branch.sha))
-            .child(h_flex().gap_3()
-                .child(v_flex().gap_1().flex_1().min_w_0()
-                    .child(caption("任务 ID"))
-                    .child(Input::new(&self.task).aria_label("任务 ID").disabled(preparing)))
-                .child(v_flex().gap_1().flex_1().min_w_0()
-                    .child(caption("标题（可选）"))
-                    .child(Input::new(&self.title).aria_label("任务标题").disabled(preparing))))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .flex_1()
+                            .min_w_0()
+                            .child(caption("任务 ID"))
+                            .child(
+                                Input::new(&self.task)
+                                    .aria_label("任务 ID")
+                                    .disabled(preparing),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .flex_1()
+                            .min_w_0()
+                            .child(caption("标题（可选）"))
+                            .child(
+                                Input::new(&self.title)
+                                    .aria_label("任务标题")
+                                    .disabled(preparing),
+                            ),
+                    ),
+            )
             .child(text_field("任务 Spec", &self.spec, 155.))
             .child(text_field("允许修改的文件", &self.paths, 68.))
             .child(text_field("验收命令", &self.check, 64.))
-            .child(caption("验收命令用 JSON 数组填写程序名和各个参数，例如 [\"cargo\", \"test\", \"--locked\"]。"));
+            .child(caption(
+                "填写 JSON 命令数组，或填写带验收项编号和多个检查的 JSON 对象。",
+            ));
         if preparing {
             return form.child(caption("正在准备指定提交上的任务…"));
         }
