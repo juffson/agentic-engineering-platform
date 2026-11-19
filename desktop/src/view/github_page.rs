@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    cleanup,
     github_pr::{self, Check, Outcome, Snapshot},
     publish::Publication,
 };
@@ -21,6 +22,9 @@ pub(crate) struct State {
     diagnostic: Option<Diagnostic>,
     error: Option<String>,
     merge_error: Option<String>,
+    cleanup: Option<cleanup::Receipt>,
+    cleaning: bool,
+    cleanup_error: Option<String>,
 }
 
 impl Studio {
@@ -35,7 +39,7 @@ impl Studio {
         }
         if let Some(state) = self.pull_request.as_ref()
             && state.publication.target == publication.target
-            && (state.merging || state.refresh)
+            && (state.merging || state.refresh || state.cleaning)
         {
             self.navigate(Page::PullRequest, window, cx);
             return;
@@ -52,6 +56,9 @@ impl Studio {
             diagnostic: None,
             error: None,
             merge_error: None,
+            cleanup: None,
+            cleaning: false,
+            cleanup_error: None,
         });
         self.navigate(Page::PullRequest, window, cx);
         self.refresh_github(cx);
@@ -84,7 +91,7 @@ impl Studio {
         let (Some(ws), Some(state)) = (self.workspace.clone(), self.pull_request.as_mut()) else {
             return;
         };
-        if state.refresh || state.merging {
+        if state.refresh || state.merging || state.cleaning {
             return;
         }
         let Some(pr) = &state.publication.pr else {
@@ -95,11 +102,12 @@ impl Studio {
         let runner = self.runner.clone();
         let reader = state.reader;
         state.refresh = true;
-        let task = cx
-            .background_executor()
-            .spawn(async move { github_pr::load(&ws, &runner, &target, number) });
+        let task = cx.background_executor().spawn(async move {
+            let receipt = cleanup::read(&ws.data.join("runs").join(&target.run));
+            (github_pr::load(&ws, &runner, &target, number), receipt)
+        });
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let (result, receipt) = task.await;
             let _ = this.update(cx, |this, cx| {
                 let Some(state) = this
                     .pull_request
@@ -109,6 +117,12 @@ impl Studio {
                     return;
                 };
                 state.refresh = false;
+                match receipt {
+                    Ok(receipt) => state.cleanup = receipt,
+                    Err(error) => {
+                        state.cleanup_error = Some(format!("读取收尾记录失败：{error:#}"))
+                    }
+                }
                 match result {
                     Ok(snapshot) => {
                         if !state
@@ -234,6 +248,53 @@ impl Studio {
         cx.notify();
     }
 
+    fn finish_merged_pr(&mut self, cx: &mut Context<Self>) {
+        let (Some(ws), Some(state)) = (self.workspace.clone(), self.pull_request.as_mut()) else {
+            return;
+        };
+        if state.cleaning
+            || state.refresh
+            || state.merging
+            || !state
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.state == "MERGED")
+        {
+            return;
+        }
+        state.cleaning = true;
+        state.cleanup_error = None;
+        let reader = state.reader;
+        let runner = self.runner.clone();
+        let publication = state.publication.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { cleanup::finish(&ws, &runner, &publication) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(state) = this
+                    .pull_request
+                    .as_mut()
+                    .filter(|state| state.reader == reader)
+                else {
+                    return;
+                };
+                state.cleaning = false;
+                match result {
+                    Ok(receipt) => {
+                        state.cleanup = Some(receipt);
+                        this.reload(cx);
+                    }
+                    Err(err) => state.cleanup_error = Some(format!("{err:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(super) fn github_pr_page(&self, cx: &Context<Self>) -> Div {
         let mut main = v_flex().size_full().min_h_0().bg(rgb(CANVAS));
         let Some(state) = &self.pull_request else {
@@ -290,7 +351,7 @@ impl Studio {
             );
         }
         let Some(snapshot) = state.snapshot.as_deref() else {
-            return main.child(
+            let mut content = main.child(
                 caption(if state.refresh {
                     "正在读取检查和审查"
                 } else {
@@ -298,6 +359,10 @@ impl Studio {
                 })
                 .p_5(),
             );
+            if state.cleanup.is_some() {
+                content = content.child(self.post_merge(state, cx).p_5());
+            }
+            return content;
         };
         let mut tabs = h_flex().gap_2();
         for (discussion, id, label) in [
@@ -448,7 +513,9 @@ impl Studio {
             .child(field("目标分支", &snapshot.base_ref))
             .child(field("目标 SHA", &snapshot.base))
             .child(field("PR head", &snapshot.head))
-            .child(field("GitHub 状态", &snapshot.merge_state));
+            .when(snapshot.state == "OPEN", |side| {
+                side.child(field("GitHub 状态", &snapshot.merge_state))
+            });
         if !snapshot.review_decision.is_empty() {
             side = side.child(field("审查结果", review_label(&snapshot.review_decision)));
         }
@@ -464,6 +531,7 @@ impl Studio {
                     receipt.confirmed_by
                 )));
             }
+            side = side.child(self.post_merge(state, cx));
         } else if state.merging {
             side = side.child(chip("正在提交合并请求", MINT));
         } else if let Some(reason) = snapshot.blocker(target) {
@@ -506,6 +574,72 @@ impl Studio {
         }
         side.into_any_element()
     }
+
+    fn post_merge(&self, state: &State, cx: &Context<Self>) -> Div {
+        let mut section = v_flex()
+            .gap_2()
+            .pt_3()
+            .border_t_1()
+            .border_color(rgb(LINE))
+            .child(heading("合并后收尾"));
+        if let Some(error) = &state.cleanup_error {
+            section =
+                section.child(detail_text("github-cleanup-error", error).text_color(rgb(RED)));
+        }
+        if let Some(receipt) = &state.cleanup {
+            section = section.child(cleanup_step(
+                "github-cleanup-target",
+                "本地目标分支",
+                &receipt.target,
+            ));
+            if let Some(branch) = &receipt.branch {
+                section = section.child(cleanup_step("github-cleanup-branch", "候选分支", branch));
+            }
+            for (index, tree) in receipt.worktrees.iter().enumerate() {
+                section = section.child(cleanup_step(
+                    SharedString::from(format!("github-cleanup-worktree-{index}")),
+                    &format!("Worktree · {}", tree.run),
+                    &tree.step,
+                ));
+            }
+            if receipt.complete() {
+                return section.child(
+                    detail_text("github-cleanup-complete", "收尾已完成").text_color(rgb(MINT)),
+                );
+            }
+        } else {
+            section = section.child(caption("快进本地目标分支，删除匹配的远端候选，移除干净的临时 Worktree。接力证据和记忆留在原仓库。"));
+        }
+        if state.cleaning {
+            section = section.child(chip("正在同步与清理", MINT));
+        } else if !state.refresh
+            && state
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.state == "MERGED")
+        {
+            section = section.child(
+                button(
+                    "github-finish-merge",
+                    if state.cleanup.is_some() {
+                        "重试同步与清理"
+                    } else {
+                        "同步目标分支并清理"
+                    },
+                    true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.finish_merged_pr(cx))),
+            );
+        }
+        section
+    }
+}
+
+fn cleanup_step(id: impl Into<ElementId>, label: &str, step: &cleanup::Step) -> Div {
+    v_flex()
+        .gap_1()
+        .child(caption(label.to_owned()))
+        .child(detail_text(id, &step.detail).text_color(rgb(if step.done { MINT } else { AMBER })))
 }
 
 fn review_label(kind: &str) -> &str {

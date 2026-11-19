@@ -84,6 +84,11 @@ impl Studio {
                 ("运行中", MINT)
             } else if relay
                 .latest(Round::Second)
+                .is_some_and(|attempt| attempt.finalized())
+            {
+                ("已收尾", MINT)
+            } else if relay
+                .latest(Round::Second)
                 .is_some_and(|attempt| attempt.merged())
             {
                 ("PR 已合并", MINT)
@@ -233,6 +238,7 @@ impl Studio {
         };
         let run = relay.run(round, &self.snapshot);
         let (progress, tone) = match run.map(|run| run.text("status")) {
+            Some("awaiting_human_review") if attempt.finalized() => ("合并与收尾已完成", MINT),
             Some("awaiting_human_review") if attempt.merged() => ("GitHub PR 已合并", MINT),
             Some("awaiting_human_review")
                 if attempt

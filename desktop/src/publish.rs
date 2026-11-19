@@ -292,7 +292,11 @@ pub(crate) fn prepare(ws: &Workspace, runner: &Runner, relay: &str, id: &str) ->
     })
 }
 
-fn remote_sha(ws: &Workspace, runner: &Runner, reference: &str) -> Result<Option<String>> {
+pub(crate) fn remote_sha(
+    ws: &Workspace,
+    runner: &Runner,
+    reference: &str,
+) -> Result<Option<String>> {
     let output = git(ws, runner, &["ls-remote", "--refs", "origin", reference])?;
     Ok(output
         .lines()

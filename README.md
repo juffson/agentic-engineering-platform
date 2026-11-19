@@ -64,6 +64,14 @@ Studio 将候选推送到 `aep/pr/<task>/<run-id>`，并保存确认账号、候
 
 检查通过且 GitHub 允许合并后，核对当前检查和审查意见，勾选确认并点击「确认合并」。Studio 会重新读取 GitHub 状态，并向 GitHub 提交匹配人审候选 SHA 的合并请求。状态或提交变化时，刷新后重新确认；分支保护和权限由 GitHub 执行。完成后可查看合并提交、账号和时间，本地 Run 的 `merge.json` 保存确认记录。
 
+### 合并后收尾
+
+GitHub 确认已合并后，在同一 PR 页点「同步目标分支并清理」。Studio 从 `origin` 同步目标分支，先确认远端仍包含本次合并提交，再快进本地分支。若目标分支有独有提交，或检出它的 Worktree 有未提交或未跟踪文件，界面会显示原因，处理后可重试。
+
+同步完成后，Studio 会删除仍指向该候选 SHA 的远端 AEP 候选分支，并清理相应的本地远端追踪引用。用户创建的本地同名分支可继续使用。Studio 仅移除本次接力 Run 记录中已经结束、可核对归属且干净的临时 Worktree。含未提交或未跟踪文件、新提交或被锁定的 Worktree 会列在结果中，供处理后重试。
+
+两轮证据、候选归档引用、共享记忆和合并记录继续存放在原仓库。第二轮 Run 的 `cleanup.json` 保存每步结果。可以重开 Studio 查看接力的收尾状态和两轮证据。
+
 ### 重复派发与本地恢复
 
 派发方可以给一次执行指定稳定的 `--run-id`。在同一设备和同一仓库（包括它的其他 Worktree）重送消息时，沿用该 ID。以下示例可执行两次；第二次复用第一次的证据。
@@ -145,7 +153,7 @@ cargo test --locked --all-targets
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug
 ```
 
-可用 `--scenario history`、`conflict`、`handoff` 或 `studio-relay` 单独运行。后者从 Studio 选任务发起两轮，并回归失败重试、修订、证据跳转、PR 发布恢复、CI 失败诊断、审查意见和人审合并。要查看某一步的实际画面，添加输出目录和截图选项。
+可用 `--scenario history`、`conflict`、`handoff` 或 `studio-relay` 单独运行。后者从 Studio 选任务发起两轮，并回归失败重试、记忆修订、证据跳转、PR 发布恢复、GitHub CI、人审合并和合并后收尾。要查看某一步的实际画面，添加输出目录和截图选项。
 
 ```sh
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \

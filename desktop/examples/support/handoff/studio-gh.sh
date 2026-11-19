@@ -7,7 +7,11 @@ test "$3" = github.com
 case "$4" in
   graphql)
     head=$(cat "$fixture/pr-head")
-    head_sha=$(/usr/bin/git --git-dir="$fixture/remote.git" rev-parse "refs/heads/$head")
+    if [ -f "$fixture/merged-head" ]; then
+      head_sha=$(cat "$fixture/merged-head")
+    else
+      head_sha=$(/usr/bin/git --git-dir="$fixture/remote.git" rev-parse "refs/heads/$head")
+    fi
     base_sha=$(/usr/bin/git --git-dir="$fixture/remote.git" rev-parse refs/heads/main)
     mode=pending
     if [ -f "$fixture/ci-state" ]; then mode=$(cat "$fixture/ci-state"); fi
@@ -72,9 +76,16 @@ JSON
     head_sha=$(/usr/bin/git --git-dir="$fixture/remote.git" rev-parse "refs/heads/$head")
     test "$4" = "sha=$head_sha"
     test "$6" = merge_method=merge
+    base_sha=$(/usr/bin/git --git-dir="$fixture/remote.git" rev-parse refs/heads/main)
+    tree=$(/usr/bin/git --git-dir="$fixture/remote.git" rev-parse "$head_sha^{tree}")
+    merge=$(/usr/bin/git --git-dir="$fixture/remote.git" -c user.name='AEP Fixture' \
+      -c user.email=fixture@example.invalid -c commit.gpgsign=false \
+      commit-tree "$tree" -p "$base_sha" -p "$head_sha" -m 'Merge smoke candidate')
+    /usr/bin/git --git-dir="$fixture/remote.git" update-ref refs/heads/main "$merge" "$base_sha"
     printf 'PUT\n' >> "$fixture/pr-merges"
-    printf '%s\n' "$head_sha" > "$fixture/merged-sha"
-    printf '{"merged":true,"sha":"%s"}\n' "$head_sha"
+    printf '%s\n' "$head_sha" > "$fixture/merged-head"
+    printf '%s\n' "$merge" > "$fixture/merged-sha"
+    printf '{"merged":true,"sha":"%s"}\n' "$merge"
     ;;
   repos/example/aep-fixture)
     printf '%s\n' '{"default_branch":"main"}'
