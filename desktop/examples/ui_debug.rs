@@ -444,7 +444,7 @@ fn continuation(
     root: &Path,
     clients: Clients<'_>,
     reference: Option<&str>,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     use handoff_fixture::{DECISION, FOLLOW_UP, RUN};
 
     let first = status(&ws.data, RUN)?;
@@ -581,19 +581,17 @@ fn continuation(
         for (file, evidence) in [
             ("question.json", question.clone()),
             ("decision.json", revised),
-            (
-                "verification.json",
-                json!({
-                    "status": "passed", "reference": reference, "question_id": original, "decision_id": decision,
-                    "first_run": RUN, "follow_up_run": FOLLOW_UP, "follow_up_inputs": next["memory_inputs"],
-                    "reference_in_implementer_note": true, "reference_in_reviewer_report": true, "studio_verified": true
-                }),
-            ),
         ] {
             fs::write(dir.join(file), serde_json::to_vec_pretty(&evidence)?)?;
         }
+        return Ok(Some(json!({
+            "status": "passed", "reference": reference, "question_id": original, "decision_id": decision,
+            "first_run": RUN, "follow_up_run": FOLLOW_UP, "follow_up_inputs": next["memory_inputs"],
+            "reference_in_implementer_note": true, "reference_in_reviewer_report": true,
+            "studio_verified": true, "studio_workspace": "workspace/repo"
+        })));
     }
-    Ok(())
+    Ok(None)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -659,11 +657,11 @@ fn with_fixture(
     inspect(args, &ws, |ui| check(ui, &ws, &sha))
 }
 
-fn inspect(
+fn inspect<T>(
     args: &Args,
     ws: &Workspace,
-    check: impl FnOnce(&mut Driver) -> Result<()>,
-) -> Result<()> {
+    check: impl FnOnce(&mut Driver) -> Result<T>,
+) -> Result<T> {
     let mut ui = Driver::open(ws, args)?;
     let result = check(&mut ui);
     if result.is_err()
@@ -677,37 +675,50 @@ fn inspect(
 fn relay(args: &Args, clients: Clients<'_>, reference: Option<&str>) -> Result<()> {
     use handoff_fixture::RUN;
 
-    let dir = tempfile::tempdir()?;
+    let output = args.output_dir.as_deref().filter(|_| reference.is_some());
+    let temporary;
+    let root = if let Some(output) = output {
+        let root = output.join("workspace");
+        fs::create_dir(&root)?;
+        root
+    } else {
+        temporary = tempfile::tempdir()?;
+        temporary.path().to_path_buf()
+    };
     let result = (|| {
-        let ws = handoff_fixture::prepare(dir.path(), clients)?;
+        let ws = handoff_fixture::prepare(&root, clients)?;
+        if output.is_some() {
+            println!("Studio workspace: {}", ws.root.display());
+        }
         println!("Running {RUN}");
-        let verified = handoff_fixture::run(dir.path(), clients, RUN).and_then(|()| {
+        let verified = handoff_fixture::run(&root, clients, RUN).and_then(|()| {
             inspect(args, &ws, |ui| {
                 handoff(ui, &ws, RUN)?;
-                continuation(ui, &ws, dir.path(), clients, reference)
+                continuation(ui, &ws, &root, clients, reference)
             })
         });
-        if reference.is_some() {
-            let output = args
-                .output_dir
-                .as_ref()
-                .context("live relay output directory")?;
+        if let Some(output) = output {
             let exported = handoff_fixture::export_runs(&ws, output);
             if let Err(error) = &exported {
                 eprintln!("Failed to save run evidence: {error:#}");
             }
-            verified.and(exported)
+            let summary = verified?;
+            exported?;
+            let summary = summary.context("missing live relay verification summary")?;
+            let mut file = tempfile::NamedTempFile::new_in(output)?;
+            serde_json::to_writer_pretty(&mut file, &summary)?;
+            file.persist(output.join("verification.json"))?;
         } else {
-            verified
+            verified?;
         }
+        Ok(())
     })();
     if let Err(error) = &result
-        && let Some(output) = args.output_dir.as_ref().filter(|_| reference.is_some())
+        && let Some(output) = output
     {
-        let path = dir.keep();
         let diagnostic = format!(
             "{error:#}\nSynthetic workspace retained at {}\n",
-            path.display()
+            root.join("repo").display()
         );
         eprintln!("{diagnostic}");
         fs::write(output.join("failure.txt"), diagnostic).context("save live relay diagnostics")?;

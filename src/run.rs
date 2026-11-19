@@ -192,13 +192,15 @@ pub fn execute(
         )?;
         record["changed_files"] = json!(repo.changes(&base, &head, &task.allowed_paths)?);
         let key = Key::new(&args.task, &base, &head);
-        if implementer.is_some() {
-            agents.handoff(&key, &mut record)?;
-        }
         // This checkout was created for this run and has never been exposed as a user workspace.
         git(&work, &["reset", "--hard", &head])?;
         git(&work, &["clean", "-ffdx"])?;
         verify_task(&agents, &task, &mut record)?;
+        if implementer.is_some() && args.shared_memory {
+            // Publish cross-run context only after the candidate has passed its checks.
+            agents.handoff(&key, &mut record)?;
+            save(&folder, &record)?;
+        }
         if args.reviewer == "claude" {
             let diff = git(&repo.root, &["diff", "--no-ext-diff", &base, &head])?;
             agents.review(&key, &spec, &diff, &mut record)?;
