@@ -22,6 +22,46 @@ fn accepts_the_pinned_task_files_including_nested_fixtures() {
     save(repo, "specs/task-a/spec.md", "task");
     let spec = save(repo, "specs/task-a/fixtures/check.txt", "fixture");
     assert!(validate_task_target(repo, &base, &spec, "task-a").is_ok());
+    assert!(validate_task_target(repo, "HEAD~2", "HEAD", "task-a").is_ok());
+}
+#[test]
+fn unresolved_targets_require_refreshing_refs_and_selecting_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    fixture(repo);
+    let spec = save(repo, "specs/task-a/spec.md", "task");
+    for target in [
+        "1111111111111111111111111111111111111111",
+        "HEAD^{tree}",
+        "--invalid-revision",
+    ] {
+        let error = validate_task_target(repo, target, &spec, "task-a")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("cannot resolve selected target {target}")));
+        assert!(error.contains("refresh GitHub refs and select again"));
+        assert!(!error.contains("new task version"));
+        assert!(!error.contains("aep dispatch"));
+    }
+}
+#[test]
+fn unresolved_specs_require_refreshing_refs_and_selecting_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    let target = fixture(repo);
+    for spec in [
+        "1111111111111111111111111111111111111111",
+        "HEAD^{tree}",
+        "--invalid-revision",
+    ] {
+        let error = validate_task_target(repo, &target, spec, "task-a")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("cannot resolve pinned Spec {spec}")));
+        assert!(error.contains("refresh GitHub refs and select again"));
+        assert!(!error.contains("new task version"));
+        assert!(!error.contains("aep dispatch"));
+    }
 }
 #[test]
 fn rejects_divergent_targets_and_unrelated_paths() {
@@ -32,7 +72,15 @@ fn rejects_divergent_targets_and_unrelated_paths() {
     assert!(validate_task_target(repo, &base, &spec, "task-a").is_err());
     git(repo, &["switch", "-qc", "other", &base]).unwrap();
     let target = save(repo, "source.txt", "different");
-    assert!(validate_task_target(repo, &target, &spec, "task-a-extra").is_err());
+    let error = validate_task_target(repo, &target, &spec, "task-a-extra")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("must be an ancestor of the Spec"));
+    assert!(error.contains(&format!(
+        "create a new task version from selected target {target}"
+    )));
+    assert!(error.contains("aep dispatch --task <new-task> --rev <new-spec-sha>"));
+    assert!(!error.contains("refresh GitHub refs"));
     assert!(validate_task_target(repo, &base, &spec, "../task").is_err());
 }
 #[test]

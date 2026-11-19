@@ -50,16 +50,26 @@ pub fn ident(id: &str, max: usize) -> Result<()> {
     Ok(())
 }
 
-/// Validates ancestry and confines changes to `specs/<task>/`, including acceptance fixtures.
-/// Callers must first resolve and check both immutable commit SHAs.
+/// Resolves commit references, validates ancestry, and confines changes to `specs/<task>/`,
+/// including acceptance fixtures.
 pub fn validate_task_target(repo: &Path, target: &str, spec: &str, task: &str) -> Result<()> {
     ident(task, 63)?;
+    let target_sha = commit(repo, target).with_context(|| {
+        format!("cannot resolve selected target {target}: refresh GitHub refs and select again")
+    })?;
+    let spec_sha = commit(repo, spec).with_context(|| {
+        format!("cannot resolve pinned Spec {spec}: refresh GitHub refs and select again")
+    })?;
     let remedy = format!(
         "create a new task version from selected target {target}, commit its requirements under \
          specs/<new-task>/, and dispatch it with \
          `aep dispatch --task <new-task> --rev <new-spec-sha>`"
     );
-    git(repo, &["merge-base", "--is-ancestor", target, spec]).with_context(|| {
+    git(
+        repo,
+        &["merge-base", "--is-ancestor", &target_sha, &spec_sha],
+    )
+    .with_context(|| {
         format!(
             "cannot use task {task} at pinned Spec {spec}: selected target {target} must be an \
              ancestor of the Spec; {remedy}"
@@ -67,7 +77,14 @@ pub fn validate_task_target(repo: &Path, target: &str, spec: &str, task: &str) -
     })?;
     let diff = git(
         repo,
-        &["diff", "--no-renames", "--name-only", "-z", target, spec],
+        &[
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            &target_sha,
+            &spec_sha,
+        ],
     )?;
     let prefix = format!("specs/{task}/");
     for path in diff.split_terminator('\0') {
