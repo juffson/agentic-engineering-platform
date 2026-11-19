@@ -50,6 +50,8 @@ pub fn ident(id: &str, max: usize) -> Result<()> {
     Ok(())
 }
 
+/// Validates ancestry and confines changes to `specs/<task>/`, including acceptance fixtures.
+/// Callers must first resolve and check both immutable commit SHAs.
 pub fn validate_task_target(repo: &Path, target: &str, spec: &str, task: &str) -> Result<()> {
     ident(task, 63)?;
     let remedy = format!(
