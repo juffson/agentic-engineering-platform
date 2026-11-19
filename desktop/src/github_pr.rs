@@ -1,6 +1,6 @@
 use crate::{
     Runner,
-    publish::{Publication, Target, field, github, repository},
+    publish::{Publication, Target, command, field, github, repository},
 };
 use aep::workspace::Workspace;
 use anyhow::{Context, Result, ensure};
@@ -34,6 +34,25 @@ pub(crate) struct Check {
     pub outcome: Outcome,
     pub url: String,
     pub description: String,
+}
+
+impl Check {
+    fn failed_actions_run(&self, repo: &str) -> Option<u64> {
+        if self.outcome != Outcome::Failed {
+            return None;
+        }
+        let (owner_repo, details) = self
+            .url
+            .strip_prefix("https://github.com/")?
+            .split_once("/actions/runs/")?;
+        let details = details.split('?').next()?;
+        let (run, job) = details
+            .split_once("/job/")
+            .or_else(|| details.split_once("/jobs/"))?;
+        (owner_repo.eq_ignore_ascii_case(repo) && job.parse::<u64>().ok()? == self.number?)
+            .then(|| run.parse().ok())
+            .flatten()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +99,48 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    pub fn can_retry_checks(&self, target: &Target) -> bool {
+        self.state == "OPEN"
+            && !self.draft
+            && self.permission
+            && self.head == target.candidate
+            && self.base_ref == target.base
+            && self.head_ref == target.head
+            && self
+                .checks
+                .iter()
+                .any(|check| check.failed_actions_run(&target.repo).is_some())
+    }
+
+    pub fn save_progress(&self, ws: &Workspace, target: &Target, pr: u64) -> Result<()> {
+        let Some(out) = crate::lifecycle::output(ws) else {
+            return Ok(());
+        };
+        let failures = self
+            .checks
+            .iter()
+            .filter(|check| check.outcome == Outcome::Failed)
+            .map(|check| format!("{} · {}", check.name, check.conclusion))
+            .collect::<Vec<_>>();
+        let blocker = self.blocker(target);
+        let (state, detail) = if self.state == "MERGED" {
+            ("merged", None)
+        } else if !failures.is_empty() {
+            ("failed", Some(failures.join("，")))
+        } else if blocker.is_none() {
+            ("ready", None)
+        } else {
+            ("checks", blocker.map(str::to_owned))
+        };
+        crate::lifecycle::save(
+            &out,
+            "github-progress.json",
+            &serde_json::json!({
+                "pr":pr, "candidate":target.candidate, "state":state, "detail":detail
+            }),
+        )
+    }
+
     pub fn blocker(&self, target: &Target) -> Option<&'static str> {
         if self.state == "MERGED" {
             Some("此 PR 已合并")
@@ -162,6 +223,65 @@ impl Snapshot {
                 .zip(&previous.checks)
                 .all(|(a, b)| a.id == b.id && a.status == b.status && a.conclusion == b.conclusion)
     }
+}
+
+pub(crate) fn rerun_checks(
+    ws: &Workspace,
+    runner: &Runner,
+    publication: &Publication,
+) -> Result<()> {
+    let target = &publication.target;
+    ensure!(repository(ws, runner)? == target.repo, "GitHub 仓库已变化");
+    let pr = publication.pr.as_ref().context("缺少已发布的 PR")?;
+    let snapshot = load(ws, runner, target, pr.number)?;
+    ensure!(
+        snapshot.can_retry_checks(target),
+        "没有可以重试的 GitHub Actions 检查"
+    );
+    let mut jobs = snapshot
+        .checks
+        .iter()
+        .filter_map(|check| check.failed_actions_run(&target.repo))
+        .collect::<Vec<_>>();
+    jobs.sort_unstable();
+    jobs.dedup();
+    let mut retry = Vec::new();
+    for id in jobs {
+        let endpoint = format!("repos/{}/actions/runs/{id}", target.repo);
+        let run = github(ws, runner, &[&endpoint])?;
+        ensure!(
+            run["id"] == id
+                && run["head_sha"] == target.candidate
+                && run["head_branch"] == target.head
+                && matches!(run["event"].as_str(), Some("push" | "pull_request")),
+            "GitHub Actions 运行与已发布的候选不一致"
+        );
+        if run["status"] == "completed"
+            && matches!(
+                run["conclusion"].as_str(),
+                Some("failure" | "timed_out" | "cancelled" | "action_required" | "startup_failure")
+            )
+        {
+            retry.push(id);
+        }
+    }
+    ensure!(!retry.is_empty(), "失败的检查已变化，请刷新");
+    for id in retry {
+        command(
+            ws,
+            runner,
+            "gh",
+            &[
+                "run",
+                "rerun",
+                &id.to_string(),
+                "--failed",
+                "--repo",
+                &target.repo,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn text(value: &Value, field: &str) -> String {
@@ -530,4 +650,26 @@ pub(crate) fn merge(
         }
     }
     load(ws, runner, target, number)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_matching_failed_actions_jobs_can_be_retried() -> Result<()> {
+        let mut job = check(&serde_json::json!({
+            "__typename":"CheckRun", "id":"job", "databaseId":5,
+            "status":"COMPLETED", "conclusion":"FAILURE",
+            "detailsUrl":"https://github.com/Owner/Repo/actions/runs/42/job/5"
+        }))?;
+        assert_eq!(job.failed_actions_run("owner/repo"), Some(42));
+        assert_eq!(job.failed_actions_run("another/repo"), None);
+        job.outcome = Outcome::Passed;
+        assert_eq!(job.failed_actions_run("owner/repo"), None);
+        job.outcome = Outcome::Failed;
+        job.number = None;
+        assert_eq!(job.failed_actions_run("owner/repo"), None);
+        Ok(())
+    }
 }

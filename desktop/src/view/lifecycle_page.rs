@@ -1,7 +1,7 @@
 use super::*;
 use crate::lifecycle;
 use std::{
-    fs,
+    fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::Path,
 };
@@ -68,6 +68,9 @@ impl Studio {
                 .keep();
             let out = root.join("evidence");
             fs::create_dir(&out)?;
+            let lock = File::create(root.join("prepare.lock"))?;
+            lock.try_lock()?;
+            lifecycle::save(&root, "request.json", &plan)?;
             let result =
                 lifecycle::Fixture::prepare_studio(&out, &root, &source.root, &runner, plan);
             if let Err(error) = &result {
@@ -97,6 +100,7 @@ impl Studio {
                     }
                     Err(error) => this.lifecycle_error = Some(format!("准备失败：{error:#}")),
                 }
+                this.load_task_sessions(cx);
                 cx.notify();
             });
         })
@@ -118,9 +122,10 @@ impl Studio {
             name: fixture.task.clone(),
             sha: fixture.spec.clone(),
         };
-        let dispatch = cx
-            .background_executor()
-            .spawn(async move { fixture.dispatch_authored(&ws, &runner) });
+        let dispatch = cx.background_executor().spawn(async move {
+            let result = fixture.dispatch_authored(&ws, &runner);
+            lifecycle::record_failure(&ws, "dispatch-error.txt", result)
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = dispatch.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -229,7 +234,7 @@ impl Studio {
             .is_some_and(|p| p.join("verification.json").is_file())
     }
 
-    fn pack_lifecycle(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn pack_lifecycle(&mut self, cx: &mut Context<Self>) {
         if self.lifecycle_packaging {
             return;
         }
@@ -239,9 +244,11 @@ impl Studio {
         };
         self.lifecycle_packaging = true;
         let generation = self.workspace_generation;
-        let job = cx
-            .background_executor()
-            .spawn(async move { lifecycle::archive(&root, &root.join("evidence")) });
+        let ws = ws.clone();
+        let job = cx.background_executor().spawn(async move {
+            let result = lifecycle::archive(&root, &root.join("evidence"));
+            lifecycle::record_failure(&ws, "archive-error.txt", result)
+        });
         cx.spawn(async move |this, cx| {
             let result = job.await;
             let _ = this.update(cx, |this, cx| {
@@ -271,6 +278,9 @@ impl Studio {
             .child(heading("隔离全流程").text_2xl());
         if let Some(error) = &self.lifecycle_error {
             body = body.child(detail_text("lifecycle-error", error).text_color(rgb(RED)));
+        }
+        if let Some(error) = &self.repo_error {
+            body = body.child(detail_text("lifecycle-repo-error", error).text_color(rgb(RED)));
         }
         if let (Some(authoring), Some(ws)) = (&self.task_authoring, &self.workspace) {
             body = body.child(authoring.render(ws, self.lifecycle_preparing, cx));
@@ -443,41 +453,8 @@ impl Studio {
             }
             body = body.child(h_flex().items_start().gap_3().child(list).child(document));
         } else if let Some(ws) = &self.workspace {
+            body = body.child(self.repository_tasks(cx));
             body = body.child(self.lifecycle_setup(ws, cx));
-            let mut sessions = fs::read_dir(ws.data.join("lifecycle"))
-                .into_iter()
-                .flatten()
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .collect::<Vec<_>>();
-            sessions.sort();
-            for session in sessions.into_iter().rev() {
-                let path = session.join("workspace/repo");
-                if let Some(test) = lifecycle::load_session(&session) {
-                    body = body.child(
-                        button(
-                            format!(
-                                "lifecycle-history-{}",
-                                session.file_name().unwrap_or_default().to_string_lossy()
-                            ),
-                            format!("{} → {}", test.task, test.base),
-                            false,
-                        )
-                        .on_click(cx.listener(move |this, _, w, cx| {
-                            if !this.lifecycle_preparing && !this.lifecycle_packaging {
-                                match Workspace::open(&path) {
-                                    Ok(ws) => this.set_workspace(ws, Page::Lifecycle, w, cx),
-                                    Err(error) => {
-                                        this.lifecycle_error = Some(format!("{error:#}"));
-                                        cx.notify();
-                                    }
-                                }
-                            }
-                        })),
-                    );
-                } else if let Ok(log) = fs::read_to_string(session.join("evidence/failure.txt")) {
-                    body = body.child(caption(log));
-                }
-            }
         }
         h_flex()
             .size_full()

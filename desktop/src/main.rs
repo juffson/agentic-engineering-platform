@@ -16,7 +16,7 @@ actions!(aep_studio, [Quit]);
 fn main() -> Result<()> {
     let ws = match Args::parse().repo {
         Some(dir) => Some(Workspace::open(&dir)?),
-        None => Workspace::open(std::path::Path::new(".")).ok(),
+        None => None,
     };
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)

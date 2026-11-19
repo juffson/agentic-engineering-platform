@@ -2,6 +2,7 @@ use super::*;
 use crate::{
     cleanup,
     github_pr::{self, Check, Outcome, Snapshot},
+    lifecycle,
     publish::Publication,
 };
 use anyhow::Context as _;
@@ -18,6 +19,7 @@ pub(crate) struct State {
     snapshot: Option<Arc<Snapshot>>,
     refresh: bool,
     merging: bool,
+    retrying: bool,
     confirmed: bool,
     discussion: bool,
     diagnostic: Option<Diagnostic>,
@@ -56,7 +58,7 @@ impl Studio {
         }
         if let Some(state) = self.pull_request.as_ref()
             && state.publication.target == publication.target
-            && (state.merging || state.refresh || state.cleaning)
+            && (state.merging || state.refresh || state.cleaning || state.retrying)
         {
             self.navigate(Page::PullRequest, window, cx);
             return;
@@ -68,6 +70,7 @@ impl Studio {
             snapshot: None,
             refresh: false,
             merging: false,
+            retrying: false,
             confirmed: false,
             discussion: false,
             diagnostic: None,
@@ -108,7 +111,7 @@ impl Studio {
         let (Some(ws), Some(state)) = (self.workspace.clone(), self.pull_request.as_mut()) else {
             return;
         };
-        if state.refresh || state.merging || state.cleaning {
+        if state.refresh || state.merging || state.cleaning || state.retrying {
             return;
         }
         let Some(pr) = &state.publication.pr else {
@@ -118,10 +121,18 @@ impl Studio {
         let target = state.publication.target.clone();
         let runner = self.runner.clone();
         let reader = state.reader;
+        let isolated_session = self.lifecycle.is_some();
         state.refresh = true;
         let task = cx.background_executor().spawn(async move {
             let receipt = cleanup::read(&ws.data.join("runs").join(&target.run));
-            (github_pr::load(&ws, &runner, &target, number), receipt)
+            let result = github_pr::load(&ws, &runner, &target, number);
+            if isolated_session && let Ok(snapshot) = &result {
+                let _ = snapshot.save_progress(&ws, &target, number);
+            }
+            (
+                lifecycle::record_failure(&ws, "github-refresh-error.txt", result),
+                receipt,
+            )
         });
         cx.spawn(async move |this, cx| {
             let (result, receipt) = task.await;
@@ -156,6 +167,45 @@ impl Studio {
                         state.error = Some(format!("读取 GitHub 失败：{error:#}"));
                         state.confirmed = false;
                     }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn retry_checks(&mut self, cx: &mut Context<Self>) {
+        let (Some(ws), Some(state)) = (self.workspace.clone(), self.pull_request.as_mut()) else {
+            return;
+        };
+        if state.retrying || state.refresh || state.merging || state.cleaning {
+            return;
+        }
+        state.retrying = true;
+        state.confirmed = false;
+        state.error = None;
+        let reader = state.reader;
+        let publication = state.publication.clone();
+        let runner = self.runner.clone();
+        let job = cx.background_executor().spawn(async move {
+            let result = github_pr::rerun_checks(&ws, &runner, &publication);
+            lifecycle::record_failure(&ws, "github-retry-error.txt", result)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(state) = this
+                    .pull_request
+                    .as_mut()
+                    .filter(|state| state.reader == reader)
+                else {
+                    return;
+                };
+                state.retrying = false;
+                match result {
+                    Ok(()) => this.refresh_github(cx),
+                    Err(error) => state.error = Some(format!("重试 GitHub 检查失败：{error:#}")),
                 }
                 cx.notify();
             });
@@ -224,6 +274,7 @@ impl Studio {
         };
         if state.merging
             || state.refresh
+            || state.retrying
             || !state.confirmed
             || state.error.is_some()
             || state.merge_error.is_some()
@@ -239,15 +290,18 @@ impl Studio {
         let snapshot = Arc::clone(snapshot);
         let lifecycle = self.lifecycle.clone();
         let task = cx.background_executor().spawn(async move {
-            if let Some(test) = lifecycle {
-                let target = &publication.target;
-                test.guard(target)?;
-                let out =
-                    crate::lifecycle::output(&ws).context("missing isolated test directory")?;
-                let pr = publication.pr.as_ref().context("missing test PR")?;
-                test.verify_ci(&ws, &out, pr.number, &target.candidate, &target.run)?;
-            }
-            github_pr::merge(&ws, &runner, &publication, &snapshot)
+            let result = (|| {
+                if let Some(test) = lifecycle {
+                    let target = &publication.target;
+                    test.guard(target)?;
+                    let out =
+                        crate::lifecycle::output(&ws).context("missing isolated test directory")?;
+                    let pr = publication.pr.as_ref().context("missing test PR")?;
+                    test.verify_ci(&ws, &out, pr.number, &target.candidate, &target.run)?;
+                }
+                github_pr::merge(&ws, &runner, &publication, &snapshot)
+            })();
+            lifecycle::record_failure(&ws, "merge-error.txt", result)
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -295,11 +349,12 @@ impl Studio {
         let publication = state.publication.clone();
         let lifecycle = self.lifecycle.clone();
         let task = cx.background_executor().spawn(async move {
-            if let Some(test) = lifecycle {
+            let result = if let Some(test) = lifecycle {
                 test.finish(&ws, &runner, &publication)
             } else {
                 cleanup::finish(&ws, &runner, &publication)
-            }
+            };
+            lifecycle::record_failure(&ws, "cleanup-error.txt", result)
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -568,8 +623,16 @@ impl Studio {
             side = side.child(self.post_merge(state, cx));
         } else if state.merging {
             side = side.child(chip("正在提交合并请求", MINT));
+        } else if state.retrying {
+            side = side.child(chip("正在重试 GitHub 检查", MINT));
         } else if let Some(reason) = snapshot.blocker(target) {
             side = side.child(detail_text("github-merge-blocker", reason).text_color(rgb(AMBER)));
+            if !state.refresh && snapshot.can_retry_checks(target) {
+                side = side.child(
+                    button("github-retry-checks", "重试失败的 GitHub 检查", true)
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_checks(cx))),
+                );
+            }
         } else if state.error.is_none() && state.merge_error.is_none() {
             side = side
                 .child(field(
@@ -637,9 +700,18 @@ impl Studio {
                 ));
             }
             if receipt.complete() {
-                return section.child(
+                section = section.child(
                     detail_text("github-cleanup-complete", "收尾已完成").text_color(rgb(MINT)),
                 );
+                if self.lifecycle.is_none()
+                    || self
+                        .workspace
+                        .as_ref()
+                        .and_then(lifecycle::output)
+                        .is_some_and(|out| out.join("verification.json").is_file())
+                {
+                    return section;
+                }
             }
         } else {
             section = section.child(caption("快进本地目标分支，删除匹配的远端候选，移除干净的临时 Worktree。接力证据和记忆留在原仓库。"));
@@ -655,7 +727,13 @@ impl Studio {
             section = section.child(
                 button(
                     "github-finish-merge",
-                    if state.cleanup.is_some() {
+                    if state
+                        .cleanup
+                        .as_ref()
+                        .is_some_and(cleanup::Receipt::complete)
+                    {
+                        "重试核验并归档"
+                    } else if state.cleanup.is_some() {
                         "重试同步与清理"
                     } else {
                         "同步目标分支并清理"

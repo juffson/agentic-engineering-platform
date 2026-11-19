@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 fixture=$(dirname "$0")/..
+if [ "$1" = run ]; then
+  test "$#" -eq 6
+  test "$2 $3 $4 $5 $6" = 'rerun 300 --failed --repo example/aep-fixture'
+  test "$(cat "$fixture/ci-state")" = failed
+  printf '%s\n' rerun >> "$fixture/ci-reruns"
+  printf '%s\n' pending > "$fixture/ci-state"
+  exit 0
+fi
 test "$1" = api
 test "$2" = --hostname
 test "$3" = github.com
@@ -66,6 +74,11 @@ JSON
     ;;
   repos/example/aep-fixture/actions/jobs/19/logs)
     printf '%s\n' 'assertion failed: upper bound' 'Process completed with exit code 1.'
+    ;;
+  repos/example/aep-fixture/actions/runs/300)
+    head=$(cat "$fixture/pr-head")
+    sha=$(/usr/bin/git --git-dir="$fixture/remote.git" rev-parse "refs/heads/$head")
+    printf '{"id":300,"head_sha":"%s","head_branch":"%s","status":"completed","conclusion":"failure","event":"pull_request"}\n' "$sha" "$head"
     ;;
   repos/example/aep-fixture/pulls/17/merge)
     shift 4
