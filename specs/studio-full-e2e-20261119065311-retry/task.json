@@ -1,0 +1,11 @@
+{
+  "title": "Synthetic Studio full lifecycle test",
+  "allowed_paths": [
+    "studio-e2e-normalize.rs"
+  ],
+  "check": [
+    "sh",
+    "-c",
+    "trap 'rm -f studio-e2e-check' 0; rustc --edition=2024 --test studio-e2e-acceptance.rs -o studio-e2e-check && ./studio-e2e-check"
+  ]
+}
