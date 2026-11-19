@@ -24,6 +24,7 @@ impl Studio {
             .find(|task| Some(&task.name) == self.relay_task.as_ref());
         let mut list = v_flex()
             .id("relay-list")
+            .test_support()
             .overflow_y_scroll()
             .h_full()
             .min_h_0()

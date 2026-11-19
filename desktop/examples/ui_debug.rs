@@ -1,6 +1,8 @@
 //! Run Studio's real event handlers in an offscreen GPUI window.
 #[path = "support/handoff.rs"]
 mod handoff_fixture;
+#[path = "support/lifecycle/mod.rs"]
+mod lifecycle;
 
 use aep::{
     memory::{Key, Kind, Memory},
@@ -8,7 +10,7 @@ use aep::{
     workspace::{Workspace, git, status},
 };
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
 use gpui_kit::{
     AnyWindowHandle, App, HeadlessAppContext, SharedString, Window, WindowBounds, WindowOptions,
     assets::Assets,
@@ -33,7 +35,8 @@ enum Scenario {
 
 #[derive(Parser)]
 #[command(
-    about = "Exercise AEP Studio in a temporary Git workspace, using an offscreen GPUI window"
+    about = "Exercise AEP Studio in a temporary Git workspace, using an offscreen GPUI window",
+    group(ArgGroup::new("live").args(["live_relay", "live_lifecycle"]))
 )]
 struct Args {
     /// Run just one scenario (default: all)
@@ -57,8 +60,11 @@ struct Args {
     /// Run two rounds with real Codex and Claude and capture evidence and PNGs
     #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo"])]
     live_relay: bool,
+    /// Run the full Studio workflow with live clients, GitHub and operator confirmation
+    #[arg(long, conflicts_with_all = ["scenario", "script", "repo"])]
+    live_lifecycle: bool,
     /// Override the Codex model for both rounds of the live relay
-    #[arg(long, requires = "live_relay")]
+    #[arg(long, requires = "live")]
     codex_model: Option<String>,
 }
 
@@ -541,7 +547,7 @@ fn continuation(
         "first run evidence changed"
     );
     if let Some(reference) = reference {
-        handoff_fixture::verify_reference(ws, &next, reference)?;
+        handoff_fixture::verify_reference(ws, FOLLOW_UP, &next, reference)?;
     }
 
     ui.click("refresh")?;
@@ -1220,7 +1226,8 @@ fn relay(args: &Args, clients: Clients<'_>, reference: Option<&str>) -> Result<(
             })
         });
         if let Some(output) = output {
-            let exported = handoff_fixture::export_runs(&ws, output);
+            let exported =
+                handoff_fixture::export_runs(&ws, output, [RUN, handoff_fixture::FOLLOW_UP]);
             if let Err(error) = &exported {
                 eprintln!("Failed to save run evidence: {error:#}");
             }
@@ -1250,6 +1257,9 @@ fn relay(args: &Args, clients: Clients<'_>, reference: Option<&str>) -> Result<(
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
+    if args.live_lifecycle {
+        return lifecycle::run(args);
+    }
     if let Some(dir) = &args.output_dir {
         fs::create_dir_all(dir)?;
     }
