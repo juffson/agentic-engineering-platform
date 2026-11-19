@@ -198,7 +198,11 @@ cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
 
 ### 用真实客户端验证 Studio 到 GitHub 的完整流程
 
-在支持 Metal 的 macOS 终端、仓库根目录运行。需要 Rust、Git、已登录的 Codex CLI 和 Claude Code，以及对 `origin` 有推送、创建和合并 PR 权限的 GitHub CLI 账号。目标仓库的默认分支需要包含 AEP pilot 工作流。
+在 Studio 打开 AEP 仓库后，进入「隔离全流程」，点击「启动隔离测试」。准备完成后，在接力页发起第一轮、修订记忆并继续第二轮。最终审查页会锁定本次的隔离目标，仍需在 Studio 分别确认发布与合并。合并后点击「同步目标分支并清理」，Studio 会校验并归档证据，在结果页预览日志和截图，也可在 Finder 中定位归档。返回原仓库后，可以从「隔离全流程」重新打开历史测试。
+
+Studio 截图只渲染自己的窗口画面，使用 Metal。此流程使用已登录的 Codex、Claude 和 GitHub CLI 账号。通过 Finder 启动 Studio 时，客户端也可放在常用的 `~/.local/bin`、`~/.cargo/bin` 或 Homebrew 的安装目录。
+
+也可在支持 Metal 的 macOS 终端、仓库根目录运行。需要 Rust、Git、已登录的 Codex CLI 和 Claude Code，以及对 `origin` 有推送、创建和合并 PR 权限的 GitHub CLI 账号。两种入口都要求目标仓库的默认分支包含 AEP pilot 工作流。
 
 ```sh
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --live-lifecycle

@@ -107,7 +107,21 @@ impl Studio {
         if editor.saving {
             return;
         }
-        let body = editor.body.read(cx).value().trim().to_owned();
+        let mut body = editor.body.read(cx).value().trim().to_owned();
+        if self.lifecycle.is_some()
+            && editor.kind == Kind::Decision
+            && editor.replaces.is_some()
+            && !body.is_empty()
+        {
+            let original = body
+                .split_once(" Decision reference ")
+                .map(|(original, _)| original)
+                .unwrap_or(&body);
+            body = format!(
+                "{original} Decision reference decision-{}.",
+                uuid::Uuid::new_v4().simple()
+            );
+        }
         if body.is_empty() || body.chars().count() > 1000 {
             editor.error = Some("正文需填写 1 至 1,000 个字符。".into());
             cx.notify();

@@ -1,6 +1,5 @@
-use aep::workspace::{Workspace, git, read};
+use aep::workspace::{Workspace, git};
 use anyhow::{Context, Result, ensure};
-use serde_json::Value;
 use std::{env, fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 pub const RUN: &str = "memory-handoff";
@@ -128,68 +127,7 @@ fn aep(root: &Path, clients: Clients<'_>, id: &str, args: &[&str]) -> Result<()>
     Ok(())
 }
 
-pub fn verify_reference(ws: &Workspace, run: &str, next: &Value, reference: &str) -> Result<()> {
-    let folder = ws.data.join("runs").join(run);
-    let handoff = read(&folder.join("handoff.json"))?;
-    let review = read(&folder.join("review-result.json"))?;
-    ensure!(
-        handoff["note"]
-            .as_str()
-            .is_some_and(|s| s.contains(reference))
-            && handoff["question"] == "",
-        "Codex did not acknowledge the decision reference and close the question"
-    );
-    ensure!(
-        review["structured_output"]["report"]
-            .as_str()
-            .is_some_and(|s| s.contains(reference)),
-        "Claude's report did not quote the decision reference"
-    );
-    let spec = next["spec_sha"].as_str().context("spec SHA")?;
-    let candidate = next["candidate_sha"].as_str().context("candidate SHA")?;
-    let diff = git(&ws.root, &["diff", "--no-ext-diff", spec, candidate])?;
-    let spec_path = format!(
-        "{spec}:specs/{}/spec.md",
-        next["task"].as_str().context("task")?
-    );
-    let spec_body = git(&ws.root, &["show", &spec_path])?;
-    ensure!(
-        !diff.contains(reference) && !spec_body.contains(reference),
-        "decision reference also appeared in the spec or code diff"
-    );
-    Ok(())
-}
-
-pub fn export_runs<'a>(
-    ws: &Workspace,
-    dest: &Path,
-    ids: impl IntoIterator<Item = &'a str>,
-) -> Result<()> {
-    for id in ids {
-        let source = ws.data.join("runs").join(id);
-        if !source.exists() {
-            continue;
-        }
-        let output = dest.join(id);
-        fs::create_dir_all(&output)?;
-        for file in [
-            "evidence.json",
-            "handoff.json",
-            "checks.log",
-            "review.txt",
-            "review-result.json",
-            "publication.json",
-            "merge.json",
-            "cleanup.json",
-        ] {
-            let path = source.join(file);
-            if path.try_exists()? {
-                fs::copy(path, output.join(file))?;
-            }
-        }
-    }
-    Ok(())
-}
+pub use aep_studio::lifecycle::{export_runs, verify_reference};
 
 pub fn studio_runner(root: &Path) -> Result<aep_studio::Runner> {
     let bin = root.join("bin");

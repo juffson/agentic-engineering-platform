@@ -4,6 +4,7 @@ use crate::{
     github_pr::{self, Check, Outcome, Snapshot},
     publish::Publication,
 };
+use anyhow::Context as _;
 use std::sync::Arc;
 
 struct Diagnostic {
@@ -25,6 +26,22 @@ pub(crate) struct State {
     cleanup: Option<cleanup::Receipt>,
     cleaning: bool,
     cleanup_error: Option<String>,
+}
+
+impl State {
+    pub(super) fn checkpoint(&self) -> Option<&'static str> {
+        let snapshot = self.snapshot.as_ref()?;
+        if snapshot.state == "MERGED" {
+            return Some("13-merged");
+        }
+        if self.confirmed {
+            return Some("12-merge-confirmed");
+        }
+        if snapshot.blocker(&self.publication.target).is_none() {
+            return Some("11-ci-passed");
+        }
+        Some("10b-ci-progress")
+    }
 }
 
 impl Studio {
@@ -220,9 +237,18 @@ impl Studio {
         let runner = self.runner.clone();
         let publication = state.publication.clone();
         let snapshot = Arc::clone(snapshot);
-        let task = cx
-            .background_executor()
-            .spawn(async move { github_pr::merge(&ws, &runner, &publication, &snapshot) });
+        let lifecycle = self.lifecycle.clone();
+        let task = cx.background_executor().spawn(async move {
+            if let Some(test) = lifecycle {
+                let target = &publication.target;
+                test.guard(target)?;
+                let out =
+                    crate::lifecycle::output(&ws).context("missing isolated test directory")?;
+                let pr = publication.pr.as_ref().context("missing test PR")?;
+                test.verify_ci(&ws, &out, pr.number, &target.candidate, &target.run)?;
+            }
+            github_pr::merge(&ws, &runner, &publication, &snapshot)
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -267,9 +293,14 @@ impl Studio {
         let reader = state.reader;
         let runner = self.runner.clone();
         let publication = state.publication.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { cleanup::finish(&ws, &runner, &publication) });
+        let lifecycle = self.lifecycle.clone();
+        let task = cx.background_executor().spawn(async move {
+            if let Some(test) = lifecycle {
+                test.finish(&ws, &runner, &publication)
+            } else {
+                cleanup::finish(&ws, &runner, &publication)
+            }
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -283,6 +314,9 @@ impl Studio {
                 state.cleaning = false;
                 match result {
                     Ok(receipt) => {
+                        if this.lifecycle.is_some() && receipt.complete() {
+                            this.page = Page::Lifecycle;
+                        }
                         state.cleanup = Some(receipt);
                         this.reload(cx);
                     }

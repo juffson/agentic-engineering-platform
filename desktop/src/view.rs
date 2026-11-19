@@ -1,6 +1,7 @@
 pub(crate) mod editor;
 pub(crate) mod github_page;
 pub(crate) mod human_review;
+mod lifecycle_page;
 mod relay_page;
 use super::*;
 use aep::studio::Run;
@@ -192,7 +193,9 @@ impl Studio {
             .hover(|s| s.bg(rgb(SELECTED)))
             .child(icon(name))
             .child(div().flex_1().text_sm().child(label))
-            .child(div().text_xs().child(n.to_string()))
+            .when(page != Page::Lifecycle, |row| {
+                row.child(div().text_xs().child(n.to_string()))
+            })
             .on_click(cx.listener(move |this, _, w, cx| this.navigate(page, w, cx)))
     }
 
@@ -251,6 +254,7 @@ impl Studio {
                 self.relays.len(),
                 cx,
             ))
+            .child(self.nav(Page::Lifecycle, "隔离全流程", IconName::Play, 0, cx))
             .child(div().flex_1())
             .child(
                 v_flex()
@@ -521,7 +525,8 @@ impl Studio {
 }
 
 impl Render for Studio {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.lifecycle_frame(window, cx);
         if self.workspace.is_none() {
             return v_flex()
                 .size_full()
@@ -548,6 +553,9 @@ impl Render for Studio {
         }
         if self.page == Page::PullRequest {
             return self.github_pr_page(cx);
+        }
+        if self.page == Page::Lifecycle {
+            return self.lifecycle_page(cx);
         }
         let runs = &self.snapshot.runs;
         let notes = &self.snapshot.notes;

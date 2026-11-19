@@ -1,19 +1,23 @@
 use aep::workspace::{Workspace, commit, git};
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     thread,
     time::{Duration, Instant},
 };
 
 use super::{field, save};
+use crate::Runner;
 
-#[derive(Serialize)]
-pub(super) struct Fixture {
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Fixture {
+    pub source: PathBuf,
+    #[serde(default)]
+    pub studio: bool,
     pub repo: String,
     pub task: String,
     pub base: String,
@@ -25,6 +29,8 @@ pub(super) struct Fixture {
 pub(super) fn command(program: &str, cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new(program)
         .current_dir(cwd)
+        .env("PATH", Runner::default().path()?)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .args(args)
         .output()
         .with_context(|| format!("start {program}"))?;
@@ -42,8 +48,15 @@ fn gh(cwd: &Path, args: &[&str]) -> Result<Value> {
 }
 
 impl Fixture {
-    pub fn prepare(out: &Path, root: &Path, runner: &Path) -> Result<(Self, Workspace)> {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    pub fn prepare(
+        out: &Path,
+        root: &Path,
+        source: &Path,
+        runner: &Runner,
+        studio: bool,
+    ) -> Result<(Self, Workspace)> {
+        let source = Workspace::open(source)?.root;
+        let binary = runner.binary()?;
         let origin = git(&source, &["remote", "get-url", "origin"])?;
         let origin = origin.trim();
         ensure!(
@@ -132,11 +145,11 @@ impl Fixture {
         save(&dir, "task.json", &manifest)?;
         fs::write(
             dir.join("normalize.rs"),
-            include_str!("../handoff/normalize.rs"),
+            include_str!("../../examples/support/handoff/normalize.rs"),
         )?;
         fs::write(
             dir.join("acceptance.rs"),
-            include_str!("../handoff/acceptance.rs"),
+            include_str!("../../examples/support/handoff/acceptance.rs"),
         )?;
         git(&ws.root, &["add", "--", &format!("specs/{task}")])?;
         git(
@@ -151,6 +164,8 @@ impl Fixture {
         )?;
         let spec = commit(&ws.root, "HEAD")?;
         let fixture = Self {
+            source,
+            studio,
             repo,
             task,
             base,
@@ -179,11 +194,30 @@ impl Fixture {
             ],
         )?;
         command(
-            runner.to_str().context("runner path")?,
+            binary.to_str().context("runner path")?,
             &ws.root,
             &["dispatch", "--task", &fixture.task, "--rev", &fixture.spec],
         )?;
         Ok((fixture, ws))
+    }
+
+    pub(crate) fn verify_ci(
+        &self,
+        ws: &Workspace,
+        out: &Path,
+        number: u64,
+        head: &str,
+        run: &str,
+    ) -> Result<()> {
+        let pr = self.pr(ws, number, head, run)?;
+        save(out, "github-ci.json", &pr)?;
+        ensure!(
+            pr["state"] == "OPEN" && pr["baseRefOid"] == self.base_sha,
+            "隔离 PR 已关闭或目标提交已变化"
+        );
+        let acceptance =
+            ci_ready(&pr)?.context("等待本次隔离测试的 GitHub 独立验收和其他检查完成")?;
+        self.checked_workflow(ws, out, head, acceptance)
     }
 
     pub fn head_branch(&self, run: &str) -> String {
@@ -349,6 +383,9 @@ impl Fixture {
 
     pub fn retire_dispatch(&self, ws: &Workspace) -> Result<()> {
         let dispatch = format!("refs/heads/aep-task/{}", self.task);
+        if remote_ref(ws, &dispatch)?.is_empty() {
+            return Ok(());
+        }
         git(
             &ws.root,
             &[
@@ -368,7 +405,7 @@ impl Fixture {
     }
 }
 
-pub(super) fn remote_ref(ws: &Workspace, reference: &str) -> Result<String> {
+pub fn remote_ref(ws: &Workspace, reference: &str) -> Result<String> {
     Ok(
         git(&ws.root, &["ls-remote", "--refs", "origin", reference])?
             .split_whitespace()
