@@ -10,6 +10,9 @@ use serde_json::Value;
 use std::{fs, path::Path};
 
 pub fn archive(root: &Path, out: &Path) -> Result<()> {
+    if load_session(root).is_some_and(|fixture| fixture.real_task) {
+        crate::task_queue::archive(root, out)?;
+    }
     let repo = root.join("workspace/repo");
     if repo.join(".git").is_dir() {
         let ws = Workspace::open(&repo)?;
@@ -51,6 +54,7 @@ pub fn archive(root: &Path, out: &Path) -> Result<()> {
         ("spec.md", "Task Spec"),
         ("task.json", "Task manifest"),
         ("dispatch.json", "Dispatch receipt"),
+        ("task-queue.json", "Task queue history"),
         ("failure.txt", "Failure"),
         ("relay-verification.json", "Relay and memory reads"),
         ("reviewed.diff", "Reviewed diff"),

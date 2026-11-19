@@ -108,43 +108,17 @@ impl Studio {
         cx.notify();
     }
 
-    fn dispatch_and_start(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn dispatch_and_start(&mut self, cx: &mut Context<Self>) {
         if self.lifecycle_preparing || self.relay_launching || !self.relays.is_empty() {
             return;
         }
-        let (Some(ws), Some(fixture)) = (self.workspace.clone(), self.lifecycle.clone()) else {
-            return;
-        };
-        let (runner, generation) = (self.runner.clone(), self.workspace_generation);
-        self.lifecycle_preparing = true;
-        self.lifecycle_error = None;
-        let task = relay::Task {
-            name: fixture.task.clone(),
-            sha: fixture.spec.clone(),
-        };
-        let dispatch = cx.background_executor().spawn(async move {
-            let result = fixture.dispatch_authored(&ws, &runner);
-            lifecycle::record_failure(&ws, "dispatch-error.txt", result)
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = dispatch.await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                if generation != this.workspace_generation {
-                    return;
-                }
-                this.lifecycle_preparing = false;
-                match result {
-                    Ok(()) => {
-                        this.navigate(Page::Relay, window, cx);
-                        this.start_relay(task, cx);
-                    }
-                    Err(error) => this.lifecycle_error = Some(format!("派发失败：{error:#}")),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
+        if let Some(fixture) = self.lifecycle.as_ref().filter(|fixture| fixture.authored) {
+            self.enqueue_round(
+                fixture.initial_relay_id(),
+                crate::task_queue::Action::Start,
+                cx,
+            );
+        }
     }
 
     pub(super) fn checkpoint(
@@ -279,6 +253,9 @@ impl Studio {
         if let Some(error) = &self.lifecycle_error {
             body = body.child(detail_text("lifecycle-error", error).text_color(rgb(RED)));
         }
+        if let Some(error) = &self.queue_error {
+            body = body.child(detail_text("task-queue-error", error).text_color(rgb(RED)));
+        }
         if let Some(error) = &self.repo_error {
             body = body.child(detail_text("lifecycle-repo-error", error).text_color(rgb(RED)));
         }
@@ -293,6 +270,19 @@ impl Studio {
             let relay_id = self.relays.first().map(|relay| relay.id.clone());
             let pending = test.authored && self.relays.is_empty() && !self.relay_launching;
             let dispatched = out.join("dispatch.json").is_file();
+            let job = self.current_queue_job();
+            let active = job.is_some_and(|job| job.state.active());
+            let label = if complete {
+                "全流程已核验".to_owned()
+            } else if let Some(job) = job.filter(|job| job.state.active()) {
+                self.job_label(job)
+            } else if pending && dispatched {
+                "已派发，等待启动第一轮".to_owned()
+            } else if pending {
+                "已准备 Spec，待派发".to_owned()
+            } else {
+                "进行中".to_owned()
+            };
             body = body.child(
                 panel()
                     .child(field("仓库", &test.repo))
@@ -302,30 +292,24 @@ impl Studio {
                         card.child(field("目标提交", &test.base_sha))
                             .child(field("Spec SHA", &test.spec))
                     })
-                    .child(detail_text(
-                        "lifecycle-status",
-                        if complete {
-                            "全流程已核验"
-                        } else if pending && dispatched {
-                            "已派发，等待启动第一轮"
-                        } else if pending {
-                            "已准备 Spec，待派发"
-                        } else {
-                            "进行中"
+                    .child(detail_text("lifecycle-status", &label))
+                    .when_some(
+                        job.and_then(|job| match &job.state {
+                            crate::task_queue::State::Failed(error) => Some(error),
+                            _ => None,
+                        }),
+                        |card, error| {
+                            card.child(
+                                detail_text("lifecycle-queue-failed", error).text_color(rgb(RED)),
+                            )
                         },
-                    ))
-                    .when(pending, |card| {
-                        card.child(self.relay_model_input())
-                            .child(if self.lifecycle_preparing {
-                                caption("正在向 GitHub 派发…")
-                            } else {
-                                div().child(
-                                    button("dispatch-task-and-start", "派发并启动全流程", true)
-                                        .on_click(cx.listener(|this, _, w, cx| {
-                                            this.dispatch_and_start(w, cx)
-                                        })),
-                                )
-                            })
+                    )
+                    .when(pending && !active && !self.lifecycle_preparing, |card| {
+                        card.child(self.relay_model_input()).child(
+                            button("dispatch-task-and-start", "派发并加入队列", true).on_click(
+                                cx.listener(|this, _, _, cx| this.dispatch_and_start(cx)),
+                            ),
+                        )
                     })
                     .child(
                         h_flex()
@@ -453,7 +437,9 @@ impl Studio {
             }
             body = body.child(h_flex().items_start().gap_3().child(list).child(document));
         } else if let Some(ws) = &self.workspace {
-            body = body.child(self.repository_tasks(cx));
+            body = body
+                .child(self.queue_settings(cx))
+                .child(self.repository_tasks(cx));
             body = body.child(self.lifecycle_setup(ws, cx));
         }
         h_flex()

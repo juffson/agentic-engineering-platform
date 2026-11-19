@@ -160,7 +160,7 @@ fn gh(cwd: &Path, args: &[&str]) -> Result<Value> {
 }
 
 impl Fixture {
-    pub(crate) fn authored_relay_id(&self) -> String {
+    pub(crate) fn initial_relay_id(&self) -> String {
         format!("relay-{}", self.spec.chars().take(32).collect::<String>())
     }
 
@@ -434,7 +434,7 @@ impl Fixture {
             &json!({
                 "repo": self.repo, "task": self.task, "ref": reference, "spec_sha": self.spec,
                 "target": self.base, "target_sha": self.base_sha,
-            "relay": self.authored_relay_id(),
+            "relay": self.initial_relay_id(),
             }),
         )
     }

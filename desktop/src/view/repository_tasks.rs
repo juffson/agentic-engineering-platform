@@ -5,6 +5,7 @@ use crate::{
         catalog::{self, Stage},
     },
     relay::{Round, Task},
+    task_queue::State,
 };
 use anyhow::Context as _;
 use std::path::PathBuf;
@@ -183,7 +184,20 @@ impl Studio {
             let stage = entry.stage;
             let id = entry.path.file_name().unwrap_or_default().to_string_lossy();
             let path = entry.path.clone();
-            let detail = entry.detail.clone();
+            let job = self.task_queue.latest(&entry.path);
+            let queued = job.is_some_and(|job| job.state.active());
+            let failure = job.and_then(|job| match &job.state {
+                State::Failed(error) => Some(error),
+                _ => None,
+            });
+            let detail = if job.is_some_and(|job| job.state == State::Waiting) {
+                None
+            } else {
+                entry.detail.clone().or_else(|| failure.cloned())
+            };
+            let label = job
+                .filter(|job| job.state.active() || failure.is_some())
+                .map_or_else(|| stage.label().to_owned(), |job| self.job_label(job));
             let action = match stage {
                 Stage::PrepareRetry => "重试准备任务",
                 Stage::Retry(_) | Stage::PublishRetry | Stage::ChecksFailed => "查看失败并重试",
@@ -191,14 +205,20 @@ impl Studio {
                 Stage::Archive => "继续归档",
                 _ => "继续任务",
             };
-            let color = match stage {
-                Stage::Archived => MINT,
-                Stage::PrepareRetry
-                | Stage::Retry(_)
-                | Stage::PublishRetry
-                | Stage::ChecksFailed
-                | Stage::Unavailable => RED,
-                _ => AMBER,
+            let color = if queued {
+                BLUE
+            } else if failure.is_some() {
+                RED
+            } else {
+                match stage {
+                    Stage::Archived => MINT,
+                    Stage::PrepareRetry
+                    | Stage::Retry(_)
+                    | Stage::PublishRetry
+                    | Stage::ChecksFailed
+                    | Stage::Unavailable => RED,
+                    _ => AMBER,
+                }
             };
             let row = v_flex()
                 .gap_1()
@@ -216,7 +236,7 @@ impl Studio {
                                 .child(caption(entry.branch.clone())),
                         )
                         .child(
-                            detail_text(format!("task-session-stage-{id}"), stage.label())
+                            detail_text(format!("task-session-stage-{id}"), &label)
                                 .text_color(rgb(color))
                                 .text_xs(),
                         ),
