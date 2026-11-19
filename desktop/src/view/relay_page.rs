@@ -82,6 +82,12 @@ impl Studio {
             let model = relay.model.clone();
             let summary = if relay.active(&self.snapshot) {
                 ("运行中", MINT)
+            } else if relay
+                .latest(Round::Second)
+                .and_then(|attempt| attempt.publication.as_ref())
+                .is_some_and(|saved| saved.pr.is_some())
+            {
+                ("已创建 PR", MINT)
             } else if relay::passed(relay.run(Round::Second, &self.snapshot)) {
                 ("两轮已完成", MINT)
             } else if relay.latest(Round::Second).is_some() {
@@ -222,6 +228,22 @@ impl Studio {
         };
         let run = relay.run(round, &self.snapshot);
         let (progress, tone) = match run.map(|run| run.text("status")) {
+            Some("awaiting_human_review")
+                if attempt
+                    .publication
+                    .as_ref()
+                    .is_some_and(|saved| saved.pr.is_some()) =>
+            {
+                ("已创建 GitHub PR", MINT)
+            }
+            Some("awaiting_human_review")
+                if attempt
+                    .publication
+                    .as_ref()
+                    .is_some_and(|saved| saved.pushed) =>
+            {
+                ("已推送候选，待创建 PR", AMBER)
+            }
             Some("awaiting_human_review") => ("验收和审查已完成，待人工审查", MINT),
             Some("failed") => ("运行失败", RED),
             Some("needs_reconciliation") => ("运行中断，需核对", RED),
@@ -243,6 +265,22 @@ impl Studio {
                     .child(caption("本轮决策"))
                     .child(self.note_link(id, "relay-decision", cx)),
             );
+        }
+        if let Some(saved) = &attempt.publication {
+            if let Some(pr) = &saved.pr {
+                let url = pr.url(&saved.target);
+                card = card.child(
+                    button(
+                        "relay-created-pr",
+                        format!("打开 GitHub PR #{} ↗", pr.number),
+                        true,
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
+                );
+            }
+            if let Some(error) = &saved.error {
+                card = card.child(caption(error.clone()));
+            }
         }
         if let Some(run) = run {
             let error = run.text("error");

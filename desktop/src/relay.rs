@@ -47,6 +47,8 @@ pub(crate) struct Attempt {
     pub decision: Option<i64>,
     #[serde(skip)]
     pub diagnostics: Option<String>,
+    #[serde(skip)]
+    pub publication: Option<crate::publish::Publication>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -194,13 +196,11 @@ fn read_relay(ws: &Workspace, path: &Path) -> Result<Relay> {
     if !relay.busy {
         for attempt in &mut relay.attempts {
             ident(&attempt.id, 64)?;
-            if ws
-                .data
-                .join("runs")
-                .join(&attempt.id)
-                .join("evidence.json")
-                .exists()
-            {
+            let run = ws.data.join("runs").join(&attempt.id);
+            if run.join("evidence.json").exists() {
+                if attempt.round == Round::Second {
+                    attempt.publication = crate::publish::load(&run)?;
+                }
                 continue;
             }
             let Ok(mut file) = File::open(path.join(format!("{}.log", attempt.id))) else {
@@ -345,6 +345,7 @@ fn launch(
         round,
         decision,
         diagnostics: None,
+        publication: None,
     });
     save(path, relay)?;
     let mut log = File::create(path.join(format!("{run_id}.log")))?;
