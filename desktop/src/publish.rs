@@ -169,7 +169,7 @@ fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("缺少 {key}"))
 }
 
-fn load(path: &Path) -> Result<Option<Publication>> {
+pub(crate) fn load(path: &Path) -> Result<Option<Publication>> {
     match File::open(path.join("publication.json")) {
         Ok(file) => Ok(Some(serde_json::from_reader(file)?)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),

@@ -155,6 +155,7 @@ impl Studio {
                         if let Some(review) = &mut state.review {
                             review.publication = Some(publication);
                         }
+                        this.reload(cx);
                     }
                     Err(error) => state.error = Some(format!("{error:#}")),
                 }

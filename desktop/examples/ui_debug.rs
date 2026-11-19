@@ -832,6 +832,10 @@ fn verify_publication(
     );
     ui.checkpoint("studio-review-published")?;
     ui.click("back-to-relay")?;
+    ensure!(
+        ui.element("relay-created-pr")?.visible(),
+        "relay did not show the PR"
+    );
     ui.reveal("relay-detail", "open-human-review")?;
     ui.click("open-human-review")?;
     ensure!(
