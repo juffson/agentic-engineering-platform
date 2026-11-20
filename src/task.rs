@@ -42,8 +42,10 @@ impl TaskManifest {
         ensure!(
             !self.allowed_paths.is_empty()
                 && self.allowed_paths.iter().all(|path| {
-                    path.split('/')
-                        .all(|part| !matches!(part, "" | "." | ".." | ".git"))
+                    !path.contains('\0')
+                        && path
+                            .split('/')
+                            .all(|part| !matches!(part, "" | "." | ".." | ".git"))
                 }),
             "invalid allowed_paths"
         );
