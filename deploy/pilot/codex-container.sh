@@ -2,13 +2,18 @@
 set -euo pipefail
 
 # Docker supplies the filesystem, network, and process boundary for this deployment.
-[[ -f /.dockerenv && $(id -u) == 10001 ]]
-grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status
-for capability in CapBnd CapEff CapPrm; do
-    grep -Eq "^${capability}:[[:space:]]+0+$" /proc/self/status
+if ! [[ -f /.dockerenv && -f /etc/aep-pilot-container && $(id -u) == 10001 ]] ||
+    ! grep -Eq '^NoNewPrivs:[[:space:]]+1$' /proc/self/status ||
+    ! findmnt -n -o OPTIONS / | grep -Eq '(^|,)ro(,|$)'; then
+    echo 'Codex requires the isolated AEP pilot container' >&2
+    exit 1
+fi
+for capability in CapBnd CapEff CapPrm CapInh CapAmb; do
+    if ! grep -Eq "^${capability}:[[:space:]]+0+$" /proc/self/status; then
+        printf 'The Codex sandbox must clear %s\n' "$capability" >&2
+        exit 1
+    fi
 done
-findmnt -n -o OPTIONS / | grep -Eq '(^|,)ro(,|$)'
-test -f /etc/aep-pilot-container
 
 arguments=("$@")
 if [[ ${arguments[0]:-} == exec ]]; then

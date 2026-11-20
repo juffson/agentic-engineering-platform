@@ -14,7 +14,7 @@ nginx_image=${AEP_PILOT_NGINX_IMAGE:-nginx:1-alpine@sha256:fb4658584bd9a916ffb6f
 helper_image=${AEP_PILOT_HELPER_IMAGE:-debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc}
 label=org.aep.pilot=$name
 
-[[ $name =~ ^[a-z][a-z0-9-]{0,38}[a-z0-9]$ && $port =~ ^[0-9]{4,5}$ ]] || {
+[[ $name =~ ^[a-z][a-z0-9-]{0,38}[a-z0-9]$ && $port =~ ^(0|[0-9]{4,5})$ ]] || {
     echo "Set a valid AEP_PILOT_NAME and AEP_PILOT_PORT" >&2
     exit 2
 }
@@ -74,7 +74,8 @@ resume_or_run() {
 }
 
 service() {
-    local directory=$1
+    local directory=$1 binding="127.0.0.1:$port:8443"
+    if [[ $port == 0 ]]; then binding="127.0.0.1::8443"; fi
     assets "$directory"
     for network in "$private" "$outbound" "$ingress"; do
         if ! docker network inspect "$network" >/dev/null 2>&1; then
@@ -103,7 +104,7 @@ service() {
         docker network connect --gw-priority 1 "$outbound" "$name-egress"
     fi
     resume_or_run "$name-control" --network "$ingress" --restart unless-stopped \
-        --publish "127.0.0.1:$port:8443" --cap-drop ALL --security-opt no-new-privileges --read-only \
+        --publish "$binding" --cap-drop ALL --security-opt no-new-privileges --read-only \
         --mount "type=volume,src=$name-control-state,dst=/var/lib/aep" \
         --mount "type=volume,src=$name-control-keys,dst=/run/aep-control,readonly" \
         "$control_image" --device "$name-worker" --lease-seconds "${AEP_PILOT_LEASE_SECONDS:-30}"
@@ -116,7 +117,7 @@ service() {
         --mount "type=volume,src=$name-tls,dst=/run/aep-tls,readonly" \
         --mount "type=bind,src=$script_dir/nginx.conf,dst=/etc/nginx/nginx.conf,readonly" \
         --entrypoint nginx "$nginx_image" -g 'daemon off;'
-    printf 'Operator HTTPS endpoint: https://127.0.0.1:%s\n' "$port"
+    printf 'Operator HTTPS endpoint: https://%s\n' "$(docker port "$name-control" 8443/tcp)"
 }
 
 proxy_arg() {
@@ -134,16 +135,21 @@ prepare_workspace() {
         --mount "type=volume,src=$name-workspace,dst=/pilot" \
         --env "HTTPS_PROXY=$proxy" --env "HTTP_PROXY=$proxy" --entrypoint /bin/sh \
         "$worker_image" -ec '
-            test ! -e /pilot/repo/.git || exit 0
-            install -d -m 700 /pilot/supervisor
-            install -d -m 700 -o 10001 -g 10001 /pilot/agent /pilot/agent/.codex /pilot/agent/.claude /pilot/tmp /pilot/cargo /pilot/build
-            install -d -m 755 -o 10001 -g 10001 /pilot/repo
-            cp -a /opt/aep-cargo/registry /pilot/cargo/
-            chown -R 10001:10001 /pilot/cargo
-            git=/usr/local/libexec/aep-pilot/git
-            "$git" clone --branch "$2" --single-branch --no-tags -- "$1" /pilot/repo
-            "$git" -C /pilot/repo config user.name "$3"
-            "$git" -C /pilot/repo config user.email "$4"
+            if [ ! -d /pilot/repo/.git ]; then
+                install -d -m 700 /pilot/supervisor
+                install -d -m 700 -o 10001 -g 10001 /pilot/agent /pilot/agent/.codex /pilot/agent/.claude /pilot/tmp /pilot/cargo /pilot/build
+                install -d -m 755 -o 10001 -g 10001 /pilot/repo
+                cp -a /opt/aep-cargo/registry /pilot/cargo/
+                chown -R 10001:10001 /pilot/cargo
+                git=/usr/local/libexec/aep-pilot/git
+                "$git" clone --branch "$2" --single-branch --no-tags -- "$1" /pilot/repo
+                "$git" -C /pilot/repo config user.name "$3"
+                "$git" -C /pilot/repo config user.email "$4"
+            fi
+            # The supervisor and unprivileged executor share each Run cancellation lock.
+            test ! -L /pilot/repo/.git && test ! -L /pilot/repo/.git/aep && test ! -L /pilot/repo/.git/aep/run-control
+            install -d -m 700 -o 10001 -g 10001 /pilot/repo/.git/aep
+            install -d -m 2770 -o 10001 -g 10001 /pilot/repo/.git/aep/run-control
         ' provision "$repo" "$branch" "$git_name" "$git_email"
 }
 
@@ -176,8 +182,9 @@ worker() {
         lifecycle=(--detach --restart unless-stopped)
     fi
     proxy=$(proxy_arg)
+    # The supervisor uses SETPCAP to clear the agent's capability bounding set.
     docker run "${lifecycle[@]}" --init --name "$name-worker" --label "$label" --network "$private" \
-        --dns 127.0.0.1 --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID \
+        --dns 127.0.0.1 --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
         --security-opt no-new-privileges --read-only --pids-limit 256 \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
         --env "AEP_PILOT_ORIGIN=https://$name-control:8443" \
@@ -188,8 +195,9 @@ worker() {
 }
 
 export_runs() {
-    local output=$1 run
+    local output=$1 run partial=no
     shift
+    if [[ ${1:-} == --partial ]]; then partial=yes; shift; fi
     [[ $# -gt 0 ]]
     for run in "$@"; do
         [[ $run =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]
@@ -201,32 +209,48 @@ export_runs() {
     docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
         --mount "type=volume,src=$name-workspace,dst=/pilot,readonly" \
         --entrypoint /bin/sh "$worker_image" -ec '
+            partial=$1
+            shift
             repo=/pilot/repo
             data=$repo/.git/aep
-            test "$(readlink -f "$data")" = "$data"
-            cd "$data"
+            journal=/pilot/supervisor/journal
             work=$(mktemp -d)
             for run do
-                test "$(readlink -f "runs/$run")" = "$data/runs/$run"
+                if [ "$(readlink -f "$journal/$run")" = "$journal/$run" ]; then
+                    for file in worker-error.txt worker.log; do
+                        source="$journal/$run/$file"
+                        if [ -f "$source" ] && [ ! -L "$source" ]; then
+                            mkdir -p "$work/supervisor/$run"
+                            cp "$source" "$work/supervisor/$run/"
+                        fi
+                    done
+                fi
+                folder="$data/runs/$run"
+                if [ "$partial" = yes ] && [ ! -d "$folder" ]; then continue; fi
+                test "$(readlink -f "$folder")" = "$folder"
                 mkdir -p "$work/runs/$run"
                 for file in evidence.json implementation.log handoff.json checks.log review.txt review-result.json; do
-                    source="runs/$run/$file"
+                    source="$folder/$file"
                     if [ -f "$source" ] && [ ! -L "$source" ]; then
                         cp "$source" "$work/runs/$run/"
                     fi
                 done
             done
-            if [ -f memory.sqlite3 ] && [ ! -L memory.sqlite3 ]; then
-                cp memory.sqlite3 "$work/"
+            if [ "$(readlink -f "$data")" = "$data" ] && [ -f "$data/memory.sqlite3" ] && [ ! -L "$data/memory.sqlite3" ]; then
+                cp "$data/memory.sqlite3" "$work/"
             fi
             count=$#
-            for run do set -- "$@" "refs/aep/runs/$run"; done
+            for run do
+                ref="refs/aep/runs/$run"
+                if [ "$partial" = yes ] && ! git -c safe.directory="$repo" -C "$repo" show-ref --verify --quiet "$ref"; then continue; fi
+                set -- "$@" "$ref"
+            done
             while [ "$count" -gt 0 ]; do shift; count=$((count - 1)); done
-            git -c safe.directory="$repo" -C "$repo" bundle create "$work/runs.bundle" "$@"
+            if [ "$#" -gt 0 ]; then git -c safe.directory="$repo" -C "$repo" bundle create "$work/runs.bundle" "$@"; fi
             tar -C "$work" -cf - .
-        ' export "$@" | tar -xf - -C "$staging"
+        ' export "$partial" "$@" | tar -xf - -C "$staging"
     # The caller chooses a fresh evidence directory for each transfer.
-    for run in runs memory.sqlite3 runs.bundle; do
+    for run in runs memory.sqlite3 runs.bundle supervisor; do
         if [[ -e $staging/$run ]]; then
             [[ ! -e $output/$run ]]
             mv "$staging/$run" "$output/$run"
@@ -235,11 +259,49 @@ export_runs() {
     rmdir "$staging"
 }
 
+check_gate() {
+    case "$1" in hold|release) ;; *) return 2 ;; esac
+    [[ $(docker volume inspect -f '{{index .Labels "org.aep.pilot"}}' "$name-workspace") == "$name" ]]
+    docker run --rm --network none --read-only \
+        --mount "type=volume,src=$name-workspace,dst=/pilot" \
+        "$helper_image" /bin/sh -ec '
+            install -d -m 755 /pilot/drill
+            case "$1" in
+                hold) install -m 444 /dev/null /pilot/drill/hold-checks ;;
+                release) rm -f /pilot/drill/hold-checks ;;
+            esac
+        ' gate "$1"
+}
+
+remove_site() {
+    local suffix object key driver
+    local -a objects
+    for driver in container network volume; do
+        case "$driver" in
+            container) objects=(worker https control egress); key=.Config.Labels ;;
+            network) objects=(private ingress outbound); key=.Labels ;;
+            volume) objects=(control-state control-keys tls worker-keys workspace); key=.Labels ;;
+        esac
+        for suffix in "${objects[@]}"; do
+            object="$name-$suffix"
+            if ! docker "$driver" inspect "$object" >/dev/null 2>&1; then continue; fi
+            [[ $(docker "$driver" inspect -f "{{index $key \"org.aep.pilot\"}}" "$object") == "$name" ]] || return 1
+            if [[ $driver == container ]]; then
+                docker container rm --force "$object" >/dev/null
+            else
+                docker "$driver" rm "$object" >/dev/null
+            fi
+        done
+    done
+}
+
 case "${1:-}" in
     serve) shift; service "$@" ;;
     workspace) shift; prepare_workspace "$@" ;;
     credential) shift; model_credential "$@" ;;
     worker) shift; worker "$@" ;;
     export) shift; export_runs "$@" ;;
-    *) echo "Usage: $0 serve PRIVATE-DIR | workspace HTTPS-REPO BRANCH GIT-NAME GIT-EMAIL | credential codex|claude < AUTH-JSON | worker [WORKER-ARGS] | export EVIDENCE-DIR RUN [RUN...]" >&2; exit 2 ;;
+    gate) shift; check_gate "$@" ;;
+    remove) shift; remove_site "$@" ;;
+    *) echo "Usage: $0 serve PRIVATE-DIR | workspace HTTPS-REPO BRANCH GIT-NAME GIT-EMAIL | credential codex|claude < AUTH-JSON | worker [WORKER-ARGS] | export EVIDENCE-DIR RUN [RUN...] | gate hold|release | remove" >&2; exit 2 ;;
 esac
