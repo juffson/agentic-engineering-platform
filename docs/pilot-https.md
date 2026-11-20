@@ -2,6 +2,21 @@
 
 这一部署在 Docker/Linux VM 内运行控制面和一个 Worker。操作端通过宿主机回环端口访问，Worker 从独立的内部网络连入 HTTPS。Nginx 只转发 `/v1/control`，AEP 本身监听共享网络命名空间里的回环地址。证书由专用 CA 签发，客户端使用 `--ca-cert` 验证签名和访问名称。
 
+## 在 Studio 运行
+
+在 Studio 打开包含 `deploy/pilot/live.sh` 的 AEP 源码仓库，选择侧栏的 **HTTPS 试点**，点击 **启动隔离试点**。Studio 使用下方命令所需的同一套 Docker 环境和登录凭证。当前阶段显示 HTTPS 停止、Lease 过期后的重连与事件回放，以及用同一候选重新验收和审查的进度。
+
+发布前在 **日志与证据** 查看候选 Diff、验收日志和 Claude 审查，核对后点击发布确认。创建 PR 后可以在页面查看 GitHub 检查进度。全部检查通过后，核对候选 SHA、目标与 CI，再点击合并确认。可在任一确认步骤选择 **停止并归档**。关闭 Studio 会关闭确认通道，脚本到达下一个确认点时会停止并保留证据。
+
+完成或失败后可在同一页面查看运行回执、失败原因和证据目录。Studio 会话保存于 Git 公共目录的 `aep/https-studio/`，其中包含启动日志和该次试点生成的 `evidence.tar.gz`。重新打开同一个仓库和页面可查看最近一次会话。环境检查失败时保留启动日志。
+
+可用 Studio 的离屏调试入口复跑并保存界面截图。调试入口需要终端操作人确认，并通过 Studio 控件提交确认。
+
+```sh
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
+  --live-https-pilot --output-dir desktop/target/live-https-ui
+```
+
 ## 一条命令重跑
 
 在 AEP 的 GitHub 克隆根目录执行。需要 Docker、Rust、Bash、jq、OpenSSL、GitHub CLI，以及已登录的 GitHub、Codex 和 Claude 账号。仓库需要公开，并包含 AEP 的 `.github/workflows/pilot.yml`。命令使用当前 GitHub 默认分支的提交作为基线。

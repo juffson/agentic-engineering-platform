@@ -1,5 +1,6 @@
 mod cleanup;
 mod github_pr;
+mod https_pilot;
 pub mod lifecycle;
 mod publish;
 mod recent;
@@ -31,6 +32,7 @@ enum Page {
     Review,
     PullRequest,
     Lifecycle,
+    HttpsPilot,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Filter {
@@ -104,6 +106,8 @@ struct Studio {
     queue_generation: u64,
     queue_error: Option<String>,
     queue_cancel_confirm: Option<(uuid::Uuid, task_queue::State)>,
+    https_pilot: Option<https_pilot::Session>,
+    https_pilot_error: Option<String>,
 }
 
 impl Studio {
@@ -170,6 +174,8 @@ impl Studio {
             queue_generation: 0,
             queue_error: None,
             queue_cancel_confirm: None,
+            https_pilot: None,
+            https_pilot_error: None,
         };
         if studio.remember_repository && studio.workspace.is_some() {
             studio.remember_workspace();
@@ -220,10 +226,9 @@ impl Studio {
         if self.lifecycle_preparing || self.lifecycle_packaging {
             return;
         }
-        let page = if self.page == Page::Lifecycle {
-            Page::Lifecycle
-        } else {
-            Page::Runs
+        let page = match self.page {
+            Page::Lifecycle | Page::HttpsPilot => self.page,
+            _ => Page::Runs,
         };
         let dialog = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -328,6 +333,9 @@ impl Studio {
         }
         if page == Page::Lifecycle {
             self.load_task_sessions(cx);
+        }
+        if page == Page::HttpsPilot {
+            self.load_https_pilot();
         }
         cx.notify();
     }

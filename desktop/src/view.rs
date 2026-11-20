@@ -1,5 +1,6 @@
 pub(crate) mod editor;
 pub(crate) mod github_page;
+mod https_pilot_page;
 pub(crate) mod human_review;
 mod lifecycle_page;
 mod relay_page;
@@ -197,7 +198,7 @@ impl Studio {
             .hover(|s| s.bg(rgb(SELECTED)))
             .child(icon(name))
             .child(div().flex_1().text_sm().child(label))
-            .when(page != Page::Lifecycle, |row| {
+            .when(!matches!(page, Page::Lifecycle | Page::HttpsPilot), |row| {
                 row.child(div().text_xs().child(n.to_string()))
             })
             .on_click(cx.listener(move |this, _, w, cx| this.navigate(page, w, cx)))
@@ -259,6 +260,7 @@ impl Studio {
                 cx,
             ))
             .child(self.nav(Page::Lifecycle, "隔离全流程", IconName::Play, 0, cx))
+            .child(self.nav(Page::HttpsPilot, "HTTPS 试点", IconName::Play, 0, cx))
             .when(
                 self.lifecycle
                     .as_ref()
@@ -599,6 +601,9 @@ impl Render for Studio {
         }
         if self.page == Page::Lifecycle {
             return self.lifecycle_page(cx);
+        }
+        if self.page == Page::HttpsPilot {
+            return self.https_pilot_page(cx);
         }
         let runs = &self.snapshot.runs;
         let notes = &self.snapshot.notes;

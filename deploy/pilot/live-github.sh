@@ -64,7 +64,8 @@ wait_ci() {
     local deadline=$((SECONDS + 2700)) snapshot pending previous=''
     snapshot="$evidence/github-ci.json"
     while (( SECONDS < deadline )); do
-        pr_view > "$snapshot"
+        pr_view > "$snapshot.tmp"
+        mv -f "$snapshot.tmp" "$snapshot"
         check_pr "$snapshot"
         if failed_rollup "$snapshot"; then
             jq -r '.statusCheckRollup[] | [.name // .context, .conclusion // .state, .detailsUrl // .targetUrl] | @tsv' "$snapshot" >&2
