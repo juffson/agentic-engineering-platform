@@ -1,0 +1,15 @@
+{
+  "title": "Keep the Studio log preview on a UTF-8 boundary",
+  "allowed_paths": [
+    "src/studio.rs"
+  ],
+  "criteria": [
+    "AC-1",
+    "AC-2"
+  ],
+  "check": [
+    "sh",
+    "specs/https-preview-boundary-fe0290382f/acceptance.sh",
+    "specs/https-preview-boundary-fe0290382f"
+  ]
+}
