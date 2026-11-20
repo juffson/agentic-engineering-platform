@@ -514,170 +514,195 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         let evidence = dir.join("evidence");
         println!("Remote task session: {}", dir.display());
 
-        let failed_run = if retry {
-            let deadline = Instant::now() + Duration::from_secs(850);
-            let failed = loop {
-                ui.cx.advance_clock(Duration::from_secs(1));
-                ui.settle()?;
-                let state = read(&session.join("state.json")).unwrap_or_default();
-                if state["exit_code"] == 1 && !ui.absent("https-failure")? {
-                    break state;
-                }
-                ensure!(
-                    Instant::now() < deadline,
-                    "the first Run did not show the injected acceptance failure"
-                );
-                thread::sleep(Duration::from_millis(200));
-            };
-            let id = failed["recovered_run"]
-                .as_str()
-                .context("missing failed Run")?
-                .to_owned();
-            let checks = evidence.join("worker/runs").join(&id).join("checks.log");
-            ensure!(
-                fs::read_to_string(&checks)?
-                    .contains("Studio retry rehearsal: first acceptance blocked"),
-                "the first Run failed for a different reason"
-            );
-            ensure!(
-                ui.element("https-resume")?.label() == Some("重试当前步骤"),
-                "failed task has no retry action"
-            );
-            ui.reveal("https-pilot-page", "https-failure")?;
-            ui.checkpoint("01b-failed-run")?;
-            docker(&[
-                "exec",
-                &format!("{site}-worker"),
-                "/bin/sh",
-                "-ec",
-                r#"if [ -e "$1" ]; then exec unlink "$1"; fi"#,
-                "unlink-rehearsal-flag",
-                &format!("/pilot/tmp/aep-studio-retry-{task}"),
-            ])?;
-            reopen_remote(&mut ui, &ws, &runner, session, 1, "01c-reopen-and-retry")?;
-            Some(id)
-        } else {
-            None
-        };
-        let checking = await_stage(&mut ui, "远程 Worker 正在验收固定候选", session, 850)?;
-        let candidate = checking["candidate"]
-            .as_str()
-            .filter(|sha| sha.len() == 40)
-            .context("missing remote candidate")?;
-        ensure!(
-            checking["task"] == task && checking["branch"] == target,
-            "the remote Run selected a different scope"
-        );
-        if let Some(draft) = &auth_draft {
-            let authoring = read(&evidence.join("authoring.json"))?;
-            let spec = checking["spec"]
-                .as_str()
-                .context("missing created Spec SHA")?;
-            let plan = read(&evidence.join("plan.json"))?;
-            let manifest = read(&evidence.join("task.json"))?;
-            ensure!(
-                authoring["task"] == task
-                    && authoring["spec"] == spec
-                    && authoring["target"] == target
-                    && authoring["baseline"] == plan["baseline"]
-                    && plan["spec"] == spec
-                    && manifest["title"] == draft.title
-                    && manifest["allowed_paths"] == serde_json::json!(draft.allowed_paths)
-                    && manifest["check"] == draft.acceptance["check"]
-                    && manifest["criteria"] == draft.acceptance["criteria"]
-                    && fs::read_to_string(evidence.join("spec.md"))?.trim_end()
-                        == draft.spec.trim_end()
-                    && git(&ws.root, &["ls-remote", "--refs", "origin", &dispatch_ref])?.trim()
-                        == format!("{spec}\t{dispatch_ref}"),
-                "Studio did not create and dispatch the exact authored Spec"
-            );
-            fs::copy(
-                evidence.join("authoring.json"),
-                output.join("authored-task.json"),
-            )?;
-        }
-        ui.checkpoint("02-remote-worker")?;
-        let current = read(&evidence.join("control-status.json"))?;
-        let run = checking["recovered_run"]
-            .as_str()
-            .context("missing scoped Run")?;
-        if let Some(failed) = &failed_run {
-            let retry = read(&evidence.join("retry.json"))?;
-            ensure!(
-                retry["data"]["predecessor"] == failed.as_str()
-                    && retry["data"]["id"] == run
-                    && retry["data"]["reverify"] == false,
-                "retry did not continue the failed task"
-            );
-        }
-        let attempts = current["data"]["attempts"]
-            .as_array()
-            .context("missing current ticket status")?;
-        ensure!(
-            attempts
-                .iter()
-                .any(|attempt| attempt["id"] == run && attempt["stage"] == "running")
-                && attempts
-                    .iter()
-                    .filter(|attempt| attempt["id"] != run)
-                    .all(|attempt| {
-                        matches!(
-                            attempt["stage"].as_str(),
-                            Some(
-                                "interrupted"
-                                    | "cancelled"
-                                    | "failed"
-                                    | "blocked"
-                                    | "published"
-                                    | "superseded"
-                            )
-                        )
-                    }),
-            "another ticket is active, or the scoped Run is no longer checking"
-        );
-        docker(&["stop", "-t", "2", &ingress_id])?;
-        let mut outage = Outage(ingress_id.clone());
-        let disconnected_at = Instant::now();
-        await_stage(&mut ui, "HTTPS 连接中断，等待控制面恢复", session, 18)?;
-        ui.checkpoint("03-https-disconnected")?;
-        thread::sleep(Duration::from_secs(lease + 4).saturating_sub(disconnected_at.elapsed()));
-        docker(&["start", &ingress_id])?;
-        outage.0.clear();
-        await_stage(
-            &mut ui,
-            "对同一候选重新验收，运行 Claude 审查",
-            session,
-            180,
-        )?;
-        ui.checkpoint("04-recovery")?;
-
-        let pending = await_stage(&mut ui, "待人工确认发布", session, 850)?;
-        if restart {
-            reopen_remote(
-                &mut ui,
-                &ws,
-                &runner,
-                session,
-                4,
-                "04b-reopened-before-publication",
-            )?;
-            let restored = await_stage(&mut ui, "待人工确认发布", session, 90)?;
+        let saved_failure = read(&session.join("state.json")).unwrap_or_default();
+        let (pending, old) = if existing.is_some() && saved_failure["stage"] == "publication" {
+            reopen_remote(&mut ui, &ws, &runner, session, 1, "05b-publication-retry")?;
+            let restored = await_stage(&mut ui, "待人工确认发布", session, 120)?;
             for field in ["ticket", "spec", "candidate", "recovered_run"] {
                 ensure!(
-                    restored[field] == pending[field],
-                    "publication restored a different {field}"
+                    restored[field] == saved_failure[field],
+                    "publication retry changed {field}"
                 );
             }
-        }
-        ensure!(
-            pending["candidate"] == candidate,
-            "the recovered Run changed the candidate"
-        );
-        let old = run;
+            let prior_retry = read(&evidence.join("retry.json"))?;
+            let previous = prior_retry["data"]["predecessor"]
+                .as_str()
+                .context("missing interrupted Run")?;
+            (restored, previous.to_owned())
+        } else {
+            let failed_run = if retry {
+                let deadline = Instant::now() + Duration::from_secs(850);
+                let failed = loop {
+                    ui.cx.advance_clock(Duration::from_secs(1));
+                    ui.settle()?;
+                    let state = read(&session.join("state.json")).unwrap_or_default();
+                    if state["exit_code"] == 1 && !ui.absent("https-failure")? {
+                        break state;
+                    }
+                    ensure!(
+                        Instant::now() < deadline,
+                        "the first Run did not show the injected acceptance failure"
+                    );
+                    thread::sleep(Duration::from_millis(200));
+                };
+                let id = failed["recovered_run"]
+                    .as_str()
+                    .context("missing failed Run")?
+                    .to_owned();
+                let checks = evidence.join("worker/runs").join(&id).join("checks.log");
+                ensure!(
+                    fs::read_to_string(&checks)?
+                        .contains("Studio retry rehearsal: first acceptance blocked"),
+                    "the first Run failed for a different reason"
+                );
+                ensure!(
+                    ui.element("https-resume")?.label() == Some("重试当前步骤"),
+                    "failed task has no retry action"
+                );
+                ui.reveal("https-pilot-page", "https-failure")?;
+                ui.checkpoint("01b-failed-run")?;
+                docker(&[
+                    "exec",
+                    &format!("{site}-worker"),
+                    "/bin/sh",
+                    "-ec",
+                    r#"if [ -e "$1" ]; then exec unlink "$1"; fi"#,
+                    "unlink-rehearsal-flag",
+                    &format!("/pilot/tmp/aep-studio-retry-{task}"),
+                ])?;
+                reopen_remote(&mut ui, &ws, &runner, session, 1, "01c-reopen-and-retry")?;
+                Some(id)
+            } else {
+                None
+            };
+            let checking = await_stage(&mut ui, "远程 Worker 正在验收固定候选", session, 850)?;
+            let candidate = checking["candidate"]
+                .as_str()
+                .filter(|sha| sha.len() == 40)
+                .context("missing remote candidate")?;
+            ensure!(
+                checking["task"] == task && checking["branch"] == target,
+                "the remote Run selected a different scope"
+            );
+            if let Some(draft) = &auth_draft {
+                let authoring = read(&evidence.join("authoring.json"))?;
+                let spec = checking["spec"]
+                    .as_str()
+                    .context("missing created Spec SHA")?;
+                let plan = read(&evidence.join("plan.json"))?;
+                let manifest = read(&evidence.join("task.json"))?;
+                ensure!(
+                    authoring["task"] == task
+                        && authoring["spec"] == spec
+                        && authoring["target"] == target
+                        && authoring["baseline"] == plan["baseline"]
+                        && plan["spec"] == spec
+                        && manifest["title"] == draft.title
+                        && manifest["allowed_paths"] == serde_json::json!(draft.allowed_paths)
+                        && manifest["check"] == draft.acceptance["check"]
+                        && manifest["criteria"] == draft.acceptance["criteria"]
+                        && fs::read_to_string(evidence.join("spec.md"))?.trim_end()
+                            == draft.spec.trim_end()
+                        && git(&ws.root, &["ls-remote", "--refs", "origin", &dispatch_ref])?.trim()
+                            == format!("{spec}\t{dispatch_ref}"),
+                    "Studio did not create and dispatch the exact authored Spec"
+                );
+                fs::copy(
+                    evidence.join("authoring.json"),
+                    output.join("authored-task.json"),
+                )?;
+            }
+            ui.checkpoint("02-remote-worker")?;
+            let current = read(&evidence.join("control-status.json"))?;
+            let run = checking["recovered_run"]
+                .as_str()
+                .context("missing scoped Run")?;
+            if let Some(failed) = &failed_run {
+                let retry = read(&evidence.join("retry.json"))?;
+                ensure!(
+                    retry["data"]["predecessor"] == failed.as_str()
+                        && retry["data"]["id"] == run
+                        && retry["data"]["reverify"] == false,
+                    "retry did not continue the failed task"
+                );
+            }
+            let attempts = current["data"]["attempts"]
+                .as_array()
+                .context("missing current ticket status")?;
+            ensure!(
+                attempts
+                    .iter()
+                    .any(|attempt| attempt["id"] == run && attempt["stage"] == "running")
+                    && attempts
+                        .iter()
+                        .filter(|attempt| attempt["id"] != run)
+                        .all(|attempt| {
+                            matches!(
+                                attempt["stage"].as_str(),
+                                Some(
+                                    "interrupted"
+                                        | "cancelled"
+                                        | "failed"
+                                        | "blocked"
+                                        | "published"
+                                        | "superseded"
+                                )
+                            )
+                        }),
+                "another ticket is active, or the scoped Run is no longer checking"
+            );
+            docker(&["stop", "-t", "2", &ingress_id])?;
+            let mut outage = Outage(ingress_id.clone());
+            let disconnected_at = Instant::now();
+            await_stage(&mut ui, "HTTPS 连接中断，等待控制面恢复", session, 18)?;
+            ui.checkpoint("03-https-disconnected")?;
+            thread::sleep(Duration::from_secs(lease + 4).saturating_sub(disconnected_at.elapsed()));
+            docker(&["start", &ingress_id])?;
+            outage.0.clear();
+            await_stage(
+                &mut ui,
+                "对同一候选重新验收，运行 Claude 审查",
+                session,
+                180,
+            )?;
+            ui.checkpoint("04-recovery")?;
+
+            let pending = await_stage(&mut ui, "待人工确认发布", session, 850)?;
+            if restart {
+                reopen_remote(
+                    &mut ui,
+                    &ws,
+                    &runner,
+                    session,
+                    4,
+                    "04b-reopened-before-publication",
+                )?;
+                let restored = await_stage(&mut ui, "待人工确认发布", session, 90)?;
+                for field in ["ticket", "spec", "candidate", "recovered_run"] {
+                    ensure!(
+                        restored[field] == pending[field],
+                        "publication restored a different {field}"
+                    );
+                }
+            }
+            ensure!(
+                pending["candidate"] == candidate,
+                "the recovered Run changed the candidate"
+            );
+            (pending, run.to_owned())
+        };
+        let candidate = pending["candidate"]
+            .as_str()
+            .context("missing approved candidate")?;
         let next = pending["recovered_run"]
             .as_str()
             .context("missing recovery Run")?;
-        let first = read(&evidence.join("worker/runs").join(old).join("evidence.json"))?;
+        let first = read(
+            &evidence
+                .join("worker/runs")
+                .join(&old)
+                .join("evidence.json"),
+        )?;
         let recovered = read(
             &evidence
                 .join("worker/runs")
