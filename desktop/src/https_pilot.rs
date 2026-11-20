@@ -40,6 +40,7 @@ pub(crate) struct Progress {
     pub ticket: String,
     pub stage: String,
     pub repository: String,
+    pub private_repository: Option<bool>,
     pub task: String,
     pub branch: String,
     pub candidate: String,

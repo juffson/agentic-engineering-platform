@@ -116,6 +116,20 @@ site="$HOME/.local/state/aep-pilot"
 
 使用 `worker --once` 可处理一个 Run 后退出。后台模式可通过 Docker 查看日志和重启同名设备。Worker 的业务进程 UID 为 10001。只读根文件系统、独立挂载、空 capabilities 和 `no-new-privileges` 由容器与启动器执行。Worker 的监督进程将设备令牌和 Lease 日志保存在独立的私有目录。应用进程无法读取它们。容器没有宿主机账号目录、SSH agent 或 Docker socket。模型文件仅存放在该试点的 Worker 卷。
 
+### 私有 GitHub 仓库
+
+为每个 Worker 生成独立的无口令 SSH 密钥，把公钥添加到目标仓库的 Deploy keys，保留只读权限。下面的命令假设 `repo` 是 `OWNER/REPO`，`key` 是操作员私有目录中的新文件路径。多 Worker 站点先按设备配置好 `worker-keys`，再用对应的 `AEP_PILOT_WORKER_SLOT` 分别安装 GitHub 密钥。
+
+```sh
+ssh-keygen -t ed25519 -N '' -f "$key"
+gh api --method POST "repos/$repo/keys" -f title="$worker_name" \
+  -f key="$(cat "$key.pub")" -F read_only=true --jq '{id,read_only}'
+./deploy/pilot/site.sh repo-key "https://github.com/$repo.git" < "$key"
+./deploy/pilot/site.sh workspace "https://github.com/$repo.git" "$branch" "$git_name" "$git_email"
+```
+
+使用本版本构建的 Worker 和出口代理。Worker 监督进程使用部署密钥并验证 GitHub 主机公钥，经代理连接 `ssh.github.com:443`。它只将指定的 Git 引用导入工作区。Codex、Claude 和验收进程无法读取 Deploy Key。Studio 用操作员本地 Git 和 `gh` 的登录身份执行任务 Spec 推送、发布和合并，继续使用 HTTPS 控制面。选择该私有仓库的本地克隆，打开「HTTPS 试点 → 真实任务」，填写控制面和操作员令牌路径后派发。归档会记录仓库的可见性，应按私有仓库权限保管。
+
 ### 原位升级
 
 先构建本次发布使用的控制面和 Worker 镜像。在部署主机指向原站点名称，使用原操作员令牌和 CA 证书，并选择一个新的收据目录。原站点须使用固定回环端口，以便回滚时恢复同一地址。收据目录含升级前的控制状态备份，应保存在操作员可访问的私有位置。

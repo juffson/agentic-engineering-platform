@@ -75,6 +75,9 @@ struct Args {
     /// Select and run a real task against an already deployed HTTPS control plane
     #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo", "codex_model"])]
     live_https_remote: bool,
+    /// Use this existing GitHub checkout for the live HTTPS remote rehearsal
+    #[arg(long, requires = "live_https_remote")]
+    https_remote_repo: Option<PathBuf>,
     /// Rehearse HTTPS queue controls with two existing tasks on the same site.
     #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo", "codex_model"])]
     live_https_queue: bool,

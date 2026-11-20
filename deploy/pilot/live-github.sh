@@ -34,10 +34,14 @@ failed_rollup() {
     ' "$1" >/dev/null
 }
 
+actions_prefix() {
+    printf 'https://github.com/%s/actions/runs/' "$repository" | tr '[:upper:]' '[:lower:]'
+}
+
 verify_workflow() {
     local acceptance run_id job_id prefix
-    prefix="https://github.com/$repository/actions/runs/"
-    acceptance=$(jq -er '[.statusCheckRollup[] | select(.name == "acceptance" and .conclusion == "SUCCESS") | .detailsUrl] | if length == 1 then .[0] else empty end' "$1")
+    prefix=$(actions_prefix)
+    acceptance=$(jq -er '[.statusCheckRollup[] | select(.name == "acceptance" and .conclusion == "SUCCESS") | .detailsUrl | ascii_downcase] | if length == 1 then .[0] else empty end' "$1")
     [[ $acceptance == "$prefix"* ]] || fail "Unexpected acceptance job URL"
     acceptance=${acceptance#"$prefix"}
     [[ $acceptance =~ ^([0-9]+)/job/([0-9]+)$ ]] || fail "Expected an Actions workflow and job ID"
@@ -62,7 +66,8 @@ verify_workflow() {
 
 retry_ci() {
     local snapshot=$1 check run seen=' ' accepted=no
-    local prefix="https://github.com/$repository/actions/runs/"
+    local prefix
+    prefix=$(actions_prefix)
     while IFS= read -r check; do
         [[ $check == "$prefix"* ]] || continue
         check=${check#"$prefix"}
@@ -83,7 +88,7 @@ retry_ci() {
             gh run rerun "$run" -R "$repository" --failed || fail "GitHub refused to rerun the failed workflow"
         fi
         accepted=yes
-    done < <(jq -r '.statusCheckRollup[] | select(.__typename=="CheckRun" and .status=="COMPLETED" and (.conclusion | IN("SUCCESS","SKIPPED","NEUTRAL") | not)) | .detailsUrl' "$snapshot")
+    done < <(jq -r '.statusCheckRollup[] | select(.__typename=="CheckRun" and .status=="COMPLETED" and (.conclusion | IN("SUCCESS","SKIPPED","NEUTRAL") | not)) | .detailsUrl // "" | ascii_downcase' "$snapshot")
     [[ $accepted == yes ]] || fail "The failed checks cannot be rerun for this pinned PR"
 }
 
