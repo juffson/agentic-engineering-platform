@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+# Cancellation locks created by the supervisor inherit the executor group from run-control.
+umask 002
 export HOME=/pilot/supervisor
 export PATH=/usr/local/libexec/aep-pilot:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
 export GIT_TERMINAL_PROMPT=0
