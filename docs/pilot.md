@@ -2,6 +2,8 @@
 
 试点包含两条入口。Studio 管理本机任务队列、两轮记忆接力、PR、CI 和收尾。需要独立控制面时，用 Rust CLI 派发，并由本地 Worker 主动领取。Studio 可打开该 Worker 的仓库，查看 Run、验收和记忆。控制面跟踪到经人工确认发布的 PR 为止，最终合并由仓库维护者确认。[架构方案与故障验收](https://app.notion.com/p/41a9d9f6f60581d08560fa33ed8c4810)
 
+通过 HTTPS 派发的任务在 Studio 中分别确认发布和合并，并保留两项回执。
+
 ## 启动控制面和设备
 
 在私有 Docker/Linux VM 里运行完整 HTTPS 试点时，使用[部署与验收手册](pilot-https.md)。下面的直接启动方式适合接入已有代理和沙箱。
