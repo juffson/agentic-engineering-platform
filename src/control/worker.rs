@@ -1,5 +1,6 @@
 //! A Studio-independent, outbound worker. The local outbox survives worker and network restarts.
 use super::{
+    evidence,
     http::{Client, DEVICE_TOKEN, OPERATOR_TOKEN, Rejected, now},
     state::{Event, Lease, Operation, Outcome, Phase, Profile, Progress, Reply, save, sha},
 };
@@ -182,9 +183,10 @@ fn prepare(repo: &Repo, lease: &Lease) -> Result<Option<String>> {
 }
 
 #[derive(Clone, Copy)]
-struct LaunchOptions<'a> {
-    model: Option<&'a str>,
-    sandbox: Option<&'a Path>,
+pub struct LaunchOptions<'a> {
+    pub model: Option<&'a str>,
+    pub sandbox: Option<&'a Path>,
+    pub upload_evidence: bool,
 }
 
 fn launch(
@@ -265,6 +267,23 @@ fn sync_run(
         }
     };
     if acknowledged && journal.exit_seen() {
+        if options.upload_evidence {
+            let path = folder.join("upload.bin");
+            let packet = if path.try_exists()? {
+                fs::read(&path)?
+            } else {
+                let packet = evidence::pack(repo, folder, &journal.lease)?;
+                evidence::persist(&path, &packet)?;
+                packet
+            };
+            if let Err(error) = client.upload(&journal.lease.run, &journal.lease.fence, packet) {
+                if error.is::<Rejected>() {
+                    return Err(error).context("terminal evidence requires reconciliation");
+                }
+                eprintln!("Retrying terminal evidence transfer: {error:#}");
+                return Ok(false);
+            }
+        }
         return Ok(true);
     }
     let mut cancel_requested = false;
@@ -398,12 +417,14 @@ pub fn run(
     repo: &Repo,
     endpoint: &str,
     ca_cert: Option<&Path>,
-    model: Option<&str>,
-    sandbox: Option<&Path>,
     journal_dir: Option<&Path>,
     once: bool,
+    options: LaunchOptions<'_>,
 ) -> Result<()> {
-    let options = LaunchOptions { model, sandbox };
+    ensure!(
+        !options.upload_evidence || endpoint.starts_with("https://"),
+        "remote evidence requires HTTPS"
+    );
     let base = journal_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo.data.join("control-worker"));

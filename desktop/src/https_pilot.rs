@@ -1,7 +1,7 @@
-use crate::Runner;
-use aep::workspace::Workspace;
+use crate::{Runner, lifecycle::Branch, relay::Task};
+use aep::workspace::{Workspace, ident};
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     fs::{self, File},
@@ -32,6 +32,8 @@ impl Gate {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub(crate) struct Progress {
+    pub remote: bool,
+    pub ticket: String,
     pub stage: String,
     pub repository: String,
     pub task: String,
@@ -54,6 +56,12 @@ fn hex(value: &str, len: usize) -> bool {
 
 impl Progress {
     fn task_is_valid(&self) -> bool {
+        if self.remote {
+            return ident(&self.task, 63).is_ok()
+                && self.ticket.starts_with("https-task-")
+                && ident(&self.ticket, 63).is_ok()
+                && !self.branch.is_empty();
+        }
         self.task
             .strip_prefix("https-drill-")
             .is_some_and(|id| hex(id, 16))
@@ -91,6 +99,15 @@ impl Progress {
             self.pr?
         ))
     }
+}
+
+#[derive(Serialize)]
+pub(crate) struct Request {
+    pub task: Task,
+    pub branch: Branch,
+    pub endpoint: String,
+    pub ca: Option<PathBuf>,
+    pub operator_file: PathBuf,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -172,18 +189,47 @@ impl Session {
                     .starts_with(source.root.canonicalize()?),
             "请打开包含 deploy/pilot/live.sh 的 AEP 源码仓库"
         );
+        let session = Self::allocate(source)?;
+        let mut command = Command::new("bash");
+        command
+            .arg(script)
+            .arg("--studio-session")
+            .arg(&session.root);
+        session.spawn(source, runner, command)
+    }
+
+    pub fn launch_remote(source: &Workspace, runner: &Runner, request: Request) -> Result<Self> {
+        let binary = runner.binary()?.canonicalize()?;
+        let session = Self::allocate(source)?;
+        let script = session.root.join("remote-task.sh");
+        fs::write(&script, include_str!("../../deploy/pilot/remote-task.sh"))?;
+        fs::write(
+            session.root.join("live-github.sh"),
+            include_str!("../../deploy/pilot/live-github.sh"),
+        )?;
+        serde_json::to_writer(File::create(session.root.join("request.json"))?, &request)?;
+        let mut command = Command::new("bash");
+        command
+            .arg(script)
+            .arg(&session.root)
+            .arg(binary)
+            .arg(&source.root);
+        session.spawn(source, runner, command)
+    }
+
+    fn allocate(source: &Workspace) -> Result<Self> {
         let parent = source.data.join("https-studio");
         fs::create_dir_all(&parent)?;
         let root = tempfile::Builder::new()
             .prefix("studio-")
             .tempdir_in(parent.canonicalize()?)?
             .keep();
-        let mut session = Self::new(root, source.root.clone());
-        let log = File::create(session.root.join("studio.log"))?;
-        match Command::new("bash")
-            .arg(script)
-            .arg("--studio-session")
-            .arg(&session.root)
+        Ok(Self::new(root, source.root.clone()))
+    }
+
+    fn spawn(mut self, source: &Workspace, runner: &Runner, mut command: Command) -> Result<Self> {
+        let log = File::create(self.root.join("studio.log"))?;
+        match command
             .current_dir(&source.root)
             .env("PATH", runner.path()?)
             .env("GH_PROMPT_DISABLED", "1")
@@ -195,16 +241,16 @@ impl Session {
             .spawn()
         {
             Ok(mut child) => {
-                session.approval = child.stdin.take();
-                session.child = Some(child);
+                self.approval = child.stdin.take();
+                self.child = Some(child);
             }
             Err(error) => {
                 let reason = format!("无法启动 HTTPS 试点：{error}");
-                fs::write(session.root.join("studio.log"), &reason)?;
-                session.error = Some(reason);
+                fs::write(self.root.join("studio.log"), &reason)?;
+                self.error = Some(reason);
             }
         }
-        Ok(session)
+        Ok(self)
     }
 
     pub fn latest(source: &Workspace) -> Option<Self> {
@@ -245,7 +291,9 @@ impl Session {
             current.gate().as_ref() == Some(&shown)
                 && self.acknowledged.as_ref() == Some(&shown)
                 && current.task == self.progress.task
-                && current.repository == self.progress.repository,
+                && current.repository == self.progress.repository
+                && current.branch == self.progress.branch
+                && current.ticket == self.progress.ticket,
             "候选、目标或确认阶段已变化，请重新核对"
         );
         self.acknowledged = None;

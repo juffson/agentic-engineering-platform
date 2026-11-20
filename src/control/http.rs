@@ -1,14 +1,20 @@
-use super::state::{Operation, Reply, Store};
+use super::{
+    evidence,
+    state::{Operation, Reply, Store},
+};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, State},
+    body::{Bytes, to_bytes},
+    extract::{DefaultBodyLimit, Path as RoutePath, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use serde_json::json;
 use std::{
+    fs::{self, File},
+    io::{ErrorKind, Read},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -46,7 +52,7 @@ struct Service {
 }
 
 impl Service {
-    fn authorized(&self, headers: &HeaderMap, operation: &Operation) -> bool {
+    fn authorized(&self, headers: &HeaderMap, device: bool) -> bool {
         let Some(value) = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -54,7 +60,7 @@ impl Service {
         else {
             return false;
         };
-        let expected = if operation.for_device() {
+        let expected = if device {
             &self.device_token
         } else {
             &self.operator
@@ -68,7 +74,7 @@ async fn command(
     headers: HeaderMap,
     Json(operation): Json<Operation>,
 ) -> Response {
-    if !service.authorized(&headers, &operation) {
+    if !service.authorized(&headers, operation.for_device()) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"authorization required"})),
@@ -94,6 +100,100 @@ async fn command(
     }
 }
 
+fn scope(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)?
+        .to_str()
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn evidence_path(
+    service: &Service,
+    id: &str,
+    ticket: Option<&str>,
+    fence: Option<&str>,
+) -> Result<PathBuf> {
+    service
+        .store
+        .lock()
+        .map_err(|_| anyhow::anyhow!("control store is unavailable"))?
+        .evidence_path(id, ticket, fence)
+}
+
+async fn upload(
+    State(service): State<Arc<Service>>,
+    RoutePath(run): RoutePath<String>,
+    request: Request,
+) -> Response {
+    if !service.authorized(request.headers(), true) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(fence) = scope(request.headers(), "x-aep-fence") else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(path) = evidence_path(&service, &run, None, Some(&fence)) else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let Ok(bytes) = to_bytes(request.into_body(), evidence::LIMIT).await else {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    if evidence::validate(&bytes).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match tokio::task::spawn_blocking(move || -> Result<bool> {
+        if path.exists() {
+            return Ok(fs::read(path)? == bytes);
+        }
+        fs::create_dir_all(path.parent().context("evidence directory")?)?;
+        if let Err(error) = evidence::persist(&path, &bytes) {
+            if path.is_file() {
+                return Ok(fs::read(path)? == bytes);
+            }
+            return Err(error);
+        }
+        Ok(true)
+    })
+    .await
+    {
+        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(false)) => StatusCode::CONFLICT.into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn download(
+    State(service): State<Arc<Service>>,
+    RoutePath(run): RoutePath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !service.authorized(&headers, false) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(ticket) = scope(&headers, "x-aep-ticket") else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(path) = evidence_path(&service, &run, Some(&ticket), None) else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    match tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take(evidence::LIMIT as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        Ok::<_, std::io::Error>(bytes)
+    })
+    .await
+    {
+        Ok(Ok(bytes)) if bytes.len() <= evidence::LIMIT => Bytes::from(bytes).into_response(),
+        Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 pub fn serve(listen: SocketAddr, db: PathBuf, device: String, ttl: u64) -> Result<()> {
     ensure!(
         listen.ip().is_loopback(),
@@ -111,8 +211,11 @@ pub fn serve(listen: SocketAddr, db: PathBuf, device: String, ttl: u64) -> Resul
         "use distinct device and operator tokens"
     );
     let app = Router::new()
-        .route("/v1/control", post(command))
-        .layer(DefaultBodyLimit::max(16 * 1024))
+        .route(
+            "/v1/control",
+            post(command).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route("/v1/evidence/{run}", get(download).put(upload))
         .with_state(Arc::new(Service {
             store: Mutex::new(Store::open(db)?),
             operator,
@@ -215,5 +318,45 @@ impl Client {
             .into());
         }
         Ok(response.error_for_status()?.json()?)
+    }
+
+    fn evidence_url(&self, run: &str) -> Result<reqwest::Url> {
+        aep::workspace::ident(run, 64)?;
+        let mut url = self.endpoint.clone();
+        url.set_path(&format!("/v1/evidence/{run}"));
+        Ok(url)
+    }
+
+    pub fn upload(&self, run: &str, fence: &str, packet: Vec<u8>) -> Result<()> {
+        let response = self
+            .client
+            .put(self.evidence_url(run)?)
+            .timeout(Duration::from_secs(40))
+            .bearer_auth(&self.token)
+            .header("x-aep-fence", fence)
+            .body(packet)
+            .send()?;
+        if response.status().is_client_error() {
+            return Err(
+                Rejected(format!("evidence upload rejected: {}", response.status())).into(),
+            );
+        }
+        response.error_for_status()?;
+        Ok(())
+    }
+
+    pub fn download(&self, ticket: &str, run: &str) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.client
+            .get(self.evidence_url(run)?)
+            .timeout(Duration::from_secs(40))
+            .bearer_auth(&self.token)
+            .header("x-aep-ticket", ticket)
+            .send()?
+            .error_for_status()?
+            .take(evidence::LIMIT as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        evidence::validate(&bytes)?;
+        Ok(bytes)
     }
 }

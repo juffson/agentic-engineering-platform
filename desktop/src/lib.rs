@@ -108,6 +108,7 @@ struct Studio {
     queue_cancel_confirm: Option<(uuid::Uuid, task_queue::State)>,
     https_pilot: Option<https_pilot::Session>,
     https_pilot_error: Option<String>,
+    https_remote_form: Option<view::https_pilot_page::RemoteForm>,
 }
 
 impl Studio {
@@ -176,6 +177,7 @@ impl Studio {
             queue_cancel_confirm: None,
             https_pilot: None,
             https_pilot_error: None,
+            https_remote_form: None,
         };
         if studio.remember_repository && studio.workspace.is_some() {
             studio.remember_workspace();
@@ -264,7 +266,9 @@ impl Studio {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let reopen_https = page == Page::HttpsPilot && self.https_remote_form.is_some();
         self.workspace_generation += 1;
+        self.https_remote_form = None;
         self.lifecycle = lifecycle::load(&ws);
         self.task_authoring = None;
         self.lifecycle_doc = None;
@@ -301,6 +305,9 @@ impl Studio {
         self.loading = false;
         self.attach_task_queue(cx);
         self.navigate(page, window, cx);
+        if reopen_https {
+            self.open_https_remote(window, cx);
+        }
         self.reload(cx);
     }
 

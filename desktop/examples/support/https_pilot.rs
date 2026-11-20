@@ -210,3 +210,247 @@ pub(super) fn run(mut args: Args) -> Result<()> {
         Ok(())
     })
 }
+
+fn choose(ui: &mut Driver<'_>, list: &str, id: &str) -> Result<()> {
+    if !ui.element(list)?.visible() {
+        ui.reveal("https-pilot-page", list)?;
+    }
+    let anchor = ui.element(list)?.bounds().center().y;
+    let option = ui.element(id)?.bounds().center().y;
+    ui.scroll(list, f32::from(anchor - option))?;
+    ui.click(id)
+}
+
+fn docker(args: &[&str]) -> Result<String> {
+    let result = std::process::Command::new("docker").args(args).output()?;
+    ensure!(
+        result.status.success(),
+        "docker {}: {}",
+        args[0],
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(String::from_utf8(result.stdout)?.trim().to_owned())
+}
+
+struct Outage(String);
+
+impl Drop for Outage {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            let _ = docker(&["start", &self.0]);
+        }
+    }
+}
+
+pub(super) fn run_remote(mut args: Args) -> Result<()> {
+    ensure!(
+        io::stdin().is_terminal(),
+        "--live-https-remote requires an operator terminal"
+    );
+    let setting = |name| std::env::var(name).with_context(|| format!("set {name}"));
+    let task = setting("AEP_STUDIO_LIVE_TASK")?;
+    let target = setting("AEP_STUDIO_LIVE_TARGET")?;
+    let site = setting("AEP_STUDIO_LIVE_OUTAGE_SITE")?;
+    ensure!(
+        target.starts_with("test/") && site.starts_with("aep-https-real-"),
+        "real rehearsal needs an isolated GitHub target and rehearsal Docker site"
+    );
+    let ingress = format!("{site}-https");
+    ensure!(
+        docker(&[
+            "inspect",
+            "-f",
+            "{{index .Config.Labels \"org.aep.pilot\"}}",
+            &ingress
+        ])? == site,
+        "the outage target does not belong to the rehearsal site"
+    );
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .canonicalize()?;
+    let ws = Workspace::open(&source)?;
+    let parent = ws.data.join("https-studio");
+    let before = sessions(&parent);
+    let output = args
+        .output_dir
+        .as_ref()
+        .context("missing checkpoint directory")?;
+    fs::create_dir_all(output)?;
+    let output = tempfile::Builder::new()
+        .prefix("studio-remote-")
+        .tempdir_in(output.canonicalize()?)?
+        .keep();
+    args.output_dir = Some(output.clone());
+    args.screenshots = true;
+    let runner = aep_studio::Runner {
+        binary: Some(crate::handoff_fixture::build_runner()?),
+        client_bin: None,
+    };
+    let mut ui = Driver::open_with_runner(&ws, &args, runner)?;
+    println!("Studio checkpoints: {}", output.display());
+    let result = (|| {
+        ui.click("HTTPS 试点")?;
+        ui.click("https-real-mode")?;
+        let selected = format!("https-task-{task}");
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while ui.absent(&selected)? {
+            ensure!(
+                Instant::now() < deadline,
+                "Studio did not load the pinned task"
+            );
+            ui.settle()?;
+            thread::sleep(Duration::from_millis(150));
+        }
+        choose(&mut ui, "https-task-list", &selected)?;
+        choose(
+            &mut ui,
+            "https-target-list",
+            &format!("https-target-{target}"),
+        )?;
+        ui.reveal("https-pilot-page", "https-dispatch")?;
+        ui.checkpoint("01-task-target-selected")?;
+        ui.click("https-dispatch")?;
+        ui.scroll("https-pilot-page", 2_000.)?;
+
+        let created = sessions(&parent);
+        let new: Vec<_> = created.difference(&before).collect();
+        ensure!(new.len() == 1, "Studio did not start exactly one real task");
+        let session = new[0];
+        let dir = session.join(&task);
+        let evidence = dir.join("evidence");
+        println!("Remote task session: {}", dir.display());
+
+        let checking = await_stage(&mut ui, "远程 Worker 正在验收固定候选", session, 850)?;
+        let candidate = checking["candidate"]
+            .as_str()
+            .filter(|sha| sha.len() == 40)
+            .context("missing remote candidate")?;
+        ensure!(
+            checking["task"] == task && checking["branch"] == target,
+            "the remote Run selected a different scope"
+        );
+        ui.checkpoint("02-remote-worker")?;
+        docker(&["stop", "-t", "2", &ingress])?;
+        let mut outage = Outage(ingress.clone());
+        let disconnected_at = Instant::now();
+        await_stage(&mut ui, "HTTPS 连接中断，等待控制面恢复", session, 18)?;
+        ui.checkpoint("03-https-disconnected")?;
+        thread::sleep(Duration::from_secs(24).saturating_sub(disconnected_at.elapsed()));
+        docker(&["start", &ingress])?;
+        outage.0.clear();
+        await_stage(
+            &mut ui,
+            "对同一候选重新验收，运行 Claude 审查",
+            session,
+            180,
+        )?;
+        ui.checkpoint("04-recovery")?;
+
+        let pending = await_stage(&mut ui, "待人工确认发布", session, 850)?;
+        ensure!(
+            pending["candidate"] == candidate,
+            "the recovered Run changed the candidate"
+        );
+        let old = pending["old_run"]
+            .as_str()
+            .context("missing interrupted Run")?;
+        let next = pending["recovered_run"]
+            .as_str()
+            .context("missing recovery Run")?;
+        let first = read(&evidence.join("worker/runs").join(old).join("evidence.json"))?;
+        let recovered = read(
+            &evidence
+                .join("worker/runs")
+                .join(next)
+                .join("evidence.json"),
+        )?;
+        ensure!(
+            old != next
+                && first["candidate_sha"] == candidate
+                && recovered["candidate_sha"] == candidate
+                && first["usage"]["implementer"]["output_tokens"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0)
+                && recovered["usage"]["reviewer"]["output_tokens"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0)
+                && recovered["check_exit_code"] == 0
+                && read(&evidence.join("stale-denied.json"))?["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("stale Run")),
+            "remote Worker evidence does not prove the two attempts"
+        );
+        let retry = read(&evidence.join("retry.json"))?;
+        ensure!(
+            retry["data"]["predecessor"] == old && retry["data"]["reverify"] == true,
+            "remote recovery did not continue from the interrupted Run"
+        );
+        ensure!(
+            !evidence.join("publication.json").exists(),
+            "published before confirmation"
+        );
+        println!(
+            "Review {} and recovered checks.log and review.txt",
+            evidence.join("candidate.diff").display()
+        );
+        ui.checkpoint("05-publication-review")?;
+        confirm(
+            &mut ui,
+            &format!("publish {}", &candidate[..12]),
+            "06-publication-approved",
+        )?;
+        await_stage(&mut ui, "等待并核对 GitHub CI", session, 240)?;
+        ui.checkpoint("07-ci-progress")?;
+
+        let pending = await_stage(&mut ui, "CI 已通过，待人工确认合并", session, 2800)?;
+        let number = pending["pr"].as_u64().context("missing GitHub PR")?;
+        let ci = read(&evidence.join("github-ci.json"))?;
+        ensure!(
+            ci["headRefOid"] == candidate
+                && ci["baseRefName"] == target
+                && ci["mergeStateStatus"] == "CLEAN",
+            "GitHub CI did not match the selected target and candidate"
+        );
+        println!(
+            "Review PR #{number} and {}",
+            evidence.join("github-ci.json").display()
+        );
+        ui.checkpoint("08-ci-passed")?;
+        confirm(
+            &mut ui,
+            &format!("merge {number} {}", &candidate[..12]),
+            "09-merge-approved",
+        )?;
+        await_stage(&mut ui, "已合并并归档", session, 240)?;
+        ui.reveal("https-pilot-page", "https-archive")?;
+        ensure!(
+            ui.element("https-archive")?.visible(),
+            "Studio did not show the archive"
+        );
+        ui.checkpoint("10-archive")?;
+        let cleanup = read(&evidence.join("cleanup.json"))?;
+        let merge = read(&evidence.join("github-merged.json"))?;
+        ensure!(
+            merge["state"] == "MERGED"
+                && merge["headRefOid"] == candidate
+                && cleanup["merge_sha"] == merge["mergeCommit"]["oid"]
+                && cleanup["target_synced"] == true
+                && cleanup["candidate_branch_removed"] == true,
+            "the remote task merge and cleanup did not match the approval"
+        );
+        fs::copy(
+            dir.join("evidence.tar.gz"),
+            output.join("pilot-evidence.tar.gz"),
+        )?;
+        fs::copy(evidence.join("result.json"), output.join("result.json"))?;
+        println!(
+            "Verified remote task PR #{number}. Evidence: {}",
+            output.display()
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = ui.checkpoint("failure");
+    }
+    result
+}

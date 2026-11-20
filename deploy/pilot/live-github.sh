@@ -89,8 +89,8 @@ approval_context() {
     jq -cS '{headRefOid,baseRefOid,reviewDecision,latestReviews,statusCheckRollup: (.statusCheckRollup | sort_by(.detailsUrl // .targetUrl // .name // .context))}' "$1"
 }
 
-sync_trial_branch() {
-    local merged remote run_path
+sync_branch_refs() {
+    local merged remote
     pr_view > "$evidence/github-merged.json"
     jq -e --arg candidate "$candidate" --arg target "$branch" --arg head "$head_branch" '
         .state == "MERGED" and .headRefOid == $candidate and .baseRefName == $target and .headRefName == $head and (.mergeCommit.oid | type == "string")
@@ -106,11 +106,17 @@ sync_trial_branch() {
         git -C "$operator" push --force-with-lease="refs/heads/$head_branch:$candidate" origin ":refs/heads/$head_branch"
     fi
     [[ -z $(git -C "$operator" ls-remote --refs origin "refs/heads/$head_branch") ]]
+    merge_sha=$merged
+}
+
+sync_trial_branch() {
+    local run_path merge_sha
+    sync_branch_refs
     run_path=$(jq -er .worktree "$evidence/worker/runs/$recovered_run/evidence.json")
     docker run --rm --network none --read-only --user 10001:10001 \
         --mount "type=volume,src=$site-workspace,dst=/pilot,readonly" \
         --entrypoint /usr/bin/git "$AEP_PILOT_WORKER_IMAGE" -C /pilot/repo worktree list --porcelain > "$evidence/worktrees.txt"
     if grep -Fxq "worktree $run_path" "$evidence/worktrees.txt"; then fail "The completed Worktree is still registered"; fi
-    jq -n --arg sha "$merged" --arg branch "$branch" \
+    jq -n --arg sha "$merge_sha" --arg branch "$branch" \
         '{merge_sha:$sha,target:$branch,target_synced:true,candidate_branch_removed:true,completed_worktree_removed:true}' > "$evidence/cleanup.json"
 }
