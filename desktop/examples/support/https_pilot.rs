@@ -55,7 +55,9 @@ fn confirm(ui: &mut Driver<'_>, action: &str, checkpoint: &str) -> Result<()> {
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     ensure!(answer.trim() == action, "operator declined {action}");
+    ui.reveal("https-pilot-page", "https-ack")?;
     ui.click("https-ack")?;
+    ui.reveal("https-pilot-page", "https-confirm")?;
     ui.checkpoint(checkpoint)?;
     ui.click("https-confirm")
 }
@@ -250,6 +252,88 @@ struct AuthoredTask {
     acceptance: Value,
 }
 
+fn reopen_remote(
+    ui: &mut Driver<'_>,
+    ws: &Workspace,
+    runner: &aep_studio::Runner,
+    session: &Path,
+    exit: i64,
+    checkpoint: &str,
+) -> Result<()> {
+    let previous = read(&session.join("state.json"))?;
+    ui.frame(|window, _| window.remove_window())?;
+    *ui = Driver::open_with_runner(ws, ui.args, runner.clone())?;
+    let deadline = Instant::now() + Duration::from_secs(55);
+    loop {
+        let state = read(&session.join("state.json"))?;
+        if state["exit_code"] == exit {
+            for field in [
+                "task",
+                "spec",
+                "baseline",
+                "branch",
+                "ticket",
+                "candidate",
+                "recovered_run",
+                "pr",
+                "stage",
+            ] {
+                ensure!(
+                    state[field] == previous[field],
+                    "closing Studio changed {field}"
+                );
+            }
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Studio did not checkpoint the closed window"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    ui.click("HTTPS 试点")?;
+    let name = session
+        .file_name()
+        .context("missing Studio session name")?
+        .to_string_lossy();
+    let selector = format!("https-session-{name}");
+    if ui.element(&selector)?.visible() {
+        ui.click(&selector)?;
+    } else {
+        choose(ui, "https-session-list", &selector)?;
+    }
+    ensure!(
+        ui.absent("https-confirm")? && ui.absent("https-ack")?,
+        "an approval survived closing Studio"
+    );
+    while ui.absent("https-resume")? {
+        ensure!(Instant::now() < deadline, "the saved task is still locked");
+        ui.cx.advance_clock(Duration::from_secs(1));
+        ui.settle()?;
+        thread::sleep(Duration::from_millis(150));
+    }
+    ui.reveal("https-pilot-page", "https-resume")?;
+    ui.checkpoint(checkpoint)?;
+    ui.click("https-resume")?;
+    loop {
+        let state = read(&session.join("state.json"))?;
+        if state["exit_code"].is_null() {
+            ensure!(
+                state["ticket"] == previous["ticket"],
+                "resume created a different ticket"
+            );
+            ui.cx.advance_clock(Duration::from_secs(1));
+            ui.settle()?;
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Studio did not restart the saved step"
+        );
+        thread::sleep(Duration::from_millis(150));
+    }
+}
+
 pub(super) fn run_remote(mut args: Args) -> Result<()> {
     ensure!(
         io::stdin().is_terminal(),
@@ -259,6 +343,12 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
     let task = setting("AEP_STUDIO_LIVE_TASK")?;
     let target = setting("AEP_STUDIO_LIVE_TARGET")?;
     let site = setting("AEP_STUDIO_LIVE_OUTAGE_SITE")?;
+    let restart = std::env::var("AEP_STUDIO_LIVE_RESTART").is_ok_and(|value| value == "1");
+    let retry = std::env::var("AEP_STUDIO_LIVE_RETRY").is_ok_and(|value| value == "1");
+    ensure!(
+        !retry || restart,
+        "the failed Run rehearsal requires AEP_STUDIO_LIVE_RESTART=1"
+    );
     ensure!(
         target.starts_with("test/") && aep::workspace::ident(&site, 40).is_ok(),
         "real rehearsal needs an isolated GitHub target and a named Docker site"
@@ -313,7 +403,30 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         })
         .transpose()?;
     let dispatch_ref = format!("refs/heads/aep-task/{task}");
-    if auth_draft.is_some() {
+    let parent = ws.data.join("https-studio");
+    let existing = std::env::var("AEP_STUDIO_LIVE_FAILED_SESSION")
+        .ok()
+        .map(|name| -> Result<PathBuf> {
+            ensure!(
+                retry
+                    && name.starts_with("studio-")
+                    && aep::workspace::ident(&name.to_ascii_lowercase(), 63).is_ok(),
+                "supply a saved failed Studio session name with retry enabled"
+            );
+            let session = parent.join(name);
+            let state = read(&session.join("state.json"))?;
+            ensure!(
+                state["remote"] == true
+                    && state["task"] == task
+                    && state["branch"] == target
+                    && state["exit_code"] == 1
+                    && state["pr"].is_null(),
+                "the saved session is not the scoped failed rehearsal"
+            );
+            Ok(session)
+        })
+        .transpose()?;
+    if auth_draft.is_some() && existing.is_none() {
         ensure!(
             git(&ws.root, &["ls-remote", "--refs", "origin", &dispatch_ref])?
                 .trim()
@@ -321,7 +434,6 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
             "the authored rehearsal needs a fresh task ID"
         );
     }
-    let parent = ws.data.join("https-studio");
     let before = sessions(&parent);
     let output = args
         .output_dir
@@ -338,158 +450,259 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         binary: Some(crate::handoff_fixture::build_runner()?),
         client_bin: None,
     };
-    let mut ui = Driver::open_with_runner(&ws, &args, runner)?;
+    let mut ui = Driver::open_with_runner(&ws, &args, runner.clone())?;
     println!("Studio checkpoints: {}", output.display());
     let result = (|| {
         ui.click("HTTPS 试点")?;
-        ui.click("https-real-mode")?;
-        let selected = format!("https-task-{task}");
-        let target_id = format!("https-target-{target}");
-        let choice = if auth_draft.is_some() {
-            &target_id
+        let session = if let Some(session) = &existing {
+            session.clone()
         } else {
-            &selected
-        };
-        let deadline = Instant::now() + Duration::from_secs(45);
-        while ui.absent(choice)? {
-            ensure!(
-                Instant::now() < deadline,
-                "Studio did not load the selected task or target"
-            );
-            ui.settle()?;
-            thread::sleep(Duration::from_millis(150));
-        }
-        if auth_draft.is_none() {
-            choose(&mut ui, "https-task-list", &selected)?;
-        }
-        choose(&mut ui, "https-target-list", &target_id)?;
-        if let Some(draft) = &auth_draft {
-            ui.reveal("https-pilot-page", "https-open-authoring")?;
-            ui.click("https-open-authoring")?;
-            let paths = draft.allowed_paths.join("\n");
-            let acceptance = serde_json::to_string(&draft.acceptance)?;
-            for (id, value) in [
-                ("task-author-name", task.as_str()),
-                ("task-author-title", draft.title.as_str()),
-                ("task-author-spec", draft.spec.as_str()),
-                ("task-author-paths", paths.as_str()),
-                ("task-author-check", acceptance.as_str()),
-            ] {
-                ui.reveal("https-pilot-page", id)?;
-                ui.click(id)?;
-                ui.input(value)?;
+            ui.click("https-real-mode")?;
+            let selected = format!("https-task-{task}");
+            let target_id = format!("https-target-{target}");
+            let choice = if auth_draft.is_some() {
+                &target_id
+            } else {
+                &selected
+            };
+            let deadline = Instant::now() + Duration::from_secs(45);
+            while ui.absent(choice)? {
+                ensure!(
+                    Instant::now() < deadline,
+                    "Studio did not load the selected task or target"
+                );
+                ui.settle()?;
+                thread::sleep(Duration::from_millis(150));
             }
-            ui.reveal("https-pilot-page", "https-create-and-dispatch")?;
-            ui.checkpoint("01-task-authored")?;
-            ui.click("https-create-and-dispatch")?;
-        } else {
-            ui.reveal("https-pilot-page", "https-dispatch")?;
-            ui.checkpoint("01-task-target-selected")?;
-            ui.click("https-dispatch")?;
-        }
-        ui.scroll("https-pilot-page", 2_000.)?;
+            if auth_draft.is_none() {
+                choose(&mut ui, "https-task-list", &selected)?;
+            }
+            choose(&mut ui, "https-target-list", &target_id)?;
+            if let Some(draft) = &auth_draft {
+                ui.reveal("https-pilot-page", "https-open-authoring")?;
+                ui.click("https-open-authoring")?;
+                let paths = draft.allowed_paths.join("\n");
+                let acceptance = serde_json::to_string(&draft.acceptance)?;
+                for (id, value) in [
+                    ("task-author-name", task.as_str()),
+                    ("task-author-title", draft.title.as_str()),
+                    ("task-author-spec", draft.spec.as_str()),
+                    ("task-author-paths", paths.as_str()),
+                    ("task-author-check", acceptance.as_str()),
+                ] {
+                    ui.reveal("https-pilot-page", id)?;
+                    ui.click(id)?;
+                    ui.input(value)?;
+                }
+                ui.reveal("https-pilot-page", "https-create-and-dispatch")?;
+                ui.checkpoint("01-task-authored")?;
+                ui.click("https-create-and-dispatch")?;
+            } else {
+                ui.reveal("https-pilot-page", "https-dispatch")?;
+                ui.checkpoint("01-task-target-selected")?;
+                ui.click("https-dispatch")?;
+            }
+            ui.scroll("https-pilot-page", 2_000.)?;
 
-        let created = sessions(&parent);
-        let new: Vec<_> = created.difference(&before).collect();
-        ensure!(new.len() == 1, "Studio did not start exactly one real task");
-        let session = new[0];
+            let created = sessions(&parent);
+            let new: Vec<_> = created.difference(&before).collect();
+            ensure!(new.len() == 1, "Studio did not start exactly one real task");
+            new[0].clone()
+        };
+        let session = session.as_path();
         let dir = session.join(&task);
         let evidence = dir.join("evidence");
         println!("Remote task session: {}", dir.display());
 
-        let checking = await_stage(&mut ui, "远程 Worker 正在验收固定候选", session, 850)?;
-        let candidate = checking["candidate"]
-            .as_str()
-            .filter(|sha| sha.len() == 40)
-            .context("missing remote candidate")?;
-        ensure!(
-            checking["task"] == task && checking["branch"] == target,
-            "the remote Run selected a different scope"
-        );
-        if let Some(draft) = &auth_draft {
-            let authoring = read(&evidence.join("authoring.json"))?;
-            let spec = checking["spec"]
+        let saved_failure = read(&session.join("state.json")).unwrap_or_default();
+        let (pending, old) = if existing.is_some() && saved_failure["stage"] == "publication" {
+            reopen_remote(&mut ui, &ws, &runner, session, 1, "05b-publication-retry")?;
+            let restored = await_stage(&mut ui, "待人工确认发布", session, 120)?;
+            for field in ["ticket", "spec", "candidate", "recovered_run"] {
+                ensure!(
+                    restored[field] == saved_failure[field],
+                    "publication retry changed {field}"
+                );
+            }
+            let prior_retry = read(&evidence.join("retry.json"))?;
+            let previous = prior_retry["data"]["predecessor"]
                 .as_str()
-                .context("missing created Spec SHA")?;
-            let plan = read(&evidence.join("plan.json"))?;
-            let manifest = read(&evidence.join("task.json"))?;
+                .context("missing interrupted Run")?;
+            (restored, previous.to_owned())
+        } else {
+            let failed_run = if retry {
+                let deadline = Instant::now() + Duration::from_secs(850);
+                let failed = loop {
+                    ui.cx.advance_clock(Duration::from_secs(1));
+                    ui.settle()?;
+                    let state = read(&session.join("state.json")).unwrap_or_default();
+                    if state["exit_code"] == 1 && !ui.absent("https-failure")? {
+                        break state;
+                    }
+                    ensure!(
+                        Instant::now() < deadline,
+                        "the first Run did not show the injected acceptance failure"
+                    );
+                    thread::sleep(Duration::from_millis(200));
+                };
+                let id = failed["recovered_run"]
+                    .as_str()
+                    .context("missing failed Run")?
+                    .to_owned();
+                let checks = evidence.join("worker/runs").join(&id).join("checks.log");
+                ensure!(
+                    fs::read_to_string(&checks)?
+                        .contains("Studio retry rehearsal: first acceptance blocked"),
+                    "the first Run failed for a different reason"
+                );
+                ensure!(
+                    ui.element("https-resume")?.label() == Some("重试当前步骤"),
+                    "failed task has no retry action"
+                );
+                ui.reveal("https-pilot-page", "https-failure")?;
+                ui.checkpoint("01b-failed-run")?;
+                docker(&[
+                    "exec",
+                    &format!("{site}-worker"),
+                    "/bin/sh",
+                    "-ec",
+                    r#"if [ -e "$1" ]; then exec unlink "$1"; fi"#,
+                    "unlink-rehearsal-flag",
+                    &format!("/pilot/tmp/aep-studio-retry-{task}"),
+                ])?;
+                reopen_remote(&mut ui, &ws, &runner, session, 1, "01c-reopen-and-retry")?;
+                Some(id)
+            } else {
+                None
+            };
+            let checking = await_stage(&mut ui, "远程 Worker 正在验收固定候选", session, 850)?;
+            let candidate = checking["candidate"]
+                .as_str()
+                .filter(|sha| sha.len() == 40)
+                .context("missing remote candidate")?;
             ensure!(
-                authoring["task"] == task
-                    && authoring["spec"] == spec
-                    && authoring["target"] == target
-                    && authoring["baseline"] == plan["baseline"]
-                    && plan["spec"] == spec
-                    && manifest["title"] == draft.title
-                    && manifest["allowed_paths"] == serde_json::json!(draft.allowed_paths)
-                    && manifest["check"] == draft.acceptance["check"]
-                    && manifest["criteria"] == draft.acceptance["criteria"]
-                    && fs::read_to_string(evidence.join("spec.md"))?.trim_end()
-                        == draft.spec.trim_end()
-                    && git(&ws.root, &["ls-remote", "--refs", "origin", &dispatch_ref])?.trim()
-                        == format!("{spec}\t{dispatch_ref}"),
-                "Studio did not create and dispatch the exact authored Spec"
+                checking["task"] == task && checking["branch"] == target,
+                "the remote Run selected a different scope"
             );
-            fs::copy(
-                evidence.join("authoring.json"),
-                output.join("authored-task.json"),
-            )?;
-        }
-        ui.checkpoint("02-remote-worker")?;
-        let current = read(&evidence.join("control-status.json"))?;
-        let run = checking["old_run"].as_str().context("missing scoped Run")?;
-        let attempts = current["data"]["attempts"]
-            .as_array()
-            .context("missing current ticket status")?;
-        ensure!(
-            attempts
-                .iter()
-                .any(|attempt| attempt["id"] == run && attempt["stage"] == "running")
-                && attempts
+            if let Some(draft) = &auth_draft {
+                let authoring = read(&evidence.join("authoring.json"))?;
+                let spec = checking["spec"]
+                    .as_str()
+                    .context("missing created Spec SHA")?;
+                let plan = read(&evidence.join("plan.json"))?;
+                let manifest = read(&evidence.join("task.json"))?;
+                ensure!(
+                    authoring["task"] == task
+                        && authoring["spec"] == spec
+                        && authoring["target"] == target
+                        && authoring["baseline"] == plan["baseline"]
+                        && plan["spec"] == spec
+                        && manifest["title"] == draft.title
+                        && manifest["allowed_paths"] == serde_json::json!(draft.allowed_paths)
+                        && manifest["check"] == draft.acceptance["check"]
+                        && manifest["criteria"] == draft.acceptance["criteria"]
+                        && fs::read_to_string(evidence.join("spec.md"))?.trim_end()
+                            == draft.spec.trim_end()
+                        && git(&ws.root, &["ls-remote", "--refs", "origin", &dispatch_ref])?.trim()
+                            == format!("{spec}\t{dispatch_ref}"),
+                    "Studio did not create and dispatch the exact authored Spec"
+                );
+                fs::copy(
+                    evidence.join("authoring.json"),
+                    output.join("authored-task.json"),
+                )?;
+            }
+            ui.checkpoint("02-remote-worker")?;
+            let current = read(&evidence.join("control-status.json"))?;
+            let run = checking["recovered_run"]
+                .as_str()
+                .context("missing scoped Run")?;
+            if let Some(failed) = &failed_run {
+                let retry = read(&evidence.join("retry.json"))?;
+                ensure!(
+                    retry["data"]["predecessor"] == failed.as_str()
+                        && retry["data"]["id"] == run
+                        && retry["data"]["reverify"] == false,
+                    "retry did not continue the failed task"
+                );
+            }
+            let attempts = current["data"]["attempts"]
+                .as_array()
+                .context("missing current ticket status")?;
+            ensure!(
+                attempts
                     .iter()
-                    .filter(|attempt| attempt["id"] != run)
-                    .all(|attempt| {
-                        matches!(
-                            attempt["stage"].as_str(),
-                            Some(
-                                "interrupted"
-                                    | "cancelled"
-                                    | "failed"
-                                    | "blocked"
-                                    | "published"
-                                    | "superseded"
+                    .any(|attempt| attempt["id"] == run && attempt["stage"] == "running")
+                    && attempts
+                        .iter()
+                        .filter(|attempt| attempt["id"] != run)
+                        .all(|attempt| {
+                            matches!(
+                                attempt["stage"].as_str(),
+                                Some(
+                                    "interrupted"
+                                        | "cancelled"
+                                        | "failed"
+                                        | "blocked"
+                                        | "published"
+                                        | "superseded"
+                                )
                             )
-                        )
-                    }),
-            "another ticket is active, or the scoped Run is no longer checking"
-        );
-        docker(&["stop", "-t", "2", &ingress_id])?;
-        let mut outage = Outage(ingress_id.clone());
-        let disconnected_at = Instant::now();
-        await_stage(&mut ui, "HTTPS 连接中断，等待控制面恢复", session, 18)?;
-        ui.checkpoint("03-https-disconnected")?;
-        thread::sleep(Duration::from_secs(lease + 4).saturating_sub(disconnected_at.elapsed()));
-        docker(&["start", &ingress_id])?;
-        outage.0.clear();
-        await_stage(
-            &mut ui,
-            "对同一候选重新验收，运行 Claude 审查",
-            session,
-            180,
-        )?;
-        ui.checkpoint("04-recovery")?;
+                        }),
+                "another ticket is active, or the scoped Run is no longer checking"
+            );
+            docker(&["stop", "-t", "2", &ingress_id])?;
+            let mut outage = Outage(ingress_id.clone());
+            let disconnected_at = Instant::now();
+            await_stage(&mut ui, "HTTPS 连接中断，等待控制面恢复", session, 18)?;
+            ui.checkpoint("03-https-disconnected")?;
+            thread::sleep(Duration::from_secs(lease + 4).saturating_sub(disconnected_at.elapsed()));
+            docker(&["start", &ingress_id])?;
+            outage.0.clear();
+            await_stage(
+                &mut ui,
+                "对同一候选重新验收，运行 Claude 审查",
+                session,
+                180,
+            )?;
+            ui.checkpoint("04-recovery")?;
 
-        let pending = await_stage(&mut ui, "待人工确认发布", session, 850)?;
-        ensure!(
-            pending["candidate"] == candidate,
-            "the recovered Run changed the candidate"
-        );
-        let old = pending["old_run"]
+            let pending = await_stage(&mut ui, "待人工确认发布", session, 850)?;
+            if restart {
+                reopen_remote(
+                    &mut ui,
+                    &ws,
+                    &runner,
+                    session,
+                    4,
+                    "04b-reopened-before-publication",
+                )?;
+                let restored = await_stage(&mut ui, "待人工确认发布", session, 90)?;
+                for field in ["ticket", "spec", "candidate", "recovered_run"] {
+                    ensure!(
+                        restored[field] == pending[field],
+                        "publication restored a different {field}"
+                    );
+                }
+            }
+            ensure!(
+                pending["candidate"] == candidate,
+                "the recovered Run changed the candidate"
+            );
+            (pending, run.to_owned())
+        };
+        let candidate = pending["candidate"]
             .as_str()
-            .context("missing interrupted Run")?;
+            .context("missing approved candidate")?;
         let next = pending["recovered_run"]
             .as_str()
             .context("missing recovery Run")?;
-        let first = read(&evidence.join("worker/runs").join(old).join("evidence.json"))?;
+        let first = read(
+            &evidence
+                .join("worker/runs")
+                .join(&old)
+                .join("evidence.json"),
+        )?;
         let recovered = read(
             &evidence
                 .join("worker/runs")
@@ -535,6 +748,23 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         ui.checkpoint("07-ci-progress")?;
 
         let pending = await_stage(&mut ui, "CI 已通过，待人工确认合并", session, 2800)?;
+        if restart {
+            reopen_remote(
+                &mut ui,
+                &ws,
+                &runner,
+                session,
+                4,
+                "07b-reopened-before-merge",
+            )?;
+            let restored = await_stage(&mut ui, "CI 已通过，待人工确认合并", session, 120)?;
+            for field in ["ticket", "candidate", "pr"] {
+                ensure!(
+                    restored[field] == pending[field],
+                    "merge restored a different {field}"
+                );
+            }
+        }
         let number = pending["pr"].as_u64().context("missing GitHub PR")?;
         let ci = read(&evidence.join("github-ci.json"))?;
         ensure!(

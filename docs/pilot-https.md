@@ -23,7 +23,7 @@ cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
 
 选择已有任务可以直接派发。创建任务时先点 **创建 HTTPS 任务…**，填写任务 ID、Spec、允许修改的文件和验收命令，再点 **创建并派发给远程 Worker**。文件路径每行一个。验收命令可以是 JSON 参数数组，也可以是带 `check`、`criteria` 和 `checks` 的对象。
 
-Studio 会在私有工作区以选定的目标 SHA 创建 Spec 提交，固定到 `aep-task/<任务 ID>`，再通过 HTTPS 派发给 Worker。归档记录实际提交的 Spec、验收清单及派发回执。若 GitHub 已保存 Spec 而 HTTPS 派发失败，可以从已派发任务列表选择该版本重试。
+Studio 会在私有工作区以选定的目标 SHA 创建 Spec 提交，固定到 `aep-task/<任务 ID>`，再通过 HTTPS 派发给 Worker。归档记录实际提交的 Spec、验收清单及派发回执。若 GitHub 已保存 Spec 而 HTTPS 派发失败，可以在原任务记录重试派发。
 
 Spec SHA 与目标 SHA 在派发前会重新核对。目标提交必须是 Spec 的祖先，且两者之间只包含任务目录中的变更。
 
@@ -33,9 +33,17 @@ Studio 会等待控制面重新连接并收齐旧 Run 的终止事件。Lease �
 
 发布和合并各需一次 Studio 确认。CI 核对结果、恢复事件、候选、验收、审查和合并回执存入本地会话归档。合并后同步该会话的操作端克隆，并清理已发布的候选分支。
 
+### 查看、继续与重试任务
+
+在同一个仓库打开 **HTTPS 试点**，从 **仓库的 HTTPS 任务** 选一条记录。列表显示目标分支、阶段和失败摘要，详情保留日志、审查、CI 和证据归档。仓库切换后会加载对应 Git 公共目录的记录。
+
+关闭 Studio 时，远程 Worker 可继续执行已派发的 Run。重新打开原仓库，选择原记录并点 **继续任务**，即可恢复跟踪同一票据、候选和 PR。若停在发布或合并确认，重新审查后再确认。已完成的发布或合并会通过回执和 GitHub 状态恢复到后续步骤。
+
+任务失败后点 **重试当前步骤**。尚未派发的任务沿用原 Spec 与目标，Worker 的失败重试在同一票据下开启新 Run，并使用该票据的剩余尝试次数。CI 失败时只重跑同一候选的失败工作流。已保存的失败和重试回执会保留在归档。恢复需要原仓库、原站点及可用的操作员令牌文件。
+
 离屏验收可对已部署的 Docker 站点演练短时断线。提前固定任务和 `test/` 目标分支，并确认同站点没有其他活动工单。调试程序核对 Docker 标签、Studio 的回环 HTTPS 地址和正在检查的 Run，停止该入口超过一个 Lease 后恢复。发布和合并仍分别等待确认。
 
-要验证界面创建，仅提前准备 `test/` 目标分支，并将 `AEP_STUDIO_LIVE_DRAFT` 设为草稿 JSON 的路径。草稿包含 `title`、`spec`、`allowed_paths` 数组和 `acceptance` 对象，`AEP_STUDIO_LIVE_TASK` 使用尚未派发的任务 ID。
+要验证界面创建，仅提前准备 `test/` 目标分支，并将 `AEP_STUDIO_LIVE_DRAFT` 设为草稿 JSON 的路径。草稿包含 `title`、`spec`、`allowed_paths` 数组和 `acceptance` 对象，`AEP_STUDIO_LIVE_TASK` 使用尚未派发的任务 ID。设置 `AEP_STUDIO_LIVE_RESTART=1` 后，离屏验收会在两次确认前关闭并重新打开 Studio，然后从列表继续原任务。
 
 ```sh
 export AEP_STUDIO_CONTROL_URL="$url" AEP_STUDIO_CONTROL_CA="$ca"

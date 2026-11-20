@@ -107,6 +107,9 @@ struct Studio {
     queue_error: Option<String>,
     queue_cancel_confirm: Option<(uuid::Uuid, task_queue::State)>,
     https_pilot: Option<https_pilot::Session>,
+    https_sessions: Vec<https_pilot::Entry>,
+    https_background: Vec<https_pilot::Session>,
+    https_polling: bool,
     https_pilot_error: Option<String>,
     https_remote_form: Option<view::https_pilot_page::RemoteForm>,
 }
@@ -176,6 +179,9 @@ impl Studio {
             queue_error: None,
             queue_cancel_confirm: None,
             https_pilot: None,
+            https_sessions: Vec::new(),
+            https_background: Vec::new(),
+            https_polling: false,
             https_pilot_error: None,
             https_remote_form: None,
         };
@@ -342,7 +348,7 @@ impl Studio {
             self.load_task_sessions(cx);
         }
         if page == Page::HttpsPilot {
-            self.load_https_pilot();
+            self.load_https_pilot(cx);
         }
         cx.notify();
     }

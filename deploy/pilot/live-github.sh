@@ -60,14 +60,42 @@ verify_workflow() {
     grep -Fq "Checks passed at $candidate." "$evidence/github-acceptance.log" || fail "The independent acceptance log does not confirm the candidate"
 }
 
+retry_ci() {
+    local snapshot=$1 check run seen=' ' accepted=no
+    local prefix="https://github.com/$repository/actions/runs/"
+    while IFS= read -r check; do
+        [[ $check == "$prefix"* ]] || continue
+        check=${check#"$prefix"}
+        [[ $check =~ ^([0-9]+)/job/[0-9]+$ ]] || continue
+        run=${BASH_REMATCH[1]}
+        [[ $seen != *" $run "* ]] || continue
+        seen+="$run "
+        retry_read gh api "repos/$repository/actions/runs/$run" > "$evidence/github-retry-$run.json"
+        if ! jq -e --arg head "$head_branch" --arg candidate "$candidate" --argjson pr "$pr" '
+            (.path | split("@")[0]) == ".github/workflows/pilot.yml" and
+            .head_sha==$candidate and .head_branch==$head and
+            (.event=="push" or (.event=="pull_request" and any(.pull_requests[]; .number==$pr and .head.sha==$candidate)))
+        ' "$evidence/github-retry-$run.json" >/dev/null; then
+            continue
+        fi
+        if jq -e '.status=="completed" and .conclusion!="success"' "$evidence/github-retry-$run.json" >/dev/null; then
+            checkpoint
+            gh run rerun "$run" -R "$repository" --failed || fail "GitHub refused to rerun the failed workflow"
+        fi
+        accepted=yes
+    done < <(jq -r '.statusCheckRollup[] | select(.__typename=="CheckRun" and .status=="COMPLETED" and (.conclusion | IN("SUCCESS","SKIPPED","NEUTRAL") | not)) | .detailsUrl' "$snapshot")
+    [[ $accepted == yes ]] || fail "The failed checks cannot be rerun for this pinned PR"
+}
+
 wait_ci() {
-    local deadline=$((SECONDS + 2700)) snapshot pending previous=''
+    local deadline=$((SECONDS + 2700)) retry_grace=$((SECONDS + ${1:-0})) snapshot pending previous=''
     snapshot="$evidence/github-ci.json"
     while (( SECONDS < deadline )); do
+        if declare -F checkpoint >/dev/null; then checkpoint; fi
         pr_view > "$snapshot.tmp"
         mv -f "$snapshot.tmp" "$snapshot"
         check_pr "$snapshot"
-        if failed_rollup "$snapshot"; then
+        if (( SECONDS >= retry_grace )) && failed_rollup "$snapshot"; then
             jq -r '.statusCheckRollup[] | [.name // .context, .conclusion // .state, .detailsUrl // .targetUrl] | @tsv' "$snapshot" >&2
             fail "GitHub CI failed"
         fi

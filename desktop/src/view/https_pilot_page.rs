@@ -1,7 +1,8 @@
 use super::task_authoring::Authoring;
 use super::*;
 use crate::{
-    https_pilot::{Artifact as Proof, Connection, Session, TaskSource},
+    Page,
+    https_pilot::{Artifact as Proof, Connection, Progress, Session, TaskSource},
     lifecycle::{self, Choices},
 };
 use anyhow::{Context as _, ensure};
@@ -65,7 +66,7 @@ fn phase(stage: &str) -> (usize, &'static str) {
         "remote_checking" => (1, "远程 Worker 正在验收固定候选"),
         "remote_reviewing" => (1, "远程 Claude 正在审查固定候选"),
         "remote_outage" => (2, "HTTPS 连接中断，等待控制面恢复"),
-        "remote_retry" => (2, "原 Run 尚无候选，重新派发实现"),
+        "remote_retry" => (2, "使用原 Spec 重新派发实现"),
         "outage" => (2, "HTTPS 入口已暂停，等待 Lease 过期"),
         "reconnect" => (2, "HTTPS 已恢复，核对过期发布拒绝和事件回放"),
         "recovery" => (2, "对同一候选重新验收，运行 Claude 审查"),
@@ -73,10 +74,23 @@ fn phase(stage: &str) -> (usize, &'static str) {
         "publication" => (3, "发布固定候选并创建 PR"),
         "ci" => (4, "等待并核对 GitHub CI"),
         "merge_confirmation" => (4, "CI 已通过，待人工确认合并"),
-        "merge" => (4, "合并已确认的隔离 PR"),
-        "cleanup" => (5, "同步隔离分支并清理候选与工作区"),
+        "merge" => (4, "合并已确认的 PR"),
+        "cleanup" => (5, "同步目标分支并清理候选与工作区"),
         "completed" => (5, "已合并并归档"),
         _ => (0, "检查 Docker 和登录凭证"),
+    }
+}
+
+fn progress_state(progress: &Progress, busy: bool, spawn_error: bool) -> (&'static str, u32) {
+    match progress.exit_code {
+        Some(0) if progress.stage == "completed" && progress.archive => ("已完成", MINT),
+        Some(3) => ("已停止", AMBER),
+        Some(4) => ("已暂停", AMBER),
+        Some(_) => ("失败", RED),
+        None if spawn_error => ("启动失败", RED),
+        None if busy => ("运行中", BLUE),
+        None if progress.remote => ("可恢复", AMBER),
+        _ => ("试点未完成", AMBER),
     }
 }
 
@@ -104,21 +118,49 @@ impl Studio {
             .or_else(|| Some(ws.clone()))
     }
 
-    pub(crate) fn load_https_pilot(&mut self) {
-        if self.https_pilot.as_ref().is_some_and(Session::active) {
+    fn select_https_session(&mut self, source: &Workspace, root: PathBuf) {
+        if self
+            .https_pilot
+            .as_ref()
+            .is_some_and(|session| session.root == root)
+        {
             return;
         }
+        if let Some(previous) = self.https_pilot.take().filter(Session::active) {
+            self.https_background.push(previous);
+        }
+        self.https_pilot = if let Some(index) = self
+            .https_background
+            .iter()
+            .position(|session| session.root == root)
+        {
+            Some(self.https_background.swap_remove(index))
+        } else {
+            Session::open(source, root)
+        };
+    }
+
+    pub(crate) fn load_https_pilot(&mut self, cx: &mut Context<Self>) {
         let Some(source) = self.https_source() else {
             return;
         };
-        if let Some(session) = self.https_pilot.as_mut()
-            && session.source == source.root
+        if let Some(session) = self
+            .https_pilot
+            .as_mut()
+            .filter(|s| s.source == source.root)
         {
             session.refresh();
         } else {
-            self.https_pilot = Session::latest(&source);
+            if let Some(previous) = self.https_pilot.take().filter(Session::active) {
+                self.https_background.push(previous);
+            }
+            if let Some(root) = Session::latest(&source) {
+                self.select_https_session(&source, root);
+            }
             self.https_pilot_error = None;
         }
+        self.https_sessions = Session::entries(&source);
+        self.poll_https(cx);
     }
 
     fn start_https_pilot(&mut self, cx: &mut Context<Self>) {
@@ -132,48 +174,87 @@ impl Studio {
         self.attach_https_pilot(result, cx);
     }
 
+    fn resume_https(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.https_source() else {
+            return;
+        };
+        if self
+            .https_pilot
+            .as_ref()
+            .is_none_or(|s| s.source != source.root || !s.can_resume())
+        {
+            return;
+        }
+        let session = self.https_pilot.take().expect("selected resumable task");
+        let root = session.root.clone();
+        let result = session.resume(&source, &self.runner);
+        if result.is_err() {
+            self.https_pilot = Session::open(&source, root);
+        }
+        self.attach_https_pilot(result, cx);
+    }
+
     fn attach_https_pilot(&mut self, result: Result<Session>, cx: &mut Context<Self>) {
         self.https_pilot_error = None;
         match result {
             Ok(session) => self.https_pilot = Some(session),
             Err(error) => self.https_pilot_error = Some(format!("启动失败：{error:#}")),
         }
+        if let Some(source) = self.https_source() {
+            self.https_sessions = Session::entries(&source);
+        }
+        self.poll_https(cx);
         cx.notify();
-        if !self.https_pilot.as_ref().is_some_and(Session::active) {
+    }
+
+    fn poll_https(&mut self, cx: &mut Context<Self>) {
+        if self.https_polling {
             return;
         }
+        self.https_polling = true;
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             loop {
                 executor.timer(Duration::from_millis(750)).await;
-                let active = this
+                let keep_polling = this
                     .update(cx, |this, cx| {
-                        let Some(session) = this.https_pilot.as_mut() else {
-                            return false;
-                        };
-                        let active = session.active();
-                        let was_gate = session.gate();
-                        session.refresh();
-                        if session.gate() != was_gate {
-                            this.https_pilot_error = None;
-                            if let Some(gate) = session.gate() {
-                                session.select(if gate.pr.is_some() {
-                                    Proof::CiLog
-                                } else {
-                                    Proof::Diff
-                                });
+                        for session in &mut this.https_background {
+                            session.refresh();
+                        }
+                        this.https_background.retain(Session::active);
+                        if let Some(session) = this.https_pilot.as_mut() {
+                            let active = session.active();
+                            let was_gate = session.gate();
+                            session.refresh();
+                            if session.gate() != was_gate {
+                                this.https_pilot_error = None;
+                                if let Some(gate) = session.gate() {
+                                    session.select(if gate.pr.is_some() {
+                                        Proof::CiLog
+                                    } else {
+                                        Proof::Diff
+                                    });
+                                }
+                            }
+                            if active && !session.active() && session.archive().is_some() {
+                                session.select(Proof::Result);
                             }
                         }
-                        if active && !session.active() && session.archive().is_some() {
-                            session.select(Proof::Result);
-                        }
-                        if this.page == Page::HttpsPilot {
+                        let visible = this.page == Page::HttpsPilot;
+                        if visible {
+                            if let Some(source) = this.https_source() {
+                                this.https_sessions = Session::entries(&source);
+                            }
                             cx.notify();
                         }
-                        session.active()
+                        let keep_polling = visible
+                            || !this.https_background.is_empty()
+                            || this.https_pilot.as_ref().is_some_and(Session::active);
+                        this.https_polling = keep_polling;
+                        keep_polling
                     })
                     .unwrap_or(false);
-                if !active {
+                if !keep_polling {
                     break;
                 }
             }
@@ -427,6 +508,60 @@ impl Studio {
         contents
     }
 
+    fn https_session_list(&self, cx: &Context<Self>) -> Div {
+        let panel = panel().flex_none().child(heading("仓库的 HTTPS 任务"));
+        let mut list = v_flex()
+            .id("https-session-list")
+            .test_support()
+            .max_h(px(230.))
+            .overflow_y_scroll()
+            .gap_2();
+        if self.https_sessions.is_empty() {
+            return panel.child(caption("此仓库还没有 HTTPS 真实任务。"));
+        }
+        for entry in &self.https_sessions {
+            let root = entry.root.clone();
+            let id = root.file_name().unwrap_or_default().to_string_lossy();
+            let task = &entry.progress.task;
+            let branch = &entry.progress.branch;
+            let (_, message) = phase(&entry.progress.stage);
+            let (status, color) = progress_state(&entry.progress, entry.busy, false);
+            let current = self
+                .https_pilot
+                .as_ref()
+                .is_some_and(|session| session.root == root);
+            let mut row = v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            button(format!("https-session-{id}"), task.clone(), current).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    if let Some(source) = this.https_source() {
+                                        this.https_pilot_error = None;
+                                        this.select_https_session(&source, root.clone());
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
+                        )
+                        .child(chip(status, color)),
+                )
+                .child(caption(format!("{branch} · {message}")));
+            if !entry.progress.reason.is_empty() {
+                row = row.child(
+                    caption(&entry.progress.reason)
+                        .max_h(px(44.))
+                        .overflow_hidden(),
+                );
+            }
+            list = list.child(row.flex_none().pb_2());
+        }
+        panel.child(list)
+    }
+
     pub(super) fn https_pilot_page(&self, cx: &Context<Self>) -> Div {
         let session = self.https_pilot.as_ref();
         let running = session.is_some_and(Session::active);
@@ -470,6 +605,7 @@ impl Studio {
         if !running && let Some(form) = &self.https_remote_form {
             page = page.child(self.https_remote_form(form, cx));
         }
+        page = page.child(self.https_session_list(cx));
         let Some(session) = session else {
             return h_flex()
                 .size_full()
@@ -479,16 +615,8 @@ impl Studio {
         };
         let progress = &session.progress;
         let (index, message) = phase(&progress.stage);
-        let (result, color) = match progress.exit_code {
-            Some(0) if progress.stage == "completed" && session.archive().is_some() => {
-                ("已完成", MINT)
-            }
-            Some(3) => ("已停止", AMBER),
-            Some(_) => ("失败", RED),
-            None if session.error.is_some() => ("启动失败", RED),
-            None if running => ("运行中", BLUE),
-            _ => ("试点未完成", AMBER),
-        };
+        let (result, color) =
+            progress_state(progress, running || session.busy, session.error.is_some());
         let mut steps = h_flex().gap_3().flex_wrap();
         for (i, label) in [
             "部署 HTTPS",
@@ -512,7 +640,7 @@ impl Studio {
                 },
             ));
         }
-        let brief = panel()
+        let mut brief = panel()
             .flex_none()
             .child(steps)
             .child(
@@ -522,12 +650,29 @@ impl Studio {
                     .child(detail_text("https-stage", message)),
             )
             .child(field("源码", &session.source.display().to_string()))
+            .when(progress.remote && !progress.task.is_empty(), |brief| {
+                brief.child(field("任务", &progress.task))
+            })
             .when(!progress.branch.is_empty(), |brief| {
                 brief.child(field("目标分支", &progress.branch))
             })
             .when(!progress.candidate.is_empty(), |brief| {
                 brief.child(field("候选 SHA", &progress.candidate))
             });
+        if session.can_resume() {
+            brief = brief.child(
+                button(
+                    "https-resume",
+                    if session.retry_needed() {
+                        "重试当前步骤"
+                    } else {
+                        "继续任务"
+                    },
+                    true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.resume_https(cx))),
+            );
+        }
         page = page.child(brief);
         if let Some(gate) = session.gate() {
             let is_merge = gate.pr.is_some();
@@ -601,10 +746,10 @@ impl Studio {
             page = page.child(
                 panel()
                     .flex_none()
-                    .child(heading(if progress.exit_code == Some(3) {
-                        "停止记录"
-                    } else {
-                        "失败原因"
+                    .child(heading(match progress.exit_code {
+                        Some(3) => "停止记录",
+                        Some(4) => "暂停记录",
+                        _ => "失败原因",
                     }))
                     .child(
                         detail_text("https-failure", &error)

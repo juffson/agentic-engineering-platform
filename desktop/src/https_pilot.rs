@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    fs::{self, File},
+    fs::{self, File, TryLockError},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
@@ -105,15 +105,17 @@ impl Progress {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub(crate) struct Connection {
     pub endpoint: String,
     pub ca: Option<PathBuf>,
     pub operator_file: PathBuf,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct Request {
+    #[serde(default)]
+    ticket: String,
     task: Task,
     branch: Branch,
     #[serde(flatten)]
@@ -164,9 +166,17 @@ fn preview(path: &Path, tail: bool) -> Option<String> {
     })
 }
 
+pub(crate) struct Entry {
+    pub root: PathBuf,
+    pub progress: Progress,
+    pub busy: bool,
+}
+
 pub(crate) struct Session {
     pub root: PathBuf,
     pub source: PathBuf,
+    remote: bool,
+    pub busy: bool,
     pub progress: Progress,
     pub checks: Vec<Value>,
     pub selected: Artifact,
@@ -183,6 +193,8 @@ impl Session {
         Self {
             root,
             source,
+            remote: false,
+            busy: false,
             progress: Progress::default(),
             checks: Vec::new(),
             selected: Artifact::Log,
@@ -210,7 +222,7 @@ impl Session {
             .arg(script)
             .arg("--studio-session")
             .arg(&session.root);
-        session.spawn(source, runner, command)
+        session.spawn(source, runner, command, None)
     }
 
     pub fn launch_remote(
@@ -220,8 +232,8 @@ impl Session {
         branch: Branch,
         connection: Connection,
     ) -> Result<Self> {
-        let binary = runner.binary()?.canonicalize()?;
-        let session = Self::allocate(source)?;
+        let mut session = Self::allocate(source)?;
+        session.remote = true;
         let task = match task {
             TaskSource::Existing(task) => task,
             TaskSource::Draft(draft) => {
@@ -233,24 +245,53 @@ impl Session {
             }
         };
         let request = Request {
+            ticket: format!("https-task-{}", uuid::Uuid::new_v4().simple()),
             task,
             branch,
             connection,
         };
-        let script = session.root.join("remote-task.sh");
+        serde_json::to_writer(File::create(session.root.join("request.json"))?, &request)?;
+        session.launch_saved(source, runner, false)
+    }
+
+    pub fn resume(mut self, source: &Workspace, runner: &Runner) -> Result<Self> {
+        self.refresh();
+        ensure!(self.can_resume(), "任务正在运行、已完成，或缺少派发参数");
+        let retry = self.retry_needed();
+        self.launch_saved(source, runner, retry)
+    }
+
+    fn launch_saved(mut self, source: &Workspace, runner: &Runner, retry: bool) -> Result<Self> {
+        let binary = runner.binary()?.canonicalize()?;
+        let owner = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root.join("operator.lock"))?;
+        owner.try_lock().context("另一个 Studio 正在跟踪此任务")?;
+        let pause = self.root.join("pause-request");
+        if pause.exists() {
+            fs::remove_file(pause)?;
+        }
+        let script = self.root.join("remote-task.sh");
         fs::write(&script, include_str!("../../deploy/pilot/remote-task.sh"))?;
         fs::write(
-            session.root.join("live-github.sh"),
+            self.root.join("live-github.sh"),
             include_str!("../../deploy/pilot/live-github.sh"),
         )?;
-        serde_json::to_writer(File::create(session.root.join("request.json"))?, &request)?;
         let mut command = Command::new("bash");
         command
             .arg(script)
-            .arg(&session.root)
+            .arg(&self.root)
             .arg(binary)
-            .arg(&source.root);
-        session.spawn(source, runner, command)
+            .arg(&source.root)
+            .arg(std::process::id().to_string())
+            .arg(if retry { "retry" } else { "observe" });
+        self.error = None;
+        self.acknowledged = None;
+        self.submitted = None;
+        self.spawn(source, runner, command, Some(owner))
     }
 
     fn allocate(source: &Workspace) -> Result<Self> {
@@ -263,16 +304,28 @@ impl Session {
         Ok(Self::new(root, source.root.clone()))
     }
 
-    fn spawn(mut self, source: &Workspace, runner: &Runner, mut command: Command) -> Result<Self> {
-        let log = File::create(self.root.join("studio.log"))?;
+    fn spawn(
+        mut self,
+        source: &Workspace,
+        runner: &Runner,
+        mut command: Command,
+        owner: Option<File>,
+    ) -> Result<Self> {
+        let log = File::options()
+            .create(true)
+            .append(true)
+            .open(self.root.join("studio.log"))?;
+        let stdout = match owner {
+            Some(owner) => owner,
+            None => log.try_clone()?,
+        };
         match command
             .current_dir(&source.root)
             .env("PATH", runner.path()?)
             .env("GH_PROMPT_DISABLED", "1")
-            // The approval pipe owns the session, including when Studio is launched from a terminal.
             .process_group(0)
             .stdin(Stdio::piped())
-            .stdout(Stdio::from(log.try_clone()?))
+            .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(log))
             .spawn()
         {
@@ -282,30 +335,103 @@ impl Session {
             }
             Err(error) => {
                 let reason = format!("无法启动 HTTPS 试点：{error}");
-                fs::write(self.root.join("studio.log"), &reason)?;
+                writeln!(
+                    File::options()
+                        .append(true)
+                        .open(self.root.join("studio.log"))?,
+                    "{reason}"
+                )?;
                 self.error = Some(reason);
             }
         }
+        self.refresh_progress();
         Ok(self)
     }
 
-    pub fn latest(source: &Workspace) -> Option<Self> {
-        let root = fs::read_dir(source.data.join("https-studio"))
-            .ok()?
+    fn roots(source: &Workspace) -> Vec<PathBuf> {
+        let mut roots = fs::read_dir(source.data.join("https-studio"))
+            .into_iter()
             .flatten()
-            .filter_map(|entry| {
-                if !entry.file_name().to_string_lossy().starts_with("studio-")
-                    || !entry.file_type().ok()?.is_dir()
-                {
-                    return None;
-                }
-                Some((entry.metadata().ok()?.modified().ok()?, entry.path()))
+            .flatten()
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with("studio-")
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
             })
-            .max()?
-            .1;
+            .collect::<Vec<_>>();
+        roots.sort_by_cached_key(|entry| {
+            std::cmp::Reverse(entry.metadata().and_then(|m| m.modified()).ok())
+        });
+        roots.into_iter().map(|entry| entry.path()).collect()
+    }
+
+    pub fn entries(source: &Workspace) -> Vec<Entry> {
+        Self::roots(source)
+            .into_iter()
+            .filter_map(|root| {
+                let (progress, remote) = Self::read_progress(&root);
+                remote.then(|| Entry {
+                    busy: Self::locked(&root),
+                    root,
+                    progress,
+                })
+            })
+            .collect()
+    }
+
+    pub fn latest(source: &Workspace) -> Option<PathBuf> {
+        Self::roots(source).into_iter().next()
+    }
+
+    pub fn open(source: &Workspace, root: PathBuf) -> Option<Self> {
+        if root.parent()? != source.data.join("https-studio") || !root.is_dir() {
+            return None;
+        }
         let mut session = Self::new(root, source.root.clone());
         session.refresh();
+        if session.archive().is_some() {
+            session.select(Artifact::Result);
+        }
         Some(session)
+    }
+
+    fn locked(root: &Path) -> bool {
+        File::open(root.join("operator.lock"))
+            .ok()
+            .is_some_and(|file| matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock)))
+    }
+
+    fn read_progress(root: &Path) -> (Progress, bool) {
+        let mut progress = read_json::<Progress>(root.join("state.json")).unwrap_or_default();
+        let request = read_json::<Request>(root.join("request.json"));
+        if let Some(request) = &request {
+            progress.remote = true;
+            if progress.task.is_empty() {
+                progress.task.clone_from(&request.task.name);
+                progress.branch.clone_from(&request.branch.name);
+                progress.ticket.clone_from(&request.ticket);
+            }
+        }
+        (progress, request.is_some())
+    }
+
+    fn refresh_progress(&mut self) {
+        (self.progress, self.remote) = Self::read_progress(&self.root);
+        self.busy = self.remote && Self::locked(&self.root);
+    }
+
+    pub fn can_resume(&self) -> bool {
+        self.remote
+            && !self.active()
+            && !self.busy
+            && (self.progress.exit_code != Some(0) || self.archive().is_none())
+    }
+
+    pub fn retry_needed(&self) -> bool {
+        self.error.is_some()
+            || self
+                .progress
+                .exit_code
+                .is_some_and(|exit| !matches!(exit, 0 | 3 | 4))
     }
 
     pub fn active(&self) -> bool {
@@ -413,9 +539,7 @@ impl Session {
             self.child.take();
             self.approval.take();
         }
-        if let Some(progress) = read_json::<Progress>(self.root.join("state.json")) {
-            self.progress = progress;
-        }
+        self.refresh_progress();
         if let Some(exit) = exit {
             self.progress.exit_code = Some(exit.code().unwrap_or(1));
         }
@@ -465,10 +589,82 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.remote && self.active() {
+            let _ = File::create(self.root.join("pause-request"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn repository_catalog_preserves_a_failed_task_and_guards_resumption() -> Result<()> {
+        use std::io::{BufRead, BufReader};
+
+        let dir = tempfile::tempdir()?;
+        let source = Workspace {
+            root: dir.path().into(),
+            data: dir.path().join("aep"),
+        };
+        let other = Workspace {
+            root: dir.path().into(),
+            data: dir.path().join("other"),
+        };
+        let root = source.data.join("https-studio/studio-example");
+        fs::create_dir_all(&root)?;
+        serde_json::to_writer(
+            File::create(root.join("request.json"))?,
+            &json!({
+                "ticket": "https-task-0123456789abcdef0123456789abcdef",
+                "task": {"name":"task-one","sha":"1".repeat(40)},
+                "branch": {"name":"test/example","sha":"2".repeat(40)},
+                "endpoint":"https://control.example.org",
+                "ca":null,
+                "operator_file":"/operator"
+            }),
+        )?;
+        fs::write(
+            root.join("state.json"),
+            br#"{"stage":"remote_checking","exit_code":1,"reason":"acceptance exited 44"}"#,
+        )?;
+        let entries = Session::entries(&source);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].progress.task, "task-one");
+        assert_eq!(entries[0].progress.branch, "test/example");
+        assert_eq!(entries[0].progress.reason, "acceptance exited 44");
+        assert!(Session::entries(&other).is_empty());
+        assert!(Session::open(&other, root.clone()).is_none());
+
+        let owner = File::create(root.join("operator.lock"))?;
+        owner.try_lock()?;
+        let mut child = Command::new("bash")
+            .args(["-c", "exec 4>&1; echo ready >&2; read -r line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(owner))
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut ready = String::new();
+        BufReader::new(child.stderr.take().context("lock holder stderr")?).read_line(&mut ready)?;
+        let mut session = Session::open(&source, root).context("saved task")?;
+        let was_locked = session.busy && !session.can_resume();
+        child
+            .stdin
+            .take()
+            .context("lock holder stdin")?
+            .write_all(b"released\n")?;
+        assert!(child.wait()?.success());
+        assert_eq!(ready.trim(), "ready");
+        assert!(was_locked);
+        session.refresh();
+        assert!(session.can_resume());
+        assert!(session.retry_needed());
+        Ok(())
+    }
 
     #[test]
     fn approval_uses_the_current_full_sha_and_stage() -> Result<()> {
