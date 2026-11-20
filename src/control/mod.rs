@@ -26,6 +26,9 @@ pub struct Control {
     /// Use HTTPS for remote control planes. Loopback HTTP is for local trials.
     #[arg(long, default_value = "http://127.0.0.1:8787")]
     url: String,
+    /// Require an explicitly trusted CA bundle for this HTTPS control endpoint.
+    #[arg(long, value_name = "PEM")]
+    ca_cert: Option<PathBuf>,
     #[command(subcommand)]
     action: Action,
 }
@@ -104,6 +107,9 @@ enum Action {
         /// Site-provided sandbox launcher that runs the executable and argv it receives.
         #[arg(long)]
         sandbox_launcher: Option<PathBuf>,
+        /// Keep device leases and the outbox in a trusted supervisor directory.
+        #[arg(long)]
+        journal_dir: Option<PathBuf>,
         /// Process at most one Run, including any unacknowledged local result.
         #[arg(long)]
         once: bool,
@@ -258,7 +264,11 @@ fn publish(
 }
 
 pub fn execute(repo: &Path, request: Control) -> Result<()> {
-    let Control { url, action } = request;
+    let Control {
+        url,
+        ca_cert,
+        action,
+    } = request;
     let action = match action {
         Action::Serve {
             listen,
@@ -269,6 +279,7 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
         Action::Worker {
             codex_model,
             sandbox_launcher,
+            journal_dir,
             once,
         } => {
             let sandbox = sandbox_launcher
@@ -277,14 +288,16 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
             return worker::run(
                 &Repo::open(repo)?,
                 &url,
+                ca_cert.as_deref(),
                 codex_model.as_deref(),
                 sandbox.as_deref(),
+                journal_dir.as_deref(),
                 once,
             );
         }
         action => action,
     };
-    let client = Client::new(&url, false)?;
+    let client = Client::new(&url, false, ca_cert.as_deref())?;
     let reply = match action {
         Action::Status => client.call(Operation::Status)?,
         Action::Cancel { ticket } => client.call(Operation::Cancel { ticket })?,
