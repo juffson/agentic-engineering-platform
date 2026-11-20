@@ -133,7 +133,7 @@ fn version(program: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-fn prepare(repo: &Repo, lease: &Lease) -> Result<Option<String>> {
+fn prepare(repo: &Repo, lease: &Lease, fetcher: Option<&Path>) -> Result<Option<String>> {
     let task = &lease.task;
     let origin = git(&repo.root, &["config", "--get", "remote.origin.url"])?;
     ensure!(
@@ -147,15 +147,31 @@ fn prepare(repo: &Repo, lease: &Lease) -> Result<Option<String>> {
     );
     let reference = format!("refs/heads/aep-task/{}", task.name);
     let pinned = format!("refs/aep/control/{}", lease.run);
-    git(
-        &repo.root,
-        &[
-            "fetch",
-            "--no-tags",
-            "origin",
-            &format!("{reference}:{pinned}"),
-        ],
-    )?;
+    if let Some(fetcher) = fetcher {
+        let output = Command::new(fetcher)
+            .arg(&repo.root)
+            .args([&task.repository, &reference, &pinned])
+            .env_remove(OPERATOR_TOKEN)
+            .env_remove(DEVICE_TOKEN)
+            .stdin(Stdio::null())
+            .output()
+            .context("start repository fetcher")?;
+        ensure!(
+            output.status.success(),
+            "repository fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    } else {
+        git(
+            &repo.root,
+            &[
+                "fetch",
+                "--no-tags",
+                "origin",
+                &format!("{reference}:{pinned}"),
+            ],
+        )?;
+    }
     ensure!(
         commit(&repo.root, &pinned)? == task.spec,
         "remote Spec changed"
@@ -186,6 +202,7 @@ fn prepare(repo: &Repo, lease: &Lease) -> Result<Option<String>> {
 pub struct LaunchOptions<'a> {
     pub model: Option<&'a str>,
     pub sandbox: Option<&'a Path>,
+    pub fetcher: Option<&'a Path>,
     pub upload_evidence: bool,
 }
 
@@ -358,7 +375,7 @@ fn sync_run(
             &state_file,
         )?;
     } else if connected {
-        match prepare(repo, &journal.lease) {
+        match prepare(repo, &journal.lease, options.fetcher) {
             Ok(candidate) => {
                 match journal.renew(client) {
                     Ok((false, false)) => (),

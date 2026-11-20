@@ -397,8 +397,10 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         "the rehearsal needs a Lease of 10–120 seconds"
     );
     let ingress_id = docker(&["inspect", "-f", "{{.Id}}", &ingress])?;
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
+    let source = args
+        .https_remote_repo
+        .clone()
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
         .canonicalize()?;
     let ws = Workspace::open(&source)?;
     let auth_draft: Option<AuthoredTask> = std::env::var_os("AEP_STUDIO_LIVE_DRAFT")

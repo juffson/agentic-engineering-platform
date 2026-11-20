@@ -17,13 +17,14 @@ stage=preflight
 failure='' repository='' task='' branch='' baseline='' spec='' candidate='' old_run='' recovered_run='' pr=''
 evidence='' archive='' worker=''
 ticket=''
+private=null
 
 report() {
     jq -n --arg stage "$stage" --arg reason "$failure" --arg repository "$repository" --arg task "$task" \
         --arg branch "$branch" --arg ticket "$ticket" --arg baseline "$baseline" --arg spec "$spec" \
         --arg candidate "$candidate" --arg old "$old_run" --arg recovered "$recovered_run" --arg pr "$pr" --arg worker "$worker" \
-        --arg archive "$archive" --argjson code "${1:-null}" \
-        '{remote:true,stage:$stage,reason:$reason,repository:$repository,task:$task,branch:$branch,ticket:$ticket,
+        --arg archive "$archive" --argjson code "${1:-null}" --argjson private "$private" \
+        '{remote:true,stage:$stage,reason:$reason,repository:$repository,private_repository:$private,task:$task,branch:$branch,ticket:$ticket,
           baseline:$baseline,spec:$spec,candidate:$candidate,old_run:$old,recovered_run:$recovered,worker:$worker,
           pr:(if $pr=="" then null else ($pr|tonumber) end),archive:($archive!=""),exit_code:$code}' > "$session/state.tmp"
     mv -f "$session/state.tmp" "$session/state.json"
@@ -112,6 +113,7 @@ if jq -e '.stage != null' <<<"$prior" >/dev/null; then
 fi
 # Keep the information displayed before a restart, even if preflight fails.
 repository=$(jq -r '.repository // empty' <<<"$prior")
+private=$(jq -c '.private_repository' <<<"$prior")
 spec=$(jq -r '.spec // empty' <<<"$prior")
 candidate=$(jq -r '.candidate // empty' <<<"$prior")
 old_run=$(jq -r '.old_run // empty' <<<"$prior")
@@ -137,8 +139,13 @@ control() { "$aep" --repo "$operator" control "${opts[@]}" "$@"; }
 source "$session/live-github.sh"
 
 origin=$(git -C "$source_repo" remote get-url origin)
-repository=$(retry_read gh repo view "$origin" --json nameWithOwner,isPrivate --jq 'select(.isPrivate==false)|.nameWithOwner')
-[[ -n $repository ]] || fail "Use a public GitHub repository accessible by the remote Worker"
+metadata=$(retry_read gh repo view "$origin" --json nameWithOwner,isPrivate) ||
+    fail "The Studio GitHub account cannot access the selected repository"
+repository=$(jq -er '.nameWithOwner | select(type == "string" and length > 0) | ascii_downcase' <<<"$metadata")
+private=$(jq -c '.isPrivate | select(type == "boolean")' <<<"$metadata")
+[[ $private == true || $private == false ]] || fail "Cannot verify repository visibility"
+jq -n --arg repo "$repository" --argjson private "$private" \
+    '{repository:$repo,private:$private}' > "$evidence/repository.json"
 actor=$(retry_read gh api user --jq .login)
 git -C "$operator" init --quiet --template=
 if ! git -C "$operator" remote get-url origin >/dev/null 2>&1; then

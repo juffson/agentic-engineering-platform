@@ -22,7 +22,7 @@ RUN npm install -g "@openai/codex@${CODEX_VERSION}" "@anthropic-ai/claude-code@$
     codex --version && claude --version && rm -rf /root/.npm
 
 FROM ${RUST_IMAGE} AS worker
-RUN apt-get update && apt-get install -y --no-install-recommends curl util-linux && \
+RUN apt-get update && apt-get install -y --no-install-recommends curl netcat-openbsd openssh-client util-linux && \
     groupadd --gid 10001 aep-agent && \
     useradd --uid 10001 --gid 10001 --home-dir /pilot/agent --no-create-home aep-agent && \
     rm -rf /var/lib/apt/lists/*
@@ -30,6 +30,7 @@ COPY --from=clients /usr/local/ /usr/local/
 COPY --from=build /usr/local/cargo/registry /opt/aep-cargo/registry
 COPY --from=build /src/target/debug/aep /usr/local/bin/aep
 COPY deploy/pilot/worker.sh deploy/pilot/sandbox.sh /usr/local/libexec/aep-pilot/
+COPY deploy/pilot/private-fetch.sh deploy/pilot/github-known-hosts /usr/local/libexec/aep-pilot/
 COPY deploy/pilot/supervisor-git.sh /usr/local/libexec/aep-pilot/git
 COPY deploy/pilot/codex-container.sh /usr/local/libexec/aep-executor/codex
 RUN rustup component add rustfmt clippy && touch /etc/aep-pilot-container && \

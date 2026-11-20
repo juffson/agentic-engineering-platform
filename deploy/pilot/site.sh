@@ -162,33 +162,74 @@ proxy_arg() {
     printf 'http://%s-egress:3128' "$name"
 }
 
+github_origin() {
+    [[ $1 =~ ^https://github\.com/([a-zA-Z0-9_-]+/([a-zA-Z0-9._-]+))$ ]] || return 2
+    local repository=${BASH_REMATCH[1]}
+    repository=${repository%.git}
+    [[ $repository != */ && $repository != */. && $repository != */.. ]] || return 2
+    printf '%s' "$repository" | tr '[:upper:]' '[:lower:]'
+}
+
+repo_key() (
+    [[ $# == 1 ]]
+    local repository staging
+    repository=$(github_origin "$1") || { echo "Expected a GitHub HTTPS origin" >&2; exit 2; }
+    [[ $(docker volume inspect -f '{{index .Labels "org.aep.pilot"}}' "$worker_keys_volume") == "$name" ]]
+    umask 077
+    staging=$(mktemp -d)
+    trap 'rm -f -- "$staging/github-key" "$staging/github-repository"; rmdir "$staging"' EXIT
+    cat > "$staging/github-key"
+    ssh-keygen -y -P '' -f "$staging/github-key" </dev/null >/dev/null
+    printf '%s\n' "$repository" > "$staging/github-repository"
+    private_files "$staging" "$worker_keys_volume" 0 0 github-key github-repository
+)
+
 prepare_workspace() {
-    local repo=$1 branch=$2 git_name=$3 git_email=$4 proxy
+    local repo=$1 branch=$2 git_name=$3 git_email=$4 proxy repository
     proxy=$(proxy_arg)
-    [[ $repo =~ ^https://github\.com/[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]] || {
-        echo "The Worker accepts a public GitHub HTTPS origin without credentials" >&2
-        exit 2
-    }
+    repository=$(github_origin "$repo") || { echo "Expected a GitHub HTTPS origin" >&2; exit 2; }
     docker run --rm --network "$private" --dns 127.0.0.1 --security-opt no-new-privileges \
         --mount "type=volume,src=$workspace_volume,dst=/pilot" \
+        --mount "type=volume,src=$worker_keys_volume,dst=/run/aep-worker,readonly" \
         --env "HTTPS_PROXY=$proxy" --env "HTTP_PROXY=$proxy" --entrypoint /bin/sh \
         "$worker_image" -ec '
+            git=/usr/local/libexec/aep-pilot/git
+            if [ -f /run/aep-worker/github-repository ]; then
+                [ "$5" = "$(cat /run/aep-worker/github-repository)" ] || {
+                    echo "The Worker deploy key belongs to another GitHub repository" >&2
+                    exit 1
+                }
+            fi
             if [ ! -d /pilot/repo/.git ]; then
                 install -d -m 700 /pilot/supervisor
                 install -d -m 700 -o 10001 -g 10001 /pilot/agent /pilot/agent/.codex /pilot/agent/.claude /pilot/tmp /pilot/cargo /pilot/build
                 install -d -m 755 -o 10001 -g 10001 /pilot/repo
                 cp -a /opt/aep-cargo/registry /pilot/cargo/
                 chown -R 10001:10001 /pilot/cargo
-                git=/usr/local/libexec/aep-pilot/git
-                "$git" clone --branch "$2" --single-branch --no-tags -- "$1" /pilot/repo
-                "$git" -C /pilot/repo config user.name "$3"
-                "$git" -C /pilot/repo config user.email "$4"
+                if [ -f /run/aep-worker/github-repository ]; then
+                    "$git" -C /pilot/repo init --quiet --template=
+                    "$git" -C /pilot/repo remote add origin "$1"
+                else
+                    "$git" clone --branch "$2" --single-branch --no-tags -- "$1" /pilot/repo
+                fi
             fi
+            if [ "$("$git" -C /pilot/repo config --get remote.origin.url)" != "$1" ]; then
+                echo "The existing Worker workspace belongs to another Git origin" >&2
+                exit 1
+            fi
+            if [ -f /run/aep-worker/github-repository ] && ! "$git" -C /pilot/repo rev-parse --verify HEAD >/dev/null 2>&1; then
+                ref=refs/heads/$2
+                /usr/local/libexec/aep-pilot/private-fetch.sh /pilot/repo "$5" "$ref" refs/aep/control/bootstrap
+                "$git" -C /pilot/repo switch -c "$2" refs/aep/control/bootstrap
+                "$git" -C /pilot/repo update-ref -d refs/aep/control/bootstrap
+            fi
+            "$git" -C /pilot/repo config user.name "$3"
+            "$git" -C /pilot/repo config user.email "$4"
             # The supervisor and unprivileged executor share each Run cancellation lock.
             test ! -L /pilot/repo/.git && test ! -L /pilot/repo/.git/aep && test ! -L /pilot/repo/.git/aep/run-control
             install -d -m 700 -o 10001 -g 10001 /pilot/repo/.git/aep
             install -d -m 2770 -o 10001 -g 10001 /pilot/repo/.git/aep/run-control
-        ' provision "$repo" "$branch" "$git_name" "$git_email"
+        ' provision "$repo" "$branch" "$git_name" "$git_email" "$repository"
 }
 
 model_credential() {
@@ -352,11 +393,12 @@ case "${1:-}" in
     upgrade) shift; source "$script_dir/upgrade.sh"; upgrade_site "$@" ;;
     worker-config) shift; worker_config "$@" ;;
     worker-keys) shift; worker_keys "$@" ;;
+    repo-key) shift; repo_key "$@" ;;
     workspace) shift; prepare_workspace "$@" ;;
     credential) shift; model_credential "$@" ;;
     worker) shift; worker "$@" ;;
     export) shift; export_runs "$@" ;;
     gate) shift; check_gate "$@" ;;
     remove) shift; remove_site "$@" ;;
-    *) echo "Usage: $0 serve PRIVATE-DIR | upgrade ACCESS-DIR RECEIPT-DIR | worker-config ACCESS-DIR | worker-keys ACCESS-DIR | workspace HTTPS-REPO BRANCH GIT-NAME GIT-EMAIL | credential codex|claude < AUTH-JSON | worker [WORKER-ARGS] | export EVIDENCE-DIR RUN [RUN...] | gate hold|release | remove" >&2; exit 2 ;;
+    *) echo "Usage: $0 serve PRIVATE-DIR | upgrade ACCESS-DIR RECEIPT-DIR | worker-config ACCESS-DIR | worker-keys ACCESS-DIR | repo-key HTTPS-REPO < PRIVATE-KEY | workspace HTTPS-REPO BRANCH GIT-NAME GIT-EMAIL | credential codex|claude < AUTH-JSON | worker [WORKER-ARGS] | export EVIDENCE-DIR RUN [RUN...] | gate hold|release | remove" >&2; exit 2 ;;
 esac

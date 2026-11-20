@@ -139,6 +139,9 @@ enum Action {
         /// Site-provided sandbox launcher that runs the executable and argv it receives.
         #[arg(long)]
         sandbox_launcher: Option<PathBuf>,
+        /// Trusted program receiving the checkout, repository, source ref and destination ref.
+        #[arg(long)]
+        repository_fetcher: Option<PathBuf>,
         /// Keep device leases and the outbox in a trusted supervisor directory.
         #[arg(long)]
         journal_dir: Option<PathBuf>,
@@ -315,11 +318,15 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
         Action::Worker {
             codex_model,
             sandbox_launcher,
+            repository_fetcher,
             journal_dir,
             once,
             upload_evidence,
         } => {
             let sandbox = sandbox_launcher
+                .map(|path| path.canonicalize())
+                .transpose()?;
+            let fetcher = repository_fetcher
                 .map(|path| path.canonicalize())
                 .transpose()?;
             return worker::run(
@@ -331,6 +338,7 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
                 worker::LaunchOptions {
                     model: codex_model.as_deref(),
                     sandbox: sandbox.as_deref(),
+                    fetcher: fetcher.as_deref(),
                     upload_evidence,
                 },
             );

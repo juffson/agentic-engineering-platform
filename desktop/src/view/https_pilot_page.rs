@@ -411,6 +411,7 @@ impl Studio {
                 "HTTPS 真实任务"
             }))
             .child(field("仓库", &form.source.root.display().to_string()))
+            .child(caption("支持公开和私有 GitHub 仓库。私有仓库需要为远程 Worker 配置该仓库的只读 Deploy Key。"))
             .when(form.authoring.is_none(), |contents| {
                 contents.child(
                     h_flex()
@@ -691,6 +692,17 @@ impl Studio {
                     .child(detail_text("https-stage", message)),
             )
             .child(field("源码", &session.source.display().to_string()))
+            .when(
+                progress.remote && !progress.repository.is_empty(),
+                |brief| {
+                    let label = match progress.private_repository {
+                        Some(true) => "私有 GitHub 仓库",
+                        Some(false) => "公开 GitHub 仓库",
+                        None => "GitHub 仓库",
+                    };
+                    brief.child(field(label, &progress.repository))
+                },
+            )
             .when(progress.remote && !progress.task.is_empty(), |brief| {
                 brief.child(field("任务", &progress.task))
             })
