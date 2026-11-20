@@ -932,6 +932,8 @@ mod tests {
         store.apply(Operation::QueuePause { paused: false }, "device", 4, 10)?;
         let lease = poll(&mut store, 4)?;
         assert_eq!(lease.run, ids[1]);
+        store.apply(Operation::QueuePause { paused: true }, "device", 4, 10)?;
+        assert_eq!(poll(&mut store, 4)?.run, lease.run);
         let cancel = |id: &str, stage| Operation::Cancel {
             ticket: "second".into(),
             expected_run: Some(id.into()),
@@ -970,7 +972,23 @@ mod tests {
             10,
         )?;
         assert_eq!(store.state.attempts[1].stage, Stage::Cancelled);
-        assert_eq!(poll(&mut store, 7)?.run, ids[0]);
+        assert!(matches!(
+            store.apply(
+                Operation::Poll {
+                    installation: "installation-1".into(),
+                    profile: Profile {
+                        codex: "codex 1".into(),
+                        claude: "claude 1".into()
+                    }
+                },
+                "device",
+                7,
+                10
+            )?,
+            Reply::Polled(None)
+        ));
+        store.apply(Operation::QueuePause { paused: false }, "device", 8, 10)?;
+        assert_eq!(poll(&mut store, 8)?.run, ids[0]);
         Ok(())
     }
 

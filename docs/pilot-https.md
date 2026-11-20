@@ -39,7 +39,7 @@ Studio 会等待控制面重新连接并收齐旧 Run 的终止事件。Lease �
 
 取消需要对当前 Run 确认。等待任务会直接结束并保存调度回执。已运行任务先显示等待 Worker 确认停止，收到进程退出回执并下载证据后可在任务详情打开归档。控制面在取消确认前保留当前 Worker 的位置，避免提前派发下一项。此功能需要支持队列管理的控制面，沿用已启用证据上传的 Worker。
 
-可用 `ui_debug --live-https-queue --output-dir <目录>` 在空闲站点复跑。先在 Studio 保存该站点连接，准备两个已固定 Spec 的任务和各自的 `test/` 目标分支，再将 `AEP_STUDIO_LIVE_QUEUE_PLAN` 指向 JSON 文件。文件的 `cancel` 和 `deliver` 各包含 `task` 和 `target`。取消用的任务应在 Worker 验收期间留出足够时间操作。验收会打开两次 Studio，保留取消和合并两份归档，并通过终端确认发布和合并。
+可用 `ui_debug --live-https-queue --output-dir <目录>` 在空闲站点复跑。先在 Studio 保存该站点连接，准备两个已固定 Spec 的任务和各自的 `test/` 目标分支，再将 `AEP_STUDIO_LIVE_QUEUE_PLAN` 指向 JSON 文件。文件的 `cancel` 和 `deliver` 各包含 `task` 和 `target`。取消用的任务应在 Worker 验收期间留出足够时间操作。验收会打开两次 Studio，保留取消和合并两份归档，并通过终端确认发布和合并。若取消已归档而验收程序中断，可设置 `AEP_STUDIO_LIVE_QUEUE_RESUME=1` 后沿用原计划继续交付任务。
 
 ### 查看、继续与重试任务
 
