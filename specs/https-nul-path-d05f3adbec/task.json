@@ -1,0 +1,15 @@
+{
+  "title": "Reject NUL characters in task allowed paths",
+  "allowed_paths": [
+    "src/task.rs"
+  ],
+  "check": [
+    "sh",
+    "-ec",
+    "if test -f /etc/aep-pilot-container; then\n    if test -f '/pilot/tmp/aep-studio-retry-https-nul-path-d05f3adbec'; then\n        printf '%s\\n' 'Studio retry rehearsal: first acceptance blocked' >&2\n        exit 44\n    fi\n    sleep 18\nfi\nout=tests/aep_studio_nul_path_contract.rs\ntest ! -e \"$out\"\ntrap 'unlink \"$out\"' EXIT\ncat > \"$out\" <<'RUST'\nuse aep::task::TaskManifest;\n\n#[test]\nfn rejects_nul_only_as_an_invalid_path_character() {\n    for (path, valid) in [\n        (\"src/main.rs\", true),\n        (\"src/示例.rs\", true),\n        (\"src/has space.rs\", true),\n        (\"src/bad\\0name.rs\", false),\n        (\"src/\\0.rs\", false),\n        (\"\", false),\n        (\"src/../main.rs\", false),\n        (\".git/config\", false),\n        (\"/src/main.rs\", false),\n    ] {\n        let manifest = TaskManifest {\n            title: None,\n            allowed_paths: vec![path.into()],\n            check: vec![\"true\".into()],\n            criteria: vec![],\n            checks: vec![],\n        };\n        assert_eq!(manifest.validate().is_ok(), valid, \"path {path:?}\");\n    }\n}\nRUST\ncargo test --quiet --locked --no-default-features --test aep_studio_nul_path_contract"
+  ],
+  "criteria": [
+    "AC-1",
+    "AC-2"
+  ]
+}
