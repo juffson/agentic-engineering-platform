@@ -1,0 +1,15 @@
+{
+  "title": "Reject NUL bytes in AEP manifest paths",
+  "allowed_paths": [
+    "src/task.rs"
+  ],
+  "criteria": [
+    "AC-1",
+    "AC-2"
+  ],
+  "check": [
+    "sh",
+    "specs/https-manifest-path-9e3596ab99/acceptance.sh",
+    "specs/https-manifest-path-9e3596ab99"
+  ]
+}

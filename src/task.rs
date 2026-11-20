@@ -42,8 +42,10 @@ impl TaskManifest {
         ensure!(
             !self.allowed_paths.is_empty()
                 && self.allowed_paths.iter().all(|path| {
-                    path.split('/')
-                        .all(|part| !matches!(part, "" | "." | ".." | ".git"))
+                    !path.contains('\0')
+                        && path
+                            .split('/')
+                            .all(|part| !matches!(part, "" | "." | ".." | ".git"))
                 }),
             "invalid allowed_paths"
         );
@@ -94,5 +96,49 @@ impl TaskManifest {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskManifest;
+
+    fn manifest(path: &str) -> TaskManifest {
+        TaskManifest {
+            title: None,
+            allowed_paths: vec![path.to_owned()],
+            check: vec!["true".to_owned()],
+            criteria: vec![],
+            checks: vec![],
+        }
+    }
+
+    #[test]
+    fn rejects_nul_in_allowed_paths() {
+        for path in ["\0file.txt", "dir/fi\0le.txt", "file.txt\0"] {
+            assert!(manifest(path).validate().is_err(), "accepted {path:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_valid_allowed_paths() {
+        for path in ["dir/nested/file.txt", "dir/file name.txt", "目录/café.txt"] {
+            assert!(manifest(path).validate().is_ok(), "rejected {path:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_path_components() {
+        for path in [
+            "",
+            "/file",
+            "dir/",
+            "dir//file",
+            "./file",
+            "dir/../file",
+            "dir/.git/config",
+        ] {
+            assert!(manifest(path).validate().is_err(), "accepted {path:?}");
+        }
     }
 }
