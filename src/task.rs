@@ -23,10 +23,8 @@ pub struct Check {
 }
 
 fn valid_command(command: &[String]) -> bool {
-    !command.is_empty()
-        && command
-            .iter()
-            .all(|part| !part.is_empty() && !part.contains('\0'))
+    command.first().is_some_and(|part| !part.is_empty())
+        && command.iter().all(|part| !part.contains('\0'))
 }
 
 fn valid_id(value: &str) -> bool {
@@ -48,7 +46,7 @@ impl TaskManifest {
             "invalid allowed_paths"
         );
         ensure!(
-            !self.check.is_empty() && self.check.iter().all(|part| !part.is_empty()),
+            self.check.first().is_some_and(|part| !part.is_empty()),
             "check must contain a command"
         );
         ensure!(
@@ -94,5 +92,43 @@ impl TaskManifest {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acceptance_commands_preserve_empty_arguments_but_require_an_executable() {
+        for (argv, valid) in [
+            (vec!["sh", "-c", "test -z \"$1\"", "sh", ""], true),
+            (vec!["command", "", "argument", ""], true),
+            (vec!["command"], true),
+            (vec![], false),
+            (vec![""], false),
+            (vec!["", "argument"], false),
+            (vec!["com\0mand"], false),
+            (vec!["command", "arg\0ument"], false),
+            (vec!["command", "", "\0"], false),
+        ] {
+            let command: Vec<String> = argv.iter().map(|part| (*part).into()).collect();
+            let mut manifest = TaskManifest {
+                title: None,
+                allowed_paths: vec!["src/task.rs".into()],
+                check: command.clone(),
+                criteria: vec!["AC-1".into()],
+                checks: vec![],
+            };
+            assert_eq!(manifest.validate().is_ok(), valid, "primary: {argv:?}");
+
+            manifest.check = vec!["command".into()];
+            manifest.checks.push(Check {
+                id: "additional".into(),
+                criteria: vec!["AC-2".into()],
+                command,
+            });
+            assert_eq!(manifest.validate().is_ok(), valid, "additional: {argv:?}");
+        }
     }
 }
