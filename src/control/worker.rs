@@ -3,6 +3,7 @@ use super::{
     evidence,
     http::{Client, DEVICE_TOKEN, OPERATOR_TOKEN, Rejected, now},
     state::{Event, Lease, Operation, Outcome, Phase, Profile, Progress, Reply, save, sha},
+    worker_keys::Manager,
 };
 use crate::git::Repo;
 use aep::{
@@ -133,7 +134,7 @@ fn version(program: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-fn prepare(repo: &Repo, lease: &Lease, fetcher: Option<&Path>) -> Result<Option<String>> {
+fn prepare(repo: &Repo, lease: &Lease, options: LaunchOptions<'_>) -> Result<Option<String>> {
     let task = &lease.task;
     let origin = git(&repo.root, &["config", "--get", "remote.origin.url"])?;
     ensure!(
@@ -147,8 +148,12 @@ fn prepare(repo: &Repo, lease: &Lease, fetcher: Option<&Path>) -> Result<Option<
     );
     let reference = format!("refs/heads/aep-task/{}", task.name);
     let pinned = format!("refs/aep/control/{}", lease.run);
-    if let Some(fetcher) = fetcher {
-        let output = Command::new(fetcher)
+    if let Some(fetcher) = options.fetcher {
+        let mut process = Command::new(fetcher);
+        if let Some(key) = options.key {
+            process.env("AEP_PILOT_GITHUB_KEY_FILE", key);
+        }
+        let output = process
             .arg(&repo.root)
             .args([&task.repository, &reference, &pinned])
             .env_remove(OPERATOR_TOKEN)
@@ -203,6 +208,7 @@ pub struct LaunchOptions<'a> {
     pub model: Option<&'a str>,
     pub sandbox: Option<&'a Path>,
     pub fetcher: Option<&'a Path>,
+    pub key: Option<&'a Path>,
     pub upload_evidence: bool,
 }
 
@@ -375,7 +381,7 @@ fn sync_run(
             &state_file,
         )?;
     } else if connected {
-        match prepare(repo, &journal.lease, options.fetcher) {
+        match prepare(repo, &journal.lease, options) {
             Ok(candidate) => {
                 match journal.renew(client) {
                     Ok((false, false)) => (),
@@ -430,11 +436,18 @@ fn executor_idle(repo: &Repo, run: &str) -> Result<bool> {
     }
 }
 
+pub struct KeyOptions<'a> {
+    pub directory: &'a Path,
+    pub fetcher: &'a Path,
+    pub legacy: Option<&'a Path>,
+}
+
 pub fn run(
     repo: &Repo,
     endpoint: &str,
     ca_cert: Option<&Path>,
     journal_dir: Option<&Path>,
+    key_options: Option<KeyOptions<'_>>,
     once: bool,
     options: LaunchOptions<'_>,
 ) -> Result<()> {
@@ -481,9 +494,33 @@ pub fn run(
         claude: version("claude").context("install Claude Code")?,
     };
     let mut child = None;
+    let mut keys = key_options
+        .map(|options| -> Result<Manager<'_>> {
+            let origin = git(&repo.root, &["config", "--get", "remote.origin.url"])?;
+            Manager::open(
+                options.directory,
+                options.legacy,
+                options.fetcher,
+                &repo.root,
+                aep::delivery::slug(origin.trim())?,
+            )
+        })
+        .transpose()?;
 
     loop {
         if !marker.try_exists()? {
+            if let Some(keys) = &mut keys
+                && let Err(error) = keys.sync(&client, &installation, &profile)
+            {
+                eprintln!("Deploy Key status temporarily unavailable: {error}");
+                if keys.active()?.is_none() {
+                    if once {
+                        return Err(error);
+                    }
+                    thread::sleep(POLL);
+                    continue;
+                }
+            }
             match client.call(Operation::Poll {
                 installation: installation.clone(),
                 profile: profile.clone(),
@@ -521,6 +558,11 @@ pub fn run(
             let folder: PathBuf = base.join(&run);
             let mut journal: Journal =
                 serde_json::from_slice(&fs::read(folder.join("events.json"))?)?;
+            let key = keys.as_ref().map(Manager::active).transpose()?.flatten();
+            let options = LaunchOptions {
+                key: key.as_deref(),
+                ..options
+            };
             if sync_run(&client, repo, &folder, &mut journal, &mut child, options)? {
                 // The last event remains in the local outbox for audit.
                 fs::remove_file(&marker)?;

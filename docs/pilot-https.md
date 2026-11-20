@@ -118,7 +118,20 @@ site="$HOME/.local/state/aep-pilot"
 
 ### 私有 GitHub 仓库
 
-为每个 Worker 生成独立的无口令 SSH 密钥，把公钥添加到目标仓库的 Deploy keys，保留只读权限。下面的命令假设 `repo` 是 `OWNER/REPO`，`key` 是操作员私有目录中的新文件路径。多 Worker 站点先按设备配置好 `worker-keys`，再用对应的 `AEP_PILOT_WORKER_SLOT` 分别安装 GitHub 密钥。
+更新 HTTPS 控制面、出口代理、Worker 和 Studio。为新 Worker 绑定 GitHub 仓库，再初始化工作区、安装模型凭证并启动 Worker。多 Worker 站点为对应的 `AEP_PILOT_WORKER_SLOT` 分别绑定仓库。已有 Deploy Key 的 Worker 升级后会识别当前密钥。
+
+```sh
+./deploy/pilot/site.sh repo-bind "https://github.com/$repo.git"
+./deploy/pilot/site.sh workspace "https://github.com/$repo.git" "$branch" "$git_name" "$git_email"
+```
+
+在 Studio 打开私有仓库的本地克隆，进入「HTTPS 试点 → 真实任务」，填写控制面、CA 和操作员令牌路径，再点「连接队列」。GitHub 登录账号需要目标仓库的 Deploy Key 管理权限。
+
+1. 在「Worker Deploy Key」核对仓库、Worker 和指纹。初次配置点「生成密钥」，已有密钥点「准备轮换」。Worker 空闲时会在本机的监督进程私有目录生成新密钥。
+2. 点「注册只读并切换」。Studio 将公钥注册为只读 Deploy Key，Worker 访问 GitHub 成功后切换。点「验证只读」可重新核对 GitHub 权限和 Worker 的读取结果。
+3. 用新密钥跑一次任务并检查证据。核对待撤销的旧指纹后点「撤销旧密钥」，再点确认。Studio 再查一次生效密钥在 GitHub 上的只读状态，按旧密钥的 GitHub ID 撤销。如果网络中断，重新打开 Studio 可以核对当前阶段并重试。
+
+已有的命令行配置也可以用于初次部署。下面假设 `repo` 是 `OWNER/REPO`，`key` 是操作员私有目录中的新文件路径。
 
 ```sh
 ssh-keygen -t ed25519 -N '' -f "$key"
@@ -128,7 +141,7 @@ gh api --method POST "repos/$repo/keys" -f title="$worker_name" \
 ./deploy/pilot/site.sh workspace "https://github.com/$repo.git" "$branch" "$git_name" "$git_email"
 ```
 
-使用本版本构建的 Worker 和出口代理。Worker 监督进程使用部署密钥并验证 GitHub 主机公钥，经代理连接 `ssh.github.com:443`。它只将指定的 Git 引用导入工作区。Codex、Claude 和验收进程无法读取 Deploy Key。Studio 用操作员本地 Git 和 `gh` 的登录身份执行任务 Spec 推送、发布和合并，继续使用 HTTPS 控制面。选择该私有仓库的本地克隆，打开「HTTPS 试点 → 真实任务」，填写控制面和操作员令牌路径后派发。归档会记录仓库的可见性，应按私有仓库权限保管。
+Worker 监督进程验证 GitHub 主机公钥，经代理连接 `ssh.github.com:443`，并将指定的 Git 引用导入工作区。控制面保存公钥、指纹和操作状态。私钥始终保存在 Worker 的私有挂载或监督进程目录。Studio 用操作员本地 Git 和 `gh` 的登录身份执行任务 Spec 推送、发布和合并。任务归档会记录仓库的可见性，应按私有仓库权限保管。
 
 ### 原位升级
 

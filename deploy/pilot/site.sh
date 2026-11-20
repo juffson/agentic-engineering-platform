@@ -184,6 +184,18 @@ repo_key() (
     private_files "$staging" "$worker_keys_volume" 0 0 github-key github-repository
 )
 
+repo_bind() (
+    [[ $# == 1 ]]
+    local repository staging
+    repository=$(github_origin "$1") || { echo "Expected a GitHub HTTPS origin" >&2; exit 2; }
+    [[ $(docker volume inspect -f '{{index .Labels "org.aep.pilot"}}' "$worker_keys_volume") == "$name" ]]
+    umask 077
+    staging=$(mktemp -d)
+    trap 'rm -f -- "$staging/github-repository"; rmdir "$staging"' EXIT
+    printf '%s\n' "$repository" > "$staging/github-repository"
+    private_files "$staging" "$worker_keys_volume" 0 0 github-repository
+)
+
 prepare_workspace() {
     local repo=$1 branch=$2 git_name=$3 git_email=$4 proxy repository
     proxy=$(proxy_arg)
@@ -217,7 +229,7 @@ prepare_workspace() {
                 echo "The existing Worker workspace belongs to another Git origin" >&2
                 exit 1
             fi
-            if [ -f /run/aep-worker/github-repository ] && ! "$git" -C /pilot/repo rev-parse --verify HEAD >/dev/null 2>&1; then
+            if [ -f /run/aep-worker/github-key ] && ! "$git" -C /pilot/repo rev-parse --verify HEAD >/dev/null 2>&1; then
                 ref=refs/heads/$2
                 /usr/local/libexec/aep-pilot/private-fetch.sh /pilot/repo "$5" "$ref" refs/aep/control/bootstrap
                 "$git" -C /pilot/repo switch -c "$2" refs/aep/control/bootstrap
@@ -394,11 +406,12 @@ case "${1:-}" in
     worker-config) shift; worker_config "$@" ;;
     worker-keys) shift; worker_keys "$@" ;;
     repo-key) shift; repo_key "$@" ;;
+    repo-bind) shift; repo_bind "$@" ;;
     workspace) shift; prepare_workspace "$@" ;;
     credential) shift; model_credential "$@" ;;
     worker) shift; worker "$@" ;;
     export) shift; export_runs "$@" ;;
     gate) shift; check_gate "$@" ;;
     remove) shift; remove_site "$@" ;;
-    *) echo "Usage: $0 serve PRIVATE-DIR | upgrade ACCESS-DIR RECEIPT-DIR | worker-config ACCESS-DIR | worker-keys ACCESS-DIR | repo-key HTTPS-REPO < PRIVATE-KEY | workspace HTTPS-REPO BRANCH GIT-NAME GIT-EMAIL | credential codex|claude < AUTH-JSON | worker [WORKER-ARGS] | export EVIDENCE-DIR RUN [RUN...] | gate hold|release | remove" >&2; exit 2 ;;
+    *) echo "Usage: $0 serve PRIVATE-DIR | upgrade ACCESS-DIR RECEIPT-DIR | worker-config ACCESS-DIR | worker-keys ACCESS-DIR | repo-bind HTTPS-REPO | repo-key HTTPS-REPO < PRIVATE-KEY | workspace HTTPS-REPO BRANCH GIT-NAME GIT-EMAIL | credential codex|claude < AUTH-JSON | worker [WORKER-ARGS] | export EVIDENCE-DIR RUN [RUN...] | gate hold|release | remove" >&2; exit 2 ;;
 esac
