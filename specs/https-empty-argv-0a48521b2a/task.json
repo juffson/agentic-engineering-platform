@@ -1,0 +1,15 @@
+{
+  "title": "Preserve deliberate empty arguments in AEP acceptance commands",
+  "allowed_paths": [
+    "src/task.rs"
+  ],
+  "check": [
+    "sh",
+    "-ec",
+    "set -eu\nprobe=tests/aep_studio_empty_argv_contract.rs\ntest ! -e \"$probe\"\ntrap 'unlink \"$probe\"' EXIT\ncat > \"$probe\" <<'RUST'\nuse aep::task::{Check, TaskManifest};\n\nfn manifest(check: &[&str]) -> TaskManifest {\n    TaskManifest {\n        title: None,\n        allowed_paths: vec![\"src/task.rs\".into()],\n        check: check.iter().map(|item| (*item).into()).collect(),\n        criteria: vec![\"AC-1\".into()],\n        checks: vec![],\n    }\n}\n\n#[test]\nfn accepts_empty_arguments_but_not_an_empty_program_or_nul() {\n    let argv = [\"sh\", \"-ec\", \"test \\\"$#\\\" = 1 && test -z \\\"$1\\\"\", \"probe\", \"\"];\n    let mut primary = manifest(&argv);\n    assert!(primary.validate().is_ok(), \"primary rejected a deliberate empty argument\");\n    assert!(std::process::Command::new(&primary.check[0]).args(&primary.check[1..]).status().unwrap().success());\n    for invalid in [vec![], vec![\"\", \"value\"], vec![\"sh\", \"a\\0b\"]] {\n        assert!(manifest(&invalid).validate().is_err());\n    }\n    let mut secondary = manifest(&[\"true\"]);\n    secondary.checks.push(Check {\n        id: \"secondary\".into(),\n        criteria: vec![\"AC-2\".into()],\n        command: primary.check.split_off(0),\n    });\n    assert!(secondary.validate().is_ok(), \"additional check rejected a deliberate empty argument\");\n    secondary.checks[0].command[4] = \"bad\\0arg\".into();\n    assert!(secondary.validate().is_err());\n    secondary.checks[0].command = vec![\"\".into(), \"value\".into()];\n    assert!(secondary.validate().is_err());\n    secondary.checks[0].command.clear();\n    assert!(secondary.validate().is_err());\n}\nRUST\nif test -f /etc/aep-pilot-container; then sleep 10; fi\ncargo test --quiet --locked --no-default-features --test aep_studio_empty_argv_contract\n"
+  ],
+  "criteria": [
+    "AC-1",
+    "AC-2"
+  ]
+}
