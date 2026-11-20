@@ -5,7 +5,8 @@ upgrade_site() (
     [[ $# == 2 ]] || { echo "Usage: site.sh upgrade ACCESS-DIR RECEIPT-DIR" >&2; exit 2; }
     local access=$1 receipt=$2 lock='' maintenance=no committed=no id endpoint lease worker_json
     local suffix object actual
-    local -a worker_args=()
+    local -a worker_args=() extra_paused=()
+    [[ -z $slot ]] || { echo "Upgrade the site without a Worker slot"; exit 2; }
     [[ -r $access/operator && -r $access/ca.pem ]] ||
         { echo "Use the existing operator token and CA certificate" >&2; exit 2; }
     for tool in jq curl openssl; do command -v "$tool" >/dev/null; done
@@ -104,6 +105,9 @@ upgrade_site() (
                 code=1
             fi
         fi
+        for extra in ${extra_paused[@]+"${extra_paused[@]}"}; do
+            docker unpause "$extra" >/dev/null || code=1
+        done
         if [[ -n $lock ]]; then docker container rm "$lock" >/dev/null || code=1; fi
         jq -n --arg site "$name" --arg endpoint "${endpoint:-}" --arg result "$result" \
             --argjson exit_code "$code" '{site:$site,endpoint:$endpoint,result:$result,exit_code:$exit_code}' \
@@ -163,6 +167,12 @@ upgrade_site() (
     fingerprint > "$receipt/before-certificate.txt"
 
     maintenance=yes
+    while IFS= read -r object; do
+        [[ $object == "$name-worker-"* ]] || continue
+        owned "$object"
+        docker pause "$object" >/dev/null
+        extra_paused+=("$object")
+    done < <(docker ps --filter "label=$label" --filter status=running --format '{{.Names}}')
     docker pause "$name-worker" >/dev/null
     status "$receipt/paused-status.json"
     idle "$receipt/paused-status.json" || fail_upgrade "A ticket became active while preparing the upgrade"
@@ -210,7 +220,8 @@ upgrade_site() (
             .data as $after | $before[0].data as $old |
             ($after.device.installation==$old.device.installation) and
             ($after.device.last_seen > $old.device.last_seen) and
-            all($old.attempts[]; . as $run | any($after.attempts[]; .==$run))
+            all($old.attempts[]; . as $run | any($after.attempts[];
+                .==$run or (del(.worker)==$run and .worker==$old.device.id)))
         ' "$receipt/after-status.json" >/dev/null; then
             ready=yes
             break

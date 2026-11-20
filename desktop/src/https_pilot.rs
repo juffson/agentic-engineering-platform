@@ -45,6 +45,7 @@ pub(crate) struct Progress {
     pub candidate: String,
     pub old_run: String,
     pub recovered_run: String,
+    pub worker: String,
     pub pr: Option<u64>,
     pub archive: bool,
     pub reason: String,

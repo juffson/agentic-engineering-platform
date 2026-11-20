@@ -22,22 +22,22 @@ struct Plan {
 }
 
 #[derive(Deserialize)]
-struct Task {
-    task: String,
-    target: String,
+pub(super) struct Task {
+    pub task: String,
+    pub target: String,
 }
 
 impl Task {
-    fn state(&self, session: &Path) -> Value {
+    pub(super) fn state(&self, session: &Path) -> Value {
         read(&session.join("state.json")).unwrap_or_default()
     }
 
-    fn evidence(&self, session: &Path) -> PathBuf {
+    pub(super) fn evidence(&self, session: &Path) -> PathBuf {
         session.join(&self.task).join("evidence")
     }
 }
 
-fn until<T>(
+pub(super) fn until<T>(
     ui: &mut Driver<'_>,
     label: &str,
     seconds: u64,
@@ -55,7 +55,7 @@ fn until<T>(
     }
 }
 
-fn click(ui: &mut Driver<'_>, id: &str) -> Result<()> {
+pub(super) fn click(ui: &mut Driver<'_>, id: &str) -> Result<()> {
     until(ui, id, 30, |ui| {
         if ui.absent(id)? {
             return Ok(None);
@@ -68,7 +68,7 @@ fn click(ui: &mut Driver<'_>, id: &str) -> Result<()> {
     ui.click(id)
 }
 
-fn label(ui: &mut Driver<'_>, id: &str, text: &str, seconds: u64) -> Result<()> {
+pub(super) fn label(ui: &mut Driver<'_>, id: &str, text: &str, seconds: u64) -> Result<()> {
     until(ui, text, seconds, |ui| {
         Ok(ui
             .element(id)
@@ -77,7 +77,7 @@ fn label(ui: &mut Driver<'_>, id: &str, text: &str, seconds: u64) -> Result<()> 
     })
 }
 
-fn dispatch(ui: &mut Driver<'_>, parent: &Path, task: &Task) -> Result<PathBuf> {
+pub(super) fn dispatch(ui: &mut Driver<'_>, parent: &Path, task: &Task) -> Result<PathBuf> {
     let before = sessions(parent);
     click(ui, "https-real-mode")?;
     let selected = format!("https-task-{}", task.task);
@@ -111,7 +111,7 @@ fn dispatch(ui: &mut Driver<'_>, parent: &Path, task: &Task) -> Result<PathBuf> 
     Ok(session)
 }
 
-fn select(ui: &mut Driver<'_>, session: &Path) -> Result<()> {
+pub(super) fn select(ui: &mut Driver<'_>, session: &Path) -> Result<()> {
     let name = session
         .file_name()
         .context("missing Studio session name")?
@@ -139,7 +139,7 @@ fn verify_order(ui: &mut Driver<'_>, first: &str, second: &str) -> Result<()> {
     })
 }
 
-fn saved_session(parent: &Path, task: &Task) -> Result<PathBuf> {
+pub(super) fn saved_session(parent: &Path, task: &Task) -> Result<PathBuf> {
     let mut saved = sessions(parent).into_iter().filter(|session| {
         let state = task.state(session);
         state["remote"] == true && state["task"] == task.task && state["branch"] == task.target

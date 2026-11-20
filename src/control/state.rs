@@ -168,6 +168,8 @@ pub struct Attempt {
     pub stage: Stage,
     pub predecessor: Option<String>,
     pub reverify: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
     pub profile: Option<Profile>,
     pub expires_at: Option<u64>,
     pub events: Vec<Event>,
@@ -201,11 +203,15 @@ pub struct Device {
     pub installation: String,
     pub last_seen: u64,
     pub profile: Profile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct State {
     pub device: Option<Device>,
+    #[serde(default)]
+    pub workers: std::collections::BTreeMap<String, Device>,
     pub attempts: Vec<Attempt>,
     #[serde(default)]
     pub queue: Queue,
@@ -317,15 +323,31 @@ impl State {
         );
     }
 
-    fn snapshot(&self) -> Reply {
+    fn migrate_workers(&mut self) {
+        if let Some(device) = &self.device {
+            self.workers
+                .entry(device.id.clone())
+                .or_insert_with(|| device.clone());
+            for run in &mut self.attempts {
+                if run.worker.is_none() && (run.profile.is_some() || run.reverify) {
+                    run.worker = Some(device.id.clone());
+                }
+            }
+        }
+    }
+
+    fn snapshot(&self, now: u64, ttl: u64) -> Reply {
         let mut snapshot = self.clone();
+        for worker in snapshot.workers.values_mut() {
+            worker.online = Some(now.saturating_sub(worker.last_seen) < ttl);
+        }
         for run in &mut snapshot.attempts {
             run.fence = None;
         }
         Reply::Snapshot(snapshot)
     }
 
-    fn move_queued(&mut self, run: &str, adjacent: &str, earlier: bool) -> Result<Reply> {
+    fn move_queued(&mut self, run: &str, adjacent: &str, earlier: bool) -> Result<()> {
         let order = &mut self.queue.order;
         let index = order
             .iter()
@@ -340,7 +362,7 @@ impl State {
             .filter(|&i| order.get(i).is_some_and(|id| id == adjacent))
             .context("Queue order changed; refresh before moving this Run")?;
         order.swap(index, neighbor);
-        Ok(self.snapshot())
+        Ok(())
     }
 
     fn expire(&mut self, now: u64) {
@@ -366,23 +388,32 @@ impl State {
             .context("unknown ticket")
     }
 
-    fn run_for_fence(&mut self, id: &str, fence: &str) -> Result<&mut Attempt> {
+    fn run_for_fence(&mut self, id: &str, fence: &str, device: &str) -> Result<&mut Attempt> {
         let run = self
             .attempts
             .iter_mut()
             .find(|run| run.id == id)
             .context("unknown Run")?;
-        ensure!(run.fence.as_deref() == Some(fence), "stale lease");
+        ensure!(
+            run.worker.as_deref() == Some(device) && run.fence.as_deref() == Some(fence),
+            "stale lease or wrong Worker"
+        );
         Ok(run)
     }
 
-    fn enqueue(&mut self, task: Task, predecessor: Option<String>, reverify: bool) -> Reply {
+    fn enqueue(
+        &mut self,
+        task: Task,
+        predecessor: Option<String>,
+        worker: Option<String>,
+    ) -> Reply {
         let run = Attempt {
             id: uuid::Uuid::new_v4().simple().to_string(),
             task,
             stage: Stage::Queued,
             predecessor,
-            reverify,
+            reverify: worker.is_some(),
+            worker,
             profile: None,
             expires_at: None,
             events: Vec::new(),
@@ -404,7 +435,7 @@ impl State {
         );
         if let Some(previous) = self.last(&task.ticket) {
             if previous.task == task {
-                return Ok(Reply::Run(Box::new(previous.clone())));
+                return Ok(Reply::Run(Box::new(public_run(previous))));
             }
             ensure!(
                 revise && previous.task.spec != task.spec,
@@ -426,7 +457,7 @@ impl State {
             let previous = self.last_mut(&task.ticket)?;
             previous.stage = Stage::Superseded;
         }
-        Ok(self.enqueue(task, None, false))
+        Ok(self.enqueue(task, None, None))
     }
 
     fn retry(&mut self, ticket: &str, reverify: bool) -> Result<Reply> {
@@ -447,7 +478,17 @@ impl State {
             used < previous.task.max_attempts,
             "attempt budget exhausted"
         );
-        Ok(self.enqueue(previous.task.clone(), Some(previous.id.clone()), reverify))
+        let worker = if reverify {
+            Some(
+                previous
+                    .worker
+                    .clone()
+                    .context("the previous Run has no Worker for its local candidate")?,
+            )
+        } else {
+            None
+        };
+        Ok(self.enqueue(previous.task.clone(), Some(previous.id.clone()), worker))
     }
 
     fn poll(
@@ -461,21 +502,34 @@ impl State {
         profile.validate()?;
         ident(&installation, 64)?;
         ensure!(
-            self.device
-                .as_ref()
-                .is_none_or(|saved| saved.id == device && saved.installation == installation),
+            self.workers
+                .get(device)
+                .is_none_or(|saved| saved.installation == installation)
+                && self
+                    .workers
+                    .values()
+                    .all(|saved| saved.id == device || saved.installation != installation),
             "a different installation is already registered for this device"
         );
-        self.device = Some(Device {
+        let worker = Device {
             id: device.into(),
             installation,
             last_seen: now,
             profile: profile.clone(),
+            online: None,
+        };
+        self.workers.insert(device.into(), worker.clone());
+        if self
+            .device
+            .as_ref()
+            .is_none_or(|legacy| legacy.id == device)
+        {
+            self.device = Some(worker);
+        }
+        let active = self.attempts.iter().find(|run| {
+            run.worker.as_deref() == Some(device)
+                && matches!(run.stage, Stage::Running | Stage::CancelPending)
         });
-        let active = self
-            .attempts
-            .iter()
-            .find(|a| matches!(a.stage, Stage::Running | Stage::CancelPending));
         if let Some(run) = active {
             // Re-deliver an unacknowledged lease, keeping the same Run ID and fence.
             return Ok(Reply::Polled(Some(lease(run)?)));
@@ -483,23 +537,25 @@ impl State {
         if self.queue.paused {
             return Ok(Reply::Polled(None));
         }
-        let Some(next) = self.queue.order.first() else {
+        let next = self.queue.order.iter().find_map(|id| {
+            self.attempts.iter().position(|run| {
+                run.id == *id && run.worker.as_deref().is_none_or(|owner| owner == device)
+            })
+        });
+        let Some(index) = next else {
             return Ok(Reply::Polled(None));
         };
-        let next = self
-            .attempts
-            .iter_mut()
-            .find(|run| run.id == *next)
-            .context("queued Run is missing")?;
+        let next = &mut self.attempts[index];
         next.stage = Stage::Running;
+        next.worker = Some(device.into());
         next.fence = Some(uuid::Uuid::new_v4().simple().to_string());
         next.expires_at = Some(now + ttl);
         next.profile = Some(profile);
         Ok(Reply::Polled(Some(lease(next)?)))
     }
 
-    fn report(&mut self, id: &str, fence: &str, event: Event) -> Result<Reply> {
-        let run = self.run_for_fence(id, fence)?;
+    fn report(&mut self, id: &str, fence: &str, device: &str, event: Event) -> Result<Reply> {
+        let run = self.run_for_fence(id, fence, device)?;
         ensure!(event.sequence > 0, "event sequence starts at 1");
         if let Some(previous) = run.events.get(event.sequence - 1) {
             ensure!(*previous == event, "conflicting replay of a recorded event");
@@ -557,16 +613,19 @@ impl State {
         self.expire(now);
         self.normalize_queue();
         match operation {
-            Operation::Status => Ok(self.snapshot()),
+            Operation::Status => Ok(self.snapshot(now, ttl)),
             Operation::QueuePause { paused } => {
                 self.queue.paused = paused;
-                Ok(self.snapshot())
+                Ok(self.snapshot(now, ttl))
             }
             Operation::QueueMove {
                 run,
                 adjacent,
                 earlier,
-            } => self.move_queued(&run, &adjacent, earlier),
+            } => {
+                self.move_queued(&run, &adjacent, earlier)?;
+                Ok(self.snapshot(now, ttl))
+            }
             Operation::Dispatch { task, revise } => self.dispatch(task, revise),
             Operation::Retry { ticket, reverify } => self.retry(&ticket, reverify),
             Operation::Poll {
@@ -574,18 +633,21 @@ impl State {
                 profile,
             } => self.poll(device, installation, profile, now, ttl),
             Operation::Renew { run, fence } => {
-                let run = self.run_for_fence(&run, &fence)?;
+                let run = self.run_for_fence(&run, &fence, device)?;
                 let cancel = run.stage == Stage::CancelPending;
                 let stale = !matches!(run.stage, Stage::Running | Stage::CancelPending);
                 if !stale {
                     run.expires_at = Some(now + ttl);
                 }
-                if let Some(device) = &mut self.device {
-                    device.last_seen = now;
+                if let Some(worker) = self.workers.get_mut(device) {
+                    worker.last_seen = now;
+                }
+                if let Some(legacy) = self.device.as_mut().filter(|worker| worker.id == device) {
+                    legacy.last_seen = now;
                 }
                 Ok(Reply::Renewed { cancel, stale })
             }
-            Operation::Report { run, fence, event } => self.report(&run, &fence, event),
+            Operation::Report { run, fence, event } => self.report(&run, &fence, device, event),
             Operation::Cancel {
                 ticket,
                 expected_run,
@@ -747,7 +809,7 @@ impl Store {
         &self,
         id: &str,
         ticket: Option<&str>,
-        fence: Option<&str>,
+        proof: Option<(&str, &str)>,
     ) -> Result<PathBuf> {
         ident(id, 64)?;
         let run = self
@@ -758,7 +820,8 @@ impl Store {
             .context("unknown Run")?;
         ensure!(
             ticket.is_none_or(|ticket| run.task.ticket == ticket)
-                && fence.is_none_or(|fence| run.fence.as_deref() == Some(fence)),
+                && proof.is_none_or(|(worker, fence)| run.worker.as_deref() == Some(worker)
+                    && run.fence.as_deref() == Some(fence)),
             "evidence scope does not match the Run"
         );
         ensure!(
@@ -778,11 +841,12 @@ impl Store {
             .open(path.with_extension("lock"))?;
         lock.try_lock()
             .context("control state is already owned by a server")?;
-        let state = match std::fs::read(&path) {
+        let mut state: State = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(error) => return Err(error.into()),
         };
+        state.migrate_workers();
         Ok(Self {
             path,
             state,
@@ -876,6 +940,107 @@ mod tests {
             10,
         )?;
         poll(store, 2)
+    }
+
+    #[test]
+    fn leased_workers_progress_independently_and_reverify_where_the_candidate_lives() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let mut store = Store::open(root.path().join("control.json"))?;
+        let profile = || Profile {
+            codex: "codex 1".into(),
+            claude: "claude 1".into(),
+        };
+        let poll = |id: &str| Operation::Poll {
+            installation: format!("install-{id}"),
+            profile: profile(),
+        };
+        let submit = |ticket: &str| Operation::Dispatch {
+            task: Task {
+                ticket: ticket.into(),
+                ..task()
+            },
+            revise: false,
+        };
+        for ticket in ["a", "b"] {
+            store.apply(submit(ticket), "operator", 1, 10)?;
+        }
+        let Reply::Polled(Some(a)) = store.apply(poll("one"), "one", 2, 10)? else {
+            anyhow::bail!("Worker one has no Run");
+        };
+        let Reply::Polled(Some(b)) = store.apply(poll("two"), "two", 3, 10)? else {
+            anyhow::bail!("Worker two cannot lease while Worker one runs");
+        };
+        assert_ne!(a.run, b.run);
+        let candidate = "3".repeat(40);
+        let exit_a = Operation::Report {
+            run: a.run.clone(),
+            fence: a.fence.clone(),
+            event: event(
+                1,
+                Progress::Exit {
+                    outcome: Outcome::Passed,
+                    candidate: Some(candidate),
+                },
+            ),
+        };
+        let renew_a = Operation::Renew {
+            run: a.run.clone(),
+            fence: a.fence.clone(),
+        };
+        assert!(store.apply(renew_a, "two", 9, 10).is_err());
+        assert!(store.apply(exit_a.clone(), "two", 10, 10).is_err());
+        store.apply(
+            Operation::Renew {
+                run: b.run.clone(),
+                fence: b.fence,
+            },
+            "two",
+            11,
+            10,
+        )?;
+        let Reply::Snapshot(s) = store.apply(Operation::Status, "operator", 12, 10)? else {
+            anyhow::bail!("missing status");
+        };
+        assert_eq!(s.workers["one"].online, Some(false));
+        assert_eq!(s.workers["two"].online, Some(true));
+        assert_eq!(s.attempts[0].stage, Stage::Interrupted);
+        assert_eq!(s.attempts[1].stage, Stage::Running);
+
+        store.apply(exit_a, "one", 13, 10)?;
+        assert!(
+            store
+                .evidence_path(&a.run, None, Some(("two", &a.fence)))
+                .is_err()
+        );
+        assert!(
+            store
+                .evidence_path(&a.run, None, Some(("one", &a.fence)))
+                .is_ok()
+        );
+        let Reply::Run(next) = store.apply(
+            Operation::Retry {
+                ticket: "a".into(),
+                reverify: true,
+            },
+            "operator",
+            14,
+            10,
+        )?
+        else {
+            anyhow::bail!("missing recovery");
+        };
+        assert_eq!(next.worker.as_deref(), Some("one"));
+        let Reply::Polled(Some(existing)) = store.apply(poll("two"), "two", 14, 10)? else {
+            anyhow::bail!("Worker two lost its Run");
+        };
+        assert_eq!(existing.run, b.run);
+        let Reply::Polled(Some(retry)) = store.apply(poll("one"), "one", 15, 10)? else {
+            anyhow::bail!("Worker one did not recover its Run");
+        };
+        assert_eq!(retry.run, next.id);
+        assert_eq!(retry.predecessor.as_deref(), Some(a.run.as_str()));
+        Ok(())
     }
 
     #[test]

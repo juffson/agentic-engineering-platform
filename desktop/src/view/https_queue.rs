@@ -155,17 +155,51 @@ impl Studio {
                     )
                 }),
         );
+        if !snapshot.workers.is_empty() {
+            let online = snapshot
+                .workers
+                .values()
+                .filter(|worker| worker.online)
+                .count();
+            panel = panel.child(caption(format!(
+                "Worker 在线 {online}/{} · 等待 {} 项",
+                snapshot.workers.len(),
+                queue.order.len()
+            )));
+            for (id, worker) in &snapshot.workers {
+                let task = snapshot.current(id).map_or_else(
+                    || {
+                        if worker.online {
+                            "空闲".into()
+                        } else {
+                            "未在执行".into()
+                        }
+                    },
+                    |run| format!("{} · {}", run.task.name, run.phase_label()),
+                );
+                panel = panel.child(
+                    h_flex().justify_between().gap_2().child(
+                        v_flex()
+                            .gap_1()
+                            .child(detail_text(
+                                format!("https-worker-{id}"),
+                                &format!(
+                                    "{} · {}",
+                                    id,
+                                    if worker.online { "在线" } else { "离线" }
+                                ),
+                            ))
+                            .child(detail_text(format!("https-worker-task-{id}"), &task)),
+                    ),
+                );
+            }
+        }
         let runs = snapshot.visible_runs();
         if runs.is_empty() {
             return panel.child(caption("没有等待领取或正在运行的任务"));
         }
         for run in runs {
-            let state = match run.stage.as_str() {
-                "queued" => "排队中",
-                "cancel_pending" => "等待 Worker 确认停止",
-                "interrupted" => "Worker 断线",
-                _ => "运行中",
-            };
+            let state = run.phase_label();
             let mut actions = h_flex().gap_2();
             if editable
                 && run.stage == "queued"
@@ -234,7 +268,10 @@ impl Studio {
                     );
                 }
             }
-            let title = format!("{} · {}", run.task.name, state);
+            let title = match queue.order.iter().position(|id| *id == run.id) {
+                Some(index) => format!("{} · {state} · 第 {} 位", run.task.name, index + 1),
+                None => format!("{} · {state}", run.task.name),
+            };
             panel = panel.child(
                 h_flex()
                     .justify_between()

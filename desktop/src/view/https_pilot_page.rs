@@ -697,6 +697,9 @@ impl Studio {
             .when(!progress.branch.is_empty(), |brief| {
                 brief.child(field("目标分支", &progress.branch))
             })
+            .when(!progress.worker.is_empty(), |brief| {
+                brief.child(field("Worker", &progress.worker))
+            })
             .when(!progress.candidate.is_empty(), |brief| {
                 brief.child(field("候选 SHA", &progress.candidate))
             });
