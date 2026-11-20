@@ -297,8 +297,11 @@ fn reopen_remote(
         .context("missing Studio session name")?
         .to_string_lossy();
     let selector = format!("https-session-{name}");
-    ui.reveal("https-pilot-page", &selector)?;
-    ui.click(&selector)?;
+    if ui.element(&selector)?.visible() {
+        ui.click(&selector)?;
+    } else {
+        choose(ui, "https-session-list", &selector)?;
+    }
     ensure!(
         ui.absent("https-confirm")? && ui.absent("https-ack")?,
         "an approval survived closing Studio"
@@ -400,7 +403,30 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         })
         .transpose()?;
     let dispatch_ref = format!("refs/heads/aep-task/{task}");
-    if auth_draft.is_some() {
+    let parent = ws.data.join("https-studio");
+    let existing = std::env::var("AEP_STUDIO_LIVE_FAILED_SESSION")
+        .ok()
+        .map(|name| -> Result<PathBuf> {
+            ensure!(
+                retry
+                    && name.starts_with("studio-")
+                    && aep::workspace::ident(&name.to_ascii_lowercase(), 63).is_ok(),
+                "supply a saved failed Studio session name with retry enabled"
+            );
+            let session = parent.join(name);
+            let state = read(&session.join("state.json"))?;
+            ensure!(
+                state["remote"] == true
+                    && state["task"] == task
+                    && state["branch"] == target
+                    && state["exit_code"] == 1
+                    && state["pr"].is_null(),
+                "the saved session is not the scoped failed rehearsal"
+            );
+            Ok(session)
+        })
+        .transpose()?;
+    if auth_draft.is_some() && existing.is_none() {
         ensure!(
             git(&ws.root, &["ls-remote", "--refs", "origin", &dispatch_ref])?
                 .trim()
@@ -408,7 +434,6 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
             "the authored rehearsal needs a fresh task ID"
         );
     }
-    let parent = ws.data.join("https-studio");
     let before = sessions(&parent);
     let output = args
         .output_dir
@@ -429,57 +454,62 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
     println!("Studio checkpoints: {}", output.display());
     let result = (|| {
         ui.click("HTTPS 试点")?;
-        ui.click("https-real-mode")?;
-        let selected = format!("https-task-{task}");
-        let target_id = format!("https-target-{target}");
-        let choice = if auth_draft.is_some() {
-            &target_id
+        let session = if let Some(session) = &existing {
+            session.clone()
         } else {
-            &selected
-        };
-        let deadline = Instant::now() + Duration::from_secs(45);
-        while ui.absent(choice)? {
-            ensure!(
-                Instant::now() < deadline,
-                "Studio did not load the selected task or target"
-            );
-            ui.settle()?;
-            thread::sleep(Duration::from_millis(150));
-        }
-        if auth_draft.is_none() {
-            choose(&mut ui, "https-task-list", &selected)?;
-        }
-        choose(&mut ui, "https-target-list", &target_id)?;
-        if let Some(draft) = &auth_draft {
-            ui.reveal("https-pilot-page", "https-open-authoring")?;
-            ui.click("https-open-authoring")?;
-            let paths = draft.allowed_paths.join("\n");
-            let acceptance = serde_json::to_string(&draft.acceptance)?;
-            for (id, value) in [
-                ("task-author-name", task.as_str()),
-                ("task-author-title", draft.title.as_str()),
-                ("task-author-spec", draft.spec.as_str()),
-                ("task-author-paths", paths.as_str()),
-                ("task-author-check", acceptance.as_str()),
-            ] {
-                ui.reveal("https-pilot-page", id)?;
-                ui.click(id)?;
-                ui.input(value)?;
+            ui.click("https-real-mode")?;
+            let selected = format!("https-task-{task}");
+            let target_id = format!("https-target-{target}");
+            let choice = if auth_draft.is_some() {
+                &target_id
+            } else {
+                &selected
+            };
+            let deadline = Instant::now() + Duration::from_secs(45);
+            while ui.absent(choice)? {
+                ensure!(
+                    Instant::now() < deadline,
+                    "Studio did not load the selected task or target"
+                );
+                ui.settle()?;
+                thread::sleep(Duration::from_millis(150));
             }
-            ui.reveal("https-pilot-page", "https-create-and-dispatch")?;
-            ui.checkpoint("01-task-authored")?;
-            ui.click("https-create-and-dispatch")?;
-        } else {
-            ui.reveal("https-pilot-page", "https-dispatch")?;
-            ui.checkpoint("01-task-target-selected")?;
-            ui.click("https-dispatch")?;
-        }
-        ui.scroll("https-pilot-page", 2_000.)?;
+            if auth_draft.is_none() {
+                choose(&mut ui, "https-task-list", &selected)?;
+            }
+            choose(&mut ui, "https-target-list", &target_id)?;
+            if let Some(draft) = &auth_draft {
+                ui.reveal("https-pilot-page", "https-open-authoring")?;
+                ui.click("https-open-authoring")?;
+                let paths = draft.allowed_paths.join("\n");
+                let acceptance = serde_json::to_string(&draft.acceptance)?;
+                for (id, value) in [
+                    ("task-author-name", task.as_str()),
+                    ("task-author-title", draft.title.as_str()),
+                    ("task-author-spec", draft.spec.as_str()),
+                    ("task-author-paths", paths.as_str()),
+                    ("task-author-check", acceptance.as_str()),
+                ] {
+                    ui.reveal("https-pilot-page", id)?;
+                    ui.click(id)?;
+                    ui.input(value)?;
+                }
+                ui.reveal("https-pilot-page", "https-create-and-dispatch")?;
+                ui.checkpoint("01-task-authored")?;
+                ui.click("https-create-and-dispatch")?;
+            } else {
+                ui.reveal("https-pilot-page", "https-dispatch")?;
+                ui.checkpoint("01-task-target-selected")?;
+                ui.click("https-dispatch")?;
+            }
+            ui.scroll("https-pilot-page", 2_000.)?;
 
-        let created = sessions(&parent);
-        let new: Vec<_> = created.difference(&before).collect();
-        ensure!(new.len() == 1, "Studio did not start exactly one real task");
-        let session = new[0];
+            let created = sessions(&parent);
+            let new: Vec<_> = created.difference(&before).collect();
+            ensure!(new.len() == 1, "Studio did not start exactly one real task");
+            new[0].clone()
+        };
+        let session = session.as_path();
         let dir = session.join(&task);
         let evidence = dir.join("evidence");
         println!("Remote task session: {}", dir.display());
@@ -518,7 +548,10 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
             docker(&[
                 "exec",
                 &format!("{site}-worker"),
-                "/usr/bin/unlink",
+                "/bin/sh",
+                "-ec",
+                r#"if [ -e "$1" ]; then exec unlink "$1"; fi"#,
+                "unlink-rehearsal-flag",
                 &format!("/pilot/tmp/aep-studio-retry-{task}"),
             ])?;
             reopen_remote(&mut ui, &ws, &runner, session, 1, "01c-reopen-and-retry")?;
