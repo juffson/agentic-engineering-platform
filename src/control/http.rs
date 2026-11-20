@@ -10,7 +10,7 @@ use axum::{
 use serde_json::json;
 use std::{
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -149,7 +149,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(origin: &str, device: bool) -> Result<Self> {
+    pub fn new(origin: &str, device: bool, ca_cert: Option<&Path>) -> Result<Self> {
         let mut endpoint = reqwest::Url::parse(origin)?;
         ensure!(
             (endpoint.scheme() == "https"
@@ -165,12 +165,29 @@ impl Client {
                 && endpoint.fragment().is_none(),
             "use an HTTPS control origin, or HTTP on loopback"
         );
+        ensure!(
+            ca_cert.is_none() || endpoint.scheme() == "https",
+            "a control CA bundle requires an HTTPS endpoint"
+        );
         endpoint.set_path("/v1/control");
         let mut client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5));
         if endpoint.scheme() == "http" {
             client = client.no_proxy();
+        }
+        if let Some(path) = ca_cert {
+            let pem = std::fs::read(path)
+                .with_context(|| format!("read CA bundle {}", path.display()))?;
+            let roots = reqwest::Certificate::from_pem_bundle(&pem)?;
+            ensure!(
+                !roots.is_empty(),
+                "the control CA bundle contains no certificates"
+            );
+            client = client.tls_built_in_root_certs(false);
+            for root in roots {
+                client = client.add_root_certificate(root);
+            }
         }
         Ok(Self {
             client: client.build()?,

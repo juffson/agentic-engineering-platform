@@ -397,12 +397,16 @@ fn executor_idle(repo: &Repo, run: &str) -> Result<bool> {
 pub fn run(
     repo: &Repo,
     endpoint: &str,
+    ca_cert: Option<&Path>,
     model: Option<&str>,
     sandbox: Option<&Path>,
+    journal_dir: Option<&Path>,
     once: bool,
 ) -> Result<()> {
     let options = LaunchOptions { model, sandbox };
-    let base = repo.data.join("control-worker");
+    let base = journal_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| repo.data.join("control-worker"));
     fs::create_dir_all(&base)?;
     let owner = OpenOptions::new()
         .create(true)
@@ -412,6 +416,18 @@ pub fn run(
     owner
         .try_lock()
         .context("this repository already has an active control worker")?;
+    if journal_dir.is_some() {
+        let workspace_file = base.join("workspace.json");
+        if workspace_file.try_exists()? {
+            let workspace: PathBuf = serde_json::from_slice(&fs::read(&workspace_file)?)?;
+            ensure!(
+                workspace == repo.root,
+                "worker journal belongs to another workspace"
+            );
+        } else {
+            save(&workspace_file, &repo.root)?;
+        }
+    }
     let marker = base.join("active.json");
     let installation_file = base.join("installation.json");
     let installation = if installation_file.try_exists()? {
@@ -421,7 +437,7 @@ pub fn run(
         save(&installation_file, &id)?;
         id
     };
-    let client = Client::new(endpoint, true)?;
+    let client = Client::new(endpoint, true, ca_cert)?;
     let profile = Profile {
         codex: version("codex").context("install Codex CLI")?,
         claude: version("claude").context("install Claude Code")?,

@@ -4,6 +4,8 @@
 
 ## 启动控制面和设备
 
+在私有 Docker/Linux VM 里运行完整 HTTPS 试点时，使用[部署与验收手册](pilot-https.md)。下面的直接启动方式适合接入已有代理和沙箱。
+
 安装同一版本的 `aep`。为操作人和设备各生成一个独立随机令牌，在服务器的进程环境中设置 `AEP_CONTROL_OPERATOR_TOKEN` 和 `AEP_CONTROL_DEVICE_TOKEN`。设备只领取设备令牌，操作端使用操作人令牌。将持久文件放在由服务用户拥有的私有目录。
 
 ```sh
