@@ -55,7 +55,9 @@ fn confirm(ui: &mut Driver<'_>, action: &str, checkpoint: &str) -> Result<()> {
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     ensure!(answer.trim() == action, "operator declined {action}");
+    ui.reveal("https-pilot-page", "https-ack")?;
     ui.click("https-ack")?;
+    ui.reveal("https-pilot-page", "https-confirm")?;
     ui.checkpoint(checkpoint)?;
     ui.click("https-confirm")
 }
@@ -250,6 +252,85 @@ struct AuthoredTask {
     acceptance: Value,
 }
 
+fn reopen_remote(
+    ui: &mut Driver<'_>,
+    ws: &Workspace,
+    runner: &aep_studio::Runner,
+    session: &Path,
+    exit: i64,
+    checkpoint: &str,
+) -> Result<()> {
+    let previous = read(&session.join("state.json"))?;
+    ui.frame(|window, _| window.remove_window())?;
+    *ui = Driver::open_with_runner(ws, ui.args, runner.clone())?;
+    let deadline = Instant::now() + Duration::from_secs(55);
+    loop {
+        let state = read(&session.join("state.json"))?;
+        if state["exit_code"] == exit {
+            for field in [
+                "task",
+                "spec",
+                "baseline",
+                "branch",
+                "ticket",
+                "candidate",
+                "recovered_run",
+                "pr",
+                "stage",
+            ] {
+                ensure!(
+                    state[field] == previous[field],
+                    "closing Studio changed {field}"
+                );
+            }
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Studio did not checkpoint the closed window"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    ui.click("HTTPS 试点")?;
+    let name = session
+        .file_name()
+        .context("missing Studio session name")?
+        .to_string_lossy();
+    let selector = format!("https-session-{name}");
+    ui.reveal("https-pilot-page", &selector)?;
+    ui.click(&selector)?;
+    ensure!(
+        ui.absent("https-confirm")? && ui.absent("https-ack")?,
+        "an approval survived closing Studio"
+    );
+    while ui.absent("https-resume")? {
+        ensure!(Instant::now() < deadline, "the saved task is still locked");
+        ui.cx.advance_clock(Duration::from_secs(1));
+        ui.settle()?;
+        thread::sleep(Duration::from_millis(150));
+    }
+    ui.reveal("https-pilot-page", "https-resume")?;
+    ui.checkpoint(checkpoint)?;
+    ui.click("https-resume")?;
+    loop {
+        let state = read(&session.join("state.json"))?;
+        if state["exit_code"].is_null() {
+            ensure!(
+                state["ticket"] == previous["ticket"],
+                "resume created a different ticket"
+            );
+            ui.cx.advance_clock(Duration::from_secs(1));
+            ui.settle()?;
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Studio did not restart the saved step"
+        );
+        thread::sleep(Duration::from_millis(150));
+    }
+}
+
 pub(super) fn run_remote(mut args: Args) -> Result<()> {
     ensure!(
         io::stdin().is_terminal(),
@@ -259,6 +340,12 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
     let task = setting("AEP_STUDIO_LIVE_TASK")?;
     let target = setting("AEP_STUDIO_LIVE_TARGET")?;
     let site = setting("AEP_STUDIO_LIVE_OUTAGE_SITE")?;
+    let restart = std::env::var("AEP_STUDIO_LIVE_RESTART").is_ok_and(|value| value == "1");
+    let retry = std::env::var("AEP_STUDIO_LIVE_RETRY").is_ok_and(|value| value == "1");
+    ensure!(
+        !retry || restart,
+        "the failed Run rehearsal requires AEP_STUDIO_LIVE_RESTART=1"
+    );
     ensure!(
         target.starts_with("test/") && aep::workspace::ident(&site, 40).is_ok(),
         "real rehearsal needs an isolated GitHub target and a named Docker site"
@@ -338,7 +425,7 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         binary: Some(crate::handoff_fixture::build_runner()?),
         client_bin: None,
     };
-    let mut ui = Driver::open_with_runner(&ws, &args, runner)?;
+    let mut ui = Driver::open_with_runner(&ws, &args, runner.clone())?;
     println!("Studio checkpoints: {}", output.display());
     let result = (|| {
         ui.click("HTTPS 试点")?;
@@ -397,6 +484,48 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         let evidence = dir.join("evidence");
         println!("Remote task session: {}", dir.display());
 
+        let failed_run = if retry {
+            let deadline = Instant::now() + Duration::from_secs(850);
+            let failed = loop {
+                ui.cx.advance_clock(Duration::from_secs(1));
+                ui.settle()?;
+                let state = read(&session.join("state.json")).unwrap_or_default();
+                if state["exit_code"] == 1 && !ui.absent("https-failure")? {
+                    break state;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "the first Run did not show the injected acceptance failure"
+                );
+                thread::sleep(Duration::from_millis(200));
+            };
+            let id = failed["recovered_run"]
+                .as_str()
+                .context("missing failed Run")?
+                .to_owned();
+            let checks = evidence.join("worker/runs").join(&id).join("checks.log");
+            ensure!(
+                fs::read_to_string(&checks)?
+                    .contains("Studio retry rehearsal: first acceptance blocked"),
+                "the first Run failed for a different reason"
+            );
+            ensure!(
+                ui.element("https-resume")?.label() == Some("重试当前步骤"),
+                "failed task has no retry action"
+            );
+            ui.reveal("https-pilot-page", "https-failure")?;
+            ui.checkpoint("01b-failed-run")?;
+            docker(&[
+                "exec",
+                &format!("{site}-worker"),
+                "/usr/bin/unlink",
+                &format!("/pilot/tmp/aep-studio-retry-{task}"),
+            ])?;
+            reopen_remote(&mut ui, &ws, &runner, session, 1, "01c-reopen-and-retry")?;
+            Some(id)
+        } else {
+            None
+        };
         let checking = await_stage(&mut ui, "远程 Worker 正在验收固定候选", session, 850)?;
         let candidate = checking["candidate"]
             .as_str()
@@ -436,7 +565,18 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         }
         ui.checkpoint("02-remote-worker")?;
         let current = read(&evidence.join("control-status.json"))?;
-        let run = checking["old_run"].as_str().context("missing scoped Run")?;
+        let run = checking["recovered_run"]
+            .as_str()
+            .context("missing scoped Run")?;
+        if let Some(failed) = &failed_run {
+            let retry = read(&evidence.join("retry.json"))?;
+            ensure!(
+                retry["data"]["predecessor"] == failed.as_str()
+                    && retry["data"]["id"] == run
+                    && retry["data"]["reverify"] == false,
+                "retry did not continue the failed task"
+            );
+        }
         let attempts = current["data"]["attempts"]
             .as_array()
             .context("missing current ticket status")?;
@@ -479,13 +619,28 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         ui.checkpoint("04-recovery")?;
 
         let pending = await_stage(&mut ui, "待人工确认发布", session, 850)?;
+        if restart {
+            reopen_remote(
+                &mut ui,
+                &ws,
+                &runner,
+                session,
+                4,
+                "04b-reopened-before-publication",
+            )?;
+            let restored = await_stage(&mut ui, "待人工确认发布", session, 90)?;
+            for field in ["ticket", "spec", "candidate", "recovered_run"] {
+                ensure!(
+                    restored[field] == pending[field],
+                    "publication restored a different {field}"
+                );
+            }
+        }
         ensure!(
             pending["candidate"] == candidate,
             "the recovered Run changed the candidate"
         );
-        let old = pending["old_run"]
-            .as_str()
-            .context("missing interrupted Run")?;
+        let old = run;
         let next = pending["recovered_run"]
             .as_str()
             .context("missing recovery Run")?;
@@ -535,6 +690,23 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         ui.checkpoint("07-ci-progress")?;
 
         let pending = await_stage(&mut ui, "CI 已通过，待人工确认合并", session, 2800)?;
+        if restart {
+            reopen_remote(
+                &mut ui,
+                &ws,
+                &runner,
+                session,
+                4,
+                "07b-reopened-before-merge",
+            )?;
+            let restored = await_stage(&mut ui, "CI 已通过，待人工确认合并", session, 120)?;
+            for field in ["ticket", "candidate", "pr"] {
+                ensure!(
+                    restored[field] == pending[field],
+                    "merge restored a different {field}"
+                );
+            }
+        }
         let number = pending["pr"].as_u64().context("missing GitHub PR")?;
         let ci = read(&evidence.join("github-ci.json"))?;
         ensure!(
