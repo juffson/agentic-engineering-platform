@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
 };
@@ -186,6 +187,8 @@ impl Session {
             .current_dir(&source.root)
             .env("PATH", runner.path()?)
             .env("GH_PROMPT_DISABLED", "1")
+            // The approval pipe owns the session, including when Studio is launched from a terminal.
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log))
