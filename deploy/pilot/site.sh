@@ -36,7 +36,7 @@ assets() {
             -subj "/CN=$name-control" -keyout "$directory/server.key" \
             -out "$directory/server.csr" 2>/dev/null
         openssl x509 -req -in "$directory/server.csr" -CA "$directory/ca.pem" \
-            -CAkey "$directory/ca.key" -CAcreateserial -days 60 -sha256 \
+            -CAkey "$directory/ca.key" -CAserial "$directory/ca.srl" -CAcreateserial -days 60 -sha256 \
             -extfile <(printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:%s-control,IP:127.0.0.1\n' "$name") \
             -out "$directory/server.pem"
     fi
@@ -73,9 +73,30 @@ resume_or_run() {
     fi
 }
 
-service() {
-    local directory=$1 binding="127.0.0.1:$port:8443"
+control_service() {
+    local binding="127.0.0.1:$port:8443"
     if [[ $port == 0 ]]; then binding="127.0.0.1::8443"; fi
+    resume_or_run "$name-control" --network "$ingress" --restart unless-stopped \
+        --publish "$binding" --cap-drop ALL --security-opt no-new-privileges --read-only \
+        --mount "type=volume,src=$name-control-state,dst=/var/lib/aep" \
+        --mount "type=volume,src=$name-control-keys,dst=/run/aep-control,readonly" \
+        "$control_image" --device "$name-worker" --lease-seconds "${AEP_PILOT_LEASE_SECONDS:-30}"
+    if [[ $(docker container inspect -f "{{if index .NetworkSettings.Networks \"$private\"}}joined{{end}}" "$name-control") != joined ]]; then
+        docker network connect "$private" "$name-control"
+    fi
+}
+
+https_service() {
+    resume_or_run "$name-https" --network "container:$name-control" --restart unless-stopped \
+        --cap-drop ALL --security-opt no-new-privileges --read-only --user 101:101 \
+        --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
+        --mount "type=volume,src=$name-tls,dst=/run/aep-tls,readonly" \
+        --mount "type=bind,src=$script_dir/nginx.conf,dst=/etc/nginx/nginx.conf,readonly" \
+        --entrypoint nginx "$nginx_image" -g 'daemon off;'
+}
+
+service() {
+    local directory=$1
     assets "$directory"
     for network in "$private" "$outbound" "$ingress"; do
         if ! docker network inspect "$network" >/dev/null 2>&1; then
@@ -103,20 +124,8 @@ service() {
     if [[ $(docker container inspect -f "{{if index .NetworkSettings.Networks \"$outbound\"}}joined{{end}}" "$name-egress") != joined ]]; then
         docker network connect --gw-priority 1 "$outbound" "$name-egress"
     fi
-    resume_or_run "$name-control" --network "$ingress" --restart unless-stopped \
-        --publish "$binding" --cap-drop ALL --security-opt no-new-privileges --read-only \
-        --mount "type=volume,src=$name-control-state,dst=/var/lib/aep" \
-        --mount "type=volume,src=$name-control-keys,dst=/run/aep-control,readonly" \
-        "$control_image" --device "$name-worker" --lease-seconds "${AEP_PILOT_LEASE_SECONDS:-30}"
-    if [[ $(docker container inspect -f "{{if index .NetworkSettings.Networks \"$private\"}}joined{{end}}" "$name-control") != joined ]]; then
-        docker network connect "$private" "$name-control"
-    fi
-    resume_or_run "$name-https" --network "container:$name-control" --restart unless-stopped \
-        --cap-drop ALL --security-opt no-new-privileges --read-only --user 101:101 \
-        --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
-        --mount "type=volume,src=$name-tls,dst=/run/aep-tls,readonly" \
-        --mount "type=bind,src=$script_dir/nginx.conf,dst=/etc/nginx/nginx.conf,readonly" \
-        --entrypoint nginx "$nginx_image" -g 'daemon off;'
+    control_service
+    https_service
     printf 'Operator HTTPS endpoint: https://%s\n' "$(docker port "$name-control" 8443/tcp)"
 }
 
@@ -297,11 +306,12 @@ remove_site() {
 
 case "${1:-}" in
     serve) shift; service "$@" ;;
+    upgrade) shift; source "$script_dir/upgrade.sh"; upgrade_site "$@" ;;
     workspace) shift; prepare_workspace "$@" ;;
     credential) shift; model_credential "$@" ;;
     worker) shift; worker "$@" ;;
     export) shift; export_runs "$@" ;;
     gate) shift; check_gate "$@" ;;
     remove) shift; remove_site "$@" ;;
-    *) echo "Usage: $0 serve PRIVATE-DIR | workspace HTTPS-REPO BRANCH GIT-NAME GIT-EMAIL | credential codex|claude < AUTH-JSON | worker [WORKER-ARGS] | export EVIDENCE-DIR RUN [RUN...] | gate hold|release | remove" >&2; exit 2 ;;
+    *) echo "Usage: $0 serve PRIVATE-DIR | upgrade ACCESS-DIR RECEIPT-DIR | workspace HTTPS-REPO BRANCH GIT-NAME GIT-EMAIL | credential codex|claude < AUTH-JSON | worker [WORKER-ARGS] | export EVIDENCE-DIR RUN [RUN...] | gate hold|release | remove" >&2; exit 2 ;;
 esac

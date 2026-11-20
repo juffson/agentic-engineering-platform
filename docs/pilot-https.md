@@ -27,7 +27,7 @@ Studio 会等待控制面重新连接并收齐旧 Run 的终止事件。Lease �
 
 发布和合并各需一次 Studio 确认。CI 核对结果、恢复事件、候选、验收、审查和合并回执存入本地会话归档。合并后同步该会话的操作端克隆，并清理已发布的候选分支。
 
-离屏验收可对隔离 Docker 站点演练断线。站点名使用 `aep-https-real-` 前缀、Lease 设为 20 秒，任务和 `test/` 目标分支提前派发。调试程序只停止指定且标签匹配的试点入口，发布和合并仍分别等待确认。
+离屏验收可对已部署的 Docker 站点演练短时断线。提前固定任务和 `test/` 目标分支，并确认同站点没有其他活动工单。调试程序核对 Docker 标签、Studio 的回环 HTTPS 地址和正在检查的 Run，停止该入口超过一个 Lease 后恢复。发布和合并仍分别等待确认。
 
 ```sh
 export AEP_STUDIO_CONTROL_URL="$url" AEP_STUDIO_CONTROL_CA="$ca"
@@ -80,7 +80,18 @@ site="$HOME/.local/state/aep-pilot"
 
 使用 `worker --once` 可处理一个 Run 后退出。后台模式可通过 Docker 查看日志和重启同名设备。Worker 的业务进程 UID 为 10001。只读根文件系统、独立挂载、空 capabilities 和 `no-new-privileges` 由容器与启动器执行。Worker 的监督进程将设备令牌和 Lease 日志保存在独立的私有目录。应用进程无法读取它们。容器没有宿主机账号目录、SSH agent 或 Docker socket。模型文件仅存放在该试点的 Worker 卷。
 
-从旧镜像升级时，在重启 Worker 前再执行一次 `site.sh workspace`，以初始化监督进程与业务进程共用的取消锁目录。已有工作区和运行记录会保留。
+### 原位升级
+
+先构建本次发布使用的控制面和 Worker 镜像。在部署主机指向原站点名称，使用原操作员令牌和 CA 证书，并选择一个新的收据目录。原站点须使用固定回环端口，以便回滚时恢复同一地址。收据目录含升级前的控制状态备份，应保存在操作员可访问的私有位置。
+
+```sh
+export AEP_PILOT_NAME="$site_name"
+export AEP_PILOT_CONTROL_IMAGE="$new_control_image" AEP_PILOT_WORKER_IMAGE="$new_worker_image"
+./deploy/pilot/build.sh
+./deploy/pilot/site.sh upgrade "$site" "$receipt_dir"
+```
+
+命令先检查没有活动工单，再冻结空闲 Worker 并核对 Lease 和本地日志。它保留现有 HTTPS 端口、证书、设备身份、模型凭证、工作区、控制状态、网络和数据卷。新 Nginx 和控制面通过 HTTPS 健康检查后，Worker 会带 `--upload-evidence` 启动。新服务未通过核验时，命令恢复原容器并记录回滚结果。
 
 此配置使用容器作为 Codex 的执行沙箱，因为 Docker 的默认 seccomp 与 AppArmor 会阻止内层 bubblewrap 建立命名空间。本部署的 Codex 包装器只在只读容器内的指定 UID、零 capabilities 与 `no-new-privileges` 均成立时接管 AEP 的沙箱参数。代理仅开放配置中的 HTTPS CONNECT 主机，内部网络无直接外部路由。验收使用构建时准备好的 Cargo 缓存并离线运行。[Codex 容器沙箱说明](https://github.com/openai/codex/blob/main/.devcontainer/README.md) · [Docker 内部网络](https://docs.docker.com/reference/cli/docker/network/create/#network-internal-mode---internal)
 
