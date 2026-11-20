@@ -291,7 +291,13 @@ wait_run() {
             step reconnect
         fi
         next=$work_stage
-        if [[ $active == interrupted ]]; then
+        if [[ $active == queued ]]; then
+            next=queue_wait
+            deadline=$((SECONDS + 900))
+        elif [[ $active == cancel_pending ]]; then
+            next=remote_cancelling
+            deadline=$((SECONDS + 900))
+        elif [[ $active == interrupted ]]; then
             [[ -f $evidence/interrupted-$run.json ]] || cp "$evidence/run-$run.json" "$evidence/interrupted-$run.json"
             next=reconnect
         elif [[ $work_stage != recovery && $active == running ]]; then
@@ -347,7 +353,7 @@ previous_at_open=$(jq -r '.recovered_run // empty' <<<"$prior")
 retry_failed=no
 if [[ $mode == retry && $recovered_run == "$previous_at_open" ]]; then
     case $terminal_at_open in
-        failed|blocked|cancelled|interrupted) retry_failed=yes ;;
+        failed|blocked|interrupted) retry_failed=yes ;;
     esac
 fi
 
@@ -403,6 +409,17 @@ done
 
 last="$evidence/worker/runs/$recovered_run"
 case "$terminal" in
+    cancelled)
+        # A queued cancellation has no process or Worker packet. An acquired
+        # Run needs the recorded exit and uploaded partial evidence.
+        cp "$run_file" "$evidence/cancellation.json"
+        if jq -e '.events | length > 0' "$run_file" >/dev/null; then
+            step remote_cancelling
+            collect "$recovered_run" || fail "The Worker stopped, but its cancellation evidence could not be downloaded"
+        fi
+        stage=cancelled
+        exit 0
+        ;;
     awaiting_approval|approved|publishing|published)
         collect "$recovered_run" || fail "Worker evidence is unavailable. Check --upload-evidence and the HTTPS route"
         ;;

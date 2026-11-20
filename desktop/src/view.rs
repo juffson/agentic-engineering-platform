@@ -1,6 +1,7 @@
 pub(crate) mod editor;
 pub(crate) mod github_page;
 pub(crate) mod https_pilot_page;
+mod https_queue;
 pub(crate) mod human_review;
 mod lifecycle_page;
 mod relay_page;

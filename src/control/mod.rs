@@ -68,6 +68,20 @@ enum Action {
         revise: bool,
     },
     Status,
+    /// Pause or resume new Worker leases.
+    QueuePause {
+        #[arg(long, action = clap::ArgAction::Set)]
+        paused: bool,
+    },
+    /// Swap a queued Run with its currently adjacent neighbor.
+    QueueMove {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        adjacent: String,
+        #[arg(long, action = clap::ArgAction::Set)]
+        earlier: bool,
+    },
     /// Retrieve immutable, bounded evidence from a terminal remote Run.
     Collect {
         #[arg(long)]
@@ -80,6 +94,11 @@ enum Action {
     Cancel {
         #[arg(long)]
         ticket: String,
+        /// Cancel only this exact current Run of the ticket.
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long, requires = "run")]
+        stage: Option<Stage>,
     },
     Retry {
         #[arg(long)]
@@ -325,7 +344,21 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
             evidence::unpack(&output, &run, &client.download(&ticket, &run)?)?;
             return Ok(());
         }
-        Action::Cancel { ticket } => client.call(Operation::Cancel { ticket })?,
+        Action::QueuePause { paused } => client.call(Operation::QueuePause { paused })?,
+        Action::QueueMove {
+            run,
+            adjacent,
+            earlier,
+        } => client.call(Operation::QueueMove {
+            run,
+            adjacent,
+            earlier,
+        })?,
+        Action::Cancel { ticket, run, stage } => client.call(Operation::Cancel {
+            ticket,
+            expected_run: run,
+            expected_stage: stage,
+        })?,
         Action::Retry { ticket, reverify } => client.call(Operation::Retry { ticket, reverify })?,
         Action::Submit {
             ticket,

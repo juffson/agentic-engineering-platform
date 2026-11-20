@@ -63,6 +63,9 @@ fn phase(stage: &str) -> (usize, &'static str) {
         "remote_preflight" => (0, "校验 HTTPS、远程 Worker 和固定版本"),
         "remote_create" => (0, "创建并固定任务 Spec"),
         "remote_dispatch" => (0, "通过 HTTPS 派发真实任务"),
+        "queue_wait" => (0, "等待 HTTPS Worker 领取"),
+        "remote_cancelling" => (1, "等待 Worker 确认停止"),
+        "cancelled" => (5, "任务已取消，证据已归档"),
         "remote_checking" => (1, "远程 Worker 正在验收固定候选"),
         "remote_reviewing" => (1, "远程 Claude 正在审查固定候选"),
         "remote_outage" => (2, "HTTPS 连接中断，等待控制面恢复"),
@@ -84,6 +87,7 @@ fn phase(stage: &str) -> (usize, &'static str) {
 fn progress_state(progress: &Progress, busy: bool, spawn_error: bool) -> (&'static str, u32) {
     match progress.exit_code {
         Some(0) if progress.stage == "completed" && progress.archive => ("已完成", MINT),
+        Some(0) if progress.stage == "cancelled" => ("已取消", AMBER),
         Some(3) => ("已停止", AMBER),
         Some(4) => ("已暂停", AMBER),
         Some(_) => ("失败", RED),
@@ -160,6 +164,7 @@ impl Studio {
             self.https_pilot_error = None;
         }
         self.https_sessions = Session::entries(&source);
+        self.restore_https_queue(&source, cx);
         self.poll_https(cx);
     }
 
@@ -194,10 +199,25 @@ impl Studio {
         self.attach_https_pilot(result, cx);
     }
 
+    pub(super) fn follow_https_cancellation(&mut self, ticket: &str, cx: &mut Context<Self>) {
+        if let Some(source) = self.https_source()
+            && let Some(entry) = Session::entries(&source)
+                .into_iter()
+                .find(|entry| entry.progress.ticket == ticket)
+        {
+            self.select_https_session(&source, entry.root);
+            self.resume_https(cx);
+        }
+    }
+
     fn attach_https_pilot(&mut self, result: Result<Session>, cx: &mut Context<Self>) {
         self.https_pilot_error = None;
         match result {
-            Ok(session) => self.https_pilot = Some(session),
+            Ok(session) => {
+                if let Some(previous) = self.https_pilot.replace(session).filter(Session::active) {
+                    self.https_background.push(previous);
+                }
+            }
             Err(error) => self.https_pilot_error = Some(format!("启动失败：{error:#}")),
         }
         if let Some(source) = self.https_source() {
@@ -245,6 +265,7 @@ impl Studio {
                             if let Some(source) = this.https_source() {
                                 this.https_sessions = Session::entries(&source);
                             }
+                            this.poll_https_queue(cx);
                             cx.notify();
                         }
                         let keep_polling = visible
@@ -318,14 +339,23 @@ impl Studio {
         cx.notify();
     }
 
-    fn start_https_remote(&mut self, cx: &mut Context<Self>) {
-        if self.https_pilot.as_ref().is_some_and(Session::active) {
-            return;
-        }
+    fn connect_remote_queue(&mut self, cx: &mut Context<Self>) {
         let Some(form) = self.https_remote_form.as_ref() else {
             return;
         };
-        let result = (|| {
+        let source = form.source.clone();
+        let result = form
+            .connection(cx)
+            .and_then(|connection| self.set_https_queue(source, connection, cx));
+        self.https_pilot_error = result.err().map(|error| format!("{error:#}"));
+        cx.notify();
+    }
+
+    fn start_https_remote(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.https_remote_form.as_ref() else {
+            return;
+        };
+        let prepared = (|| {
             let connection = form.connection(cx)?;
             let (task, branch) = if let Some(authoring) = &form.authoring {
                 (
@@ -339,8 +369,12 @@ impl Studio {
                     choices.branch.clone().context("请选择目标分支")?,
                 )
             };
-            Session::launch_remote(&form.source, &self.runner, task, branch, connection)
+            Ok::<_, anyhow::Error>((form.source.clone(), task, branch, connection))
         })();
+        let result = prepared.and_then(|(source, task, branch, connection)| {
+            self.set_https_queue(source.clone(), connection.clone(), cx)?;
+            Session::launch_remote(&source, &self.runner, task, branch, connection)
+        });
         if result.is_ok() {
             self.https_remote_form = None;
         }
@@ -397,6 +431,10 @@ impl Studio {
                     .gap_3()
                     .child(input("CA 证书路径", &form.ca))
                     .child(input("操作员令牌文件路径", &form.operator_file)),
+            )
+            .child(
+                button("https-connect-queue", "连接队列", false)
+                    .on_click(cx.listener(|this, _, _, cx| this.connect_remote_queue(cx))),
             );
         if let Some(authoring) = &form.authoring {
             return contents.child(authoring.fields(&form.source, false)).child(
@@ -565,12 +603,11 @@ impl Studio {
     pub(super) fn https_pilot_page(&self, cx: &Context<Self>) -> Div {
         let session = self.https_pilot.as_ref();
         let running = session.is_some_and(Session::active);
-        let mut header = h_flex()
+        let header = h_flex()
             .justify_between()
             .gap_3()
-            .child(heading("HTTPS 试点").text_2xl());
-        if !running {
-            header = header.child(
+            .child(heading("HTTPS 试点").text_2xl())
+            .child(
                 h_flex()
                     .gap_2()
                     .child(
@@ -581,12 +618,13 @@ impl Studio {
                         )
                         .on_click(cx.listener(|this, _, w, cx| this.open_https_remote(w, cx))),
                     )
-                    .child(
-                        button("https-start", "启动隔离试点", true)
-                            .on_click(cx.listener(|this, _, _, cx| this.start_https_pilot(cx))),
-                    ),
+                    .when(!running, |row| {
+                        row.child(
+                            button("https-start", "启动隔离试点", true)
+                                .on_click(cx.listener(|this, _, _, cx| this.start_https_pilot(cx))),
+                        )
+                    }),
             );
-        }
         let mut page = v_flex()
             .id("https-pilot-page")
             .test_support()
@@ -602,8 +640,11 @@ impl Studio {
         if let Some(error) = &self.https_pilot_error {
             page = page.child(detail_text("https-action-error", error).text_color(rgb(RED)));
         }
-        if !running && let Some(form) = &self.https_remote_form {
+        if let Some(form) = &self.https_remote_form {
             page = page.child(self.https_remote_form(form, cx));
+        }
+        if let Some(site) = &self.https_queue {
+            page = page.child(self.https_queue_panel(site, cx));
         }
         page = page.child(self.https_session_list(cx));
         let Some(session) = session else {
