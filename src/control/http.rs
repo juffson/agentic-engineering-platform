@@ -13,6 +13,7 @@ use axum::{
 };
 use serde_json::json;
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::{ErrorKind, Read},
     net::SocketAddr,
@@ -34,38 +35,46 @@ pub fn now() -> u64 {
 fn token(name: &str) -> Result<String> {
     let value = std::env::var(name).with_context(|| format!("configure {name}"))?;
     ensure!(
-        (32..=128).contains(&value.len())
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        valid_token(&value),
         "{name} must contain 32–128 ASCII letters, digits or hyphens"
     );
     Ok(value)
 }
 
+fn valid_token(value: &str) -> bool {
+    (32..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
 struct Service {
     store: Mutex<Store>,
     operator: String,
-    device_token: String,
+    workers: BTreeMap<String, String>,
     device: String,
     ttl: u64,
 }
 
 impl Service {
-    fn authorized(&self, headers: &HeaderMap, device: bool) -> bool {
-        let Some(value) = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-        else {
-            return false;
-        };
-        let expected = if device {
-            &self.device_token
-        } else {
-            &self.operator
-        };
-        bool::from(value.as_bytes().ct_eq(expected.as_bytes()))
+    fn is_operator(&self, headers: &HeaderMap) -> bool {
+        bearer(headers)
+            .is_some_and(|value| bool::from(value.as_bytes().ct_eq(self.operator.as_bytes())))
+    }
+
+    fn worker(&self, headers: &HeaderMap) -> Option<&str> {
+        let token = bearer(headers)?;
+        self.workers.iter().find_map(|(worker, expected)| {
+            bool::from(token.as_bytes().ct_eq(expected.as_bytes())).then_some(worker.as_str())
+        })
     }
 }
 
@@ -74,19 +83,26 @@ async fn command(
     headers: HeaderMap,
     Json(operation): Json<Operation>,
 ) -> Response {
-    if !service.authorized(&headers, operation.for_device()) {
+    let identity = if operation.for_device() {
+        service.worker(&headers)
+    } else {
+        service
+            .is_operator(&headers)
+            .then_some(service.device.as_str())
+    };
+    let Some(identity) = identity.map(str::to_owned) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"authorization required"})),
         )
             .into_response();
-    }
+    };
     let result = tokio::task::spawn_blocking(move || {
         service
             .store
             .lock()
             .map_err(|_| anyhow::anyhow!("control store is unavailable"))?
-            .apply(operation, &service.device, now(), service.ttl)
+            .apply(operation, &identity, now(), service.ttl)
     })
     .await;
     match result {
@@ -113,13 +129,13 @@ fn evidence_path(
     service: &Service,
     id: &str,
     ticket: Option<&str>,
-    fence: Option<&str>,
+    proof: Option<(&str, &str)>,
 ) -> Result<PathBuf> {
     service
         .store
         .lock()
         .map_err(|_| anyhow::anyhow!("control store is unavailable"))?
-        .evidence_path(id, ticket, fence)
+        .evidence_path(id, ticket, proof)
 }
 
 async fn upload(
@@ -127,13 +143,13 @@ async fn upload(
     RoutePath(run): RoutePath<String>,
     request: Request,
 ) -> Response {
-    if !service.authorized(request.headers(), true) {
+    let Some(worker) = service.worker(request.headers()) else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     let Some(fence) = scope(request.headers(), "x-aep-fence") else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Ok(path) = evidence_path(&service, &run, None, Some(&fence)) else {
+    let Ok(path) = evidence_path(&service, &run, None, Some((worker, &fence))) else {
         return StatusCode::CONFLICT.into_response();
     };
     let Ok(bytes) = to_bytes(request.into_body(), evidence::LIMIT).await else {
@@ -168,7 +184,7 @@ async fn download(
     RoutePath(run): RoutePath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !service.authorized(&headers, false) {
+    if !service.is_operator(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Some(ticket) = scope(&headers, "x-aep-ticket") else {
@@ -194,7 +210,13 @@ async fn download(
     }
 }
 
-pub fn serve(listen: SocketAddr, db: PathBuf, device: String, ttl: u64) -> Result<()> {
+pub fn serve(
+    listen: SocketAddr,
+    db: PathBuf,
+    device: String,
+    ttl: u64,
+    extra_workers: Option<&Path>,
+) -> Result<()> {
     ensure!(
         listen.ip().is_loopback(),
         "bind to loopback and put a TLS reverse proxy in front for remote access"
@@ -210,6 +232,28 @@ pub fn serve(listen: SocketAddr, db: PathBuf, device: String, ttl: u64) -> Resul
         operator != device_token,
         "use distinct device and operator tokens"
     );
+    let mut workers = BTreeMap::from([(device.clone(), device_token)]);
+    if let Some(path) = extra_workers {
+        let bytes = fs::read(path).context("read Worker credentials")?;
+        ensure!(
+            bytes.len() <= 16 * 1024,
+            "Worker configuration is too large"
+        );
+        let extra: BTreeMap<String, String> =
+            serde_json::from_slice(&bytes).context("parse Worker credentials")?;
+        ensure!(extra.len() <= 32, "too many configured Workers");
+        for (id, token) in extra {
+            aep::workspace::ident(&id, 63)?;
+            ensure!(
+                !workers.contains_key(&id)
+                    && valid_token(&token)
+                    && token != operator
+                    && !workers.values().any(|existing| *existing == token),
+                "invalid or duplicate Worker credentials for {id}"
+            );
+            workers.insert(id, token);
+        }
+    }
     let app = Router::new()
         .route(
             "/v1/control",
@@ -219,7 +263,7 @@ pub fn serve(listen: SocketAddr, db: PathBuf, device: String, ttl: u64) -> Resul
         .with_state(Arc::new(Service {
             store: Mutex::new(Store::open(db)?),
             operator,
-            device_token,
+            workers,
             device,
             ttl,
         }));

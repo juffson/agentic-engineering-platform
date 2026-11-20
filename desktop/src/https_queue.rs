@@ -9,7 +9,7 @@ use aep::{
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::{self, File},
     process::Command,
     time::Instant,
@@ -21,6 +21,9 @@ pub(crate) struct Run {
     pub task: Ticket,
     pub stage: String,
     pub expires_at: Option<u64>,
+    pub worker: Option<String>,
+    #[serde(default)]
+    events: Vec<Event>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -31,7 +34,43 @@ pub(crate) struct Ticket {
     repository: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct Event {
+    progress: Phase,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct Phase {
+    phase: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct Worker {
+    #[serde(default)]
+    pub online: bool,
+}
+
 impl Run {
+    pub fn phase_label(&self) -> &str {
+        match self.stage.as_str() {
+            "queued" if self.worker.is_some() => "等待原 Worker",
+            "queued" => "排队中",
+            "cancel_pending" => "等待 Worker 确认停止",
+            "interrupted" => "断线，等待恢复",
+            _ => match self
+                .events
+                .last()
+                .and_then(|event| event.progress.phase.as_deref())
+            {
+                Some("preparing") => "正在准备",
+                Some("implementing") => "Codex 实现",
+                Some("checking") => "运行验收",
+                Some("reviewing") => "Claude 审查",
+                _ => "运行中",
+            },
+        }
+    }
+
     pub fn can_cancel(&self) -> bool {
         matches!(self.stage.as_str(), "queued" | "running")
             || (self.stage == "interrupted" && self.expires_at.is_some())
@@ -47,10 +86,20 @@ pub(crate) struct Queue {
 #[derive(Deserialize)]
 pub(crate) struct Snapshot {
     pub queue: Option<Queue>,
+    #[serde(default)]
+    pub workers: BTreeMap<String, Worker>,
     pub attempts: Vec<Run>,
 }
 
 impl Snapshot {
+    pub fn current(&self, worker: &str) -> Option<&Run> {
+        self.attempts.iter().rev().find(|run| {
+            run.worker.as_deref() == Some(worker)
+                && (matches!(run.stage.as_str(), "running" | "cancel_pending")
+                    || (run.stage == "interrupted" && run.expires_at.is_some()))
+        })
+    }
+
     pub fn visible_runs(&self) -> Vec<&Run> {
         let mut seen = HashSet::new();
         let mut rows = self

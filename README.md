@@ -134,7 +134,7 @@ aep status --run-id market-handoff-001
 
 ## 试点边界
 
-- Git 远端固定 Spec，Studio 管理本机接力和队列。也可启动 Rust 控制面和独立 Worker，以单仓库、单设备方式派发和恢复任务。Worker 主动连接，控制面持久化 Lease、执行事件和批准记录。[控制面启动与试点手册](docs/pilot.md)
+- Git 远端固定 Spec，Studio 管理本机接力和队列。也可启动 Rust 控制面和独立 Worker，在一个仓库中向独立 Worker 派发和恢复任务。HTTPS 控制面支持多 Worker 并行。Worker 主动连接，控制面持久化 Lease、执行事件和批准记录。[控制面启动与试点手册](docs/pilot.md)
 - 只在受信任的仓库运行。Worktree 隔开文件变更，测试命令和待测代码会以本机用户身份执行。选择外部模型客户端前，须确认其环境与数据权限。
 - 同一任务可以有多个 Run。每次都针对固定版本生成证据。用户可以在 Studio 核对证据并确认发布候选，CI 在 PR 当前提交上独立复验。
 - 本仓库用作流程试点与基线。业务收益、费用和可靠性由后续真实需求测量。[AEP 架构提案与八周路线图](https://app.notion.com/p/41a9d9f6f60581d08560fa33ed8c4810)

@@ -44,6 +44,9 @@ enum Action {
         state: PathBuf,
         #[arg(long)]
         device: String,
+        /// Read additional Worker IDs and unique bearer tokens from a private JSON file.
+        #[arg(long)]
+        workers: Option<PathBuf>,
         #[arg(long, default_value_t = 60)]
         lease_seconds: u64,
     },
@@ -307,7 +310,8 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
             state,
             device,
             lease_seconds,
-        } => return http::serve(listen, state, device, lease_seconds),
+            workers,
+        } => return http::serve(listen, state, device, lease_seconds, workers.as_deref()),
         Action::Worker {
             codex_model,
             sandbox_launcher,

@@ -15,16 +15,16 @@ exec 3<&0 </dev/null
 request=$session/request.json
 stage=preflight
 failure='' repository='' task='' branch='' baseline='' spec='' candidate='' old_run='' recovered_run='' pr=''
-evidence='' archive=''
+evidence='' archive='' worker=''
 ticket=''
 
 report() {
     jq -n --arg stage "$stage" --arg reason "$failure" --arg repository "$repository" --arg task "$task" \
         --arg branch "$branch" --arg ticket "$ticket" --arg baseline "$baseline" --arg spec "$spec" \
-        --arg candidate "$candidate" --arg old "$old_run" --arg recovered "$recovered_run" --arg pr "$pr" \
+        --arg candidate "$candidate" --arg old "$old_run" --arg recovered "$recovered_run" --arg pr "$pr" --arg worker "$worker" \
         --arg archive "$archive" --argjson code "${1:-null}" \
         '{remote:true,stage:$stage,reason:$reason,repository:$repository,task:$task,branch:$branch,ticket:$ticket,
-          baseline:$baseline,spec:$spec,candidate:$candidate,old_run:$old,recovered_run:$recovered,
+          baseline:$baseline,spec:$spec,candidate:$candidate,old_run:$old,recovered_run:$recovered,worker:$worker,
           pr:(if $pr=="" then null else ($pr|tonumber) end),archive:($archive!=""),exit_code:$code}' > "$session/state.tmp"
     mv -f "$session/state.tmp" "$session/state.json"
 }
@@ -117,6 +117,7 @@ candidate=$(jq -r '.candidate // empty' <<<"$prior")
 old_run=$(jq -r '.old_run // empty' <<<"$prior")
 recovered_run=$(jq -r '.recovered_run // empty' <<<"$prior")
 pr=$(jq -r '.pr // empty' <<<"$prior")
+worker=$(jq -r '.worker // empty' <<<"$prior")
 step remote_preflight
 checkpoint
 
@@ -264,7 +265,7 @@ old_run=$first
 recovered_run=$(jq -er '.[-1].id' <<<"$runs")
 
 wait_run() {
-    local run=$1 work_stage=$2 deadline=$((SECONDS + 900)) offline=no snapshot active sha phase next
+    local run=$1 work_stage=$2 deadline=$((SECONDS + 900)) offline=no snapshot active sha phase next assigned
     while (( SECONDS < deadline )); do
         checkpoint
         if ! control status > "$evidence/status.tmp" 2> "$evidence/control-last-error.log"; then
@@ -306,7 +307,8 @@ wait_run() {
                 reviewing) next=remote_reviewing ;;
             esac
         fi
-        if [[ $sha != "$candidate" ]]; then candidate=$sha; report; fi
+        assigned=$(jq -r '.worker // empty' <<<"$snapshot")
+        if [[ $sha != "$candidate" || $worker != "$assigned" ]]; then candidate=$sha; worker=$assigned; report; fi
         if [[ $stage != "$next" ]]; then
             step "$next"
         fi
@@ -439,6 +441,10 @@ if jq -e '.reverify' "$run_file" >/dev/null; then
     preserved=$(git -C "$operator" rev-parse "refs/aep/runs/$predecessor") ||
         fail "The predecessor candidate is missing from the saved evidence"
     [[ $candidate == "$preserved" ]] || fail "Recovery changed the pinned candidate"
+    if [[ -n $worker ]]; then
+        predecessor_worker=$(jq -er .worker "$evidence/run-$predecessor.json" 2>/dev/null || jq -er --arg run "$predecessor" '.data.attempts[] | select(.id==$run) | .worker' "$evidence/control-status.json")
+        [[ $worker == "$predecessor_worker" ]] || fail "Recovery changed the Worker holding the candidate"
+    fi
 fi
 jq -e --arg sha "$candidate" --arg spec "$spec" --arg task "$task" '
     .candidate_sha==$sha and .spec_sha==$spec and .task==$task and .check_exit_code==0 and

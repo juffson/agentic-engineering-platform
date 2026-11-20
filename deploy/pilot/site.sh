@@ -19,6 +19,35 @@ label=org.aep.pilot=$name
     exit 2
 }
 
+slot=${AEP_PILOT_WORKER_SLOT:-}
+[[ -z $slot || $slot =~ ^[a-z0-9][a-z0-9-]{0,15}$ ]] || { echo "Invalid Worker slot" >&2; exit 2; }
+suffix=${slot:+-$slot}
+worker_name=$name-worker$suffix
+workspace_volume=$name-workspace$suffix
+worker_keys_volume=$name-worker-keys$suffix
+[[ ${#worker_name} -le 63 ]]
+
+worker_config() {
+    local directory=$1
+    [[ -z $slot && -r $directory/workers.json ]]
+    jq -e 'type=="object" and length<=32 and all(to_entries[]; (.key|test("^[a-z0-9][a-z0-9-]{0,62}$")) and (.value|type=="string" and test("^[A-Za-z0-9-]{32,128}$")))' "$directory/workers.json" >/dev/null
+    [[ $(docker volume inspect -f '{{index .Labels "org.aep.pilot"}}' "$name-control-keys") == "$name" ]]
+    private_files "$directory" "$name-control-keys" 65532 65532 workers.json
+}
+
+worker_keys() (
+    local directory=$1 staging
+    [[ -n $slot && -r $directory/workers.json && -r $directory/ca.pem ]]
+    umask 077
+    staging=$(mktemp -d)
+    trap 'for file in "$staging/device" "$staging/site-ca.pem"; do if [[ -f $file ]]; then unlink "$file"; fi; done; rmdir "$staging"' EXIT
+    jq -er --arg worker "$worker_name" '.[$worker] | select(type=="string" and test("^[A-Za-z0-9-]{32,128}$"))' "$directory/workers.json" > "$staging/device"
+    cp "$directory/ca.pem" "$staging/site-ca.pem"
+    volume "$workspace_volume"
+    volume "$worker_keys_volume"
+    private_files "$staging" "$worker_keys_volume" 0 0 device site-ca.pem
+)
+
 assets() {
     local directory=$1
     umask 077
@@ -141,7 +170,7 @@ prepare_workspace() {
         exit 2
     }
     docker run --rm --network "$private" --dns 127.0.0.1 --security-opt no-new-privileges \
-        --mount "type=volume,src=$name-workspace,dst=/pilot" \
+        --mount "type=volume,src=$workspace_volume,dst=/pilot" \
         --env "HTTPS_PROXY=$proxy" --env "HTTP_PROXY=$proxy" --entrypoint /bin/sh \
         "$worker_image" -ec '
             if [ ! -d /pilot/repo/.git ]; then
@@ -169,7 +198,7 @@ model_credential() {
         claude) path=/pilot/agent/.claude/.credentials.json ;;
         *) return 2 ;;
     esac
-    docker run --rm -i --network none --mount "type=volume,src=$name-workspace,dst=/pilot" \
+    docker run --rm -i --network none --mount "type=volume,src=$workspace_volume,dst=/pilot" \
         --entrypoint /bin/sh "$worker_image" -ec '
             umask 077
             profile=$(dirname "$1")
@@ -192,14 +221,14 @@ worker() {
     fi
     proxy=$(proxy_arg)
     # The supervisor uses SETPCAP to clear the agent's capability bounding set.
-    docker run "${lifecycle[@]}" --init --name "$name-worker" --label "$label" --network "$private" \
+    docker run "${lifecycle[@]}" --init --name "$worker_name" --label "$label" --network "$private" \
         --dns 127.0.0.1 --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID --cap-add SETPCAP \
         --security-opt no-new-privileges --read-only --pids-limit 256 \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
         --env "AEP_PILOT_ORIGIN=https://$name-control:8443" \
         --env "HTTPS_PROXY=$proxy" --env "HTTP_PROXY=$proxy" --env "NO_PROXY=$name-control" \
-        --mount "type=volume,src=$name-workspace,dst=/pilot" \
-        --mount "type=volume,src=$name-worker-keys,dst=/run/aep-worker,readonly" \
+        --mount "type=volume,src=$workspace_volume,dst=/pilot" \
+        --mount "type=volume,src=$worker_keys_volume,dst=/run/aep-worker,readonly" \
         "$worker_image" "$@"
 }
 
@@ -216,7 +245,7 @@ export_runs() {
     local staging
     staging=$(mktemp -d "$output/.transfer.XXXXXX")
     docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
-        --mount "type=volume,src=$name-workspace,dst=/pilot,readonly" \
+        --mount "type=volume,src=$workspace_volume,dst=/pilot,readonly" \
         --entrypoint /bin/sh "$worker_image" -ec '
             partial=$1
             shift
@@ -270,9 +299,9 @@ export_runs() {
 
 check_gate() {
     case "$1" in hold|release) ;; *) return 2 ;; esac
-    [[ $(docker volume inspect -f '{{index .Labels "org.aep.pilot"}}' "$name-workspace") == "$name" ]]
+    [[ $(docker volume inspect -f '{{index .Labels "org.aep.pilot"}}' "$workspace_volume") == "$name" ]]
     docker run --rm --network none --read-only \
-        --mount "type=volume,src=$name-workspace,dst=/pilot" \
+        --mount "type=volume,src=$workspace_volume,dst=/pilot" \
         "$helper_image" /bin/sh -ec '
             install -d -m 755 /pilot/drill
             case "$1" in
@@ -283,7 +312,7 @@ check_gate() {
 }
 
 remove_site() {
-    local suffix object key driver
+    local suffix object key driver existing
     local -a objects
     for driver in container network volume; do
         case "$driver" in
@@ -291,6 +320,20 @@ remove_site() {
             network) objects=(private ingress outbound); key=.Labels ;;
             volume) objects=(control-state control-keys tls worker-keys workspace); key=.Labels ;;
         esac
+        if [[ $driver == container || $driver == volume ]]; then
+            while IFS= read -r existing; do
+                case "$driver:$existing" in
+                    container:"$name-worker-"*|volume:"$name-worker-keys-"*|volume:"$name-workspace-"*)
+                        objects+=("${existing#"$name-"}") ;;
+                esac
+            done < <(
+                if [[ $driver == volume ]]; then
+                    docker volume ls --filter "label=$label" --format '{{.Name}}'
+                else
+                    docker container ls -a --filter "label=$label" --format '{{.Names}}'
+                fi
+            )
+        fi
         for suffix in "${objects[@]}"; do
             object="$name-$suffix"
             if ! docker "$driver" inspect "$object" >/dev/null 2>&1; then continue; fi
@@ -307,11 +350,13 @@ remove_site() {
 case "${1:-}" in
     serve) shift; service "$@" ;;
     upgrade) shift; source "$script_dir/upgrade.sh"; upgrade_site "$@" ;;
+    worker-config) shift; worker_config "$@" ;;
+    worker-keys) shift; worker_keys "$@" ;;
     workspace) shift; prepare_workspace "$@" ;;
     credential) shift; model_credential "$@" ;;
     worker) shift; worker "$@" ;;
     export) shift; export_runs "$@" ;;
     gate) shift; check_gate "$@" ;;
     remove) shift; remove_site "$@" ;;
-    *) echo "Usage: $0 serve PRIVATE-DIR | upgrade ACCESS-DIR RECEIPT-DIR | workspace HTTPS-REPO BRANCH GIT-NAME GIT-EMAIL | credential codex|claude < AUTH-JSON | worker [WORKER-ARGS] | export EVIDENCE-DIR RUN [RUN...] | gate hold|release | remove" >&2; exit 2 ;;
+    *) echo "Usage: $0 serve PRIVATE-DIR | upgrade ACCESS-DIR RECEIPT-DIR | worker-config ACCESS-DIR | worker-keys ACCESS-DIR | workspace HTTPS-REPO BRANCH GIT-NAME GIT-EMAIL | credential codex|claude < AUTH-JSON | worker [WORKER-ARGS] | export EVIDENCE-DIR RUN [RUN...] | gate hold|release | remove" >&2; exit 2 ;;
 esac

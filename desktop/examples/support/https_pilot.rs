@@ -228,7 +228,7 @@ pub(super) fn choose(ui: &mut Driver<'_>, list: &str, id: &str) -> Result<()> {
     ui.click(id)
 }
 
-fn docker(args: &[&str]) -> Result<String> {
+pub(super) fn docker(args: &[&str]) -> Result<String> {
     let result = std::process::Command::new("docker").args(args).output()?;
     ensure!(
         result.status.success(),

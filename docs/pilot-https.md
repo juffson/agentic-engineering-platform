@@ -33,6 +33,18 @@ Studio 会等待控制面重新连接并收齐旧 Run 的终止事件。Lease �
 
 发布和合并各需一次 Studio 确认。CI 核对结果、恢复事件、候选、验收、审查和合并回执存入本地会话归档。合并后同步该会话的操作端克隆，并清理已发布的候选分支。
 
+### 多 Worker 并行
+
+同一 HTTPS 控制面可注册多台 Worker，每台同时持有一条 Run。Studio 的 **HTTPS 任务队列** 显示各 Worker 的心跳状态、任务与当前阶段，以及排队位置。心跳超过 Lease 时限时，该 Worker 显示离线，其他在线 Worker 可继续运行或领取队列中的可执行任务。断线 Run 已生成候选时，重新验收会留给原 Worker，沿用同一候选 SHA。
+
+每台 Worker 使用独立的令牌、安装身份、仓库和证据目录。原站点的设备令牌仍对应默认的 `<站点>-worker`。新增 Worker 时，在可信操作机的访问目录中准备权限为 600 的 `workers.json`，对象的键为完整 Worker ID，例如 `<站点>-worker-two`，值为单独生成的随机令牌。文件应列出该站点所有额外 Worker。部署顺序如下。
+
+1. 以默认槽调用 `site.sh worker-config <访问目录>`，在空闲站点升级控制面。
+2. 设置 `AEP_PILOT_WORKER_SLOT=two`，调用 `site.sh worker-keys <访问目录>`，再按下方部署步骤为该槽准备仓库和模型凭证。
+3. 用同一槽运行 `site.sh worker --detach --upload-evidence`。Studio 会在首个心跳后显示新 Worker。
+
+离屏复跑可用 `ui_debug --live-https-workers --output-dir <目录>`。先连接这个空闲站点，准备两条已固定 Spec 的任务和各自的 `test/` 目标分支。将 `AEP_STUDIO_LIVE_WORKERS_PLAN` 指向含 `site`、`second_slot`、`recover`、`steady` 的 JSON 文件，两条任务各包含 `task` 和 `target`。Worker 验收命令应以部署手册中的容器验收门闩等待，保证有足够时间断开指定 Worker。此演练只断开目标 Worker 的 Docker 私网，发布和合并仍各自确认。断线演练完成后若终端退出，设置 `AEP_STUDIO_LIVE_WORKERS_RESUME=1` 可继续两个已保存的任务。
+
 ### 队列管理
 
 在 **HTTPS 试点 → 真实任务** 使用现有连接，或填写站点后点 **连接队列**。**暂停派发** 保留等待队列的顺序并阻止发出新 Lease。已在运行的 Worker 可以继续上报。可对等待的任务上移或下移，控制面会保存顺序，关闭 Studio 或重启控制面后都可恢复。选择 **恢复派发** 让空闲 Worker 按新顺序领取。

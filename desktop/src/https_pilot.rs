@@ -45,6 +45,7 @@ pub(crate) struct Progress {
     pub candidate: String,
     pub old_run: String,
     pub recovered_run: String,
+    pub worker: String,
     pub pr: Option<u64>,
     pub archive: bool,
     pub reason: String,
@@ -666,8 +667,20 @@ mod tests {
         assert!(child.wait()?.success());
         assert_eq!(ready.trim(), "ready");
         assert!(was_locked);
-        session.refresh();
-        assert!(session.can_resume());
+        // Another test can fork while the lock descriptor is open. Its next exec
+        // releases that short-lived copy, so wait for the observable unlock.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            session.refresh();
+            if session.can_resume() {
+                break;
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "the saved task stayed locked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(session.retry_needed());
         Ok(())
     }
