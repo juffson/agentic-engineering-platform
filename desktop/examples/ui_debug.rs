@@ -38,7 +38,7 @@ enum Scenario {
 #[derive(Parser)]
 #[command(
     about = "Exercise AEP Studio in a temporary Git workspace, using an offscreen GPUI window",
-    group(ArgGroup::new("live").args(["live_relay", "live_lifecycle", "live_https_pilot"]))
+    group(ArgGroup::new("live").args(["live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote"]))
 )]
 struct Args {
     /// Run just one scenario (default: all)
@@ -68,6 +68,9 @@ struct Args {
     /// Run the live HTTPS pilot through Studio, requiring both operator confirmations
     #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo", "codex_model"])]
     live_https_pilot: bool,
+    /// Select and run a real task against an already deployed HTTPS control plane
+    #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo", "codex_model"])]
+    live_https_remote: bool,
     /// Override the Codex model for both rounds of the live relay
     #[arg(long, requires = "live")]
     codex_model: Option<String>,
@@ -1270,6 +1273,9 @@ fn relay(args: &Args, clients: Clients<'_>, reference: Option<&str>) -> Result<(
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
+    if args.live_https_remote {
+        return https_pilot::run_remote(args);
+    }
     if args.live_https_pilot {
         return https_pilot::run(args);
     }

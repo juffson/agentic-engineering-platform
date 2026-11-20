@@ -1,6 +1,6 @@
 # HTTPS 私有试点
 
-这一部署在 Docker/Linux VM 内运行控制面和一个 Worker。操作端通过宿主机回环端口访问，Worker 从独立的内部网络连入 HTTPS。Nginx 只转发 `/v1/control`，AEP 本身监听共享网络命名空间里的回环地址。证书由专用 CA 签发，客户端使用 `--ca-cert` 验证签名和访问名称。
+这一部署在 Docker/Linux VM 内运行控制面和一个 Worker。操作端通过宿主机回环端口访问，Worker 从独立的内部网络连入 HTTPS。Nginx 转发 `/v1/control` 和 `/v1/evidence/`，AEP 本身监听共享网络命名空间里的回环地址。证书由专用 CA 签发，客户端使用 `--ca-cert` 验证签名和访问名称。
 
 ## 在 Studio 运行
 
@@ -15,6 +15,27 @@
 ```sh
 cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
   --live-https-pilot --output-dir desktop/target/live-https-ui
+```
+
+### 派发真实任务
+
+在 Studio 的 **HTTPS 试点 → 真实任务** 选择本地 GitHub 克隆、已派发的任务和目标分支。填写 HTTPS 控制面的 origin、操作员令牌文件路径，以及私有 CA 的证书路径。使用系统信任的证书时可将 CA 留空。被选中的 Spec SHA 与目标 SHA 在派发前会重新核对。目标提交必须是 Spec 的祖先，且两者之间只包含任务目录中的变更。
+
+此流程连接已经部署的控制面。每个控制面对应一个项目，Worker 需要能匿名拉取所选的公开 GitHub 仓库。目标分支应包含 AEP 的独立验收工作流。使用更新后的控制面、Nginx 配置与 Worker，在远程 Worker 侧按部署步骤准备镜像、工作区和模型凭证，然后启动 `site.sh worker --detach --upload-evidence`。私网部署需要开放 `/v1/control` 和 `/v1/evidence/` 的 HTTPS 路由。
+
+Studio 会等待控制面重新连接并收齐旧 Run 的终止事件。Lease 过期时，有候选的 Run 会沿用同一 SHA 重新验收和审查，尚未生成候选的 Run 会重新派发实现。Worker 使用设备令牌和该 Run 的 Fence 上传固定范围的证据。操作员用其令牌读取对应工单的证据。单次传输上限为 24 MiB，控制面保留收到的原始证据以便重复下载。
+
+发布和合并各需一次 Studio 确认。CI 核对结果、恢复事件、候选、验收、审查和合并回执存入本地会话归档。合并后同步该会话的操作端克隆，并清理已发布的候选分支。
+
+离屏验收可对隔离 Docker 站点演练断线。站点名使用 `aep-https-real-` 前缀、Lease 设为 20 秒，任务和 `test/` 目标分支提前派发。调试程序只停止指定且标签匹配的试点入口，发布和合并仍分别等待确认。
+
+```sh
+export AEP_STUDIO_CONTROL_URL="$url" AEP_STUDIO_CONTROL_CA="$ca"
+export AEP_STUDIO_CONTROL_OPERATOR_FILE="$operator_file"
+export AEP_STUDIO_LIVE_TASK="$task" AEP_STUDIO_LIVE_TARGET="$target"
+export AEP_STUDIO_LIVE_OUTAGE_SITE="$site_name"
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
+  --live-https-remote --output-dir desktop/target/live-https-remote
 ```
 
 ## 一条命令重跑

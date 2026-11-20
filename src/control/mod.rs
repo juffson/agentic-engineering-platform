@@ -1,3 +1,4 @@
+mod evidence;
 mod http;
 mod state;
 mod worker;
@@ -67,6 +68,15 @@ enum Action {
         revise: bool,
     },
     Status,
+    /// Retrieve immutable, bounded evidence from a terminal remote Run.
+    Collect {
+        #[arg(long)]
+        ticket: String,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     Cancel {
         #[arg(long)]
         ticket: String,
@@ -113,6 +123,9 @@ enum Action {
         /// Process at most one Run, including any unacknowledged local result.
         #[arg(long)]
         once: bool,
+        /// Send allowlisted terminal evidence to the configured HTTPS control plane.
+        #[arg(long)]
+        upload_evidence: bool,
     },
 }
 
@@ -281,6 +294,7 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
             sandbox_launcher,
             journal_dir,
             once,
+            upload_evidence,
         } => {
             let sandbox = sandbox_launcher
                 .map(|path| path.canonicalize())
@@ -289,10 +303,13 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
                 &Repo::open(repo)?,
                 &url,
                 ca_cert.as_deref(),
-                codex_model.as_deref(),
-                sandbox.as_deref(),
                 journal_dir.as_deref(),
                 once,
+                worker::LaunchOptions {
+                    model: codex_model.as_deref(),
+                    sandbox: sandbox.as_deref(),
+                    upload_evidence,
+                },
             );
         }
         action => action,
@@ -300,6 +317,14 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
     let client = Client::new(&url, false, ca_cert.as_deref())?;
     let reply = match action {
         Action::Status => client.call(Operation::Status)?,
+        Action::Collect {
+            ticket,
+            run,
+            output,
+        } => {
+            evidence::unpack(&output, &run, &client.download(&ticket, &run)?)?;
+            return Ok(());
+        }
         Action::Cancel { ticket } => client.call(Operation::Cancel { ticket })?,
         Action::Retry { ticket, reverify } => client.call(Operation::Retry { ticket, reverify })?,
         Action::Submit {

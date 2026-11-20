@@ -1,5 +1,48 @@
 use super::*;
-use crate::https_pilot::{Artifact as Proof, Session};
+use crate::{
+    https_pilot::{Artifact as Proof, Request, Session},
+    lifecycle::{self, Choices},
+};
+use anyhow::{Context as _, ensure};
+
+pub(crate) struct RemoteForm {
+    source: Workspace,
+    endpoint: Entity<InputState>,
+    ca: Entity<InputState>,
+    operator_file: Entity<InputState>,
+    choices: Option<Choices>,
+}
+
+impl RemoteForm {
+    fn request(&self, cx: &App) -> Result<Request> {
+        let choices = self.choices.as_ref().context("请先加载仓库分支")?;
+        let endpoint = self.endpoint.read(cx).value().trim().to_owned();
+        let ca = self.ca.read(cx).value().trim().to_owned();
+        let token = self.operator_file.read(cx).value().trim().to_owned();
+        ensure!(
+            endpoint.starts_with("https://"),
+            "远程控制面需要 HTTPS 地址"
+        );
+        let operator_file = PathBuf::from(token);
+        ensure!(
+            operator_file.is_absolute() && operator_file.is_file(),
+            "请选择操作员令牌文件的绝对路径"
+        );
+        let ca = (!ca.is_empty()).then(|| PathBuf::from(ca));
+        ensure!(
+            ca.as_ref()
+                .is_none_or(|path| path.is_absolute() && path.is_file()),
+            "请填写 CA 证书文件的绝对路径"
+        );
+        Ok(Request {
+            task: choices.task.clone().context("请选择已派发的任务")?,
+            branch: choices.branch.clone().context("请选择目标分支")?,
+            endpoint,
+            ca,
+            operator_file,
+        })
+    }
+}
 
 const PROOFS: [(Proof, &str, &str); 8] = [
     (Proof::Log, "log", "运行日志"),
@@ -17,6 +60,12 @@ fn phase(stage: &str) -> (usize, &'static str) {
         "preparation" => (0, "构建镜像并固定隔离分支"),
         "https" => (0, "启动 HTTPS 控制面并校验证书"),
         "candidate" => (1, "Codex 生成候选并进入独立验收"),
+        "remote_preflight" => (0, "校验 HTTPS、远程 Worker 和固定版本"),
+        "remote_dispatch" => (0, "通过 HTTPS 派发真实任务"),
+        "remote_checking" => (1, "远程 Worker 正在验收固定候选"),
+        "remote_reviewing" => (1, "远程 Claude 正在审查固定候选"),
+        "remote_outage" => (2, "HTTPS 连接中断，等待控制面恢复"),
+        "remote_retry" => (2, "原 Run 尚无候选，重新派发实现"),
         "outage" => (2, "HTTPS 入口已暂停，等待 Lease 过期"),
         "reconnect" => (2, "HTTPS 已恢复，核对过期发布拒绝和事件回放"),
         "recovery" => (2, "对同一候选重新验收，运行 Claude 审查"),
@@ -79,8 +128,13 @@ impl Studio {
         let Some(source) = self.https_source() else {
             return;
         };
+        let result = Session::launch(&source, &self.runner);
+        self.attach_https_pilot(result, cx);
+    }
+
+    fn attach_https_pilot(&mut self, result: Result<Session>, cx: &mut Context<Self>) {
         self.https_pilot_error = None;
-        match Session::launch(&source, &self.runner) {
+        match result {
             Ok(session) => self.https_pilot = Some(session),
             Err(error) => self.https_pilot_error = Some(format!("启动失败：{error:#}")),
         }
@@ -127,6 +181,192 @@ impl Studio {
         .detach();
     }
 
+    pub(crate) fn open_https_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = self.https_source() else {
+            return;
+        };
+        let mut input = |name, placeholder| {
+            let value = std::env::var(name).unwrap_or_default();
+            cx.new(|cx| {
+                let mut state = InputState::new(window, cx).placeholder(placeholder);
+                state.set_value(&value, window, cx);
+                state
+            })
+        };
+        self.https_remote_form = Some(RemoteForm {
+            source,
+            endpoint: input("AEP_STUDIO_CONTROL_URL", "https://control.example.org"),
+            ca: input("AEP_STUDIO_CONTROL_CA", "系统信任的证书可留空"),
+            operator_file: input("AEP_STUDIO_CONTROL_OPERATOR_FILE", "/path/to/operator"),
+            choices: None,
+        });
+        self.load_https_remote_choices(cx);
+    }
+
+    fn load_https_remote_choices(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.https_remote_form.as_mut() else {
+            return;
+        };
+        self.https_pilot_error = None;
+        form.choices = None;
+        let source = form.source.clone();
+        let runner = self.runner.clone();
+        let generation = self.workspace_generation;
+        let task = cx
+            .background_executor()
+            .spawn(async move { lifecycle::choices(&source, &runner) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.workspace_generation == generation
+                    && let Some(form) = this.https_remote_form.as_mut()
+                {
+                    match result {
+                        Ok(choices) => form.choices = Some(choices),
+                        Err(error) => {
+                            this.https_pilot_error =
+                                Some(format!("读取 GitHub 任务和分支失败：{error:#}"))
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn start_https_remote(&mut self, cx: &mut Context<Self>) {
+        if self.https_pilot.as_ref().is_some_and(Session::active) {
+            return;
+        }
+        let Some(form) = self.https_remote_form.as_ref() else {
+            return;
+        };
+        let result = form
+            .request(cx)
+            .and_then(|request| Session::launch_remote(&form.source, &self.runner, request));
+        if result.is_ok() {
+            self.https_remote_form = None;
+        }
+        self.attach_https_pilot(result, cx);
+    }
+
+    fn https_remote_form(&self, form: &RemoteForm, cx: &Context<Self>) -> Div {
+        let input = |label, state| {
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(caption(label))
+                .child(Input::new(state).aria_label(label))
+        };
+        let mut contents =
+            panel()
+                .flex_none()
+                .child(heading("HTTPS 真实任务"))
+                .child(field("仓库", &form.source.root.display().to_string()))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(button("https-change-repo", "选择仓库…", false).on_click(
+                            cx.listener(|this, _, window, cx| this.choose_repo(window, cx)),
+                        ))
+                        .child(
+                            button("https-refresh-choices", "刷新任务和分支", false).on_click(
+                                cx.listener(|this, _, _, cx| this.load_https_remote_choices(cx)),
+                            ),
+                        ),
+                )
+                .child(input("HTTPS 控制面", &form.endpoint))
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .child(input("CA 证书路径", &form.ca))
+                        .child(input("操作员令牌文件路径", &form.operator_file)),
+                );
+        if let Some(choices) = &form.choices {
+            let mut tasks = h_flex().gap_2().flex_wrap();
+            for task in &choices.tasks {
+                let task = task.clone();
+                tasks = tasks.child(
+                    button(
+                        format!("https-task-{}", task.name),
+                        task.name.clone(),
+                        choices.task.as_ref().is_some_and(|selected| {
+                            selected.sha == task.sha && selected.name == task.name
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(choices) = this
+                            .https_remote_form
+                            .as_mut()
+                            .and_then(|form| form.choices.as_mut())
+                        {
+                            choices.task = Some(task.clone());
+                            cx.notify();
+                        }
+                    })),
+                );
+            }
+            let mut branches = h_flex().gap_2().flex_wrap();
+            for branch in &choices.branches {
+                let branch = branch.clone();
+                branches = branches.child(
+                    button(
+                        format!("https-target-{}", branch.name),
+                        branch.name.clone(),
+                        choices
+                            .branch
+                            .as_ref()
+                            .is_some_and(|selected| selected.name == branch.name),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(choices) = this
+                            .https_remote_form
+                            .as_mut()
+                            .and_then(|form| form.choices.as_mut())
+                        {
+                            choices.branch = Some(branch.clone());
+                            cx.notify();
+                        }
+                    })),
+                );
+            }
+            contents = contents
+                .child(caption("选择已派发的任务"))
+                .child(
+                    div()
+                        .id("https-task-list")
+                        .test_support()
+                        .max_h(px(125.))
+                        .overflow_y_scroll()
+                        .child(tasks),
+                )
+                .child(caption("选择 GitHub 目标分支"))
+                .child(
+                    div()
+                        .id("https-target-list")
+                        .test_support()
+                        .max_h(px(125.))
+                        .overflow_y_scroll()
+                        .child(branches),
+                );
+            if let (Some(task), Some(branch)) = (&choices.task, &choices.branch) {
+                contents = contents
+                    .child(field("Spec SHA", &task.sha))
+                    .child(field("目标 SHA", &branch.sha))
+                    .child(
+                        button("https-dispatch", "派发给远程 Worker", true)
+                            .on_click(cx.listener(|this, _, _, cx| this.start_https_remote(cx))),
+                    );
+            }
+        } else if self.https_pilot_error.is_none() {
+            contents = contents.child(caption("正在读取 GitHub 任务和目标分支"));
+        }
+        contents
+    }
+
     pub(super) fn https_pilot_page(&self, cx: &Context<Self>) -> Div {
         let session = self.https_pilot.as_ref();
         let running = session.is_some_and(Session::active);
@@ -136,8 +376,20 @@ impl Studio {
             .child(heading("HTTPS 试点").text_2xl());
         if !running {
             header = header.child(
-                button("https-start", "启动隔离试点", true)
-                    .on_click(cx.listener(|this, _, _, cx| this.start_https_pilot(cx))),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        button(
+                            "https-real-mode",
+                            "真实任务",
+                            self.https_remote_form.is_some(),
+                        )
+                        .on_click(cx.listener(|this, _, w, cx| this.open_https_remote(w, cx))),
+                    )
+                    .child(
+                        button("https-start", "启动隔离试点", true)
+                            .on_click(cx.listener(|this, _, _, cx| this.start_https_pilot(cx))),
+                    ),
             );
         }
         let mut page = v_flex()
@@ -154,6 +406,9 @@ impl Studio {
             .child(caption("在独立 HTTPS 站点和 GitHub 测试分支运行 Codex、Claude 与断线恢复。发布和合并分别确认。"));
         if let Some(error) = &self.https_pilot_error {
             page = page.child(detail_text("https-action-error", error).text_color(rgb(RED)));
+        }
+        if !running && let Some(form) = &self.https_remote_form {
+            page = page.child(self.https_remote_form(form, cx));
         }
         let Some(session) = session else {
             return h_flex()
@@ -242,7 +497,7 @@ impl Studio {
                     button(
                         "https-confirm",
                         if is_merge {
-                            "确认合并隔离 PR"
+                            "确认合并 PR"
                         } else {
                             "确认发布并创建 PR"
                         },

@@ -655,6 +655,33 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn evidence_path(
+        &self,
+        id: &str,
+        ticket: Option<&str>,
+        fence: Option<&str>,
+    ) -> Result<PathBuf> {
+        ident(id, 64)?;
+        let run = self
+            .state
+            .attempts
+            .iter()
+            .find(|run| run.id == id)
+            .context("unknown Run")?;
+        ensure!(
+            ticket.is_none_or(|ticket| run.task.ticket == ticket)
+                && fence.is_none_or(|fence| run.fence.as_deref() == Some(fence)),
+            "evidence scope does not match the Run"
+        );
+        ensure!(
+            run.events
+                .last()
+                .is_some_and(|event| matches!(event.progress, Progress::Exit { .. })),
+            "evidence requires a recorded terminal event"
+        );
+        Ok(self.path.with_extension("evidence").join(id))
+    }
+
     pub fn open(path: PathBuf) -> Result<Self> {
         let lock = std::fs::OpenOptions::new()
             .create(true)
