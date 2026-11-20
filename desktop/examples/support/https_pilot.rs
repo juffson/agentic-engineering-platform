@@ -252,19 +252,48 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
     let target = setting("AEP_STUDIO_LIVE_TARGET")?;
     let site = setting("AEP_STUDIO_LIVE_OUTAGE_SITE")?;
     ensure!(
-        target.starts_with("test/") && site.starts_with("aep-https-real-"),
-        "real rehearsal needs an isolated GitHub target and rehearsal Docker site"
+        target.starts_with("test/") && aep::workspace::ident(&site, 40).is_ok(),
+        "real rehearsal needs an isolated GitHub target and a named Docker site"
     );
     let ingress = format!("{site}-https");
+    let control = format!("{site}-control");
     ensure!(
         docker(&[
             "inspect",
             "-f",
             "{{index .Config.Labels \"org.aep.pilot\"}}",
             &ingress
-        ])? == site,
-        "the outage target does not belong to the rehearsal site"
+        ])? == site
+            && docker(&[
+                "inspect",
+                "-f",
+                "{{index .Config.Labels \"org.aep.pilot\"}}",
+                &control
+            ])? == site,
+        "the outage target does not belong to the selected site"
     );
+    let bind = docker(&["port", &control, "8443/tcp"])?;
+    ensure!(
+        bind.starts_with("127.0.0.1:")
+            && setting("AEP_STUDIO_CONTROL_URL")? == format!("https://{bind}"),
+        "the Studio endpoint is not the selected site's loopback HTTPS binding"
+    );
+    let control_argv: Vec<String> = serde_json::from_str(&docker(&[
+        "inspect",
+        "-f",
+        "{{json .Config.Cmd}}",
+        &control,
+    ])?)?;
+    let lease: u64 = control_argv
+        .windows(2)
+        .find(|pair| pair[0] == "--lease-seconds")
+        .context("the deployed control plane has no explicit lease interval")?[1]
+        .parse()?;
+    ensure!(
+        (10..=120).contains(&lease),
+        "the rehearsal needs a Lease of 10–120 seconds"
+    );
+    let ingress_id = docker(&["inspect", "-f", "{{.Id}}", &ingress])?;
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .canonicalize()?;
@@ -330,13 +359,40 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
             "the remote Run selected a different scope"
         );
         ui.checkpoint("02-remote-worker")?;
-        docker(&["stop", "-t", "2", &ingress])?;
-        let mut outage = Outage(ingress.clone());
+        let current = read(&evidence.join("control-status.json"))?;
+        let run = checking["old_run"].as_str().context("missing scoped Run")?;
+        let attempts = current["data"]["attempts"]
+            .as_array()
+            .context("missing current ticket status")?;
+        ensure!(
+            attempts
+                .iter()
+                .any(|attempt| attempt["id"] == run && attempt["stage"] == "running")
+                && attempts
+                    .iter()
+                    .filter(|attempt| attempt["id"] != run)
+                    .all(|attempt| {
+                        matches!(
+                            attempt["stage"].as_str(),
+                            Some(
+                                "interrupted"
+                                    | "cancelled"
+                                    | "failed"
+                                    | "blocked"
+                                    | "published"
+                                    | "superseded"
+                            )
+                        )
+                    }),
+            "another ticket is active, or the scoped Run is no longer checking"
+        );
+        docker(&["stop", "-t", "2", &ingress_id])?;
+        let mut outage = Outage(ingress_id.clone());
         let disconnected_at = Instant::now();
         await_stage(&mut ui, "HTTPS 连接中断，等待控制面恢复", session, 18)?;
         ui.checkpoint("03-https-disconnected")?;
-        thread::sleep(Duration::from_secs(24).saturating_sub(disconnected_at.elapsed()));
-        docker(&["start", &ingress])?;
+        thread::sleep(Duration::from_secs(lease + 4).saturating_sub(disconnected_at.elapsed()));
+        docker(&["start", &ingress_id])?;
         outage.0.clear();
         await_stage(
             &mut ui,
