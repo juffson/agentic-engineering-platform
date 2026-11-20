@@ -152,6 +152,12 @@ if ! git -C "$operator" remote get-url origin >/dev/null 2>&1; then
     git -C "$operator" remote add origin "$origin"
 fi
 [[ $(git -C "$operator" remote get-url origin) == "$origin" ]] || fail "The source repository remote changed"
+if [[ $private == true && $origin == https://github.com/* ]]; then
+    # Use the signed-in operator in this session's checkout, including after a restart.
+    credential=credential.https://github.com.helper
+    git -C "$operator" config --local --replace-all "$credential" ''
+    git -C "$operator" config --local --add "$credential" '!gh auth git-credential'
+fi
 target_ref=refs/heads/$branch
 spec_ref=refs/heads/aep-task/$task
 pinned_ref=refs/aep/studio/spec
