@@ -1,0 +1,17 @@
+{
+  "title": "Convert pilot fixture seconds to milliseconds",
+  "allowed_paths": [
+    "specs/https-drill-d74cfb42702e3491/normalize.rs"
+  ],
+  "check": [
+    "sh",
+    "-ec",
+    "if test -f /etc/aep-pilot-container; then while test -f /pilot/drill/hold-checks; do sleep 1; done; fi; binary=$(mktemp); trap \"rm -f -- \\\"$binary\\\"\" EXIT; rustc --edition=2024 --test \"$1/acceptance.rs\" -o \"$binary\"; \"$binary\"",
+    "pilot-acceptance",
+    "specs/https-drill-d74cfb42702e3491"
+  ],
+  "criteria": [
+    "AC-1",
+    "AC-2"
+  ]
+}
