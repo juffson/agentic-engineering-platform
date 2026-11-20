@@ -8,6 +8,7 @@ codex_auth=${CODEX_HOME:-$HOME/.codex}/auth.json
 claude_auth=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json
 model=gpt-6.1-sol
 output=''
+studio_session=''
 while (( $# )); do
     case $1 in
         --help|-h)
@@ -16,23 +17,50 @@ Usage: deploy/pilot/live.sh [--output-dir DIRECTORY] [--codex-model MODEL]
                             [--codex-auth FILE] [--claude-auth FILE]
 
 Run the real Codex, Claude and GitHub HTTPS pilot on a fresh test branch.
-Requires a terminal for the publication and merge confirmations.
+Run in Studio or in a terminal for the publication and merge confirmations.
 USAGE
             exit 0 ;;
-        --output-dir|--codex-model|--codex-auth|--claude-auth)
+        --output-dir|--codex-model|--codex-auth|--claude-auth|--studio-session)
             [[ $# -ge 2 && -n $2 && $2 != --* ]] || { echo "$1 requires a value" >&2; exit 2; }
             case $1 in
                 --output-dir) output=$2 ;;
                 --codex-model) model=$2 ;;
                 --codex-auth) codex_auth=$2 ;;
                 --claude-auth) claude_auth=$2 ;;
+                --studio-session) studio_session=$2 ;;
             esac
             shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
-fail() { printf 'HTTPS pilot: %s\n' "$*" >&2; exit 1; }
+stage=preflight
+repository='' task='' branch='' candidate='' old_run='' recovered_run='' pr='' failure=''
+run_dir='' archive=''
+
+fail() {
+    failure=$*
+    printf 'HTTPS pilot: %s\n' "$failure" >&2
+    exit 1
+}
+
+studio_report() {
+    [[ -n $studio_session ]] || return 0
+    jq -n --arg stage "$stage" --arg repo "$repository" --arg task "$task" --arg branch "$branch" \
+        --arg candidate "$candidate" --arg old_run "$old_run" --arg recovered_run "$recovered_run" \
+        --arg pr "$pr" --arg archive "$archive" --arg reason "$failure" --argjson exit_code "${1:-null}" \
+        '{stage:$stage,repository:$repo,task:$task,branch:$branch,candidate:$candidate,old_run:$old_run,
+          recovered_run:$recovered_run,pr:(if $pr == "" then null else ($pr|tonumber) end),
+          archive:($archive!=""),reason:$reason,exit_code:$exit_code}' \
+        > "$studio_session/state.tmp"
+    mv -f "$studio_session/state.tmp" "$studio_session/state.json"
+}
+
+step() {
+    stage=$1
+    studio_report
+}
+
 retry_read() {
     local attempt
     for attempt in 1 2 3 4; do
@@ -43,7 +71,12 @@ retry_read() {
 }
 confirm() {
     local expected=$1 answer
-    printf 'Type "%s" to confirm, or press Enter to stop: ' "$expected" >&2
+    if [[ -z $studio_session ]]; then
+        printf 'Type "%s" to confirm, or press Enter to stop: ' "$expected" >&2
+    else
+        # Studio uses the full candidate SHA over the pipe it owns.
+        expected="${expected% *} $candidate"
+    fi
     if ! IFS= read -r answer <&3 || [[ $answer != "$expected" ]]; then
         printf 'Stopped at the operator gate. Evidence: %s\n' "$evidence" >&2
         exit 3
@@ -51,10 +84,20 @@ confirm() {
     printf '%s\t%s\n' "$(date -u +%FT%TZ)" "$expected" >> "$evidence/confirmations.tsv"
 }
 
-if ! { exec 3</dev/tty; } 2>/dev/null; then fail "A terminal is required for the publication and merge approvals"; fi
+if [[ -n $studio_session ]]; then
+    [[ -z $output && -d $studio_session && -p /dev/stdin ]] ||
+        fail "Studio requires a private session directory and a dedicated approval pipe"
+    studio_session=$(cd -- "$studio_session" && pwd -P)
+    output=$studio_session
+    exec 3<&0 </dev/null
+else
+    if ! { exec 3</dev/tty; } 2>/dev/null; then fail "A terminal is required for the publication and merge approvals"; fi
+fi
 for tool in cargo curl docker git gh jq openssl tar; do
     command -v "$tool" >/dev/null || fail "Install $tool"
 done
+trap 'studio_report $?' EXIT
+studio_report
 test -r "$codex_auth" || fail "Codex authentication file is missing. Sign in or pass --codex-auth."
 if [[ ! -r $claude_auth ]]; then
     if [[ $claude_auth != "$HOME/.claude/.credentials.json" || $(uname -s) != Darwin ]]; then
@@ -97,8 +140,7 @@ export AEP_PILOT_WORKER_IMAGE="aep-pilot-worker:$id"
 export AEP_PILOT_EGRESS_IMAGE="aep-pilot-egress:$id"
 export NO_PROXY="127.0.0.1${NO_PROXY:+,$NO_PROXY}"
 unset AEP_CONTROL_DEVICE_TOKEN AEP_CONTROL_OPERATOR_TOKEN
-old_run='' recovered_run='' pr='' candidate='' baseline='' spec='' site_created=''
-stage=preparation
+baseline='' spec='' site_created=''
 
 finish() {
     local status=$1 ids=()
@@ -133,9 +175,13 @@ finish() {
         '{exit_code:$exit_code,stage:$stage,repository:$repo,branch:$branch,candidate:$candidate,old_run:$old_run,recovered_run:$recovered_run,pr:$pr}' > "$evidence/result.json"
     if ! tar -czf "$run_dir/evidence.tar.gz" -C "$run_dir" evidence ||
         ! gzip -t "$run_dir/evidence.tar.gz"; then
+        failure="Could not package evidence"
         printf 'Could not package evidence at %s\n' "$run_dir" >&2
         (( status != 0 )) || status=1
+    else
+        archive=$run_dir/evidence.tar.gz
     fi
+    studio_report "$status"
     printf 'Evidence: %s/evidence.tar.gz\n' "$run_dir"
     exit "$status"
 }
@@ -143,6 +189,7 @@ trap 'finish $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+step preparation
 printf 'Trial %s starts on %s. Evidence: %s\n' "$task" "$branch" "$evidence"
 if ! "$script_dir/build.sh" > "$run_dir/build.log" 2>&1; then tail -50 "$run_dir/build.log" >&2; fail "Pilot images could not be built"; fi
 cargo build --quiet --locked --manifest-path "$repo/Cargo.toml" --target-dir "$repo/target" --bin aep
@@ -187,7 +234,7 @@ jq -e '.status=="failed" and .check_exit_code==101' "$baseline_dir/evidence.json
 cp "$baseline_dir/evidence.json" "$evidence/baseline.json"
 cp "$baseline_dir/checks.log" "$evidence/baseline-checks.log"
 
-stage=https
+step https
 site_created=yes
 "$script_dir/site.sh" serve "$private"
 endpoint="https://$(docker port "$site-control" 8443/tcp)"
@@ -230,10 +277,11 @@ else
     security find-generic-password -s 'Claude Code-credentials' -w | "$script_dir/site.sh" credential claude
 fi
 
-stage=candidate
+step candidate
 dispatch=(submit --ticket "$task" --task "$task" --spec "$spec" --target "$branch" --baseline "$baseline" --max-attempts 2 --timeout 600)
 retry_read control "${dispatch[@]}" > "$evidence/submission.json"
 old_run=$(jq -er '.data | select(.stage=="queued") | .id' "$evidence/submission.json")
+studio_report
 retry_read control "${dispatch[@]}" > "$evidence/duplicate.json"
 cmp "$evidence/submission.json" "$evidence/duplicate.json"
 "$script_dir/site.sh" gate hold
@@ -267,7 +315,7 @@ docker exec --user 10001:10001 --workdir /pilot/repo "$site-worker" /bin/sh -ec 
 ' sandbox "test/$task-read-only" > "$evidence/sandbox.json"
 printf 'Candidate %s is pinned. Disconnecting the HTTPS ingress.\n' "$candidate"
 
-stage=outage
+step outage
 docker stop -t 3 "$site-https" >/dev/null
 if curl --silent --noproxy '*' --max-time 3 --cacert "$private/ca.pem" "$endpoint/v1/control" >/dev/null 2>&1; then
     fail "The HTTPS ingress remained reachable during the outage"
@@ -276,6 +324,7 @@ sleep "$((lease + 3))"
 docker start "$site-https" >/dev/null
 wait_https "$evidence/expired.json"
 jq -e --arg run "$old_run" '.data.attempts[] | select(.id==$run) | .stage=="interrupted"' "$evidence/expired.json" >/dev/null
+step reconnect
 stale=$(jq -nc --arg ticket "$task" --arg run "$old_run" --arg spec "$spec" --arg candidate "$candidate" '
     {action:"begin_publication",ticket:$ticket,run:$run,spec:$spec,candidate:$candidate,report_sha256:("0"*64)}
 ')
@@ -291,9 +340,9 @@ jq -e --arg run "$old_run" --arg candidate "$candidate" '
 ' "$evidence/reconnected.json" >/dev/null || fail "The Worker did not stop and replay the stale Run"
 "$script_dir/site.sh" gate release
 
-stage=recovery
 control retry --ticket "$task" --reverify > "$evidence/retry.json"
 recovered_run=$(jq -er --arg previous "$old_run" '.data | select(.predecessor==$previous and .reverify) | .id' "$evidence/retry.json")
+step recovery
 printf 'Reverifying %s in Run %s with Claude.\n' "$candidate" "$recovered_run"
 "$script_dir/site.sh" worker --once --codex-model "$model" > "$evidence/worker-recovered.log" 2>&1
 control status > "$evidence/recovered.json"
@@ -318,10 +367,10 @@ cp -R "$evidence/worker/runs/." "$operator/.git/aep/runs/"
 git -C "$operator" diff --check "$spec" "$candidate"
 git -C "$operator" diff --no-ext-diff "$spec" "$candidate" > "$evidence/candidate.diff"
 
-stage=publish_confirmation
+step publish_confirmation
 printf 'Review %s/candidate.diff, %s/checks.log and %s/review.txt\n' "$evidence" "$last" "$last"
 confirm "publish ${candidate:0:12}"
-stage=publication
+step publication
 scope=(--ticket "$task" --run "$recovered_run" --spec "$spec" --candidate "$candidate")
 control approve "${scope[@]}" > "$evidence/approval.json"
 control publish "${scope[@]}" > "$evidence/publication.json"
@@ -332,9 +381,9 @@ printf 'Published https://github.com/%s/pull/%s\n' "$repository" "$pr"
 
 # shellcheck source=live-github.sh
 source "$script_dir/live-github.sh"
-stage=ci
+step ci
 wait_ci
-stage=merge_confirmation
+step merge_confirmation
 printf 'Review GitHub CI in %s/github-ci.json and the PR at https://github.com/%s/pull/%s\n' "$evidence" "$repository" "$pr"
 confirm "merge $pr ${candidate:0:12}"
 pr_view > "$evidence/github-before-merge.json"
@@ -342,9 +391,9 @@ check_pr "$evidence/github-before-merge.json"
 ready_rollup "$evidence/github-before-merge.json" || fail "GitHub checks or review are no longer ready"
 [[ $(approval_context "$evidence/github-ci.json") == "$(approval_context "$evidence/github-before-merge.json")" ]] ||
     fail "The candidate, reviews or CI changed during manual confirmation"
-stage=merge
+step merge
 gh pr merge "$pr" -R "$repository" --merge --match-head-commit "$candidate"
-stage=cleanup
+step cleanup
 sync_trial_branch
 stage=completed
 printf 'HTTPS pilot passed and merged to %s.\n' "$branch"
