@@ -23,10 +23,10 @@ pub struct Check {
 }
 
 fn valid_command(command: &[String]) -> bool {
-    !command.is_empty()
-        && command
-            .iter()
-            .all(|part| !part.is_empty() && !part.contains('\0'))
+    command
+        .first()
+        .is_some_and(|executable| !executable.is_empty())
+        && command.iter().all(|part| !part.contains('\0'))
 }
 
 fn valid_id(value: &str) -> bool {
@@ -48,7 +48,9 @@ impl TaskManifest {
             "invalid allowed_paths"
         );
         ensure!(
-            !self.check.is_empty() && self.check.iter().all(|part| !part.is_empty()),
+            self.check
+                .first()
+                .is_some_and(|executable| !executable.is_empty()),
             "check must contain a command"
         );
         ensure!(
@@ -94,5 +96,56 @@ impl TaskManifest {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(command: &[&str], additional: bool) -> TaskManifest {
+        let command: Vec<String> = command.iter().map(|part| (*part).to_owned()).collect();
+        let mut manifest = TaskManifest {
+            title: None,
+            allowed_paths: vec!["src/task.rs".into()],
+            check: vec!["true".into()],
+            criteria: vec![],
+            checks: vec![],
+        };
+        if additional {
+            manifest.checks.push(Check {
+                id: "extra".into(),
+                criteria: vec!["AC-1".into()],
+                command,
+            });
+        } else {
+            manifest.check = command;
+        }
+        manifest
+    }
+
+    #[test]
+    fn acceptance_commands_preserve_empty_arguments() {
+        for additional in [false, true] {
+            for command in [vec!["sh"], vec!["sh", ""], vec!["sh", "", "arg", ""]] {
+                assert!(manifest(&command, additional).validate().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn acceptance_commands_require_an_executable_and_reject_nul() {
+        for additional in [false, true] {
+            for command in [
+                vec![],
+                vec![""],
+                vec!["", "arg"],
+                vec!["sh\0"],
+                vec!["sh", "\0"],
+                vec!["sh", "", "arg\0"],
+            ] {
+                assert!(manifest(&command, additional).validate().is_err());
+            }
+        }
     }
 }
