@@ -4,6 +4,7 @@ use crate::{
 };
 use aep::{
     delivery::slug,
+    deploy_keys::WorkerKeys,
     workspace::{Workspace, git},
 };
 use anyhow::{Context, Result, ensure};
@@ -88,6 +89,8 @@ pub(crate) struct Snapshot {
     pub queue: Option<Queue>,
     #[serde(default)]
     pub workers: BTreeMap<String, Worker>,
+    #[serde(default)]
+    pub deploy_keys: BTreeMap<String, WorkerKeys>,
     pub attempts: Vec<Run>,
 }
 
@@ -135,6 +138,22 @@ pub(crate) enum Action {
         earlier: bool,
     },
     Cancel(Run),
+    DeployKey(KeyCommand),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KeyAction {
+    Prepare,
+    Install(String),
+    Verify(String),
+    Revoke(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyCommand {
+    pub worker: String,
+    pub installation: String,
+    pub action: KeyAction,
 }
 
 pub(crate) struct Site {
@@ -142,6 +161,7 @@ pub(crate) struct Site {
     pub connection: Connection,
     pub snapshot: Option<Snapshot>,
     pub pending: Option<Run>,
+    pub pending_revoke: Option<KeyCommand>,
     pub busy: bool,
     pub checked: Option<Instant>,
     pub error: Option<String>,
@@ -155,6 +175,7 @@ impl Site {
             connection,
             snapshot: None,
             pending: None,
+            pending_revoke: None,
             busy: false,
             checked: None,
             error: None,
@@ -219,7 +240,12 @@ pub(crate) fn perform(
                 .data
                 .attempts
                 .iter()
-                .all(|run| run.task.repository == repository),
+                .all(|run| run.task.repository == repository)
+                && reply
+                    .data
+                    .deploy_keys
+                    .values()
+                    .all(|entry| entry.repository == repository),
             "控制面属于另一个仓库"
         );
         Ok(reply.data)
@@ -257,6 +283,27 @@ pub(crate) fn perform(
                     "--stage",
                     &run.stage,
                 ])?,
+                Action::DeployKey(key) => {
+                    let (operation, fingerprint) = match &key.action {
+                        KeyAction::Prepare => ("prepare", None),
+                        KeyAction::Install(value) => ("install", Some(value)),
+                        KeyAction::Verify(value) => ("verify", Some(value)),
+                        KeyAction::Revoke(value) => ("revoke", Some(value)),
+                    };
+                    let mut argv = vec![
+                        "deploy-key",
+                        "--worker",
+                        &key.worker,
+                        "--installation",
+                        &key.installation,
+                        "--action",
+                        operation,
+                    ];
+                    if let Some(fingerprint) = fingerprint {
+                        argv.extend(["--fingerprint", fingerprint]);
+                    }
+                    command(&argv)?
+                }
                 Action::Status => unreachable!(),
             };
         }

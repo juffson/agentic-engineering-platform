@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     https_pilot::Connection,
-    https_queue::{self as queue, Action, Run, Site},
+    https_queue::{self as queue, Action, KeyAction, KeyCommand, Run, Site},
 };
 use std::time::Instant;
 
@@ -59,6 +59,7 @@ impl Studio {
         if !status {
             site.action_error = None;
             site.pending = None;
+            site.pending_revoke = None;
         }
         let source = site.source.clone();
         let connection = site.connection.clone();
@@ -106,6 +107,137 @@ impl Studio {
         })
         .detach();
         cx.notify();
+    }
+
+    fn https_deploy_keys(
+        &self,
+        site: &Site,
+        snapshot: &queue::Snapshot,
+        cx: &Context<Self>,
+    ) -> Div {
+        let mut section = v_flex().gap_2().child(heading("Worker Deploy Key"));
+        for (worker, entry) in &snapshot.deploy_keys {
+            let ready = !site.busy
+                && site.error.is_none()
+                && entry.request.is_none()
+                && snapshot
+                    .workers
+                    .get(worker)
+                    .is_some_and(|worker| worker.online);
+            let mut card = v_flex().gap_1().child(detail_text(
+                format!("https-key-scope-{worker}"),
+                &format!("{} · {worker}", entry.repository),
+            ));
+            for (slot, label, key) in [
+                ("active", "生效密钥", entry.inventory.active.as_ref()),
+                ("staged", "待切换密钥", entry.inventory.staged.as_ref()),
+                (
+                    "retiring",
+                    "待撤销旧密钥",
+                    entry.inventory.retiring.as_ref(),
+                ),
+            ] {
+                if let Some(key) = key {
+                    card = card.child(detail_text(
+                        format!("https-key-{slot}-{worker}"),
+                        &format!("{label} · {}", key.fingerprint),
+                    ));
+                }
+            }
+            let status = if entry.request.is_some() {
+                "等待 Worker 空闲后执行凭证操作"
+            } else if entry.verified_at.is_some() {
+                "上次验证通过 · GitHub 只读 · Worker 可读取"
+            } else if entry.inventory.active.is_some() {
+                "等待验证生效密钥的只读权限"
+            } else {
+                "等待配置 Deploy Key"
+            };
+            card = card.child(detail_text(format!("https-key-status-{worker}"), status));
+            if let Some(error) = entry
+                .last
+                .as_ref()
+                .and_then(|receipt| receipt.error.as_ref())
+            {
+                card = card.child(
+                    detail_text(format!("https-key-error-{worker}"), error).text_color(rgb(RED)),
+                );
+            }
+            if ready {
+                let command = |action| KeyCommand {
+                    worker: worker.clone(),
+                    installation: entry.installation.clone(),
+                    action,
+                };
+                let mut buttons = h_flex().gap_2().flex_wrap();
+                let control = |id: &str, label: &str, action| {
+                    let action = Action::DeployKey(command(action));
+                    button(format!("https-key-{id}-{worker}"), label.to_owned(), false).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.https_queue_action(action.clone(), cx)
+                        }),
+                    )
+                };
+                if let Some(key) = &entry.inventory.active {
+                    buttons = buttons.child(control(
+                        "verify",
+                        "验证只读",
+                        KeyAction::Verify(key.fingerprint.clone()),
+                    ));
+                }
+                if let Some(staged) = &entry.inventory.staged {
+                    buttons = buttons.child(control(
+                        "install",
+                        "注册只读并切换",
+                        KeyAction::Install(staged.fingerprint.clone()),
+                    ));
+                } else if let Some(retiring) = &entry.inventory.retiring {
+                    if entry.verified_at.is_some() {
+                        let revoke = command(KeyAction::Revoke(retiring.fingerprint.clone()));
+                        if site.pending_revoke.as_ref() == Some(&revoke) {
+                            card = card.child(caption(format!(
+                                "从 {} 撤销 {}",
+                                entry.repository, retiring.fingerprint
+                            )));
+                            buttons = buttons.child(control(
+                                "confirm-revoke",
+                                "确认撤销旧密钥",
+                                revoke.action,
+                            ));
+                        } else {
+                            buttons = buttons.child(
+                                button(
+                                    format!("https-key-review-revoke-{worker}"),
+                                    "撤销旧密钥",
+                                    false,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        if let Some(site) = &mut this.https_queue {
+                                            site.pending_revoke = Some(revoke.clone());
+                                            cx.notify();
+                                        }
+                                    },
+                                )),
+                            );
+                        }
+                    }
+                } else {
+                    buttons = buttons.child(control(
+                        "prepare",
+                        if entry.inventory.active.is_some() {
+                            "准备轮换"
+                        } else {
+                            "生成密钥"
+                        },
+                        KeyAction::Prepare,
+                    ));
+                }
+                card = card.child(buttons);
+            }
+            section = section.child(card);
+        }
+        section
     }
 
     pub(super) fn https_queue_panel(&self, site: &Site, cx: &Context<Self>) -> Div {
@@ -193,6 +325,9 @@ impl Studio {
                     ),
                 );
             }
+        }
+        if !snapshot.deploy_keys.is_empty() {
+            panel = panel.child(self.https_deploy_keys(site, snapshot, cx));
         }
         let runs = snapshot.visible_runs();
         if runs.is_empty() {

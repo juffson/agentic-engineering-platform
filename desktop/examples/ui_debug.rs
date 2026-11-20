@@ -1,6 +1,8 @@
 //! Run Studio's real event handlers in an offscreen GPUI window.
 #[path = "support/handoff.rs"]
 mod handoff_fixture;
+#[path = "support/https_keys.rs"]
+mod https_keys;
 #[path = "support/https_pilot.rs"]
 mod https_pilot;
 #[path = "support/https_queue.rs"]
@@ -42,7 +44,7 @@ enum Scenario {
 #[derive(Parser)]
 #[command(
     about = "Exercise AEP Studio in a temporary Git workspace, using an offscreen GPUI window",
-    group(ArgGroup::new("live").args(["live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers"]))
+    group(ArgGroup::new("live").args(["live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys"]))
 )]
 struct Args {
     /// Run just one scenario (default: all)
@@ -76,7 +78,7 @@ struct Args {
     #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo", "codex_model"])]
     live_https_remote: bool,
     /// Use this existing GitHub checkout for the live HTTPS remote rehearsal
-    #[arg(long, requires = "live_https_remote")]
+    #[arg(long, requires = "live")]
     https_remote_repo: Option<PathBuf>,
     /// Rehearse HTTPS queue controls with two existing tasks on the same site.
     #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo", "codex_model"])]
@@ -84,6 +86,14 @@ struct Args {
     /// Verify two HTTPS Workers and an outage scoped to one of them.
     #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo", "codex_model"])]
     live_https_workers: bool,
+    /// Configure or rotate a Deploy Key through a live HTTPS Studio site.
+    #[arg(long, requires_all = ["output_dir", "https_remote_repo", "https_key_worker"], conflicts_with_all = ["scenario", "script", "repo", "codex_model"])]
+    live_https_keys: bool,
+    #[arg(long, requires = "live_https_keys")]
+    https_key_worker: Option<String>,
+    /// Confirm retirement of the previously rotated key through Studio.
+    #[arg(long, requires = "live_https_keys")]
+    https_key_revoke: bool,
     /// Override the Codex model for both rounds of the live relay
     #[arg(long, requires = "live")]
     codex_model: Option<String>,
@@ -1286,6 +1296,9 @@ fn relay(args: &Args, clients: Clients<'_>, reference: Option<&str>) -> Result<(
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
+    if args.live_https_keys {
+        return https_keys::run(args);
+    }
     if args.live_https_workers {
         return https_workers::run(args);
     }

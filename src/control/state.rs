@@ -1,5 +1,8 @@
 //! Single-project control-plane state. Only identifiers and execution summaries cross the wire.
-use aep::workspace::ident;
+use aep::{
+    deploy_keys::{Change, Inventory, Receipt, Request, WorkerKeys},
+    workspace::ident,
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -215,6 +218,8 @@ pub struct State {
     pub attempts: Vec<Attempt>,
     #[serde(default)]
     pub queue: Queue,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub deploy_keys: std::collections::BTreeMap<String, WorkerKeys>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -275,6 +280,19 @@ pub enum Operation {
         installation: String,
         profile: Profile,
     },
+    KeySync {
+        installation: String,
+        profile: Profile,
+        repository: String,
+        inventory: Inventory,
+        receipt: Option<Receipt>,
+    },
+    KeyRequest {
+        repository: String,
+        worker: String,
+        installation: String,
+        change: Change,
+    },
     Renew {
         run: String,
         fence: String,
@@ -290,7 +308,7 @@ impl Operation {
     pub fn for_device(&self) -> bool {
         matches!(
             self,
-            Self::Poll { .. } | Self::Renew { .. } | Self::Report { .. }
+            Self::Poll { .. } | Self::Renew { .. } | Self::Report { .. } | Self::KeySync { .. }
         )
     }
 }
@@ -303,6 +321,7 @@ pub enum Reply {
     Polled(Option<Lease>),
     Renewed { cancel: bool, stale: bool },
     Ack(usize),
+    KeyWork(Option<Request>),
 }
 
 impl State {
@@ -430,7 +449,11 @@ impl State {
         ensure!(
             self.attempts
                 .first()
-                .is_none_or(|a| a.task.repository == task.repository),
+                .is_none_or(|a| a.task.repository == task.repository)
+                && self
+                    .deploy_keys
+                    .values()
+                    .all(|entry| entry.repository == task.repository),
             "control plane already belongs to another repository"
         );
         if let Some(previous) = self.last(&task.ticket) {
@@ -491,14 +514,13 @@ impl State {
         Ok(self.enqueue(previous.task.clone(), Some(previous.id.clone()), worker))
     }
 
-    fn poll(
+    fn touch_worker(
         &mut self,
         device: &str,
         installation: String,
         profile: Profile,
         now: u64,
-        ttl: u64,
-    ) -> Result<Reply> {
+    ) -> Result<()> {
         profile.validate()?;
         ident(&installation, 64)?;
         ensure!(
@@ -526,15 +548,105 @@ impl State {
         {
             self.device = Some(worker);
         }
-        let active = self.attempts.iter().find(|run| {
+        Ok(())
+    }
+
+    fn active_run(&self, device: &str) -> Option<&Attempt> {
+        self.attempts.iter().find(|run| {
             run.worker.as_deref() == Some(device)
                 && matches!(run.stage, Stage::Running | Stage::CancelPending)
-        });
-        if let Some(run) = active {
+        })
+    }
+
+    fn key_sync(
+        &mut self,
+        device: &str,
+        repository: String,
+        inventory: Inventory,
+        receipt: Option<Receipt>,
+        now: u64,
+    ) -> Result<Reply> {
+        ensure!(
+            repository.len() <= 200
+                && aep::delivery::slug(&format!("https://github.com/{repository}"))? == repository
+                && self
+                    .attempts
+                    .first()
+                    .is_none_or(|a| a.task.repository == repository)
+                && self
+                    .deploy_keys
+                    .values()
+                    .all(|entry| entry.repository == repository),
+            "Deploy Keys belong to another repository"
+        );
+        inventory.validate()?;
+        if let Some(receipt) = &receipt {
+            ident(&receipt.id, 64)?;
+            ensure!(
+                receipt
+                    .error
+                    .as_ref()
+                    .is_none_or(|error| error.len() <= 512 && !error.chars().any(char::is_control)),
+                "invalid Deploy Key receipt"
+            );
+        }
+        let idle = self.active_run(device).is_none();
+        let entry = self
+            .deploy_keys
+            .entry(device.into())
+            .or_insert_with(|| WorkerKeys {
+                repository,
+                installation: self.workers[device].installation.clone(),
+                inventory: Inventory::default(),
+                request: None,
+                last: None,
+                verified_at: None,
+            });
+        if entry.inventory.active != inventory.active {
+            entry.verified_at = None;
+        }
+        if let Some(receipt) = receipt
+            && entry
+                .request
+                .as_ref()
+                .is_some_and(|request| request.id == receipt.id)
+        {
+            let request = entry.request.take().context("missing Deploy Key request")?;
+            if receipt.error.is_none() && request.change.verifies_active(&inventory) {
+                entry.verified_at = Some(now);
+            }
+            if receipt.error.is_some() && matches!(request.change, Change::Verify { .. }) {
+                entry.verified_at = None;
+            }
+            entry.last = Some(receipt);
+        }
+        entry.inventory = inventory;
+        Ok(Reply::KeyWork(if idle {
+            entry.request.clone()
+        } else {
+            None
+        }))
+    }
+
+    fn poll(
+        &mut self,
+        device: &str,
+        installation: String,
+        profile: Profile,
+        now: u64,
+        ttl: u64,
+    ) -> Result<Reply> {
+        self.touch_worker(device, installation, profile.clone(), now)?;
+        if let Some(run) = self.active_run(device) {
             // Re-deliver an unacknowledged lease, keeping the same Run ID and fence.
             return Ok(Reply::Polled(Some(lease(run)?)));
         }
-        if self.queue.paused {
+        if self.queue.paused
+            || (!self.deploy_keys.is_empty()
+                && self.deploy_keys.get(device).is_none_or(|entry| {
+                    entry.inventory.active.is_none() || entry.request.is_some()
+                }))
+        {
             return Ok(Reply::Polled(None));
         }
         let next = self.queue.order.iter().find_map(|id| {
@@ -614,6 +726,50 @@ impl State {
         self.normalize_queue();
         match operation {
             Operation::Status => Ok(self.snapshot(now, ttl)),
+            Operation::KeySync {
+                installation,
+                profile,
+                repository,
+                inventory,
+                receipt,
+            } => {
+                self.touch_worker(device, installation, profile, now)?;
+                self.key_sync(device, repository, inventory, receipt, now)
+            }
+            Operation::KeyRequest {
+                repository,
+                worker,
+                installation,
+                change,
+            } => {
+                ensure!(
+                    self.workers.get(&worker).is_some_and(|device| {
+                        device.installation == installation
+                            && now.saturating_sub(device.last_seen) < ttl
+                    }),
+                    "the selected Worker is offline or its installation changed"
+                );
+                let entry = self
+                    .deploy_keys
+                    .get_mut(&worker)
+                    .filter(|entry| {
+                        entry.repository == repository && entry.installation == installation
+                    })
+                    .context("the Worker does not manage Deploy Keys for this repository")?;
+                if let Some(request) = &entry.request {
+                    ensure!(
+                        request.change == change,
+                        "a Deploy Key operation is already pending"
+                    );
+                } else {
+                    change.validate(&entry.inventory)?;
+                    entry.request = Some(Request {
+                        id: uuid::Uuid::new_v4().simple().to_string(),
+                        change,
+                    });
+                }
+                Ok(self.snapshot(now, ttl))
+            }
             Operation::QueuePause { paused } => {
                 self.queue.paused = paused;
                 Ok(self.snapshot(now, ttl))
@@ -940,6 +1096,132 @@ mod tests {
             10,
         )?;
         poll(store, 2)
+    }
+
+    #[test]
+    fn deploy_key_requests_are_scoped_and_survive_restart_before_activation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let file = root.path().join("control.json");
+        let mut store = Store::open(file.clone())?;
+        let profile = Profile {
+            codex: "codex 1".into(),
+            claude: "claude 1".into(),
+        };
+        let sync = |inventory, receipt| Operation::KeySync {
+            installation: "installation-1".into(),
+            profile: profile.clone(),
+            repository: "owner/repo".into(),
+            inventory,
+            receipt,
+        };
+        let request = |repository: &str, change| Operation::KeyRequest {
+            repository: repository.into(),
+            worker: "device".into(),
+            installation: "installation-1".into(),
+            change,
+        };
+        let empty = Inventory::default();
+        store.apply(sync(empty.clone(), None), "device", 1, 10)?;
+        store.apply(
+            Operation::Dispatch {
+                task: task(),
+                revise: false,
+            },
+            "device",
+            2,
+            10,
+        )?;
+        assert!(matches!(
+            store.apply(
+                Operation::Poll {
+                    installation: "installation-1".into(),
+                    profile: profile.clone()
+                },
+                "device",
+                3,
+                10
+            )?,
+            Reply::Polled(None)
+        ));
+        assert!(
+            store
+                .apply(request("owner/other", Change::Prepare), "device", 4, 10)
+                .is_err()
+        );
+        store.apply(request("owner/repo", Change::Prepare), "device", 4, 10)?;
+        drop(store);
+        let mut store = Store::open(file)?;
+        let Reply::KeyWork(Some(prepare)) = store.apply(sync(empty, None), "device", 5, 10)? else {
+            anyhow::bail!("missing resumed key request");
+        };
+        assert_eq!(prepare.change, Change::Prepare);
+        let key = aep::deploy_keys::Key {
+            public: format!("ssh-ed25519 {}", "a".repeat(64)),
+            fingerprint: format!("SHA256:{}", "b".repeat(43)),
+        };
+        let staged = Inventory {
+            staged: Some(key.clone()),
+            ..Inventory::default()
+        };
+        store.apply(
+            sync(
+                staged.clone(),
+                Some(Receipt {
+                    id: prepare.id,
+                    error: None,
+                }),
+            ),
+            "device",
+            6,
+            10,
+        )?;
+        let activate = Change::Activate {
+            fingerprint: key.fingerprint.clone(),
+        };
+        store.apply(request("owner/repo", activate.clone()), "device", 6, 10)?;
+        let Reply::KeyWork(Some(failed)) =
+            store.apply(sync(staged.clone(), None), "device", 7, 10)?
+        else {
+            anyhow::bail!("missing activation");
+        };
+        store.apply(
+            sync(
+                staged.clone(),
+                Some(Receipt {
+                    id: failed.id,
+                    error: Some("read failed".into()),
+                }),
+            ),
+            "device",
+            8,
+            10,
+        )?;
+        let entry = &store.state.deploy_keys["device"];
+        assert_eq!(entry.inventory, staged);
+        assert_eq!(entry.verified_at, None);
+        store.apply(request("owner/repo", activate), "device", 8, 10)?;
+        let Reply::KeyWork(Some(retry)) = store.apply(sync(staged, None), "device", 9, 10)? else {
+            anyhow::bail!("missing activation retry");
+        };
+        let active = Inventory {
+            active: Some(key),
+            ..Inventory::default()
+        };
+        store.apply(
+            sync(
+                active,
+                Some(Receipt {
+                    id: retry.id,
+                    error: None,
+                }),
+            ),
+            "device",
+            10,
+            10,
+        )?;
+        assert_eq!(store.state.deploy_keys["device"].verified_at, Some(10));
+        assert_eq!(poll(&mut store, 11)?.task.repository, "owner/repo");
+        Ok(())
     }
 
     #[test]

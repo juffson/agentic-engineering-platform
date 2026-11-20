@@ -1,7 +1,9 @@
+mod deploy_keys;
 mod evidence;
 mod http;
 mod state;
 mod worker;
+mod worker_keys;
 
 use crate::git::Repo;
 use aep::{
@@ -71,6 +73,17 @@ enum Action {
         revise: bool,
     },
     Status,
+    /// Manage repository-scoped Deploy Keys for one HTTPS Worker installation.
+    DeployKey {
+        #[arg(long)]
+        worker: String,
+        #[arg(long)]
+        installation: String,
+        #[arg(long, value_enum)]
+        action: deploy_keys::Action,
+        #[arg(long)]
+        fingerprint: Option<String>,
+    },
     /// Pause or resume new Worker leases.
     QueuePause {
         #[arg(long, action = clap::ArgAction::Set)]
@@ -142,6 +155,12 @@ enum Action {
         /// Trusted program receiving the checkout, repository, source ref and destination ref.
         #[arg(long)]
         repository_fetcher: Option<PathBuf>,
+        /// Worker-owned private directory for managed Deploy Keys.
+        #[arg(long, requires_all = ["repository_fetcher", "sandbox_launcher", "journal_dir"])]
+        deploy_key_directory: Option<PathBuf>,
+        /// Previously provisioned read-only Deploy Key, if this Worker already has one.
+        #[arg(long, requires = "deploy_key_directory")]
+        legacy_deploy_key: Option<PathBuf>,
         /// Keep device leases and the outbox in a trusted supervisor directory.
         #[arg(long)]
         journal_dir: Option<PathBuf>,
@@ -319,6 +338,8 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
             codex_model,
             sandbox_launcher,
             repository_fetcher,
+            deploy_key_directory,
+            legacy_deploy_key,
             journal_dir,
             once,
             upload_evidence,
@@ -334,11 +355,19 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
                 &url,
                 ca_cert.as_deref(),
                 journal_dir.as_deref(),
+                deploy_key_directory.as_deref().zip(fetcher.as_deref()).map(
+                    |(directory, fetcher)| worker::KeyOptions {
+                        directory,
+                        fetcher,
+                        legacy: legacy_deploy_key.as_deref(),
+                    },
+                ),
                 once,
                 worker::LaunchOptions {
                     model: codex_model.as_deref(),
                     sandbox: sandbox.as_deref(),
                     fetcher: fetcher.as_deref(),
+                    key: None,
                     upload_evidence,
                 },
             );
@@ -348,6 +377,26 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
     let client = Client::new(&url, false, ca_cert.as_deref())?;
     let reply = match action {
         Action::Status => client.call(Operation::Status)?,
+        Action::DeployKey {
+            worker,
+            installation,
+            action,
+            fingerprint,
+        } => {
+            ensure!(
+                url.starts_with("https://"),
+                "Deploy Key operations require HTTPS"
+            );
+            deploy_keys::execute(
+                &client,
+                &Workspace::open(repo)?,
+                &tool_path()?,
+                worker,
+                installation,
+                action,
+                fingerprint.as_deref(),
+            )?
+        }
         Action::Collect {
             ticket,
             run,
