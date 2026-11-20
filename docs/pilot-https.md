@@ -17,9 +17,15 @@ cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- \
   --live-https-pilot --output-dir desktop/target/live-https-ui
 ```
 
-### 派发真实任务
+### 创建与派发真实任务
 
-在 Studio 的 **HTTPS 试点 → 真实任务** 选择本地 GitHub 克隆、已派发的任务和目标分支。填写 HTTPS 控制面的 origin、操作员令牌文件路径，以及私有 CA 的证书路径。使用系统信任的证书时可将 CA 留空。被选中的 Spec SHA 与目标 SHA 在派发前会重新核对。目标提交必须是 Spec 的祖先，且两者之间只包含任务目录中的变更。
+在 Studio 的 **HTTPS 试点 → 真实任务** 选择本地 GitHub 克隆和目标分支。填写 HTTPS 控制面的 origin、操作员令牌文件路径，以及私有 CA 的证书路径。使用系统信任的证书时可将 CA 留空。
+
+选择已有任务可以直接派发。创建任务时先点 **创建 HTTPS 任务…**，填写任务 ID、Spec、允许修改的文件和验收命令，再点 **创建并派发给远程 Worker**。文件路径每行一个。验收命令可以是 JSON 参数数组，也可以是带 `check`、`criteria` 和 `checks` 的对象。
+
+Studio 会在私有工作区以选定的目标 SHA 创建 Spec 提交，固定到 `aep-task/<任务 ID>`，再通过 HTTPS 派发给 Worker。归档记录实际提交的 Spec、验收清单及派发回执。若 GitHub 已保存 Spec 而 HTTPS 派发失败，可以从已派发任务列表选择该版本重试。
+
+Spec SHA 与目标 SHA 在派发前会重新核对。目标提交必须是 Spec 的祖先，且两者之间只包含任务目录中的变更。
 
 此流程连接已经部署的控制面。每个控制面对应一个项目，Worker 需要能匿名拉取所选的公开 GitHub 仓库。目标分支应包含 AEP 的独立验收工作流。使用更新后的控制面、Nginx 配置与 Worker，在远程 Worker 侧按部署步骤准备镜像、工作区和模型凭证，然后启动 `site.sh worker --detach --upload-evidence`。私网部署需要开放 `/v1/control` 和 `/v1/evidence/` 的 HTTPS 路由。
 
@@ -28,6 +34,8 @@ Studio 会等待控制面重新连接并收齐旧 Run 的终止事件。Lease �
 发布和合并各需一次 Studio 确认。CI 核对结果、恢复事件、候选、验收、审查和合并回执存入本地会话归档。合并后同步该会话的操作端克隆，并清理已发布的候选分支。
 
 离屏验收可对已部署的 Docker 站点演练短时断线。提前固定任务和 `test/` 目标分支，并确认同站点没有其他活动工单。调试程序核对 Docker 标签、Studio 的回环 HTTPS 地址和正在检查的 Run，停止该入口超过一个 Lease 后恢复。发布和合并仍分别等待确认。
+
+要验证界面创建，仅提前准备 `test/` 目标分支，并将 `AEP_STUDIO_LIVE_DRAFT` 设为草稿 JSON 的路径。草稿包含 `title`、`spec`、`allowed_paths` 数组和 `acceptance` 对象，`AEP_STUDIO_LIVE_TASK` 使用尚未派发的任务 ID。
 
 ```sh
 export AEP_STUDIO_CONTROL_URL="$url" AEP_STUDIO_CONTROL_CA="$ca"

@@ -1,6 +1,7 @@
+use super::task_authoring::Authoring;
 use super::*;
 use crate::{
-    https_pilot::{Artifact as Proof, Request, Session},
+    https_pilot::{Artifact as Proof, Connection, Session, TaskSource},
     lifecycle::{self, Choices},
 };
 use anyhow::{Context as _, ensure};
@@ -11,11 +12,11 @@ pub(crate) struct RemoteForm {
     ca: Entity<InputState>,
     operator_file: Entity<InputState>,
     choices: Option<Choices>,
+    authoring: Option<Authoring>,
 }
 
 impl RemoteForm {
-    fn request(&self, cx: &App) -> Result<Request> {
-        let choices = self.choices.as_ref().context("请先加载仓库分支")?;
+    fn connection(&self, cx: &App) -> Result<Connection> {
         let endpoint = self.endpoint.read(cx).value().trim().to_owned();
         let ca = self.ca.read(cx).value().trim().to_owned();
         let token = self.operator_file.read(cx).value().trim().to_owned();
@@ -34,9 +35,7 @@ impl RemoteForm {
                 .is_none_or(|path| path.is_absolute() && path.is_file()),
             "请填写 CA 证书文件的绝对路径"
         );
-        Ok(Request {
-            task: choices.task.clone().context("请选择已派发的任务")?,
-            branch: choices.branch.clone().context("请选择目标分支")?,
+        Ok(Connection {
             endpoint,
             ca,
             operator_file,
@@ -61,6 +60,7 @@ fn phase(stage: &str) -> (usize, &'static str) {
         "https" => (0, "启动 HTTPS 控制面并校验证书"),
         "candidate" => (1, "Codex 生成候选并进入独立验收"),
         "remote_preflight" => (0, "校验 HTTPS、远程 Worker 和固定版本"),
+        "remote_create" => (0, "创建并固定任务 Spec"),
         "remote_dispatch" => (0, "通过 HTTPS 派发真实任务"),
         "remote_checking" => (1, "远程 Worker 正在验收固定候选"),
         "remote_reviewing" => (1, "远程 Claude 正在审查固定候选"),
@@ -199,6 +199,7 @@ impl Studio {
             ca: input("AEP_STUDIO_CONTROL_CA", "系统信任的证书可留空"),
             operator_file: input("AEP_STUDIO_CONTROL_OPERATOR_FILE", "/path/to/operator"),
             choices: None,
+            authoring: None,
         });
         self.load_https_remote_choices(cx);
     }
@@ -243,13 +244,39 @@ impl Studio {
         let Some(form) = self.https_remote_form.as_ref() else {
             return;
         };
-        let result = form
-            .request(cx)
-            .and_then(|request| Session::launch_remote(&form.source, &self.runner, request));
+        let result = (|| {
+            let connection = form.connection(cx)?;
+            let (task, branch) = if let Some(authoring) = &form.authoring {
+                (
+                    TaskSource::Draft(authoring.draft(cx)?),
+                    authoring.branch.clone(),
+                )
+            } else {
+                let choices = form.choices.as_ref().context("请先加载仓库分支")?;
+                (
+                    TaskSource::Existing(choices.task.clone().context("请选择已派发的任务")?),
+                    choices.branch.clone().context("请选择目标分支")?,
+                )
+            };
+            Session::launch_remote(&form.source, &self.runner, task, branch, connection)
+        })();
         if result.is_ok() {
             self.https_remote_form = None;
         }
         self.attach_https_pilot(result, cx);
+    }
+
+    fn open_https_authoring(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(form) = self.https_remote_form.as_mut()
+            && let Some(branch) = form
+                .choices
+                .as_ref()
+                .and_then(|choices| choices.branch.clone())
+        {
+            form.authoring = Some(Authoring::new(branch, window, cx));
+            self.https_pilot_error = None;
+            cx.notify();
+        }
     }
 
     fn https_remote_form(&self, form: &RemoteForm, cx: &Context<Self>) -> Div {
@@ -261,12 +288,16 @@ impl Studio {
                 .child(caption(label))
                 .child(Input::new(state).aria_label(label))
         };
-        let mut contents =
-            panel()
-                .flex_none()
-                .child(heading("HTTPS 真实任务"))
-                .child(field("仓库", &form.source.root.display().to_string()))
-                .child(
+        let mut contents = panel()
+            .flex_none()
+            .child(heading(if form.authoring.is_some() {
+                "创建 HTTPS 真实任务"
+            } else {
+                "HTTPS 真实任务"
+            }))
+            .child(field("仓库", &form.source.root.display().to_string()))
+            .when(form.authoring.is_none(), |contents| {
+                contents.child(
                     h_flex()
                         .gap_2()
                         .child(button("https-change-repo", "选择仓库…", false).on_click(
@@ -278,13 +309,35 @@ impl Studio {
                             ),
                         ),
                 )
-                .child(input("HTTPS 控制面", &form.endpoint))
-                .child(
-                    h_flex()
-                        .gap_3()
-                        .child(input("CA 证书路径", &form.ca))
-                        .child(input("操作员令牌文件路径", &form.operator_file)),
-                );
+            })
+            .child(input("HTTPS 控制面", &form.endpoint))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(input("CA 证书路径", &form.ca))
+                    .child(input("操作员令牌文件路径", &form.operator_file)),
+            );
+        if let Some(authoring) = &form.authoring {
+            return contents.child(authoring.fields(&form.source, false)).child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        button("https-create-and-dispatch", "创建并派发给远程 Worker", true)
+                            .on_click(cx.listener(|this, _, _, cx| this.start_https_remote(cx))),
+                    )
+                    .child(
+                        button("https-cancel-authoring", "返回任务选择", false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = this.https_remote_form.as_mut() {
+                                    form.authoring = None;
+                                    this.https_pilot_error = None;
+                                    cx.notify();
+                                }
+                            }),
+                        ),
+                    ),
+            );
+        }
         if let Some(choices) = &form.choices {
             let mut tasks = h_flex().gap_2().flex_wrap();
             for task in &choices.tasks {
@@ -360,6 +413,13 @@ impl Studio {
                         button("https-dispatch", "派发给远程 Worker", true)
                             .on_click(cx.listener(|this, _, _, cx| this.start_https_remote(cx))),
                     );
+            }
+            if choices.branch.is_some() {
+                contents = contents.child(
+                    button("https-open-authoring", "创建 HTTPS 任务…", true).on_click(
+                        cx.listener(|this, _, window, cx| this.open_https_authoring(window, cx)),
+                    ),
+                );
             }
         } else if self.https_pilot_error.is_none() {
             contents = contents.child(caption("正在读取 GitHub 任务和目标分支"));

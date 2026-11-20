@@ -242,6 +242,14 @@ impl Drop for Outage {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct AuthoredTask {
+    title: String,
+    spec: String,
+    allowed_paths: Vec<String>,
+    acceptance: Value,
+}
+
 pub(super) fn run_remote(mut args: Args) -> Result<()> {
     ensure!(
         io::stdin().is_terminal(),
@@ -298,6 +306,21 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         .join("..")
         .canonicalize()?;
     let ws = Workspace::open(&source)?;
+    let auth_draft: Option<AuthoredTask> = std::env::var_os("AEP_STUDIO_LIVE_DRAFT")
+        .map(|path| {
+            let bytes = fs::read(path)?;
+            Ok::<_, anyhow::Error>(serde_json::from_slice(&bytes)?)
+        })
+        .transpose()?;
+    let dispatch_ref = format!("refs/heads/aep-task/{task}");
+    if auth_draft.is_some() {
+        ensure!(
+            git(&ws.root, &["ls-remote", "--refs", "origin", &dispatch_ref])?
+                .trim()
+                .is_empty(),
+            "the authored rehearsal needs a fresh task ID"
+        );
+    }
     let parent = ws.data.join("https-studio");
     let before = sessions(&parent);
     let output = args
@@ -321,24 +344,49 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         ui.click("HTTPS 试点")?;
         ui.click("https-real-mode")?;
         let selected = format!("https-task-{task}");
+        let target_id = format!("https-target-{target}");
+        let choice = if auth_draft.is_some() {
+            &target_id
+        } else {
+            &selected
+        };
         let deadline = Instant::now() + Duration::from_secs(45);
-        while ui.absent(&selected)? {
+        while ui.absent(choice)? {
             ensure!(
                 Instant::now() < deadline,
-                "Studio did not load the pinned task"
+                "Studio did not load the selected task or target"
             );
             ui.settle()?;
             thread::sleep(Duration::from_millis(150));
         }
-        choose(&mut ui, "https-task-list", &selected)?;
-        choose(
-            &mut ui,
-            "https-target-list",
-            &format!("https-target-{target}"),
-        )?;
-        ui.reveal("https-pilot-page", "https-dispatch")?;
-        ui.checkpoint("01-task-target-selected")?;
-        ui.click("https-dispatch")?;
+        if auth_draft.is_none() {
+            choose(&mut ui, "https-task-list", &selected)?;
+        }
+        choose(&mut ui, "https-target-list", &target_id)?;
+        if let Some(draft) = &auth_draft {
+            ui.reveal("https-pilot-page", "https-open-authoring")?;
+            ui.click("https-open-authoring")?;
+            let paths = draft.allowed_paths.join("\n");
+            let acceptance = serde_json::to_string(&draft.acceptance)?;
+            for (id, value) in [
+                ("task-author-name", task.as_str()),
+                ("task-author-title", draft.title.as_str()),
+                ("task-author-spec", draft.spec.as_str()),
+                ("task-author-paths", paths.as_str()),
+                ("task-author-check", acceptance.as_str()),
+            ] {
+                ui.reveal("https-pilot-page", id)?;
+                ui.click(id)?;
+                ui.input(value)?;
+            }
+            ui.reveal("https-pilot-page", "https-create-and-dispatch")?;
+            ui.checkpoint("01-task-authored")?;
+            ui.click("https-create-and-dispatch")?;
+        } else {
+            ui.reveal("https-pilot-page", "https-dispatch")?;
+            ui.checkpoint("01-task-target-selected")?;
+            ui.click("https-dispatch")?;
+        }
         ui.scroll("https-pilot-page", 2_000.)?;
 
         let created = sessions(&parent);
@@ -358,6 +406,34 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
             checking["task"] == task && checking["branch"] == target,
             "the remote Run selected a different scope"
         );
+        if let Some(draft) = &auth_draft {
+            let authoring = read(&evidence.join("authoring.json"))?;
+            let spec = checking["spec"]
+                .as_str()
+                .context("missing created Spec SHA")?;
+            let plan = read(&evidence.join("plan.json"))?;
+            let manifest = read(&evidence.join("task.json"))?;
+            ensure!(
+                authoring["task"] == task
+                    && authoring["spec"] == spec
+                    && authoring["target"] == target
+                    && authoring["baseline"] == plan["baseline"]
+                    && plan["spec"] == spec
+                    && manifest["title"] == draft.title
+                    && manifest["allowed_paths"] == serde_json::json!(draft.allowed_paths)
+                    && manifest["check"] == draft.acceptance["check"]
+                    && manifest["criteria"] == draft.acceptance["criteria"]
+                    && fs::read_to_string(evidence.join("spec.md"))?.trim_end()
+                        == draft.spec.trim_end()
+                    && git(&ws.root, &["ls-remote", "--refs", "origin", &dispatch_ref])?.trim()
+                        == format!("{spec}\t{dispatch_ref}"),
+                "Studio did not create and dispatch the exact authored Spec"
+            );
+            fs::copy(
+                evidence.join("authoring.json"),
+                output.join("authored-task.json"),
+            )?;
+        }
         ui.checkpoint("02-remote-worker")?;
         let current = read(&evidence.join("control-status.json"))?;
         let run = checking["old_run"].as_str().context("missing scoped Run")?;
