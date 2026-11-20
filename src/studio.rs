@@ -102,11 +102,30 @@ pub fn preview(data: &Path, id: &str, artifact: Artifact) -> Result<Option<Previ
     };
     let len = file.metadata()?.len();
     let truncated = len > LIMIT;
-    file.seek(SeekFrom::Start(len.saturating_sub(LIMIT)))?;
+    let start = len.saturating_sub(LIMIT);
+    // Look behind the cutoff so only a split, valid character is omitted.
+    // Stray continuation bytes in the retained text must still decode lossily.
+    let lookbehind = start.min(3) as usize;
+    file.seek(SeekFrom::Start(start - lookbehind as u64))?;
     let mut bytes = Vec::new();
-    file.take(LIMIT).read_to_end(&mut bytes)?;
+    file.take(LIMIT + lookbehind as u64)
+        .read_to_end(&mut bytes)?;
+    let mut retained = lookbehind.min(bytes.len());
+    for i in 0..retained {
+        let width = match bytes[i] {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => continue,
+        };
+        let end = i + width;
+        if end > retained && end <= bytes.len() && std::str::from_utf8(&bytes[i..end]).is_ok() {
+            retained = end;
+            break;
+        }
+    }
     Ok(Some(Preview {
-        text: String::from_utf8_lossy(&bytes).into_owned(),
+        text: String::from_utf8_lossy(&bytes[retained..]).into_owned(),
         truncated,
     }))
 }
@@ -130,3 +149,66 @@ pub fn artifact_file(data: &Path, id: &str, artifact: Artifact) -> Result<Option
 #[cfg(test)]
 #[path = "studio_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod preview_boundary_tests {
+    use super::*;
+
+    fn read(bytes: &[u8]) -> Preview {
+        let data = tempfile::tempdir().unwrap();
+        let run = data.path().join("runs/test");
+        fs::create_dir_all(&run).unwrap();
+        fs::write(run.join("checks.log"), bytes).unwrap();
+        preview(data.path(), "test", Artifact::Checks)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn preserves_whole_characters_and_omits_only_split_characters() {
+        const LIMIT: usize = 48 * 1024;
+        for character in ["é", "€", "😀"] {
+            for cut in 0..character.len() {
+                let mut bytes = vec![b'x'; 4];
+                bytes.extend_from_slice(character.as_bytes());
+                bytes.resize(4 + cut + LIMIT, b'a');
+                let result = read(&bytes);
+                assert!(result.truncated);
+                let expected = if cut == 0 {
+                    format!("{character}{}", "a".repeat(LIMIT - character.len()))
+                } else {
+                    "a".repeat(LIMIT - (character.len() - cut))
+                };
+                assert_eq!(result.text, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn retains_lossy_decoding_for_actual_malformed_bytes() {
+        const LIMIT: usize = 48 * 1024;
+        // Includes stray continuations, overlong encodings, surrogates,
+        // out-of-range code points, and incomplete characters.
+        for malformed in [
+            &b"\x80\x80"[..],
+            &b"\xc0\x80"[..],
+            &b"\xe0\x80\x80"[..],
+            &b"\xed\xa0\x80"[..],
+            &b"\xf4\x90\x80\x80"[..],
+            &b"\xf0\x9f"[..],
+        ] {
+            let short = read(malformed);
+            assert!(!short.truncated);
+            assert_eq!(short.text, String::from_utf8_lossy(malformed));
+
+            for cut in 0..malformed.len() {
+                let mut bytes = vec![b'x'; 4];
+                bytes.extend_from_slice(malformed);
+                bytes.resize(4 + cut + LIMIT, b'a');
+                let result = read(&bytes);
+                assert!(result.truncated);
+                assert_eq!(result.text, String::from_utf8_lossy(&bytes[4 + cut..]));
+            }
+        }
+    }
+}
