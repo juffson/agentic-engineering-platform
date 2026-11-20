@@ -1,0 +1,15 @@
+{
+  "title": "Keep truncated Studio log previews aligned to UTF-8",
+  "allowed_paths": [
+    "src/studio.rs"
+  ],
+  "check": [
+    "sh",
+    "-ec",
+    "cp specs/preview-utf8-https-20261120-00cdfa/check.rs tests/aep_pilot_utf8.rs; trap \"rm -f tests/aep_pilot_utf8.rs\" EXIT; cargo test --locked --test aep_pilot_utf8"
+  ],
+  "criteria": [
+    "AC-1",
+    "AC-2"
+  ]
+}
