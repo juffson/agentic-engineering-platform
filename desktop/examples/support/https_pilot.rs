@@ -24,6 +24,7 @@ fn sessions(parent: &Path) -> HashSet<PathBuf> {
 fn await_stage(ui: &mut Driver<'_>, label: &str, session: &Path, seconds: u64) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
+        ui.cx.advance_clock(Duration::from_secs(1));
         ui.settle()?;
         let state = read(&session.join("state.json")).unwrap_or_default();
         ensure!(
