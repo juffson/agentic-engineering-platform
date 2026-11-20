@@ -1,6 +1,7 @@
 mod cleanup;
 mod github_pr;
 mod https_pilot;
+mod https_queue;
 pub mod lifecycle;
 mod publish;
 mod recent;
@@ -110,6 +111,7 @@ struct Studio {
     https_sessions: Vec<https_pilot::Entry>,
     https_background: Vec<https_pilot::Session>,
     https_polling: bool,
+    https_queue: Option<https_queue::Site>,
     https_pilot_error: Option<String>,
     https_remote_form: Option<view::https_pilot_page::RemoteForm>,
 }
@@ -182,6 +184,7 @@ impl Studio {
             https_sessions: Vec::new(),
             https_background: Vec::new(),
             https_polling: false,
+            https_queue: None,
             https_pilot_error: None,
             https_remote_form: None,
         };
@@ -275,6 +278,7 @@ impl Studio {
         let reopen_https = page == Page::HttpsPilot && self.https_remote_form.is_some();
         self.workspace_generation += 1;
         self.https_remote_form = None;
+        self.https_queue = None;
         self.lifecycle = lifecycle::load(&ws);
         self.task_authoring = None;
         self.lifecycle_doc = None;

@@ -105,7 +105,7 @@ impl Progress {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct Connection {
     pub endpoint: String,
     pub ca: Option<PathBuf>,
@@ -376,6 +376,12 @@ impl Session {
                 })
             })
             .collect()
+    }
+
+    pub fn saved_connection(source: &Workspace) -> Option<Connection> {
+        Self::roots(source).into_iter().find_map(|root| {
+            read_json::<Request>(root.join("request.json")).map(|request| request.connection)
+        })
     }
 
     pub fn latest(source: &Workspace) -> Option<PathBuf> {

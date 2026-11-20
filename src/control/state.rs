@@ -135,7 +135,7 @@ pub struct Event {
     pub progress: Progress,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     Queued,
@@ -207,6 +207,14 @@ pub struct Device {
 pub struct State {
     pub device: Option<Device>,
     pub attempts: Vec<Attempt>,
+    #[serde(default)]
+    pub queue: Queue,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Queue {
+    pub paused: bool,
+    pub order: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -217,8 +225,20 @@ pub enum Operation {
         revise: bool,
     },
     Status,
+    QueuePause {
+        paused: bool,
+    },
+    QueueMove {
+        run: String,
+        adjacent: String,
+        earlier: bool,
+    },
     Cancel {
         ticket: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_stage: Option<Stage>,
     },
     Retry {
         ticket: String,
@@ -280,6 +300,49 @@ pub enum Reply {
 }
 
 impl State {
+    fn normalize_queue(&mut self) {
+        // Attempt history stays in insertion order for retry and approval fencing.
+        let mut queued = self
+            .attempts
+            .iter()
+            .filter(|run| run.stage == Stage::Queued)
+            .map(|run| run.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        self.queue.order.retain(|id| queued.remove(id.as_str()));
+        self.queue.order.extend(
+            self.attempts
+                .iter()
+                .filter(|run| queued.contains(run.id.as_str()))
+                .map(|run| run.id.clone()),
+        );
+    }
+
+    fn snapshot(&self) -> Reply {
+        let mut snapshot = self.clone();
+        for run in &mut snapshot.attempts {
+            run.fence = None;
+        }
+        Reply::Snapshot(snapshot)
+    }
+
+    fn move_queued(&mut self, run: &str, adjacent: &str, earlier: bool) -> Result<Reply> {
+        let order = &mut self.queue.order;
+        let index = order
+            .iter()
+            .position(|id| id == run)
+            .context("Run is no longer queued")?;
+        let neighbor = if earlier {
+            index.checked_sub(1)
+        } else {
+            index.checked_add(1)
+        };
+        let neighbor = neighbor
+            .filter(|&i| order.get(i).is_some_and(|id| id == adjacent))
+            .context("Queue order changed; refresh before moving this Run")?;
+        order.swap(index, neighbor);
+        Ok(self.snapshot())
+    }
+
     fn expire(&mut self, now: u64) {
         for run in &mut self.attempts {
             if run.stage == Stage::Running && run.expires_at.is_some_and(|expiry| expiry <= now) {
@@ -417,9 +480,17 @@ impl State {
             // Re-deliver an unacknowledged lease, keeping the same Run ID and fence.
             return Ok(Reply::Polled(Some(lease(run)?)));
         }
-        let Some(next) = self.attempts.iter_mut().find(|a| a.stage == Stage::Queued) else {
+        if self.queue.paused {
+            return Ok(Reply::Polled(None));
+        }
+        let Some(next) = self.queue.order.first() else {
             return Ok(Reply::Polled(None));
         };
+        let next = self
+            .attempts
+            .iter_mut()
+            .find(|run| run.id == *next)
+            .context("queued Run is missing")?;
         next.stage = Stage::Running;
         next.fence = Some(uuid::Uuid::new_v4().simple().to_string());
         next.expires_at = Some(now + ttl);
@@ -484,14 +555,18 @@ impl State {
         ttl: u64,
     ) -> Result<Reply> {
         self.expire(now);
+        self.normalize_queue();
         match operation {
-            Operation::Status => {
-                let mut snapshot = self.clone();
-                for run in &mut snapshot.attempts {
-                    run.fence = None;
-                }
-                Ok(Reply::Snapshot(snapshot))
+            Operation::Status => Ok(self.snapshot()),
+            Operation::QueuePause { paused } => {
+                self.queue.paused = paused;
+                Ok(self.snapshot())
             }
+            Operation::QueueMove {
+                run,
+                adjacent,
+                earlier,
+            } => self.move_queued(&run, &adjacent, earlier),
             Operation::Dispatch { task, revise } => self.dispatch(task, revise),
             Operation::Retry { ticket, reverify } => self.retry(&ticket, reverify),
             Operation::Poll {
@@ -511,8 +586,21 @@ impl State {
                 Ok(Reply::Renewed { cancel, stale })
             }
             Operation::Report { run, fence, event } => self.report(&run, &fence, event),
-            Operation::Cancel { ticket } => {
+            Operation::Cancel {
+                ticket,
+                expected_run,
+                expected_stage,
+            } => {
                 let run = self.last_mut(&ticket)?;
+                ensure!(
+                    expected_run.is_none_or(|id| id == run.id),
+                    "Run changed; refresh before cancelling"
+                );
+                ensure!(
+                    expected_stage.is_none_or(|stage| stage == run.stage)
+                        || matches!(run.stage, Stage::Cancelled | Stage::CancelPending),
+                    "Run stage changed; review it before cancelling"
+                );
                 run.stage = match run.stage {
                     Stage::Running => Stage::CancelPending,
                     Stage::Interrupted if run.expires_at.is_some() => Stage::CancelPending,
@@ -711,6 +799,7 @@ impl Store {
     ) -> Result<Reply> {
         let mut next = self.state.clone();
         let reply = next.apply(operation, device, now, ttl)?;
+        next.normalize_queue();
         if next != self.state {
             save(&self.path, &next)?;
             self.state = next;
@@ -787,6 +876,120 @@ mod tests {
             10,
         )?;
         poll(store, 2)
+    }
+
+    #[test]
+    fn queue_controls_survive_restart_and_cancel_only_the_confirmed_run() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.json");
+        let mut store = Store::open(path.clone())?;
+        store.apply(Operation::QueuePause { paused: true }, "device", 1, 10)?;
+        let mut ids = Vec::new();
+        for ticket in ["first", "second"] {
+            let mut task = task();
+            task.ticket = ticket.into();
+            let Reply::Run(run) = store.apply(
+                Operation::Dispatch {
+                    task,
+                    revise: false,
+                },
+                "device",
+                1,
+                10,
+            )?
+            else {
+                anyhow::bail!("missing dispatched Run")
+            };
+            ids.push(run.id);
+        }
+        let shift = Operation::QueueMove {
+            run: ids[1].clone(),
+            adjacent: ids[0].clone(),
+            earlier: true,
+        };
+        store.apply(shift.clone(), "device", 2, 10)?;
+        assert!(store.apply(shift, "device", 2, 10).is_err());
+        drop(store);
+
+        let mut store = Store::open(path)?;
+        assert!(store.state.queue.paused);
+        assert_eq!(store.state.queue.order, [ids[1].clone(), ids[0].clone()]);
+        assert!(matches!(
+            store.apply(
+                Operation::Poll {
+                    installation: "installation-1".into(),
+                    profile: Profile {
+                        codex: "codex 1".into(),
+                        claude: "claude 1".into()
+                    }
+                },
+                "device",
+                3,
+                10
+            )?,
+            Reply::Polled(None)
+        ));
+        store.apply(Operation::QueuePause { paused: false }, "device", 4, 10)?;
+        let lease = poll(&mut store, 4)?;
+        assert_eq!(lease.run, ids[1]);
+        store.apply(Operation::QueuePause { paused: true }, "device", 4, 10)?;
+        assert_eq!(poll(&mut store, 4)?.run, lease.run);
+        let cancel = |id: &str, stage| Operation::Cancel {
+            ticket: "second".into(),
+            expected_run: Some(id.into()),
+            expected_stage: Some(stage),
+        };
+        assert!(
+            store
+                .apply(cancel(&ids[0], Stage::Running), "device", 5, 10)
+                .is_err()
+        );
+        assert!(
+            store
+                .apply(cancel(&ids[1], Stage::Queued), "device", 5, 10)
+                .is_err()
+        );
+        assert!(matches!(
+            store.apply(cancel(&ids[1], Stage::Running), "device", 5, 10)?,
+            Reply::Run(run) if run.stage == Stage::CancelPending
+        ));
+        assert_eq!(poll(&mut store, 6)?.run, ids[1]);
+        store.apply(
+            Operation::Report {
+                run: ids[1].clone(),
+                fence: lease.fence,
+                event: Event {
+                    sequence: 1,
+                    unix_seconds: 6,
+                    progress: Progress::Exit {
+                        outcome: Outcome::Passed,
+                        candidate: Some("3".repeat(40)),
+                    },
+                },
+            },
+            "device",
+            6,
+            10,
+        )?;
+        assert_eq!(store.state.attempts[1].stage, Stage::Cancelled);
+        assert!(matches!(
+            store.apply(
+                Operation::Poll {
+                    installation: "installation-1".into(),
+                    profile: Profile {
+                        codex: "codex 1".into(),
+                        claude: "claude 1".into()
+                    }
+                },
+                "device",
+                7,
+                10
+            )?,
+            Reply::Polled(None)
+        ));
+        store.apply(Operation::QueuePause { paused: false }, "device", 8, 10)?;
+        assert_eq!(poll(&mut store, 8)?.run, ids[0]);
+        Ok(())
     }
 
     #[test]
@@ -898,7 +1101,7 @@ mod tests {
         let mut store = Store::open(directory.path().join("control.json"))?;
         let lease = start(&mut store)?;
         assert!(
-            matches!(store.apply(Operation::Cancel { ticket: "pilot".into() }, "device", 14, 10)?, Reply::Run(run) if run.stage == Stage::CancelPending)
+            matches!(store.apply(Operation::Cancel { ticket: "pilot".into(), expected_run: None, expected_stage: None }, "device", 14, 10)?, Reply::Run(run) if run.stage == Stage::CancelPending)
         );
         assert!(matches!(
             store.apply(

@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn sessions(parent: &Path) -> HashSet<PathBuf> {
+pub(super) fn sessions(parent: &Path) -> HashSet<PathBuf> {
     fs::read_dir(parent)
         .into_iter()
         .flatten()
@@ -21,7 +21,12 @@ fn sessions(parent: &Path) -> HashSet<PathBuf> {
         .collect()
 }
 
-fn await_stage(ui: &mut Driver<'_>, label: &str, session: &Path, seconds: u64) -> Result<Value> {
+pub(super) fn await_stage(
+    ui: &mut Driver<'_>,
+    label: &str,
+    session: &Path,
+    seconds: u64,
+) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         ui.cx.advance_clock(Duration::from_secs(1));
@@ -45,7 +50,7 @@ fn await_stage(ui: &mut Driver<'_>, label: &str, session: &Path, seconds: u64) -
     }
 }
 
-fn confirm(ui: &mut Driver<'_>, action: &str, checkpoint: &str) -> Result<()> {
+pub(super) fn confirm(ui: &mut Driver<'_>, action: &str, checkpoint: &str) -> Result<()> {
     ensure!(
         ui.absent("https-confirm")?,
         "Studio exposed an unconfirmed action"
@@ -213,7 +218,7 @@ pub(super) fn run(mut args: Args) -> Result<()> {
     })
 }
 
-fn choose(ui: &mut Driver<'_>, list: &str, id: &str) -> Result<()> {
+pub(super) fn choose(ui: &mut Driver<'_>, list: &str, id: &str) -> Result<()> {
     if !ui.element(list)?.visible() {
         ui.reveal("https-pilot-page", list)?;
     }
