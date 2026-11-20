@@ -1,0 +1,1 @@
+{"title": "Document the Studio confirmation records", "allowed_paths": ["docs/pilot.md"], "check": ["sh", "-ec", "if test -f /etc/aep-pilot-container; then while test -f /pilot/drill/hold-checks; do sleep 1; done; fi\ncount=$(grep -Fcx -- '通过 HTTPS 派发的任务在 Studio 中分别确认发布和合并，并保留两项回执。' docs/pilot.md)\ntest \"$count\" = 1"], "criteria": ["AC-1"]}
