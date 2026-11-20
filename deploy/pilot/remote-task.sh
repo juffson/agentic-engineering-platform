@@ -84,8 +84,15 @@ spec=$(jq -er .task.sha "$request")
 endpoint=$(jq -er .endpoint "$request")
 ca=$(jq -r '.ca // empty' "$request")
 token_file=$(jq -er .operator_file "$request")
-[[ $task =~ ^[a-z0-9][a-z0-9-]{0,62}$ && $baseline =~ ^[a-f0-9]{40}$ && $spec =~ ^[a-f0-9]{40}$ &&
+[[ $task =~ ^[a-z0-9][a-z0-9-]{0,62}$ && $baseline =~ ^[a-f0-9]{40}$ &&
    $endpoint == https://* && -r $token_file ]] || fail "Invalid pinned task, HTTPS origin or operator token file"
+authored=no
+if [[ -z $spec ]]; then
+    [[ -s $session/draft/spec.md && -s $session/draft/task.json ]] || fail "Missing Studio task draft"
+    authored=yes
+else
+    [[ $spec =~ ^[a-f0-9]{40}$ ]] || fail "Invalid pinned Spec SHA"
+fi
 git check-ref-format "refs/heads/$branch"
 opts=(--url "$endpoint")
 if [[ -n $ca ]]; then
@@ -110,19 +117,54 @@ git -C "$operator" init --quiet --template=
 git -C "$operator" remote add origin "$origin"
 target_ref=refs/heads/$branch
 spec_ref=refs/heads/aep-task/$task
-retry_read git -C "$operator" fetch -q --no-tags origin \
-    "$target_ref:refs/aep/remote/baseline" "$spec_ref:refs/aep/remote/spec"
-[[ $(git -C "$operator" rev-parse refs/aep/remote/baseline) == "$baseline" &&
-   $(git -C "$operator" rev-parse refs/aep/remote/spec) == "$spec" ]] ||
-    fail "The selected Spec or target changed. Refresh the repository branches and select again."
+refs=("$target_ref:refs/aep/remote/baseline")
+if [[ $authored == no ]]; then refs+=("$spec_ref:refs/aep/remote/spec"); fi
+retry_read git -C "$operator" fetch -q --no-tags origin "${refs[@]}"
+[[ $(git -C "$operator" rev-parse refs/aep/remote/baseline) == "$baseline" ]] ||
+    fail "The selected target changed. Refresh the repository branches and select again."
 git -C "$operator" switch -qc "$branch" "$baseline"
-for file in spec.md task.json; do git -C "$operator" show "$spec:specs/$task/$file" > "$evidence/$file"; done
 retry_read control status > "$evidence/control-before.json"
 jq -e --arg repository "$repository" '
     (.data.attempts | all(.[]; .task.repository==$repository)) and
     (.data.device.installation | type=="string" and length>0)
 ' "$evidence/control-before.json" >/dev/null ||
     fail "The control plane belongs to another repository or has no registered Worker"
+
+if [[ $authored == yes ]]; then
+    step remote_create
+    existing_spec=$(retry_read git -C "$operator" ls-remote --refs origin "$spec_ref")
+    [[ -z $existing_spec ]] ||
+        fail "This task ID is already dispatched. Choose a new ID or select the existing task."
+    for key in user.name user.email; do
+        value=$(git -C "$source_repo" config --get "$key") ||
+            fail "Configure Git $key in the selected repository"
+        git -C "$operator" config --local "$key" "$value"
+    done
+    git -C "$operator" switch -q --detach "$baseline"
+    [[ ! -L $operator/specs ]] || fail "The selected target must have a regular specs directory"
+    mkdir -p "$operator/specs"
+    mkdir "$operator/specs/$task" || fail "The selected target already contains this task directory"
+    cp "$session/draft/spec.md" "$session/draft/task.json" "$operator/specs/$task/"
+    git -C "$operator" add -- "specs/$task"
+    git -C "$operator" -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm "Specify $task"
+    spec=$(git -C "$operator" rev-parse HEAD)
+    report
+    git -C "$operator" switch -q --no-guess -- "$branch"
+else
+    [[ $(git -C "$operator" rev-parse refs/aep/remote/spec) == "$spec" ]] ||
+        fail "The selected Spec changed. Refresh the repository branches and select again."
+fi
+for file in spec.md task.json; do git -C "$operator" show "$spec:specs/$task/$file" > "$evidence/$file"; done
+
+if [[ $authored == yes ]]; then
+    current_target=$(retry_read git -C "$operator" ls-remote --refs origin "$target_ref")
+    [[ $current_target == "$baseline"$'\t'"$target_ref" ]] ||
+        fail "The target changed before dispatch. Refresh the repository branches and select again."
+    retry_read "$aep" --repo "$operator" dispatch --task "$task" --rev "$spec" > "$evidence/spec-dispatch.txt"
+    jq -n --arg task "$task" --arg spec "$spec" --arg target "$branch" --arg base "$baseline" \
+        --arg ref "$spec_ref" '{task:$task,spec:$spec,target:$target,baseline:$base,dispatch_ref:$ref}' \
+        > "$evidence/authoring.json"
+fi
 jq -n --arg repo "$repository" --arg actor "$actor" --arg ticket "$ticket" --arg task "$task" \
     --arg branch "$branch" --arg baseline "$baseline" --arg spec "$spec" \
     '{repository:$repo,actor:$actor,ticket:$ticket,task:$task,target:$branch,baseline:$baseline,spec:$spec}' > "$evidence/plan.json"

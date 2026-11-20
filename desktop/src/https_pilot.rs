@@ -1,4 +1,8 @@
-use crate::{Runner, lifecycle::Branch, relay::Task};
+use crate::{
+    Runner,
+    lifecycle::{Branch, Draft},
+    relay::Task,
+};
 use aep::workspace::{Workspace, ident};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -102,12 +106,23 @@ impl Progress {
 }
 
 #[derive(Serialize)]
-pub(crate) struct Request {
-    pub task: Task,
-    pub branch: Branch,
+pub(crate) struct Connection {
     pub endpoint: String,
     pub ca: Option<PathBuf>,
     pub operator_file: PathBuf,
+}
+
+#[derive(Serialize)]
+struct Request {
+    task: Task,
+    branch: Branch,
+    #[serde(flatten)]
+    connection: Connection,
+}
+
+pub(crate) enum TaskSource {
+    Existing(Task),
+    Draft(Draft),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -198,9 +213,30 @@ impl Session {
         session.spawn(source, runner, command)
     }
 
-    pub fn launch_remote(source: &Workspace, runner: &Runner, request: Request) -> Result<Self> {
+    pub fn launch_remote(
+        source: &Workspace,
+        runner: &Runner,
+        task: TaskSource,
+        branch: Branch,
+        connection: Connection,
+    ) -> Result<Self> {
         let binary = runner.binary()?.canonicalize()?;
         let session = Self::allocate(source)?;
+        let task = match task {
+            TaskSource::Existing(task) => task,
+            TaskSource::Draft(draft) => {
+                draft.write_files(&session.root.join("draft"))?;
+                Task {
+                    name: draft.name,
+                    sha: String::new(),
+                }
+            }
+        };
+        let request = Request {
+            task,
+            branch,
+            connection,
+        };
         let script = session.root.join("remote-task.sh");
         fs::write(&script, include_str!("../../deploy/pilot/remote-task.sh"))?;
         fs::write(

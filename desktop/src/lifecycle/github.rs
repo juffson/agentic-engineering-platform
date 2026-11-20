@@ -55,6 +55,13 @@ impl Draft {
             .context("请检查允许修改的文件和验收命令")
     }
 
+    pub(crate) fn write_files(&self, dir: &Path) -> Result<()> {
+        self.validate()?;
+        fs::create_dir(dir).context("任务目录已存在，或无法创建任务目录")?;
+        fs::write(dir.join("spec.md"), &self.spec)?;
+        save(dir, "task.json", &self.manifest)
+    }
+
     fn commit(&self, ws: &Workspace, branch: &Branch) -> Result<String> {
         let reference = format!("refs/heads/aep-task/{}", self.name);
         ensure!(
@@ -68,10 +75,7 @@ impl Draft {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&specs)?,
             Err(error) => return Err(error.into()),
         }
-        let dir = specs.join(&self.name);
-        fs::create_dir(&dir).context("所选目标已包含这个任务目录，或无法创建目录")?;
-        fs::write(dir.join("spec.md"), &self.spec)?;
-        save(&dir, "task.json", &self.manifest)?;
+        self.write_files(&specs.join(&self.name))?;
         git(&ws.root, &["add", "--", &format!("specs/{}", self.name)])?;
         git(
             &ws.root,

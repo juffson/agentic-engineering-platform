@@ -5,7 +5,7 @@ use anyhow::Context as _;
 use gpui_kit::component::input::{Textarea, TextareaState};
 
 pub(crate) struct Authoring {
-    branch: lifecycle::Branch,
+    pub(super) branch: lifecycle::Branch,
     task: Entity<InputState>,
     title: Entity<InputState>,
     spec: Entity<TextareaState>,
@@ -14,7 +14,28 @@ pub(crate) struct Authoring {
 }
 
 impl Authoring {
-    fn draft(&self, cx: &App) -> Result<lifecycle::Draft> {
+    pub(super) fn new(
+        branch: lifecycle::Branch,
+        window: &mut Window,
+        cx: &mut Context<Studio>,
+    ) -> Self {
+        let task = cx.new(|cx| InputState::new(window, cx).placeholder("如 improve-task-errors"));
+        task.focus_handle(cx).focus(window, cx);
+        Self {
+            branch,
+            task,
+            title: cx.new(|cx| InputState::new(window, cx)),
+            spec: cx
+                .new(|cx| TextareaState::new(window, cx).placeholder("描述范围、要求和验收标准")),
+            paths: cx
+                .new(|cx| TextareaState::new(window, cx).placeholder("每行一个仓库相对文件路径")),
+            check: cx.new(|cx| {
+                TextareaState::new(window, cx).placeholder("[\"cargo\",\"test\",\"--locked\"]")
+            }),
+        }
+    }
+
+    pub(super) fn draft(&self, cx: &App) -> Result<lifecycle::Draft> {
         #[derive(serde::Deserialize)]
         #[serde(untagged)]
         enum Acceptance {
@@ -62,16 +83,18 @@ impl Authoring {
         Ok(draft)
     }
 
-    pub(super) fn render(&self, ws: &Workspace, preparing: bool, cx: &Context<Studio>) -> Div {
-        let text_field = |label, field, height| {
+    pub(super) fn fields(&self, ws: &Workspace, preparing: bool) -> Div {
+        let text_field = |id, label, field, height| {
             v_flex().gap_1().child(caption(label)).child(
-                Textarea::new(field)
-                    .aria_label(label)
-                    .h(px(height))
-                    .disabled(preparing),
+                div().id(id).test_support().child(
+                    Textarea::new(field)
+                        .aria_label(label)
+                        .h(px(height))
+                        .disabled(preparing),
+                ),
             )
         };
-        let mut form = panel()
+        panel()
             .child(field("仓库", &ws.root.display().to_string()))
             .child(field("目标分支", &self.branch.name))
             .child(field("目标提交", &self.branch.sha))
@@ -85,9 +108,11 @@ impl Authoring {
                             .min_w_0()
                             .child(caption("任务 ID"))
                             .child(
-                                Input::new(&self.task)
-                                    .aria_label("任务 ID")
-                                    .disabled(preparing),
+                                div().id("task-author-name").test_support().child(
+                                    Input::new(&self.task)
+                                        .aria_label("任务 ID")
+                                        .disabled(preparing),
+                                ),
                             ),
                     )
                     .child(
@@ -97,38 +122,59 @@ impl Authoring {
                             .min_w_0()
                             .child(caption("标题（可选）"))
                             .child(
-                                Input::new(&self.title)
-                                    .aria_label("任务标题")
-                                    .disabled(preparing),
+                                div().id("task-author-title").test_support().child(
+                                    Input::new(&self.title)
+                                        .aria_label("任务标题")
+                                        .disabled(preparing),
+                                ),
                             ),
                     ),
             )
-            .child(text_field("任务 Spec", &self.spec, 155.))
-            .child(text_field("允许修改的文件", &self.paths, 68.))
-            .child(text_field("验收命令", &self.check, 64.))
+            .child(text_field(
+                "task-author-spec",
+                "任务 Spec",
+                &self.spec,
+                155.,
+            ))
+            .child(text_field(
+                "task-author-paths",
+                "允许修改的文件",
+                &self.paths,
+                68.,
+            ))
+            .child(text_field(
+                "task-author-check",
+                "验收命令",
+                &self.check,
+                64.,
+            ))
             .child(caption(
                 "填写 JSON 命令数组，或填写带验收项编号和多个检查的 JSON 对象。",
-            ));
+            ))
+    }
+
+    pub(super) fn render(&self, ws: &Workspace, preparing: bool, cx: &Context<Studio>) -> Div {
+        let form = self.fields(ws, preparing);
         if preparing {
             return form.child(caption("正在准备指定提交上的任务…"));
         }
-        form =
-            form.child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        button("prepare-task-draft", "准备派发", true)
-                            .on_click(cx.listener(|this, _, w, cx| this.prepare_task_draft(w, cx))),
-                    )
-                    .child(button("cancel-task-draft", "返回任务列表", false).on_click(
-                        cx.listener(|this, _, _, cx| {
+        form.child(
+            h_flex()
+                .gap_2()
+                .child(
+                    button("prepare-task-draft", "准备派发", true)
+                        .on_click(cx.listener(|this, _, w, cx| this.prepare_task_draft(w, cx))),
+                )
+                .child(
+                    button("cancel-task-draft", "返回任务列表", false).on_click(cx.listener(
+                        |this, _, _, cx| {
                             this.task_authoring = None;
                             this.lifecycle_error = None;
                             cx.notify();
-                        }),
+                        },
                     )),
-            );
-        form
+                ),
+        )
     }
 }
 
@@ -142,20 +188,7 @@ impl Studio {
         if self.lifecycle_preparing || self.lifecycle.is_some() {
             return;
         }
-        let task = cx.new(|cx| InputState::new(window, cx).placeholder("如 improve-task-errors"));
-        task.focus_handle(cx).focus(window, cx);
-        self.task_authoring = Some(Authoring {
-            branch,
-            task,
-            title: cx.new(|cx| InputState::new(window, cx)),
-            spec: cx
-                .new(|cx| TextareaState::new(window, cx).placeholder("描述范围、要求和验收标准")),
-            paths: cx
-                .new(|cx| TextareaState::new(window, cx).placeholder("每行一个仓库相对文件路径")),
-            check: cx.new(|cx| {
-                TextareaState::new(window, cx).placeholder("[\"cargo\",\"test\",\"--locked\"]")
-            }),
-        });
+        self.task_authoring = Some(Authoring::new(branch, window, cx));
         self.lifecycle_error = None;
         cx.notify();
     }
