@@ -293,6 +293,7 @@ impl Studio {
         };
         let (label, color) = match session.status.exit_code {
             Some(0) if session.archive().is_some() => ("已完成", MINT),
+            Some(4) => ("已暂停", AMBER),
             Some(_) => ("已停止或失败", RED),
             None if session.active() => ("运行中", BLUE),
             _ => ("已断开", AMBER),
@@ -323,7 +324,30 @@ impl Studio {
                 detail_text("rolling-failure", &session.status.reason).text_color(rgb(RED)),
             ));
         }
-        if let Some(gate) = session.gate() {
+        if session.can_resume() {
+            view = view.child(
+                panel().child(
+                    button(
+                        "rolling-resume",
+                        if session.status.exit_code.is_some_and(|code| code != 4) {
+                            "安全重试"
+                        } else {
+                            "继续演练"
+                        },
+                        true,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(session) = &mut this.https_rolling {
+                            this.https_rolling_error =
+                                session.resume(&this.runner).err().map(|e| format!("{e:#}"));
+                            this.poll_https(cx);
+                            cx.notify();
+                        }
+                    })),
+                ),
+            );
+        }
+        if let Some(gate) = session.pending_gate() {
             let (title, details, action) = match &gate.action {
                 Action::Revoke { old, replacement } => (
                     "撤销旧密钥",
@@ -370,10 +394,11 @@ impl Studio {
                     }),
                 ));
             }
-            actions = actions.child(button("rolling-stop", "停止并归档", false).on_click(
+            actions = actions.child(button("rolling-stop", "暂停并保留证据", false).on_click(
                 cx.listener(|this, _, _, cx| {
                     if let Some(session) = &mut this.https_rolling {
-                        session.stop_at_gate();
+                        this.https_rolling_error =
+                            session.stop_at_gate().err().map(|e| format!("{e:#}"));
                         cx.notify();
                     }
                 }),
@@ -384,7 +409,7 @@ impl Studio {
                     .child(heading(title))
                     .child(detail_text("rolling-gate-worker", &gate.worker))
                     .child(detail_text("rolling-gate-scope", &details))
-                    .child(actions),
+                    .when(session.gate().is_some(), |panel| panel.child(actions)),
             );
         }
         let mut tabs = h_flex().gap_2().flex_wrap();

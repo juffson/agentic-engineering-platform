@@ -40,6 +40,7 @@ enum LiveKeyStep {
     Provision,
     Start,
     Stage,
+    Verify,
     ExpectFailure,
     Deliver,
 }

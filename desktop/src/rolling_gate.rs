@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -23,13 +24,23 @@ pub struct Gate {
     pub id: String,
     pub worker: String,
     pub repository: String,
+    #[serde(default)]
+    pub binding: String,
     #[serde(flatten)]
     pub action: Action,
 }
 
 impl Gate {
-    pub fn command(&self) -> String {
-        format!("approve {}\n", self.id)
+    pub fn same_scope(&self, other: &Self) -> bool {
+        self.worker == other.worker
+            && self.repository == other.repository
+            && self.binding == other.binding
+            && self.action == other.action
+    }
+
+    pub fn receipt(&self, root: &Path) -> PathBuf {
+        root.join("evidence/approvals")
+            .join(format!("{}.json", self.id))
     }
 
     pub fn valid(&self) -> bool {

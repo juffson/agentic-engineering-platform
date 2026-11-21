@@ -9,11 +9,10 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    fs::{self, File},
-    io::Write,
+    fs::{self, File, TryLockError},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, Command, Stdio},
 };
 
 fn command(runner: &Runner, program: &str, args: &[&str]) -> Result<String> {
@@ -228,9 +227,7 @@ pub(crate) struct Session {
     pub selected: Option<PathBuf>,
     pub acknowledged: Option<Gate>,
     pending: Option<Gate>,
-    submitted: Option<Gate>,
     child: Option<Child>,
-    approval: Option<ChildStdin>,
 }
 
 impl Session {
@@ -247,21 +244,11 @@ impl Session {
             selected: None,
             acknowledged: None,
             pending: None,
-            submitted: None,
             child: None,
-            approval: None,
         }
     }
 
     pub fn launch(source: &Workspace, runner: &Runner, site: Site) -> Result<Self> {
-        let script = source.root.join("deploy/pilot/rolling-keys.sh");
-        ensure!(
-            script.is_file()
-                && script
-                    .canonicalize()?
-                    .starts_with(source.root.canonicalize()?),
-            "请打开包含 deploy/pilot/rolling-keys.sh 的 AEP 源码仓库"
-        );
         let parent = source.data.join("https-rolling-studio");
         fs::create_dir_all(&parent)?;
         let root = tempfile::Builder::new()
@@ -269,35 +256,71 @@ impl Session {
             .tempdir_in(parent.canonicalize()?)?
             .keep();
         serde_json::to_writer(File::create(root.join("site.json"))?, &site)?;
-        let log = File::create(root.join("rolling.log"))?;
+        let mut session = Self::from_disk(root, source, site);
+        session.spawn(runner, false)?;
+        Ok(session)
+    }
+
+    fn spawn(&mut self, runner: &Runner, resume: bool) -> Result<()> {
+        let script = self.source.join("deploy/pilot/rolling-keys.sh");
+        ensure!(
+            script.is_file()
+                && script
+                    .canonicalize()?
+                    .starts_with(self.source.canonicalize()?),
+            "请打开包含 deploy/pilot/rolling-keys.sh 的 AEP 源码仓库",
+        );
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.root.join("owner.lock"))?;
+        lock.try_lock().context("另一个 Studio 正在跟踪此演练")?;
+        let log = File::options()
+            .create(true)
+            .append(true)
+            .open(self.root.join("rolling.log"))?;
         let mut cmd = Command::new("bash");
-        cmd.current_dir(&source.root)
+        cmd.current_dir(&self.source)
             .env("PATH", runner.path()?)
             .env("GH_PROMPT_DISABLED", "1")
             .arg(script)
             .arg("--studio-session")
-            .arg(&root)
+            .arg(&self.root)
             .args([
                 "--site",
-                &site.name,
+                &self.site.name,
                 "--repo",
-                &site.repository,
+                &self.site.repository,
                 "--access-dir",
             ])
-            .arg(&site.access);
-        for worker in &site.workers {
+            .arg(&self.site.access);
+        if resume {
+            cmd.arg("--resume");
+        }
+        for worker in &self.site.workers {
             cmd.args(["--worker", worker]);
         }
-        let mut child = cmd
-            .process_group(0)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
-            .spawn()?;
-        let mut session = Self::from_disk(root, source, site);
-        session.approval = child.stdin.take();
-        session.child = Some(child);
-        Ok(session)
+        self.child = Some(
+            cmd.process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(lock))
+                .stderr(Stdio::from(log))
+                .spawn()?,
+        );
+        self.status.exit_code = None;
+        self.acknowledged = None;
+        Ok(())
+    }
+
+    pub fn can_resume(&self) -> bool {
+        self.root.join("owner.lock").is_file() && !self.active() && self.status.exit_code != Some(0)
+    }
+
+    pub fn resume(&mut self, runner: &Runner) -> Result<()> {
+        ensure!(self.can_resume(), "当前演练无法继续");
+        self.spawn(runner, true)
     }
 
     pub fn latest(source: &Workspace) -> Option<Self> {
@@ -320,13 +343,21 @@ impl Session {
 
     pub fn active(&self) -> bool {
         self.child.is_some()
+            || File::open(self.root.join("owner.lock"))
+                .ok()
+                .is_some_and(|file| matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock)))
+    }
+
+    pub fn pending_gate(&self) -> Option<&Gate> {
+        self.pending
+            .as_ref()
+            .filter(|gate| !gate.receipt(&self.root).exists())
     }
 
     pub fn gate(&self) -> Option<&Gate> {
-        self.approval.as_ref()?;
-        self.pending
-            .as_ref()
-            .filter(|pending| Some(*pending) != self.submitted.as_ref())
+        (self.active() && !self.root.join("pause-request").exists())
+            .then(|| self.pending_gate())
+            .flatten()
     }
 
     pub fn confirm(&mut self) -> Result<()> {
@@ -334,21 +365,25 @@ impl Session {
         ensure!(
             self.acknowledged.as_ref() == Some(&shown)
                 && read_json::<Gate>(self.root.join("gate.json")).as_ref() == Some(&shown),
-            "确认内容已更新，请重新核对"
+            "确认内容已更新，请重新核对",
         );
-        let pipe = self.approval.as_mut().context("确认通道已关闭")?;
-        pipe.write_all(shown.command().as_bytes())
-            .context("无法发送确认")?;
+        let receipt = shown.receipt(&self.root);
+        let directory = receipt.parent().context("缺少确认记录目录")?;
+        fs::create_dir_all(directory)?;
+        let temp = tempfile::NamedTempFile::new_in(directory)?;
+        serde_json::to_writer(temp.as_file(), &shown)?;
+        temp.as_file().sync_all()?;
+        temp.persist_noclobber(receipt)
+            .context("确认已记录或无法保存")?;
         self.acknowledged = None;
-        self.submitted = Some(shown);
         Ok(())
     }
 
-    pub fn stop_at_gate(&mut self) {
-        if self.gate().is_some() {
-            self.approval.take();
-            self.acknowledged = None;
-        }
+    pub fn stop_at_gate(&mut self) -> Result<()> {
+        ensure!(self.gate().is_some(), "当前没有可暂停的确认步骤");
+        File::create(self.root.join("pause-request"))?;
+        self.acknowledged = None;
+        Ok(())
     }
 
     pub fn archive(&self) -> Option<PathBuf> {
@@ -366,7 +401,6 @@ impl Session {
             .and_then(|child| child.try_wait().transpose())
         {
             self.child = None;
-            self.approval = None;
             if self.status.exit_code.is_none() {
                 self.status.exit_code =
                     Some(result.ok().and_then(|status| status.code()).unwrap_or(1));
@@ -456,15 +490,13 @@ mod tests {
             workers: vec!["pilot-worker".into(), "pilot-worker-two".into()],
         };
         let mut session = Session::from_disk(scratch.path().into(), &source, site);
-        let mut child = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
-        session.approval = child.stdin.take();
+        let lock = File::create(scratch.path().join("owner.lock"))?;
+        lock.lock()?;
         let gate = Gate {
             id: uuid::Uuid::new_v4().to_string(),
             worker: "pilot-worker".into(),
             repository: "owner/private".into(),
+            binding: "run".into(),
             action: Action::Publish {
                 target: "test/https-rolling-run".into(),
                 candidate: "a".repeat(40),
@@ -489,10 +521,12 @@ mod tests {
         session.acknowledged = Some(changed.clone());
         session.confirm()?;
         assert!(session.confirm().is_err());
-        session.approval.take();
+        let mut reopened = Session::from_disk(scratch.path().into(), &source, session.site.clone());
+        reopened.refresh();
+        assert!(reopened.gate().is_none());
         assert_eq!(
-            child.wait_with_output()?.stdout,
-            changed.command().as_bytes()
+            read_json::<Gate>(changed.receipt(scratch.path())),
+            Some(changed)
         );
         Ok(())
     }
