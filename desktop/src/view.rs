@@ -6,6 +6,7 @@ pub(crate) mod https_rolling;
 pub(crate) mod human_review;
 mod lifecycle_page;
 pub(crate) mod local_page;
+pub(crate) mod project_page;
 mod relay_page;
 mod repository_tasks;
 pub(crate) mod task_authoring;
@@ -209,6 +210,9 @@ impl Studio {
     }
 
     fn rail(&self, cx: &Context<Self>) -> Div {
+        if self.context_work().is_some() {
+            return self.project_rail(cx);
+        }
         let repo = self
             .workspace
             .as_ref()
@@ -241,6 +245,18 @@ impl Studio {
                             .child(div().text_color(rgb(RAIL)).font_bold().child("A")),
                     )
                     .child(heading("AEP Studio")),
+            )
+            .child(
+                button(
+                    "back-to-project",
+                    if self.context_work().is_some() {
+                        "返回开发事项"
+                    } else {
+                        "项目工作台"
+                    },
+                    false,
+                )
+                .on_click(cx.listener(|this, _, w, cx| this.return_to_project(w, cx))),
             )
             .child(self.nav(
                 Page::Runs,
@@ -576,6 +592,9 @@ impl Studio {
 
 impl Render for Studio {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.page == Page::Project {
+            return self.project_page(cx);
+        }
         self.lifecycle_frame(window, cx);
         if self.workspace.is_none() {
             return v_flex()

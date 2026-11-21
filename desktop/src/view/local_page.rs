@@ -34,6 +34,7 @@ pub(crate) struct State {
     loading: bool,
     operation: Option<&'static str>,
     cancelling: bool,
+    pub(super) show_catalog: bool,
     error: Option<String>,
 }
 
@@ -51,7 +52,7 @@ struct Authoring {
     fields: DraftFields,
 }
 
-fn call(
+pub(super) fn call(
     ws: &Workspace,
     runner: &Runner,
     args: &[String],
@@ -84,7 +85,7 @@ fn call(
     Ok(output.stdout)
 }
 
-fn label(phase: &str) -> (&str, u32) {
+pub(super) fn label(phase: &str) -> (&str, u32) {
     match phase {
         "plan_pending" => ("待批准计划", AMBER),
         "ready" => ("待实现", BLUE),
@@ -101,6 +102,27 @@ fn label(phase: &str) -> (&str, u32) {
 }
 
 impl Studio {
+    pub(super) fn focus_project_ticket(
+        &mut self,
+        ticket: &str,
+        tab: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = &mut self.local_tasks {
+            state.show_catalog = false;
+            state.fields[0].update(cx, |input, cx| input.set_value(ticket, window, cx));
+            state.selected = Some(ticket.into());
+            state.inspection = Inspection::default();
+            state.authoring = None;
+            state.detail = Value::Null;
+            state.tab = tab;
+            state.error = None;
+        }
+        self.refresh_local(cx);
+        cx.notify();
+    }
+
     pub(crate) fn open_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.local_tasks.is_none() {
             self.local_tasks = Some(State {
@@ -116,6 +138,7 @@ impl Studio {
                 loading: false,
                 operation: None,
                 cancelling: false,
+                show_catalog: false,
                 error: None,
             });
         }
@@ -454,6 +477,9 @@ impl Studio {
             return;
         };
         let detail = &state.detail;
+        if !self.ticket_in_context(string(detail, "ticket")) {
+            return;
+        }
         if detail["historical"] == true {
             return;
         }
@@ -503,9 +529,53 @@ impl Studio {
             .overflow_y_scroll()
             .gap_4()
             .p_5()
-            .child(heading("本地任务"));
+            .child(heading(
+                self.context_work()
+                    .map(|work| work.name.as_str())
+                    .unwrap_or("本地任务")
+                    .to_owned(),
+            ));
+        let scoped = self.context_work().is_some();
+        if scoped {
+            let repo = self
+                .workspace
+                .as_ref()
+                .map(|ws| ws.root.display().to_string())
+                .unwrap_or_default();
+            page = page.child(
+                h_flex().justify_between().child(caption(repo)).child(
+                    button(
+                        "project-toggle-catalog",
+                        if state.show_catalog {
+                            "返回事项任务"
+                        } else {
+                            "关联已有任务"
+                        },
+                        false,
+                    )
+                    .on_click(cx.listener(|this, _, w, cx| {
+                        let current = this
+                            .context_work()
+                            .zip(this.workspace.as_ref())
+                            .map(|(work, ws)| work.ticket(&ws.root));
+                        if let Some(state) = &mut this.local_tasks {
+                            state.show_catalog = !state.show_catalog;
+                            if !state.show_catalog
+                                && let Some(ticket) = current
+                            {
+                                this.focus_project_ticket(&ticket, "spec", w, cx);
+                            }
+                        }
+                        cx.notify();
+                    })),
+                ),
+            );
+        }
         let mut form = panel().flex_none().child(heading("拟定任务计划"));
         for ((id, name, _), input) in FIELDS.iter().zip(&state.fields) {
+            if scoped && matches!(*id, "ticket" | "task" | "spec") {
+                continue;
+            }
             form = form.child(
                 v_flex().gap_1().child(caption(*name)).child(
                     div()
@@ -545,18 +615,20 @@ impl Studio {
         }
         let mut controls = h_flex().gap_2();
         if state.operation.is_none() {
-            controls = controls
-                .child(button("local-new-spec", "编写 Spec", true).on_click(
-                    cx.listener(|this, _, window, cx| this.edit_local_spec(false, window, cx)),
-                ))
-                .child(
-                    button("local-plan", "从已有提交生成计划", false)
-                        .on_click(cx.listener(|this, _, _, cx| this.propose_local(false, cx))),
-                )
-                .child(
-                    button("local-revise", "用已有提交修订", false)
-                        .on_click(cx.listener(|this, _, _, cx| this.propose_local(true, cx))),
-                );
+            controls =
+                controls
+                    .child(button("local-new-spec", "编写 Spec", true).on_click(
+                        cx.listener(|this, _, window, cx| this.edit_local_spec(false, window, cx)),
+                    ))
+                    .when(!scoped, |controls| {
+                        controls
+                            .child(button("local-plan", "从已有提交生成计划", false).on_click(
+                                cx.listener(|this, _, _, cx| this.propose_local(false, cx)),
+                            ))
+                            .child(button("local-revise", "用已有提交修订", false).on_click(
+                                cx.listener(|this, _, _, cx| this.propose_local(true, cx)),
+                            ))
+                    });
         }
         if let Some(editor) = &state.authoring {
             let saving = state.operation.is_some();
@@ -626,13 +698,13 @@ impl Studio {
                 );
             }
             page = page.child(editor_view);
-        } else {
+        } else if !scoped || (state.detail.is_null() && !state.show_catalog) {
             page = page.child(form.child(controls));
         }
         if let Some(error) = &state.error {
             page = page.child(detail_text("local-command-error", error));
         }
-        if !state.rows.is_empty() {
+        if (!scoped || state.show_catalog) && !state.rows.is_empty() {
             let mut rows = panel().flex_none().child(heading("任务记录"));
             for row in &state.rows {
                 let ticket = string(row, "ticket").to_owned();
@@ -688,6 +760,26 @@ impl Studio {
             .child(field("目标", string(pin, "target")))
             .child(field("基线", string(pin, "baseline")))
             .child(field("Spec", string(pin, "spec")));
+        if let (Some(work), Some(ws)) = (self.context_work(), self.workspace.as_ref()) {
+            let ticket = string(detail, "ticket").to_owned();
+            if work.ticket(&ws.root) == ticket {
+                review = review.child(field("开发事项", &work.name));
+            } else {
+                review = review.child(
+                    button(
+                        "project-bind-ticket",
+                        format!("将此任务关联到「{}」", work.name),
+                        false,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.link_project_ticket(ticket.clone(), cx)
+                    })),
+                );
+            }
+            if let Some(error) = &self.board.error {
+                review = review.child(t(error.clone(), AMBER));
+            }
+        }
         if let Some(model) = pin["codex_model"].as_str() {
             review = review.child(field("Codex 模型", model));
         }
@@ -828,6 +920,7 @@ impl Studio {
             _ => None,
         };
         if let Some((op, title)) = action
+            && self.ticket_in_context(string(detail, "ticket"))
             && ((state.operation.is_none() && state.authoring.is_none()) || op == "cancel")
         {
             review =
@@ -837,7 +930,8 @@ impl Studio {
                     ),
                 ));
         }
-        if !matches!(phase, "running" | "history" | "merge_pending")
+        if self.ticket_in_context(string(detail, "ticket"))
+            && !matches!(phase, "running" | "history" | "merge_pending")
             && state.operation.is_none()
             && state.authoring.is_none()
         {

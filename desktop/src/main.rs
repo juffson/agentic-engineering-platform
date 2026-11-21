@@ -1,4 +1,3 @@
-use aep::workspace::Workspace;
 use anyhow::Result;
 use clap::Parser;
 use gpui_kit::{component::input, *};
@@ -14,10 +13,7 @@ struct Args {
 
 actions!(aep_studio, [Quit]);
 fn main() -> Result<()> {
-    let ws = match Args::parse().repo {
-        Some(dir) => Some(Workspace::open(&dir)?),
-        None => None,
-    };
+    let repo = Args::parse().repo;
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
@@ -44,7 +40,7 @@ fn main() -> Result<()> {
                 window_min_size: Some(size(px(840.), px(530.))),
                 ..Default::default()
             };
-            aep_studio::open_studio(ws, opts, cx).expect("无法打开 AEP Studio 窗口");
+            aep_studio::open_project_window(repo, opts, cx).expect("无法打开 AEP Studio 窗口");
             cx.activate(true);
         });
     Ok(())

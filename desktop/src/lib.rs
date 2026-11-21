@@ -3,6 +3,7 @@ mod github_pr;
 mod https_pilot;
 mod https_queue;
 pub mod lifecycle;
+mod project;
 mod publish;
 mod recent;
 mod relay;
@@ -29,6 +30,7 @@ use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
+    Project,
     Runs,
     Memory,
     Relay,
@@ -63,6 +65,7 @@ fn attention(status: &str) -> bool {
 }
 
 struct Studio {
+    board: view::project_page::Board,
     editor: Option<view::editor::Editor>,
     workspace: Option<Workspace>,
     snapshot: Snapshot,
@@ -141,11 +144,18 @@ impl Studio {
             }
         });
         let lifecycle = workspace.as_ref().and_then(lifecycle::load);
+        let board =
+            view::project_page::Board::load(workspace.as_ref(), remember_repository, window, cx);
         let mut studio = Self {
+            board,
             editor: None,
             workspace,
             snapshot: Snapshot::default(),
-            page: Page::Runs,
+            page: if remember_repository {
+                Page::Project
+            } else {
+                Page::Runs
+            },
             filter: Filter::All,
             run: None,
             note: None,
@@ -207,7 +217,6 @@ impl Studio {
         };
         if studio.remember_repository && studio.workspace.is_some() {
             studio.remember_workspace();
-            studio.navigate(Page::Lifecycle, window, cx);
         }
         studio.attach_task_queue(cx);
         studio.reload(cx);
@@ -542,10 +551,58 @@ pub fn open_studio(
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
-    let ws = ws
-        .or_else(recent::restore)
-        .or_else(|| Workspace::open(std::path::Path::new(".")).ok());
-    open_window(ws, Runner::default(), true, options, cx)
+    match ws {
+        Some(ws) => {
+            open_window(Some(ws), Runner::default(), true, options, cx).map(|(window, _)| window)
+        }
+        None => open_project_window(None, options, cx),
+    }
+}
+
+/// Present the project library before Git resolves a working tree (which may be offline).
+pub fn open_project_window(
+    path: Option<PathBuf>,
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    let (window, studio) = open_window(None, Runner::default(), true, options, cx)?;
+    let recent = recent::last_path();
+    let explicit = path.is_some();
+    let Some(path) = path.or(recent.clone()) else {
+        return Ok(window);
+    };
+    window.update(cx, |_, w, cx| {
+        studio.update(cx, |this, cx| {
+            if recent.as_ref() == Some(&path) {
+                this.adopt_first_repository(&path, cx);
+            }
+            let generation = this.workspace_generation;
+            let job = cx
+                .background_executor()
+                .spawn(async move { Workspace::open(&path) });
+            cx.spawn_in(w, async move |this, cx| {
+                let result = job.await;
+                let _ = this.update_in(cx, |this, w, cx| {
+                    if this.workspace_generation != generation || this.page != Page::Project {
+                        return;
+                    }
+                    match result {
+                        Ok(ws) => {
+                            this.adopt_first_repository(&ws.root, cx);
+                            this.set_workspace(ws, Page::Project, w, cx);
+                        }
+                        Err(e) if explicit => {
+                            this.board.error = Some(format!("打开仓库失败 {e:#}"));
+                            cx.notify();
+                        }
+                        Err(_) => {}
+                    }
+                });
+            })
+            .detach();
+        })
+    })?;
+    Ok(window)
 }
 
 pub fn open_studio_with_runner(
@@ -554,7 +611,7 @@ pub fn open_studio_with_runner(
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
-    open_window(ws, runner, false, options, cx)
+    open_window(ws, runner, false, options, cx).map(|(window, _)| window)
 }
 
 fn open_window(
@@ -563,10 +620,9 @@ fn open_window(
     remember_repository: bool,
     options: WindowOptions,
     cx: &mut App,
-) -> Result<AnyWindowHandle> {
-    let (window, _) = gpui_kit::open_window(options, cx, move |window, cx| {
+) -> Result<(AnyWindowHandle, Entity<Studio>)> {
+    gpui_kit::open_window(options, cx, move |window, cx| {
         window.set_window_title("AEP Studio");
         cx.new(|cx| Studio::new(ws, runner, remember_repository, window, cx))
-    })?;
-    Ok(window)
+    })
 }

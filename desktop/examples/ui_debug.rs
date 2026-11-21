@@ -15,6 +15,8 @@ mod https_workers;
 mod lifecycle;
 #[path = "support/local.rs"]
 mod local;
+#[path = "support/project.rs"]
+mod project;
 
 use aep::{
     memory::{Key, Kind, Memory},
@@ -49,6 +51,7 @@ enum LiveKeyStep {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Scenario {
+    Project,
     History,
     Conflict,
     Handoff,
@@ -1388,6 +1391,7 @@ fn main() -> Result<()> {
                 Scenario::Handoff,
                 Scenario::StudioRelay,
                 Scenario::Local,
+                Scenario::Project,
             ],
         };
         for scenario in scenarios {
@@ -1396,6 +1400,7 @@ fn main() -> Result<()> {
                 Scenario::Conflict => with_fixture(&args, |ui, ws, _| conflict(ui, ws))?,
                 Scenario::Handoff => relay(&args, Clients::Fixture, None)?,
                 Scenario::StudioRelay => studio_relay(&args)?,
+                Scenario::Project => project::run(&args)?,
                 Scenario::Local => local::run(&args)?,
             }
         }

@@ -16,7 +16,7 @@ aep run --task market-volume-dedup-rust --candidate origin/aep-task/market-volum
 
 已有仓库可直接使用原 Git 公共目录中的 SQLite 记忆库、Run 锁和 JSON 证据。历史派发继续使用其固定提交里声明的验收命令。新的行情示例使用独立任务 ID `market-volume-dedup-rust`。
 
-### 用 AEP Studio 查看运行、编写交接记忆
+### AEP Studio 项目工作台
 
 macOS 上可用 Rust 桌面端浏览执行记录、写入和修订共享记忆。安装 Xcode 及命令行工具，使用当前稳定版 Rust，在仓库根目录运行：
 
@@ -25,7 +25,9 @@ macOS 上可用 Rust 桌面端浏览执行记录、写入和修订共享记忆�
 open "desktop/target/AEP Studio.app"
 ```
 
-点击「打开仓库」选择执行过 AEP 的 Git 工作区。也可用命令直接指定仓库：
+从「项目库」创建或打开项目，在「关联仓库」中选择一个或多个本地 Git 仓库。点击「新建事项」选择功能或版本，按需求定义、方案设计、开发实现、测试审查和发布归档五个阶段跟进。每个事项可以选择参与的仓库、记录阶段结论，也可以回到已完成的阶段。阶段由项目成员确认，仓库任务进度从对应的 AEP 票据读取。
+
+在事项下点击仓库的阶段入口，可创建独立的本地交付任务，或关联该仓库已有的任务。完整的运行记录、共享记忆、接力和试点工具可从「关联仓库」进入。项目库保存在本机的 `~/Library/Application Support/AEP Studio/projects.json`，任务与证据保存在对应仓库。首次启动也可以用已有仓库建立初始项目。
 
 ```sh
 cargo run --locked --manifest-path desktop/Cargo.toml -- --repo /path/to/repo
