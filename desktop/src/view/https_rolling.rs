@@ -3,10 +3,11 @@ use super::{
     *,
 };
 use crate::{
-    rolling::{self, Session, Site},
-    rolling_gate::Action,
+    rolling::{self, History, Session, Site, Status},
+    rolling_gate::{Action, Gate},
 };
 use anyhow::Context as _;
+use std::path::Path;
 
 pub(crate) struct Form {
     site: Option<String>,
@@ -17,11 +18,148 @@ pub(crate) struct Form {
     pending: bool,
 }
 
+fn rolling_phase(stage: &str) -> &'static str {
+    match stage {
+        "build-studio" | "prepare-isolated-tasks" => "准备隔离分支和固定 Spec",
+        "start-rotation" => "启动轮换并生成待切换密钥",
+        "simulate-failed-cutover" => "演练第一台新密钥读取失败",
+        "dispatch-during-failure" => "第二台在故障期间执行任务",
+        "retry-and-retire-first" => "重试并验证第一台密钥",
+        "dispatch-after-first-retirement" => "第一台使用新密钥执行任务",
+        "rotate-and-retire-second" => "切换并验证第二台密钥",
+        "verify" => "核对归档及 GitHub 密钥状态",
+        "completed" => "滚动轮换与归档已完成",
+        _ => "检查站点与登录凭证",
+    }
+}
+
+fn rolling_status(status: &Status, active: bool, archived: bool) -> (&'static str, u32) {
+    if active {
+        return ("运行中", BLUE);
+    }
+    match status.exit_code {
+        Some(0) if archived => ("已完成", MINT),
+        Some(4) => ("已暂停", AMBER),
+        Some(_) => ("已停止或失败", RED),
+        None => ("已断开", AMBER),
+    }
+}
+
+fn gate_scope(gate: &Gate) -> (&'static str, String, &'static str) {
+    match &gate.action {
+        Action::Revoke { old, replacement } => (
+            "撤销旧密钥",
+            format!("旧密钥 {old}\n已验证的新密钥 {replacement}"),
+            "确认撤销旧密钥",
+        ),
+        Action::Publish { target, candidate } => (
+            "发布候选",
+            format!("目标 {target}\n候选 {candidate}"),
+            "确认发布并创建 PR",
+        ),
+        Action::Merge {
+            target,
+            candidate,
+            pr,
+        } => (
+            "合并 PR",
+            format!("PR #{pr} → {target}\n候选 {candidate}"),
+            "确认合并 PR",
+        ),
+    }
+}
+
 impl Studio {
-    pub(super) fn open_rolling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.https_rolling.as_ref().is_some_and(Session::active)
-            || self.https_rolling_form.is_some()
+    pub(super) fn load_rolling_history(&mut self, source: &Workspace) {
+        if self
+            .https_rolling_history
+            .as_ref()
+            .is_none_or(|history| history.source != source.root)
         {
+            let history = History::load(source);
+            let preferred = history.preferred().map(Path::to_path_buf);
+            self.https_rolling_history = Some(history);
+            if let Some(root) = preferred {
+                if let Err(error) = self.show_rolling(source, &root) {
+                    self.https_rolling_error = Some(format!("{error:#}"));
+                }
+            } else {
+                self.stash_rolling();
+            }
+        } else if let Some(history) = &mut self.https_rolling_history {
+            history.refresh(true);
+        }
+    }
+
+    pub(super) fn poll_rolling_history(&mut self, visible: bool) {
+        if visible && let Some(history) = &mut self.https_rolling_history {
+            history.refresh(false);
+        }
+        if let Some(session) = &mut self.https_rolling {
+            session.refresh();
+        }
+        for session in &mut self.https_rolling_background {
+            session.refresh();
+        }
+        self.https_rolling_background.retain(Session::active);
+    }
+
+    pub(super) fn rolling_busy(&self) -> bool {
+        self.https_rolling.as_ref().is_some_and(Session::active)
+            || self.https_rolling_background.iter().any(Session::active)
+            || self
+                .https_rolling_history
+                .as_ref()
+                .is_some_and(History::any_active)
+    }
+
+    fn stash_rolling(&mut self) {
+        if let Some(mut previous) = self.https_rolling.take().filter(Session::active) {
+            previous.acknowledged = None;
+            self.https_rolling_background.push(previous);
+        }
+    }
+
+    fn show_rolling(&mut self, source: &Workspace, root: &Path) -> Result<()> {
+        if self.https_rolling.as_ref().is_some_and(|session| {
+            session.root == root && (session.source == source.root || session.active())
+        }) {
+            return Ok(());
+        }
+        let session = if let Some(index) = self
+            .https_rolling_background
+            .iter()
+            .position(|s| s.root == root)
+        {
+            self.https_rolling_background.swap_remove(index)
+        } else {
+            Session::open(source, root.to_path_buf()).context("无法打开演练记录")?
+        };
+        self.stash_rolling();
+        self.https_rolling = Some(session);
+        Ok(())
+    }
+
+    fn select_rolling(&mut self, root: &Path, cx: &mut Context<Self>) {
+        let result = (|| {
+            let source = self.https_source().context("请选择源码仓库")?;
+            let history = self
+                .https_rolling_history
+                .as_mut()
+                .context("演练历史尚未加载")?;
+            history.lookup(root).context("该演练不在此仓库的历史中")?;
+            self.show_rolling(&source, root)?;
+            if let Some(history) = &mut self.https_rolling_history {
+                history.select(root)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })();
+        self.https_rolling_error = result.err().map(|e| format!("{e:#}"));
+        cx.notify();
+    }
+
+    pub(super) fn open_rolling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rolling_busy() || self.https_rolling_form.is_some() {
             return;
         }
         let access = std::env::var_os("AEP_STUDIO_CONTROL_OPERATOR_FILE")
@@ -145,7 +283,7 @@ impl Studio {
     }
 
     fn start_rolling(&mut self, cx: &mut Context<Self>) {
-        if self.https_rolling.as_ref().is_some_and(Session::active) {
+        if self.rolling_busy() {
             return;
         }
         let result = (|| {
@@ -167,6 +305,15 @@ impl Studio {
                 self.https_rolling = Some(session);
                 self.https_rolling_form = None;
                 self.https_rolling_error = None;
+                if let Some(history) = &mut self.https_rolling_history
+                    && let Some(session) = &self.https_rolling
+                {
+                    history.refresh(true);
+                    self.https_rolling_error = history
+                        .select(&session.root)
+                        .err()
+                        .map(|e| format!("{e:#}"));
+                }
                 self.poll_https(cx);
             }
             Err(error) => self.https_rolling_error = Some(format!("{error:#}")),
@@ -181,6 +328,13 @@ impl Studio {
                 panel().child(detail_text("rolling-action-error", error).text_color(rgb(RED))),
             );
         }
+        let history = self
+            .https_rolling_history
+            .as_ref()
+            .filter(|history| !history.is_empty());
+        if let Some(history) = history {
+            section = section.child(self.rolling_history_panel(history, cx));
+        }
         if let Some(form) = &self.https_rolling_form {
             section = section.child(self.rolling_form(form, cx));
         }
@@ -189,8 +343,121 @@ impl Studio {
         }
         (self.https_rolling.is_some()
             || self.https_rolling_form.is_some()
-            || self.https_rolling_error.is_some())
+            || self.https_rolling_error.is_some()
+            || history.is_some())
         .then_some(section)
+    }
+
+    fn rolling_history_panel(&self, history: &History, cx: &Context<Self>) -> Div {
+        let mut sites = h_flex().gap_2().flex_wrap().child(
+            button(
+                "rolling-history-site-all",
+                "全部站点",
+                history.site().is_none(),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.filter_rolling_history(None, true, cx))),
+        );
+        for site in history.sites() {
+            let site = site.to_owned();
+            sites = sites.child(
+                button(
+                    format!("rolling-history-site-{site}"),
+                    site.clone(),
+                    history.site() == Some(site.as_str()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.filter_rolling_history(Some(site.clone()), true, cx)
+                })),
+            );
+        }
+        let mut workers = h_flex().gap_2().flex_wrap().child(
+            button(
+                "rolling-history-worker-all",
+                "全部 Worker",
+                history.worker().is_none(),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.filter_rolling_history(None, false, cx))),
+        );
+        for worker in history.workers() {
+            let worker = worker.to_owned();
+            workers = workers.child(
+                button(
+                    format!("rolling-history-worker-{worker}"),
+                    worker.clone(),
+                    history.worker() == Some(worker.as_str()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.filter_rolling_history(Some(worker.clone()), false, cx)
+                })),
+            );
+        }
+        let mut list = v_flex()
+            .id("rolling-history-list")
+            .test_support()
+            .max_h(px(230.))
+            .overflow_y_scroll()
+            .gap_2();
+        let mut entries = history.visible().peekable();
+        if entries.peek().is_none() {
+            list = list.child(caption("没有符合筛选条件的演练"));
+        }
+        for entry in entries {
+            let root = entry.root.clone();
+            let (label, color) = rolling_status(&entry.status, entry.active, entry.archived);
+            let current = self.https_rolling.as_ref().is_some_and(|s| s.root == root);
+            list =
+                list.child(
+                    v_flex()
+                        .flex_none()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .flex_wrap()
+                                .child(
+                                    button(
+                                        format!("rolling-history-entry-{}", entry.id),
+                                        entry.id.clone(),
+                                        current,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| this.select_rolling(&root, cx),
+                                    )),
+                                )
+                                .child(chip(label, color))
+                                .when(entry.archived, |row| row.child(caption("有证据归档"))),
+                        )
+                        .child(caption(format!(
+                            "{} · {}",
+                            entry.site.name,
+                            rolling_phase(&entry.status.stage)
+                        )))
+                        .child(caption(entry.site.workers.join(" · "))),
+                );
+        }
+        panel()
+            .flex_none()
+            .child(heading("滚动轮换演练历史"))
+            .child(sites)
+            .child(workers)
+            .child(list)
+    }
+
+    fn filter_rolling_history(
+        &mut self,
+        value: Option<String>,
+        site: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(history) = &mut self.https_rolling_history {
+            let result = if site {
+                history.filter_site(value)
+            } else {
+                history.filter_worker(value)
+            };
+            self.https_rolling_error = result.err().map(|e| format!("{e:#}"));
+            cx.notify();
+        }
     }
 
     fn rolling_form(&self, form: &Form, cx: &Context<Self>) -> Div {
@@ -279,25 +546,12 @@ impl Studio {
     }
 
     fn rolling_run(&self, session: &Session, cx: &Context<Self>) -> Div {
-        let stage = match session.status.stage.as_str() {
-            "build-studio" | "prepare-isolated-tasks" => "准备隔离分支和固定 Spec",
-            "start-rotation" => "启动轮换并生成待切换密钥",
-            "simulate-failed-cutover" => "演练第一台新密钥读取失败",
-            "dispatch-during-failure" => "第二台在故障期间执行任务",
-            "retry-and-retire-first" => "重试并验证第一台密钥",
-            "dispatch-after-first-retirement" => "第一台使用新密钥执行任务",
-            "rotate-and-retire-second" => "切换并验证第二台密钥",
-            "verify" => "核对归档及 GitHub 密钥状态",
-            "completed" => "滚动轮换与归档已完成",
-            _ => "检查站点与登录凭证",
-        };
-        let (label, color) = match session.status.exit_code {
-            Some(0) if session.archive().is_some() => ("已完成", MINT),
-            Some(4) => ("已暂停", AMBER),
-            Some(_) => ("已停止或失败", RED),
-            None if session.active() => ("运行中", BLUE),
-            _ => ("已断开", AMBER),
-        };
+        let stage = rolling_phase(&session.status.stage);
+        let (label, color) = rolling_status(
+            &session.status,
+            session.active(),
+            session.archive().is_some(),
+        );
         let mut view = v_flex().gap_3().child(
             panel()
                 .flex_none()
@@ -308,6 +562,14 @@ impl Studio {
                         .child(chip(label, color))
                         .child(detail_text("rolling-stage", stage)),
                 )
+                .child(detail_text(
+                    "rolling-history-current",
+                    &session
+                        .root
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                ))
                 .child(field("站点", &session.site.name))
                 .child(field("私有仓库", &session.site.repository))
                 .child(field("Worker", &session.site.workers.join(" · "))),
@@ -348,27 +610,7 @@ impl Studio {
             );
         }
         if let Some(gate) = session.pending_gate() {
-            let (title, details, action) = match &gate.action {
-                Action::Revoke { old, replacement } => (
-                    "撤销旧密钥",
-                    format!("旧密钥 {old}\n已验证的新密钥 {replacement}"),
-                    "确认撤销旧密钥",
-                ),
-                Action::Publish { target, candidate } => (
-                    "发布候选",
-                    format!("目标 {target}\n候选 {candidate}"),
-                    "确认发布并创建 PR",
-                ),
-                Action::Merge {
-                    target,
-                    candidate,
-                    pr,
-                } => (
-                    "合并 PR",
-                    format!("PR #{pr} → {target}\n候选 {candidate}"),
-                    "确认合并 PR",
-                ),
-            };
+            let (title, details, action) = gate_scope(gate);
             let acknowledged = session.acknowledged.as_ref() == Some(gate);
             let mut actions = h_flex().gap_2().flex_wrap().child(
                 button("rolling-ack", "我已核对", acknowledged).on_click(cx.listener(
@@ -411,6 +653,60 @@ impl Studio {
                     .child(detail_text("rolling-gate-scope", &details))
                     .when(session.gate().is_some(), |panel| panel.child(actions)),
             );
+        }
+        if !session.attempts.is_empty() {
+            let mut attempts = panel().flex_none().child(heading("运行尝试"));
+            for (index, attempt) in session.attempts.iter().enumerate() {
+                let (status, color) =
+                    rolling_status(&attempt.status, false, attempt.status.exit_code == Some(0));
+                attempts = attempts.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .flex_wrap()
+                                .child(self.rolling_proof(
+                                    format!("rolling-attempt-{index}"),
+                                    format!(
+                                        "第 {} 次 · {}",
+                                        index + 1,
+                                        rolling_phase(&attempt.status.stage)
+                                    ),
+                                    attempt.receipt.clone(),
+                                    session,
+                                    cx,
+                                ))
+                                .child(chip(status, color)),
+                        )
+                        .when(!attempt.status.reason.is_empty(), |attempts| {
+                            attempts.child(detail_text(
+                                format!("rolling-attempt-reason-{index}"),
+                                &attempt.status.reason,
+                            ))
+                        }),
+                );
+            }
+            view = view.child(attempts);
+        }
+        if !session.approvals.is_empty() {
+            let mut receipts = panel().flex_none().child(heading("确认回执"));
+            for (index, approval) in session.approvals.iter().enumerate() {
+                let (action, scope, _) = gate_scope(&approval.gate);
+                receipts = receipts.child(
+                    v_flex()
+                        .gap_1()
+                        .child(self.rolling_proof(
+                            format!("rolling-receipt-{index}"),
+                            format!("{action} · {}", approval.gate.worker),
+                            approval.receipt.clone(),
+                            session,
+                            cx,
+                        ))
+                        .child(caption(scope)),
+                );
+            }
+            view = view.child(receipts);
         }
         let mut tabs = h_flex().gap_2().flex_wrap();
         for run in &session.deliveries {

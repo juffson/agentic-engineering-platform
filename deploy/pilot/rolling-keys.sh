@@ -83,6 +83,18 @@ restore_slot() {
     ' restore "$key_slot" "$id"
 }
 
+delivery_failure() {
+    local role session
+    case "$stage" in
+        dispatch-during-failure) role=peer ;;
+        dispatch-after-first-retirement) role=switched ;;
+        *) return 1 ;;
+    esac
+    session=$(jq -er .session "$root/delivery-$role.json" 2>/dev/null) || return 1
+    [[ $session == "$checkout/.git/aep/https-studio/studio-"* ]] || return 1
+    jq -er '.reason | strings | select(length > 0)' "$session/state.json"
+}
+
 finish() {
     local status=$1 report
     if [[ -f $root/pause-request && $status != 0 ]]; then status=4; fi
@@ -96,6 +108,9 @@ finish() {
     fi
     if (( status != 0 )) && [[ -d $checkout/.git && -n ${aep:-} && -n ${AEP_STUDIO_CONTROL_URL:-} ]] && ! snapshot "$proof/final-site-status.json"; then
         printf 'Could not read the site after the interruption.\n' >&2
+    fi
+    if [[ $status != 0 && $status != 4 && -z $failure ]]; then
+        failure=$(delivery_failure) || failure="The rehearsal failed at $stage. See the rehearsal log."
     fi
     report=$(jq -n --argjson exit_code "$status" --arg stage "$stage" --arg repository "$repository" \
         --arg plan "$plan" --arg first_task "$first_task" --arg second_task "$second_task" --arg reason "$failure" \

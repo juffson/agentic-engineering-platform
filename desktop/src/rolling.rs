@@ -1,3 +1,6 @@
+mod history;
+pub(crate) use history::History;
+
 use crate::{
     Runner,
     https_pilot::{Connection, Progress, preview, read_json},
@@ -215,6 +218,46 @@ impl Delivery {
     }
 }
 
+fn sessions_dir(source: &Workspace) -> PathBuf {
+    source.data.join("https-rolling-studio")
+}
+
+fn running(root: &Path) -> bool {
+    File::open(root.join("owner.lock"))
+        .ok()
+        .is_some_and(|file| matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock)))
+}
+
+fn archive_path(root: &Path) -> Option<PathBuf> {
+    let path = root.join("evidence.tar.gz");
+    path.is_file().then_some(path)
+}
+
+fn evidence_entries(directory: &Path) -> Vec<fs::DirEntry> {
+    let mut entries: Vec<_> = fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    entries.sort_by_cached_key(|entry| {
+        (
+            entry.metadata().and_then(|meta| meta.modified()).ok(),
+            entry.file_name(),
+        )
+    });
+    entries
+}
+
+pub(crate) struct Attempt {
+    pub status: Status,
+    pub receipt: PathBuf,
+}
+
+pub(crate) struct Approval {
+    pub gate: Gate,
+    pub receipt: PathBuf,
+}
+
 pub(crate) struct Session {
     pub root: PathBuf,
     pub source: PathBuf,
@@ -224,6 +267,8 @@ pub(crate) struct Session {
     pub cutover_error: Option<String>,
     pub deliveries: Vec<Delivery>,
     pub shots: Vec<(String, PathBuf)>,
+    pub attempts: Vec<Attempt>,
+    pub approvals: Vec<Approval>,
     pub selected: Option<PathBuf>,
     pub acknowledged: Option<Gate>,
     pending: Option<Gate>,
@@ -241,6 +286,8 @@ impl Session {
             cutover_error: None,
             deliveries: Vec::new(),
             shots: Vec::new(),
+            attempts: Vec::new(),
+            approvals: Vec::new(),
             selected: None,
             acknowledged: None,
             pending: None,
@@ -249,7 +296,7 @@ impl Session {
     }
 
     pub fn launch(source: &Workspace, runner: &Runner, site: Site) -> Result<Self> {
-        let parent = source.data.join("https-rolling-studio");
+        let parent = sessions_dir(source);
         fs::create_dir_all(&parent)?;
         let root = tempfile::Builder::new()
             .prefix("studio-")
@@ -323,29 +370,18 @@ impl Session {
         self.spawn(runner, true)
     }
 
-    pub fn latest(source: &Workspace) -> Option<Self> {
-        let mut roots: Vec<_> = fs::read_dir(source.data.join("https-rolling-studio"))
-            .ok()?
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|typ| typ.is_dir()))
-            .collect();
-        roots.sort_by_cached_key(|entry| {
-            std::cmp::Reverse(entry.metadata().and_then(|m| m.modified()).ok())
-        });
-        roots.into_iter().find_map(|entry| {
-            let root = entry.path();
-            let site = read_json(root.join("site.json"))?;
-            let mut session = Self::from_disk(root, source, site);
-            session.refresh();
-            Some(session)
-        })
+    pub fn open(source: &Workspace, root: PathBuf) -> Option<Self> {
+        if root.parent()? != sessions_dir(source) || !root.symlink_metadata().ok()?.is_dir() {
+            return None;
+        }
+        let site = read_json(root.join("site.json"))?;
+        let mut session = Self::from_disk(root, source, site);
+        session.refresh();
+        Some(session)
     }
 
     pub fn active(&self) -> bool {
-        self.child.is_some()
-            || File::open(self.root.join("owner.lock"))
-                .ok()
-                .is_some_and(|file| matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock)))
+        self.child.is_some() || running(&self.root)
     }
 
     pub fn pending_gate(&self) -> Option<&Gate> {
@@ -387,8 +423,7 @@ impl Session {
     }
 
     pub fn archive(&self) -> Option<PathBuf> {
-        let path = self.root.join("evidence.tar.gz");
-        path.is_file().then_some(path)
+        archive_path(&self.root)
     }
 
     pub fn refresh(&mut self) {
@@ -430,6 +465,33 @@ impl Session {
             }
         }
         self.shots = screenshots(&proof);
+        self.attempts = evidence_entries(&proof.join("attempts"))
+            .into_iter()
+            .filter_map(|entry| {
+                if !entry.file_type().ok()?.is_dir() {
+                    return None;
+                }
+                let receipt = entry.path().join("result.json");
+                let status: Status = read_json(&receipt)?;
+                status.exit_code?;
+                Some(Attempt { status, receipt })
+            })
+            .collect();
+        self.approvals = evidence_entries(&proof.join("approvals"))
+            .into_iter()
+            .filter_map(|entry| {
+                if !entry.file_type().ok()?.is_file() {
+                    return None;
+                }
+                let receipt = entry.path();
+                let gate: Gate = read_json(&receipt)?;
+                (gate.valid()
+                    && gate.receipt(&self.root) == receipt
+                    && gate.repository == self.site.repository
+                    && self.site.workers.contains(&gate.worker))
+                .then_some(Approval { gate, receipt })
+            })
+            .collect();
     }
 }
 
