@@ -6,6 +6,8 @@ pub mod lifecycle;
 mod publish;
 mod recent;
 mod relay;
+mod rolling;
+pub mod rolling_gate;
 mod task_queue;
 mod view;
 pub use relay::Runner;
@@ -112,6 +114,9 @@ struct Studio {
     https_background: Vec<https_pilot::Session>,
     https_polling: bool,
     https_queue: Option<https_queue::Site>,
+    https_rolling: Option<rolling::Session>,
+    https_rolling_form: Option<view::https_rolling::Form>,
+    https_rolling_error: Option<String>,
     https_pilot_error: Option<String>,
     https_remote_form: Option<view::https_pilot_page::RemoteForm>,
 }
@@ -185,6 +190,9 @@ impl Studio {
             https_background: Vec::new(),
             https_polling: false,
             https_queue: None,
+            https_rolling: None,
+            https_rolling_form: None,
+            https_rolling_error: None,
             https_pilot_error: None,
             https_remote_form: None,
         };
@@ -278,6 +286,8 @@ impl Studio {
         let reopen_https = page == Page::HttpsPilot && self.https_remote_form.is_some();
         self.workspace_generation += 1;
         self.https_remote_form = None;
+        self.https_rolling_form = None;
+        self.https_rolling_error = None;
         self.https_queue = None;
         self.lifecycle = lifecycle::load(&ws);
         self.task_authoring = None;

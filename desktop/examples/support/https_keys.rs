@@ -1,12 +1,13 @@
 use super::{
     Args, Driver, LiveKeyStep, handoff_fixture,
-    https_pilot::{await_stage, confirm},
+    https_pilot::{await_stage, confirm, confirm_with},
     https_queue::{Task, dispatch_selected},
 };
 use aep::{
     deploy_keys::{RollingRotation, WorkerKeys},
     workspace::{Workspace, ident, read},
 };
+use aep_studio::rolling_gate::{Action, Gate};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::{
@@ -17,6 +18,40 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+fn rolling_session() -> Option<std::path::PathBuf> {
+    std::env::var_os("AEP_STUDIO_ROLLING_SESSION").map(Into::into)
+}
+
+fn request_approval(root: &Path, repository: &str, worker: &str, action: Action) -> Result<()> {
+    let gate = Gate {
+        id: uuid::Uuid::new_v4().to_string(),
+        repository: repository.into(),
+        worker: worker.into(),
+        action,
+    };
+    ensure!(gate.valid(), "invalid Studio approval");
+    let path = root.join("gate.json");
+    write_json(&path, &gate)?;
+    let mut answer = String::new();
+    let read = io::stdin().read_line(&mut answer);
+    fs::remove_file(path)?;
+    read?;
+    ensure!(
+        answer == gate.command(),
+        "Studio operator stopped at approval"
+    );
+    let log = root.join("evidence/approvals");
+    fs::create_dir_all(&log)?;
+    write_json(&log.join(format!("{}.json", gate.id)), &gate)
+}
+
+fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let temp = tempfile::NamedTempFile::new_in(path.parent().context("missing path parent")?)?;
+    serde_json::to_writer(temp.as_file(), value)?;
+    temp.persist(path)?;
+    Ok(())
+}
 
 fn pause(ui: &mut Driver<'_>) -> Result<()> {
     ui.cx.advance_clock(Duration::from_millis(500));
@@ -247,7 +282,7 @@ pub(super) fn run(mut args: Args) -> Result<()> {
     }
     if args.https_key_revoke {
         ensure!(
-            io::stdin().is_terminal(),
+            io::stdin().is_terminal() || rolling_session().is_some(),
             "retirement requires an operator terminal"
         );
         let old = state
@@ -266,18 +301,30 @@ pub(super) fn run(mut args: Args) -> Result<()> {
         );
         click(&mut ui, &format!("https-key-review-revoke-{worker}"))?;
         ui.checkpoint("02-review-retirement")?;
-        let confirmation = format!("revoke {}", old.fingerprint);
-        print!(
-            "Active {}. Type {confirmation} to confirm retirement: ",
-            current.fingerprint
-        );
-        io::stdout().flush()?;
-        let mut response = String::new();
-        io::stdin().read_line(&mut response)?;
-        ensure!(
-            response.trim() == confirmation,
-            "operator declined retirement"
-        );
+        if let Some(root) = rolling_session() {
+            request_approval(
+                &root,
+                &state.repository,
+                &worker,
+                Action::Revoke {
+                    old: old.fingerprint.clone(),
+                    replacement: current.fingerprint.clone(),
+                },
+            )?;
+        } else {
+            let confirmation = format!("revoke {}", old.fingerprint);
+            print!(
+                "Active {}. Type {confirmation} to confirm retirement: ",
+                current.fingerprint
+            );
+            io::stdout().flush()?;
+            let mut response = String::new();
+            io::stdin().read_line(&mut response)?;
+            ensure!(
+                response.trim() == confirmation,
+                "operator declined retirement"
+            );
+        }
         click(&mut ui, &format!("https-key-confirm-revoke-{worker}"))?;
         let after = complete(&mut ui, &status, &state)?;
         ensure!(
@@ -378,7 +425,7 @@ fn deliver(
     snapshot: &impl Fn() -> Result<Value>,
 ) -> Result<()> {
     ensure!(
-        io::stdin().is_terminal(),
+        io::stdin().is_terminal() || rolling_session().is_some(),
         "delivery requires an operator terminal"
     );
     let task = Task {
@@ -407,6 +454,18 @@ fn deliver(
     )?;
     let session = dispatch_selected(ui, &ws.data.join("https-studio"), &task)?;
     println!("Remote task session: {}", session.display());
+    let studio = rolling_session();
+    if let Some(root) = &studio {
+        let role = std::env::var("AEP_STUDIO_ROLLING_DELIVERY")?;
+        ensure!(
+            matches!(role.as_str(), "peer" | "switched"),
+            "unknown delivery role"
+        );
+        write_json(
+            &root.join(format!("delivery-{role}.json")),
+            &serde_json::json!({"session": session, "task": task.task}),
+        )?;
+    }
     let pending = await_stage(ui, "待人工确认发布", &session, 850)?;
     ensure!(
         pending["worker"] == worker && pending["branch"] == task.target,
@@ -450,11 +509,25 @@ fn deliver(
         evidence.join("candidate.diff").display(),
         evidence.display()
     );
-    confirm(
-        ui,
-        &format!("publish {}", &candidate[..12]),
-        "04-peer-approved",
-    )?;
+    if let Some(root) = &studio {
+        confirm_with(ui, "04-peer-approved", || {
+            request_approval(
+                root,
+                &plan.repository,
+                worker,
+                Action::Publish {
+                    target: task.target.clone(),
+                    candidate: candidate.into(),
+                },
+            )
+        })?;
+    } else {
+        confirm(
+            ui,
+            &format!("publish {}", &candidate[..12]),
+            "04-peer-approved",
+        )?;
+    }
     let merge = await_stage(ui, "CI 已通过，待人工确认合并", &session, 2800)?;
     ensure!(
         merge["candidate"] == candidate && merge["worker"] == worker,
@@ -465,11 +538,26 @@ fn deliver(
         "Review PR #{pr} and {}",
         evidence.join("github-ci.json").display()
     );
-    confirm(
-        ui,
-        &format!("merge {pr} {}", &candidate[..12]),
-        "05-peer-merge",
-    )?;
+    if let Some(root) = &studio {
+        confirm_with(ui, "05-peer-merge", || {
+            request_approval(
+                root,
+                &plan.repository,
+                worker,
+                Action::Merge {
+                    target: task.target.clone(),
+                    candidate: candidate.into(),
+                    pr,
+                },
+            )
+        })?;
+    } else {
+        confirm(
+            ui,
+            &format!("merge {pr} {}", &candidate[..12]),
+            "05-peer-merge",
+        )?;
+    }
     let completed = await_stage(ui, "已合并并归档", &session, 240)?;
     ensure!(
         completed["worker"] == worker

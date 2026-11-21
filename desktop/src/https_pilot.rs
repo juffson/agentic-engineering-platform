@@ -142,11 +142,11 @@ pub(crate) enum Artifact {
     Result,
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> Option<T> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> Option<T> {
     serde_json::from_reader(File::open(path).ok()?).ok()
 }
 
-fn preview(path: &Path, tail: bool) -> Option<String> {
+pub(crate) fn preview(path: &Path, tail: bool) -> Option<String> {
     let mut file = File::open(path).ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
