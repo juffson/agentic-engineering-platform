@@ -7,6 +7,8 @@ mod https_keys;
 mod https_pilot;
 #[path = "support/https_queue.rs"]
 mod https_queue;
+#[path = "support/https_rolling.rs"]
+mod https_rolling;
 #[path = "support/https_workers.rs"]
 mod https_workers;
 #[path = "support/lifecycle/mod.rs"]
@@ -53,7 +55,7 @@ enum Scenario {
 #[derive(Parser)]
 #[command(
     about = "Exercise AEP Studio in a temporary Git workspace, using an offscreen GPUI window",
-    group(ArgGroup::new("live").args(["live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys"]))
+    group(ArgGroup::new("live").args(["live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
 )]
 struct Args {
     /// Run just one scenario (default: all)
@@ -98,6 +100,9 @@ struct Args {
     /// Configure or rotate a Deploy Key through a live HTTPS Studio site.
     #[arg(long, requires_all = ["output_dir", "https_remote_repo", "https_key_worker"], conflicts_with_all = ["scenario", "script", "repo", "codex_model"])]
     live_https_keys: bool,
+    /// Start the existing-site rolling-key rehearsal from Studio and confirm its UI gates.
+    #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo", "codex_model"])]
+    live_https_rolling_studio: bool,
     #[arg(long, requires = "live_https_keys")]
     https_key_worker: Option<String>,
     /// Confirm retirement of the previously rotated key through Studio.
@@ -1312,6 +1317,9 @@ fn relay(args: &Args, clients: Clients<'_>, reference: Option<&str>) -> Result<(
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
+    if args.live_https_rolling_studio {
+        return https_rolling::run(args);
+    }
     if args.live_https_keys {
         return https_keys::run(args);
     }

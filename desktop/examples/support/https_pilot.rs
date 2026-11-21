@@ -51,15 +51,26 @@ pub(super) fn await_stage(
 }
 
 pub(super) fn confirm(ui: &mut Driver<'_>, action: &str, checkpoint: &str) -> Result<()> {
+    confirm_with(ui, checkpoint, || {
+        print!("Type {action} to approve this Studio action: ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        ensure!(answer.trim() == action, "operator declined {action}");
+        Ok(())
+    })
+}
+
+pub(super) fn confirm_with(
+    ui: &mut Driver<'_>,
+    checkpoint: &str,
+    approve: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     ensure!(
         ui.absent("https-confirm")?,
         "Studio exposed an unconfirmed action"
     );
-    print!("Type {action} to approve this Studio action: ");
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    ensure!(answer.trim() == action, "operator declined {action}");
+    approve()?;
     ui.reveal("https-pilot-page", "https-ack")?;
     ui.click("https-ack")?;
     ui.reveal("https-pilot-page", "https-confirm")?;

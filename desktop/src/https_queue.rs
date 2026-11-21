@@ -97,6 +97,20 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    pub fn belongs_to(&self, repository: &str) -> bool {
+        self.attempts
+            .iter()
+            .all(|run| run.task.repository == repository)
+            && self
+                .deploy_keys
+                .values()
+                .all(|words| words.repository == repository)
+            && self
+                .key_rotation
+                .as_ref()
+                .is_none_or(|plan| plan.repository == repository)
+    }
+
     pub fn current(&self, worker: &str) -> Option<&Run> {
         self.attempts.iter().rev().find(|run| {
             run.worker.as_deref() == Some(worker)
@@ -206,6 +220,46 @@ impl Site {
     }
 }
 
+fn control(
+    source: &Workspace,
+    connection: &Connection,
+    runner: &Runner,
+    args: &[&str],
+) -> Result<Vec<u8>> {
+    let token = fs::read_to_string(&connection.operator_file).context("无法读取操作员令牌文件")?;
+    let mut process = Command::new(runner.binary()?);
+    process
+        .current_dir(&source.root)
+        .env("PATH", runner.path()?)
+        .env("AEP_CONTROL_OPERATOR_TOKEN", token.trim())
+        .env_remove("AEP_CONTROL_DEVICE_TOKEN")
+        .args(["control", "--url", &connection.endpoint]);
+    if let Some(ca) = &connection.ca {
+        process.arg("--ca-cert").arg(ca);
+    }
+    let result = process.args(args).output()?;
+    ensure!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr).trim()
+    );
+    Ok(result.stdout)
+}
+
+pub(crate) fn site_status(
+    source: &Workspace,
+    connection: &Connection,
+    runner: &Runner,
+) -> Result<Snapshot> {
+    #[derive(Deserialize)]
+    struct Reply {
+        data: Snapshot,
+    }
+    let reply: Reply = serde_json::from_slice(&control(source, connection, runner, &["status"])?)
+        .context("HTTPS 控制面返回了无效的队列状态")?;
+    Ok(reply.data)
+}
+
 pub(crate) fn perform(
     source: &Workspace,
     connection: &Connection,
@@ -213,52 +267,11 @@ pub(crate) fn perform(
     action: Action,
 ) -> Result<Snapshot> {
     let repository = slug(git(&source.root, &["remote", "get-url", "origin"])?.trim())?;
-    let token = fs::read_to_string(&connection.operator_file).context("无法读取操作员令牌文件")?;
-    let command = |argv: &[&str]| -> Result<Vec<u8>> {
-        let mut process = Command::new(runner.binary()?);
-        process
-            .current_dir(&source.root)
-            .env("PATH", runner.path()?)
-            .env("AEP_CONTROL_OPERATOR_TOKEN", token.trim())
-            .env_remove("AEP_CONTROL_DEVICE_TOKEN")
-            .args(["control", "--url", &connection.endpoint]);
-        if let Some(ca) = &connection.ca {
-            process.arg("--ca-cert").arg(ca);
-        }
-        let result = process.args(argv).output()?;
-        ensure!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr).trim()
-        );
-        Ok(result.stdout)
-    };
+    let command = |args: &[&str]| control(source, connection, runner, args);
     let read = || -> Result<Snapshot> {
-        #[derive(Deserialize)]
-        struct Reply {
-            data: Snapshot,
-        }
-        let reply: Reply = serde_json::from_slice(&command(&["status"])?)
-            .context("HTTPS 控制面返回了无效的队列状态")?;
-        ensure!(
-            reply
-                .data
-                .attempts
-                .iter()
-                .all(|run| run.task.repository == repository)
-                && reply
-                    .data
-                    .deploy_keys
-                    .values()
-                    .all(|entry| entry.repository == repository)
-                && reply
-                    .data
-                    .key_rotation
-                    .as_ref()
-                    .is_none_or(|plan| plan.repository == repository),
-            "控制面属于另一个仓库"
-        );
-        Ok(reply.data)
+        let snapshot = site_status(source, connection, runner)?;
+        ensure!(snapshot.belongs_to(&repository), "控制面属于另一个仓库");
+        Ok(snapshot)
     };
     let snapshot = read()?;
     match action {

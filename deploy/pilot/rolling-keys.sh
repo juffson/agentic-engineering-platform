@@ -3,7 +3,8 @@ set -euo pipefail
 umask 077
 
 source_dir=$(cd -- "$(dirname -- "$0")/../.." && pwd -P)
-site='' repository='' access='' output=''
+site='' repository='' access='' output='' studio_session=''
+selected_workers=()
 while (( $# )); do
     case $1 in
         --help|-h)
@@ -18,24 +19,35 @@ Studio renders offscreen. An operator must review and type every retirement,
 publication and merge confirmation in the foreground terminal.
 USAGE
             exit 0 ;;
-        --site|--repo|--access-dir|--output-dir)
+        --site|--repo|--access-dir|--output-dir|--studio-session|--worker)
             [[ $# -ge 2 && -n $2 && $2 != --* ]] || { echo "$1 requires a value" >&2; exit 2; }
             case $1 in
                 --site) site=$2 ;;
                 --repo) repository=$2 ;;
                 --access-dir) access=$2 ;;
                 --output-dir) output=$2 ;;
+                --studio-session) studio_session=$2 ;;
+                --worker) selected_workers+=("$2") ;;
             esac
             shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
-fail() { printf 'Rolling Deploy Key rehearsal: %s\n' "$*" >&2; exit 1; }
+failure=''
+fail() { failure=$*; printf 'Rolling Deploy Key rehearsal: %s\n' "$failure" >&2; exit 1; }
 [[ $site =~ ^[a-z][a-z0-9-]{0,38}[a-z0-9]$ &&
    $repository =~ ^[A-Za-z0-9_-]+/[A-Za-z0-9._-]+$ && -d $access ]] ||
     fail "Supply --site, --repo OWNER/PRIVATE-REPO and --access-dir (see --help)"
-[[ -t 0 ]] || fail "Run in a terminal for Studio's confirmation checkpoints"
+if [[ -n $studio_session ]]; then
+    [[ -z $output && -d $studio_session && -p /dev/stdin && ${#selected_workers[@]} == 2 ]] ||
+        fail "Studio requires a private session directory, two Workers and an approval pipe"
+    studio_session=$(cd -- "$studio_session" && pwd -P)
+    export AEP_STUDIO_ROLLING_SESSION=$studio_session
+else
+    [[ -t 0 ]] || fail "Run in a terminal for Studio's confirmation checkpoints"
+    unset AEP_STUDIO_ROLLING_SESSION
+fi
 for tool in cargo docker gh git gzip jq openssl tar; do
     command -v "$tool" >/dev/null || fail "Install $tool"
 done
@@ -63,8 +75,12 @@ if [[ -z $output ]]; then
 fi
 mkdir -p -- "$output"
 id=$(openssl rand -hex 8)
-root=$(mktemp -d "$output/rolling-$id.XXXXXX")
-root=$(cd -- "$root" && pwd -P)
+if [[ -n $studio_session ]]; then
+    root=$studio_session
+else
+    root=$(mktemp -d "$output/rolling-$id.XXXXXX")
+    root=$(cd -- "$root" && pwd -P)
+fi
 proof="$root/evidence"
 checkout="$root/checkout"
 mkdir "$proof"
@@ -108,6 +124,7 @@ finish() {
         printf 'Could not package evidence. Check %s\n' "$proof" >&2
         (( status != 0 )) || status=1
     fi
+    studio_status "$status"
     if (( status != 0 )); then
         printf 'Stopped in %s. Studio task checkout: %s\n' "$stage" "$checkout" >&2
     fi
@@ -117,7 +134,14 @@ trap 'finish $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-step() { stage=$1; printf '\n%s\n' "$1"; }
+studio_status() {
+    [[ -n $studio_session ]] || return 0
+    jq -n --arg stage "$stage" --arg reason "$failure" --argjson exit_code "${1:-null}" \
+        '{stage:$stage,reason:$reason,exit_code:$exit_code}' > "$root/rolling-state.tmp"
+    mv -f "$root/rolling-state.tmp" "$root/rolling-state.json"
+}
+
+step() { stage=$1; studio_status; printf '\n%s\n' "$1"; }
 
 snapshot() {
     AEP_CONTROL_OPERATOR_TOKEN="$(cat "$AEP_STUDIO_CONTROL_OPERATOR_FILE")" \
@@ -179,6 +203,10 @@ jq -e --arg repo "$repository" '
 
 workers=$(jq -er '.data.deploy_keys|keys|join(" ")' "$proof/before.json")
 read -r first second <<<"$workers"
+if (( ${#selected_workers[@]} != 0 )); then
+    [[ ${#selected_workers[@]} == 2 && ${selected_workers[0]} == "$first" && ${selected_workers[1]} == "$second" ]] ||
+        fail "The selected Worker pair no longer matches this site's enrolled Workers"
+fi
 for worker in "$first" "$second"; do
     [[ $worker == "$site-worker" || $worker == "$site-worker-"* ]] || fail "Unexpected Worker: $worker"
     container "$worker"
@@ -256,7 +284,7 @@ jq -e --arg w "$first" --slurpfile before "$proof/before-fault.json" '
 
 deliver() {
     local worker=$1 task=$2 position=$3 role=$4 artifacts result pr candidate merge head review
-    AEP_STUDIO_LIVE_TASK="$task" AEP_STUDIO_LIVE_TARGET="test/$task" AEP_STUDIO_ROLLING_TASK_PLAN="$proof/$task.json" \
+    AEP_STUDIO_LIVE_TASK="$task" AEP_STUDIO_LIVE_TARGET="test/$task" AEP_STUDIO_ROLLING_TASK_PLAN="$proof/$task.json" AEP_STUDIO_ROLLING_DELIVERY="$role" \
         studio "$worker" "$role" --https-key-step deliver
     local steps=("$proof/$role"/studio-keys-*)
     [[ ${#steps[@]} == 1 && -d ${steps[0]} ]] || fail "Missing Studio checkpoint directory for $task"

@@ -55,7 +55,7 @@ const PROOFS: [(Proof, &str, &str); 8] = [
     (Proof::Result, "result", "运行回执"),
 ];
 
-fn phase(stage: &str) -> (usize, &'static str) {
+pub(super) fn phase(stage: &str) -> (usize, &'static str) {
     match stage {
         "preparation" => (0, "构建镜像并固定隔离分支"),
         "https" => (0, "启动 HTTPS 控制面并校验证书"),
@@ -98,7 +98,7 @@ fn progress_state(progress: &Progress, busy: bool, spawn_error: bool) -> (&'stat
     }
 }
 
-fn check_state(check: &Value) -> (&str, u32) {
+pub(super) fn check_state(check: &Value) -> (&str, u32) {
     match string(check, "conclusion") {
         "SUCCESS" => ("通过", MINT),
         "SKIPPED" => ("已跳过", MUTED),
@@ -114,7 +114,7 @@ fn check_state(check: &Value) -> (&str, u32) {
 }
 
 impl Studio {
-    fn https_source(&self) -> Option<Workspace> {
+    pub(super) fn https_source(&self) -> Option<Workspace> {
         let ws = self.workspace.as_ref()?;
         self.lifecycle
             .as_ref()
@@ -164,6 +164,13 @@ impl Studio {
             self.https_pilot_error = None;
         }
         self.https_sessions = Session::entries(&source);
+        if self
+            .https_rolling
+            .as_ref()
+            .is_none_or(|session| !session.active() && session.source != source.root)
+        {
+            self.https_rolling = crate::rolling::Session::latest(&source);
+        }
         self.restore_https_queue(&source, cx);
         self.poll_https(cx);
     }
@@ -227,7 +234,7 @@ impl Studio {
         cx.notify();
     }
 
-    fn poll_https(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn poll_https(&mut self, cx: &mut Context<Self>) {
         if self.https_polling {
             return;
         }
@@ -260,6 +267,9 @@ impl Studio {
                                 session.select(Proof::Result);
                             }
                         }
+                        if let Some(session) = &mut this.https_rolling {
+                            session.refresh();
+                        }
                         let visible = this.page == Page::HttpsPilot;
                         if visible {
                             if let Some(source) = this.https_source() {
@@ -270,7 +280,11 @@ impl Studio {
                         }
                         let keep_polling = visible
                             || !this.https_background.is_empty()
-                            || this.https_pilot.as_ref().is_some_and(Session::active);
+                            || this.https_pilot.as_ref().is_some_and(Session::active)
+                            || this
+                                .https_rolling
+                                .as_ref()
+                                .is_some_and(crate::rolling::Session::active);
                         this.https_polling = keep_polling;
                         keep_polling
                     })
@@ -619,6 +633,25 @@ impl Studio {
                         )
                         .on_click(cx.listener(|this, _, w, cx| this.open_https_remote(w, cx))),
                     )
+                    .when(
+                        self.https_rolling
+                            .as_ref()
+                            .is_none_or(|session| !session.active()),
+                        |row| {
+                            row.child(
+                                button(
+                                    "https-rolling-mode",
+                                    "滚动轮换演练",
+                                    self.https_rolling_form.is_some(),
+                                )
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.open_rolling(window, cx)
+                                    }),
+                                ),
+                            )
+                        },
+                    )
                     .when(!running, |row| {
                         row.child(
                             button("https-start", "启动隔离试点", true)
@@ -640,6 +673,9 @@ impl Studio {
             .child(caption("在独立 HTTPS 站点和 GitHub 测试分支运行 Codex、Claude 与断线恢复。发布和合并分别确认。"));
         if let Some(error) = &self.https_pilot_error {
             page = page.child(detail_text("https-action-error", error).text_color(rgb(RED)));
+        }
+        if let Some(rolling) = self.rolling_panel(cx) {
+            page = page.child(rolling);
         }
         if let Some(form) = &self.https_remote_form {
             page = page.child(self.https_remote_form(form, cx));
