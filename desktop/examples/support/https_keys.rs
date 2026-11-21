@@ -543,26 +543,12 @@ fn open_delivery(
 }
 
 fn merge_binding(evidence: &Path, run: &str) -> Result<String> {
-    let ci = read(&evidence.join("github-ci.json"))?;
-    let mut checks = ci["statusCheckRollup"]
-        .as_array()
-        .context("missing GitHub CI")?
-        .clone();
-    checks.sort_by_cached_key(|check| {
-        ["detailsUrl", "targetUrl", "name", "context"]
-            .into_iter()
-            .find_map(|key| check[key].as_str())
-            .unwrap_or_default()
-            .to_owned()
-    });
-    Ok(serde_json::to_string(&serde_json::json!({
-        "run": run,
-        "head": ci["headRefOid"],
-        "base": ci["baseRefOid"],
-        "review": ci["reviewDecision"],
-        "latest_reviews": ci["latestReviews"],
-        "checks": checks,
-    }))?)
+    let binding = read(&evidence.join("worker-merge-context.json"))?;
+    ensure!(
+        binding["acceptance"]["run"] == run && binding["acceptance"]["result"] == "passed",
+        "missing Worker CI for this Run"
+    );
+    Ok(serde_json::to_string(&binding)?)
 }
 
 fn deliver(
@@ -690,9 +676,11 @@ fn deliver(
     );
     let pr = merge["pr"].as_u64().context("missing GitHub PR")?;
     let completed = if merge["stage"] == "merge_confirmation" {
+        ui.reveal("https-pilot-page", "https-check-0")?;
+        ui.checkpoint("05-worker-ci-passed")?;
         println!(
             "Review PR #{pr} and {}",
-            evidence.join("github-ci.json").display()
+            evidence.join("worker-ci.json").display()
         );
         if let Some(root) = &studio {
             let binding = merge_binding(&evidence, run)?;

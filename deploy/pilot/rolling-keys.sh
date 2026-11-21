@@ -442,16 +442,23 @@ deliver() {
     local bundle="$artifacts/pilot-evidence.tar.gz"
     gzip -t "$bundle"
     tar -xOf "$bundle" evidence/cleanup.json > "$artifacts/cleanup.json"
+    tar -xOf "$bundle" evidence/worker-ci.json > "$artifacts/worker-ci.json"
+    jq -e --arg repo "$repository" --arg task "$task" --arg w "$worker" \
+        --arg sha "$candidate" --argjson pr "$pr" --slurpfile state "$artifacts/session-state.json" '
+        .provider=="https_worker" and .result=="passed" and
+        .repository==$repo and .task==$task and .target==("test/"+$task) and .worker==$w and
+        .candidate==$sha and .pr==$pr and .run==$state[0].recovered_run and .ticket==$state[0].ticket and
+        (.checks | length>0 and all(.[]; .status=="passed" and .exit_code==0))
+    ' "$artifacts/worker-ci.json" >/dev/null || fail "Worker acceptance receipt disagrees for $task"
     review=$(tar -xOf "$bundle" evidence/confirmations.tsv)
     [[ $review == *$'\tpublish '"$candidate"* && $review == *$'\tmerge '"$pr $candidate"* ]] ||
         fail "The archive lacks the Studio publication or merge receipt for $task"
-    gh pr view "$pr" -R "$repository" --json state,baseRefName,headRefName,headRefOid,mergeCommit,mergedBy,url,statusCheckRollup \
+    gh pr view "$pr" -R "$repository" --json state,baseRefName,headRefName,headRefOid,mergeCommit,mergedBy,url \
         > "$artifacts/github.json"
     jq -e --arg candidate "$candidate" --arg target "test/$task" --arg actor "$actor" --slurpfile cleanup "$artifacts/cleanup.json" '
         .state=="MERGED" and .baseRefName==$target and .headRefOid==$candidate and
         .mergedBy.login==$actor and .mergeCommit.oid==$cleanup[0].merge_sha and
-        ($cleanup[0]|.target==$target and .target_synced and .candidate_branch_removed) and
-        ([.statusCheckRollup[]|select(.name=="acceptance" and .conclusion=="SUCCESS")]|length)>0
+        ($cleanup[0]|.target==$target and .target_synced and .candidate_branch_removed)
     ' "$artifacts/github.json" >/dev/null || fail "GitHub merge and cleanup receipts disagree for $task"
     merge=$(jq -er .mergeCommit.oid "$artifacts/github.json")
     head=$(jq -er .headRefName "$artifacts/github.json")

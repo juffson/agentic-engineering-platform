@@ -173,6 +173,24 @@ pub fn validate(packet: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub struct AcceptanceArtifacts<'a> {
+    pub record: &'a [u8],
+    pub checks: &'a [u8],
+    pub review: &'a [u8],
+}
+
+pub fn acceptance_artifacts(packet: &[u8]) -> Result<AcceptanceArtifacts<'_>> {
+    let slots = slots(packet)?;
+    let [Some(record), Some(checks), Some(review), ..] = slots.as_slice() else {
+        anyhow::bail!("Worker evidence is missing its report, checks or review");
+    };
+    Ok(AcceptanceArtifacts {
+        record,
+        checks,
+        review,
+    })
+}
+
 pub fn unpack(output: &Path, run: &str, packet: &[u8]) -> Result<()> {
     ident(run, 64)?;
     let slots = slots(packet)?;

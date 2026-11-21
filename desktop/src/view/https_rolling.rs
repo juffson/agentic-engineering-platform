@@ -734,6 +734,9 @@ impl Studio {
                     )
                     .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
                 );
+                if run.progress.ci_provider == "https_worker" {
+                    card = card.child(caption("Worker CI"));
+                }
                 for (index, check) in run.checks.iter().enumerate() {
                     let (state, tone) = check_state(check);
                     card = card.child(
@@ -744,7 +747,7 @@ impl Studio {
                                 check["name"]
                                     .as_str()
                                     .or_else(|| check["context"].as_str())
-                                    .unwrap_or("GitHub 检查"),
+                                    .unwrap_or("验收检查"),
                             ))
                             .child(chip(state, tone)),
                     );

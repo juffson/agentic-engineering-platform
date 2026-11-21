@@ -37,6 +37,7 @@ impl Gate {
 #[serde(default)]
 pub(crate) struct Progress {
     pub remote: bool,
+    pub ci_provider: String,
     pub ticket: String,
     pub stage: String,
     pub repository: String,
@@ -144,6 +145,45 @@ pub(crate) enum Artifact {
 
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: impl AsRef<Path>) -> Option<T> {
     serde_json::from_reader(File::open(path).ok()?).ok()
+}
+
+pub(crate) fn ci_checks(evidence: &Path, progress: &Progress) -> Vec<Value> {
+    if progress.ci_provider == "https_worker" {
+        return read_json::<Value>(evidence.join("worker-ci.json"))
+            .filter(|receipt| {
+                receipt["provider"] == "https_worker"
+                    && receipt["result"] == "passed"
+                    && receipt["ticket"] == progress.ticket
+                    && receipt["run"] == progress.recovered_run
+                    && receipt["worker"] == progress.worker
+                    && receipt["candidate"] == progress.candidate
+                    && receipt["target"] == progress.branch
+                    && receipt["pr"].as_u64() == progress.pr
+            })
+            .and_then(|receipt| {
+                Some(
+                    receipt["checks"]
+                        .as_array()?
+                        .iter()
+                        .filter_map(|check| {
+                            Some(serde_json::json!({
+                                "name": check["id"].as_str()?,
+                                "conclusion": if check["status"] == "passed" && check["exit_code"] == 0 {
+                                    "SUCCESS"
+                                } else {
+                                    "FAILURE"
+                                },
+                            }))
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+    }
+    read_json::<Value>(evidence.join("github-ci.json"))
+        .filter(|pr| pr["headRefOid"] == progress.candidate)
+        .and_then(|mut pr| pr["statusCheckRollup"].take().as_array().cloned())
+        .unwrap_or_default()
 }
 
 pub(crate) fn preview(path: &Path, tail: bool) -> Option<String> {
@@ -520,6 +560,9 @@ impl Session {
             Artifact::Review => run(&self.progress.recovered_run, "review.txt"),
             Artifact::FirstRun => run(&self.progress.old_run, "evidence.json"),
             Artifact::RecoveryRun => run(&self.progress.recovered_run, "evidence.json"),
+            Artifact::CiLog if self.progress.ci_provider == "https_worker" => {
+                run(&self.progress.recovered_run, "checks.log")
+            }
             Artifact::CiLog => Some(dir.join("github-acceptance.log")),
             Artifact::Result => Some(dir.join("result.json")),
             Artifact::Log => unreachable!(),
@@ -556,9 +599,7 @@ impl Session {
         }
         self.checks = self
             .run_dir()
-            .and_then(|dir| read_json::<Value>(dir.join("evidence/github-ci.json")))
-            .filter(|pr| pr["headRefOid"] == self.progress.candidate)
-            .and_then(|mut pr| pr["statusCheckRollup"].take().as_array().cloned())
+            .map(|dir| ci_checks(&dir.join("evidence"), &self.progress))
             .unwrap_or_default();
         self.text = self
             .artifact_path(self.selected)
@@ -609,6 +650,41 @@ impl Drop for Session {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn worker_ci_displays_only_the_receipt_for_the_selected_attempt() -> Result<()> {
+        let evidence = tempfile::tempdir()?;
+        let progress = Progress {
+            ci_provider: "https_worker".into(),
+            ticket: "ticket-1".into(),
+            recovered_run: "run-1".into(),
+            worker: "worker-two".into(),
+            candidate: "candidate".into(),
+            branch: "test/task".into(),
+            pr: Some(15),
+            ..Progress::default()
+        };
+        fs::write(
+            evidence.path().join("github-ci.json"),
+            br#"{"headRefOid":"candidate","statusCheckRollup":[{"name":"legacy","conclusion":"FAILURE"}]}"#,
+        )?;
+        assert!(ci_checks(evidence.path(), &progress).is_empty());
+        let path = evidence.path().join("worker-ci.json");
+        let mut receipt = json!({
+            "provider":"https_worker", "result":"passed", "ticket":"ticket-1",
+            "run":"run-1", "worker":"worker-two", "candidate":"candidate", "target":"test/task",
+            "pr":15, "checks":[{"id":"primary","status":"passed","exit_code":0}],
+        });
+        fs::write(&path, serde_json::to_vec(&receipt)?)?;
+        assert_eq!(
+            ci_checks(evidence.path(), &progress),
+            vec![json!({"name":"primary", "conclusion":"SUCCESS"})],
+        );
+        receipt["run"] = json!("old-run");
+        fs::write(path, serde_json::to_vec(&receipt)?)?;
+        assert!(ci_checks(evidence.path(), &progress).is_empty());
+        Ok(())
+    }
 
     #[test]
     fn repository_catalog_preserves_a_failed_task_and_guards_resumption() -> Result<()> {
