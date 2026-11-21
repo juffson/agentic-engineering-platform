@@ -47,20 +47,26 @@ verify_workflow() {
     [[ $acceptance =~ ^([0-9]+)/job/([0-9]+)$ ]] || fail "Expected an Actions workflow and job ID"
     run_id=${BASH_REMATCH[1]}
     job_id=${BASH_REMATCH[2]}
-    retry_read gh api "repos/$repository/actions/runs/$run_id" > "$evidence/github-workflow.json"
+    retry_read gh api "repos/$repository/actions/runs/$run_id" > "$evidence/github-workflow.json" ||
+        fail "Could not read the GitHub Actions run"
     jq -e --arg candidate "$candidate" --arg head "$head_branch" --argjson pr "$pr" '
         (.path | split("@")[0]) == ".github/workflows/pilot.yml" and
         .head_sha == $candidate and .head_branch == $head and .event == "pull_request" and
-        .status == "completed" and .conclusion == "success" and
         (.pull_requests | length == 0 or any(.[]; .number == $pr and .head.sha == $candidate))
     ' "$evidence/github-workflow.json" >/dev/null || fail "The successful acceptance run is not for the pinned PR"
-    retry_read gh run view "$run_id" -R "$repository" --json jobs > "$evidence/github-jobs.json"
+    # Individual check conclusions can appear before the workflow's final status.
+    jq -e '.status == "completed"' "$evidence/github-workflow.json" >/dev/null || return 1
+    jq -e '.conclusion == "success"' "$evidence/github-workflow.json" >/dev/null ||
+        fail "The pinned GitHub Actions run did not succeed"
+    retry_read gh run view "$run_id" -R "$repository" --json jobs > "$evidence/github-jobs.json" ||
+        fail "Could not read the GitHub Actions jobs"
     jq -e --argjson job "$job_id" '
         .jobs as $jobs |
         all(["protocol","desktop","acceptance"][]; . as $name | any($jobs[]; .name == $name and .conclusion == "success")) and
         any($jobs[]; .databaseId == $job and .name == "acceptance" and .conclusion == "success")
     ' "$evidence/github-jobs.json" >/dev/null || fail "The PR workflow did not pass each required job"
-    retry_read gh run view "$run_id" -R "$repository" --job "$job_id" --log > "$evidence/github-acceptance.log"
+    retry_read gh run view "$run_id" -R "$repository" --job "$job_id" --log > "$evidence/github-acceptance.log" ||
+        fail "Could not read the independent acceptance log"
     grep -Fq "Checks passed at $candidate." "$evidence/github-acceptance.log" || fail "The independent acceptance log does not confirm the candidate"
 }
 
@@ -109,8 +115,7 @@ wait_ci() {
             printf 'GitHub CI: %s\n' "$pending"
             previous=$pending
         fi
-        if ready_rollup "$snapshot"; then
-            verify_workflow "$snapshot"
+        if ready_rollup "$snapshot" && verify_workflow "$snapshot"; then
             return
         fi
         sleep 15
