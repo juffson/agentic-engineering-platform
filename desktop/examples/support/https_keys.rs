@@ -413,7 +413,7 @@ fn deliver(
         "dispatch did not use the expected Worker or branch"
     );
     if let Some(plan) = std::env::var_os("AEP_STUDIO_ROLLING_TASK_PLAN") {
-        let expected = read(&Path::new(&plan))?;
+        let expected = read(Path::new(&plan))?;
         ensure!(
             pending["task"] == expected["task"]
                 && pending["branch"] == expected["target"]
