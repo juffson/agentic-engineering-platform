@@ -164,13 +164,7 @@ impl Studio {
             self.https_pilot_error = None;
         }
         self.https_sessions = Session::entries(&source);
-        if self
-            .https_rolling
-            .as_ref()
-            .is_none_or(|session| !session.active() && session.source != source.root)
-        {
-            self.https_rolling = crate::rolling::Session::latest(&source);
-        }
+        self.load_rolling_history(&source);
         self.restore_https_queue(&source, cx);
         self.poll_https(cx);
     }
@@ -267,10 +261,8 @@ impl Studio {
                                 session.select(Proof::Result);
                             }
                         }
-                        if let Some(session) = &mut this.https_rolling {
-                            session.refresh();
-                        }
                         let visible = this.page == Page::HttpsPilot;
+                        this.poll_rolling_history(visible);
                         if visible {
                             if let Some(source) = this.https_source() {
                                 this.https_sessions = Session::entries(&source);
@@ -280,6 +272,7 @@ impl Studio {
                         }
                         let keep_polling = visible
                             || !this.https_background.is_empty()
+                            || !this.https_rolling_background.is_empty()
                             || this.https_pilot.as_ref().is_some_and(Session::active)
                             || this
                                 .https_rolling
@@ -633,25 +626,18 @@ impl Studio {
                         )
                         .on_click(cx.listener(|this, _, w, cx| this.open_https_remote(w, cx))),
                     )
-                    .when(
-                        self.https_rolling
-                            .as_ref()
-                            .is_none_or(|session| !session.active()),
-                        |row| {
-                            row.child(
-                                button(
-                                    "https-rolling-mode",
-                                    "滚动轮换演练",
-                                    self.https_rolling_form.is_some(),
-                                )
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.open_rolling(window, cx)
-                                    }),
-                                ),
+                    .when(!self.rolling_busy(), |row| {
+                        row.child(
+                            button(
+                                "https-rolling-mode",
+                                "滚动轮换演练",
+                                self.https_rolling_form.is_some(),
                             )
-                        },
-                    )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_rolling(window, cx)),
+                            ),
+                        )
+                    })
                     .when(!running, |row| {
                         row.child(
                             button("https-start", "启动隔离试点", true)
