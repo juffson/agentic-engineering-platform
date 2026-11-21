@@ -24,6 +24,7 @@ pub struct Check {
 
 fn valid_command(command: &[String]) -> bool {
     !command.is_empty()
+        && !command[0].trim().is_empty()
         && command
             .iter()
             .all(|part| !part.is_empty() && !part.contains('\0'))
@@ -53,7 +54,7 @@ impl TaskManifest {
         );
         ensure!(
             valid_command(&self.check),
-            "acceptance argv cannot contain NUL bytes"
+            "invalid acceptance command: executable is blank or an argument contains NUL bytes"
         );
         ensure!(
             self.criteria.len() <= 32 && self.checks.len() <= 16,
@@ -94,5 +95,50 @@ impl TaskManifest {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_primary_and_additional_command_arguments() {
+        for command in [
+            vec![],
+            vec![""],
+            vec![" \t"],
+            vec!["\n\r"],
+            vec!["\u{2003}"],
+            vec!["tool", ""],
+            vec!["tool\0"],
+            vec!["tool", "arg\0"],
+            vec![" /path with spaces/tool ", " \t", "argument"],
+        ] {
+            let valid = command == [" /path with spaces/tool ", " \t", "argument"];
+            let command: Vec<String> = command.into_iter().map(String::from).collect();
+            let mut task = TaskManifest {
+                title: None,
+                allowed_paths: vec!["src/task.rs".into()],
+                check: command.clone(),
+                criteria: vec![],
+                checks: vec![],
+            };
+            assert_eq!(task.validate().is_ok(), valid, "primary: {command:?}");
+            assert_eq!(task.check, command);
+
+            task.check = vec!["tool".into()];
+            task.checks.push(Check {
+                id: "extra".into(),
+                criteria: vec!["AC-1".into()],
+                command: command.clone(),
+            });
+            let result = task.validate();
+            assert_eq!(result.is_ok(), valid, "additional: {command:?}");
+            if let Err(error) = result {
+                assert!(error.to_string().contains("extra"));
+            }
+            assert_eq!(task.checks[0].command, command);
+        }
     }
 }
