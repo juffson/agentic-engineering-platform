@@ -188,6 +188,21 @@ pub(super) fn run(mut args: Args) -> Result<()> {
         );
         checkpoint(&mut ui, &output, "03-retired-and-verified", &worker, &state)?;
     } else {
+        if state.inventory.active.is_some() {
+            click(&mut ui, &format!("https-key-verify-{worker}"))?;
+            state = complete(&mut ui, &status, &state)?;
+            ensure!(
+                state.verified_at.is_some(),
+                "the existing Deploy Key did not verify"
+            );
+            checkpoint(
+                &mut ui,
+                &output,
+                "01-existing-key-verified",
+                &worker,
+                &state,
+            )?;
+        }
         // A fresh Worker starts with no key. Configure its first key before rotating.
         let count = if state.inventory.active.is_none() {
             2

@@ -4,6 +4,7 @@ upgrade_site() (
     umask 077
     [[ $# == 2 ]] || { echo "Usage: site.sh upgrade ACCESS-DIR RECEIPT-DIR" >&2; exit 2; }
     local access=$1 receipt=$2 lock='' maintenance=no committed=no id endpoint lease worker_json
+    local repin=no old_control_image old_nginx_image legacy_fingerprint='' legacy_repository=''
     local suffix object actual
     local -a worker_args=() extra_paused=()
     [[ -z $slot ]] || { echo "Upgrade the site without a Worker slot"; exit 2; }
@@ -50,7 +51,19 @@ upgrade_site() (
         docker container inspect "$name-control" "$name-https" "$name-worker" "$name-egress" |
             jq '[.[] | {name:.Name,id:.Id,image:.Image,argv:.Config.Cmd,running:.State.Running,
                   volumes:[.Mounts[]|select(.Type=="volume")|{name:.Name,destination:.Destination}],
-                  port:.NetworkSettings.Ports["8443/tcp"]}]' > "$target"
+                  port:.NetworkSettings.Ports["8443/tcp"],
+                  binding:.HostConfig.PortBindings["8443/tcp"]}]' > "$target"
+    }
+
+    evidence_inventory() {
+        docker run --rm --network none --read-only \
+            --mount "type=volume,src=$name-control-state,dst=/state,readonly" \
+            "$helper_image" sh -ec '
+                cd /state
+                if [ -d control.evidence ]; then
+                    find control.evidence -type f -exec sha256sum {} +
+                fi
+            ' | LC_ALL=C sort > "$1"
     }
 
     stop_new() {
@@ -65,9 +78,19 @@ upgrade_site() (
     }
 
     restore() {
-        local kind original kept rc=0
+        local kind original kept recreate=no rc=0
+        kept=$(backup_name control)
+        if [[ $repin == yes ]] && docker container inspect "$kept" >/dev/null 2>&1 &&
+            [[ $(docker inspect -f '{{.State.Running}}' "$kept") != true ]]; then
+            recreate=yes
+        fi
         for kind in worker https control; do stop_new "$kind" || rc=1; done
+        if [[ $recreate == yes ]]; then
+            # Docker can allocate a different port when the old automatic binding restarts.
+            (control_image=$old_control_image; nginx_image=$old_nginx_image; control_service && https_service) || return 1
+        fi
         for kind in control https worker; do
+            if [[ $recreate == yes && $kind != worker ]]; then continue; fi
             original=$name-$kind
             kept=$(backup_name "$kind")
             if docker container inspect "$kept" >/dev/null 2>&1; then
@@ -82,7 +105,15 @@ upgrade_site() (
         done
         if (( rc == 0 )); then
             for _ in {1..20}; do
-                if status "$receipt/rollback-status.json"; then return 0; fi
+                if status "$receipt/rollback-status.json"; then
+                    if [[ $recreate == yes ]]; then
+                        for kind in https control; do
+                            kept=$(backup_name "$kind")
+                            owned "$kept" && docker container rm "$kept" >/dev/null || return 1
+                        done
+                    fi
+                    return 0
+                fi
                 sleep 1
             done
         fi
@@ -139,9 +170,14 @@ upgrade_site() (
     [[ $actual =~ ^127\.0\.0\.1:[0-9]{1,5}$ ]] || fail_upgrade "Expected one loopback HTTPS binding"
     endpoint=https://$actual
     port=${actual##*:}
-    docker inspect -f '{{json (index .HostConfig.PortBindings "8443/tcp")}}' "$name-control" |
-        jq -e --arg port "$port" 'length==1 and .[0].HostIp=="127.0.0.1" and .[0].HostPort==$port' >/dev/null ||
-        fail_upgrade "Upgrade requires a fixed loopback port so rollback can restore the same endpoint"
+    local binding
+    binding=$(docker inspect -f '{{json (index .HostConfig.PortBindings "8443/tcp")}}' "$name-control" |
+        jq -er 'select(length==1 and .[0].HostIp=="127.0.0.1") | .[0].HostPort | select(type=="string")') ||
+        fail_upgrade "Expected one loopback port binding"
+    [[ -z $binding || $binding == "$port" ]] || fail_upgrade "Unexpected loopback port binding"
+    if [[ -z $binding ]]; then repin=yes; fi
+    old_control_image=$(jq -er '.[0].image' "$receipt/before-runtime.json")
+    old_nginx_image=$(jq -er '.[1].image' "$receipt/before-runtime.json")
     lease=$(jq -er --arg worker "$name-worker" '
       .[0].argv | select(length==4 and .[0]=="--device" and .[1]==$worker and .[2]=="--lease-seconds")
       | .[3] | select(test("^[0-9]+$"))' "$receipt/before-runtime.json") ||
@@ -159,6 +195,16 @@ upgrade_site() (
     idle "$receipt/before-status.json" || fail_upgrade "Finish active tickets before upgrading"
     jq -e '.data.device.installation | type=="string" and length>0' "$receipt/before-status.json" >/dev/null ||
         fail_upgrade "The current site has no enrolled Worker"
+    legacy_repository=$(docker exec "$name-worker" sh -ec '
+        if [ -r /run/aep-worker/github-key ] && [ ! -e /pilot/supervisor/deploy-keys/keys.json ]; then
+            cat /run/aep-worker/github-repository
+        fi')
+    if [[ -n $legacy_repository ]]; then
+        legacy_fingerprint=$(docker exec "$name-worker" ssh-keygen -lf /run/aep-worker/github-key | awk 'NR==1 {print $2}')
+        [[ $legacy_fingerprint == SHA256:* ]] || fail_upgrade "The legacy Deploy Key has no fingerprint"
+        jq -n --arg worker "$name-worker" --arg repository "$legacy_repository" --arg fingerprint "$legacy_fingerprint" \
+            '{worker:$worker,repository:$repository,fingerprint:$fingerprint}' > "$receipt/legacy-key.json"
+    fi
     docker run --rm --network none --cap-drop ALL --user 101:101 --read-only \
         --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
         --mount "type=volume,src=$name-tls,dst=/run/aep-tls,readonly" \
@@ -191,13 +237,15 @@ upgrade_site() (
             install -d -m 2770 -o 10001 -g 10001 /pilot/repo/.git/aep/run-control
         '
     for suffix in https control; do
-        docker stop -t 10 "$name-$suffix" >/dev/null
-        docker rename "$name-$suffix" "$(backup_name "$suffix")"
+        object=$(backup_name "$suffix")
+        docker rename "$name-$suffix" "$object"
+        docker stop -t 10 "$object" >/dev/null
     done
     # Keep a state-only backup in the operator receipt directory. TLS/model keys remain in their volumes.
     docker run --rm --network none --read-only \
         --mount "type=volume,src=$name-control-state,dst=/state,readonly" \
         "$helper_image" cat /state/control.json > "$receipt/control-backup.json"
+    evidence_inventory "$receipt/before-evidence.sha256"
     control_service
     https_service
 
@@ -216,10 +264,14 @@ upgrade_site() (
 
     ready=no
     for _ in {1..30}; do
-        if status "$receipt/after-status.json" && jq -e --slurpfile before "$receipt/before-status.json" '
+        if status "$receipt/after-status.json" && jq -e --slurpfile before "$receipt/before-status.json" \
+            --arg worker "$name-worker" --arg fingerprint "$legacy_fingerprint" --arg repository "$legacy_repository" '
             .data as $after | $before[0].data as $old |
             ($after.device.installation==$old.device.installation) and
             ($after.device.last_seen > $old.device.last_seen) and
+            ($old.queue==null or $after.queue==$old.queue) and
+            ($fingerprint=="" or ($after.deploy_keys[$worker].repository==$repository and
+                $after.deploy_keys[$worker].inventory.active.fingerprint==$fingerprint)) and
             all($old.attempts[]; . as $run | any($after.attempts[];
                 .==$run or (del(.worker)==$run and .worker==$old.device.id)))
         ' "$receipt/after-status.json" >/dev/null; then
@@ -229,6 +281,9 @@ upgrade_site() (
         sleep 1
     done
     [[ $ready == yes ]] || fail_upgrade "The existing Worker did not reconnect with its original identity and history"
+    evidence_inventory "$receipt/after-evidence.sha256"
+    cmp "$receipt/before-evidence.sha256" "$receipt/after-evidence.sha256" ||
+        fail_upgrade "Archived control evidence changed during the upgrade"
     runtime_snapshot "$receipt/after-runtime.json"
     committed=yes
     for suffix in worker https control; do

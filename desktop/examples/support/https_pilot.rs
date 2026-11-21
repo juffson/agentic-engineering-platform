@@ -427,7 +427,7 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
                     && state["task"] == task
                     && state["branch"] == target
                     && state["exit_code"] == 1
-                    && state["pr"].is_null(),
+                    && (state["pr"].is_null() || (state["stage"] == "ci" && state["pr"].is_u64())),
                 "the saved session is not the scoped failed rehearsal"
             );
             Ok(session)
@@ -522,7 +522,16 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         println!("Remote task session: {}", dir.display());
 
         let saved_failure = read(&session.join("state.json")).unwrap_or_default();
-        let (pending, old) = if existing.is_some() && saved_failure["stage"] == "publication" {
+        let resume_ci =
+            existing.is_some() && saved_failure["stage"] == "ci" && saved_failure["pr"].is_u64();
+        let (pending, old) = if resume_ci {
+            let old = saved_failure["old_run"]
+                .as_str()
+                .context("missing interrupted Run")?
+                .to_owned();
+            reopen_remote(&mut ui, &ws, &runner, session, 1, "07a-ci-retry")?;
+            (saved_failure.clone(), old)
+        } else if existing.is_some() && saved_failure["stage"] == "publication" {
             reopen_remote(&mut ui, &ws, &runner, session, 1, "05b-publication-retry")?;
             let restored = await_stage(&mut ui, "待人工确认发布", session, 120)?;
             for field in ["ticket", "spec", "candidate", "recovered_run"] {
@@ -737,24 +746,34 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
             retry["data"]["predecessor"] == old && retry["data"]["reverify"] == true,
             "remote recovery did not continue from the interrupted Run"
         );
-        ensure!(
-            !evidence.join("publication.json").exists(),
-            "published before confirmation"
-        );
-        println!(
-            "Review {} and recovered checks.log and review.txt",
-            evidence.join("candidate.diff").display()
-        );
-        ui.checkpoint("05-publication-review")?;
-        confirm(
-            &mut ui,
-            &format!("publish {}", &candidate[..12]),
-            "06-publication-approved",
-        )?;
-        await_stage(&mut ui, "等待并核对 GitHub CI", session, 240)?;
-        ui.checkpoint("07-ci-progress")?;
+        if !resume_ci {
+            ensure!(
+                !evidence.join("publication.json").exists(),
+                "published before confirmation"
+            );
+            println!(
+                "Review {} and recovered checks.log and review.txt",
+                evidence.join("candidate.diff").display()
+            );
+            ui.checkpoint("05-publication-review")?;
+            confirm(
+                &mut ui,
+                &format!("publish {}", &candidate[..12]),
+                "06-publication-approved",
+            )?;
+            await_stage(&mut ui, "等待并核对 GitHub CI", session, 240)?;
+            ui.checkpoint("07-ci-progress")?;
+        }
 
         let pending = await_stage(&mut ui, "CI 已通过，待人工确认合并", session, 2800)?;
+        if resume_ci {
+            for field in ["ticket", "candidate", "pr"] {
+                ensure!(
+                    pending[field] == saved_failure[field],
+                    "CI retry changed {field}"
+                );
+            }
+        }
         if restart {
             reopen_remote(
                 &mut ui,

@@ -145,7 +145,7 @@ Worker 监督进程验证 GitHub 主机公钥，经代理连接 `ssh.github.com:
 
 ### 原位升级
 
-先构建本次发布使用的控制面和 Worker 镜像。在部署主机指向原站点名称，使用原操作员令牌和 CA 证书，并选择一个新的收据目录。原站点须使用固定回环端口，以便回滚时恢复同一地址。收据目录含升级前的控制状态备份，应保存在操作员可访问的私有位置。
+先构建本次发布使用的控制面和 Worker 镜像。在部署主机指向原站点名称，使用原操作员令牌和 CA 证书，并选择一个新的收据目录。如果原站点由 Docker 自动分配回环端口，升级会保留当前端口并将其固定下来。收据目录含升级前的控制状态备份，应保存在操作员可访问的私有位置。
 
 ```sh
 export AEP_PILOT_NAME="$site_name"
@@ -154,7 +154,7 @@ export AEP_PILOT_CONTROL_IMAGE="$new_control_image" AEP_PILOT_WORKER_IMAGE="$new
 ./deploy/pilot/site.sh upgrade "$site" "$receipt_dir"
 ```
 
-命令先检查没有活动工单，再冻结空闲 Worker 并核对 Lease 和本地日志。它保留现有 HTTPS 端口、证书、设备身份、模型凭证、工作区、控制状态、网络和数据卷。新 Nginx 和控制面通过 HTTPS 健康检查后，Worker 会带 `--upload-evidence` 启动。新服务未通过核验时，命令恢复原容器并记录回滚结果。
+命令先检查没有活动工单，再冻结空闲 Worker 并核对 Lease 和本地日志。它保留现有 HTTPS 端口、证书、设备身份、模型凭证、工作区、控制状态、网络和数据卷。新 Nginx 和控制面通过 HTTPS 健康检查后，Worker 会带 `--upload-evidence` 启动。验收会对比旧工单、控制面归档的 SHA-256，以及手工配置 Deploy Key 的指纹。新服务未通过核验时，命令使用原镜像和原数据卷在同一地址回滚，并记录结果。
 
 此配置使用容器作为 Codex 的执行沙箱，因为 Docker 的默认 seccomp 与 AppArmor 会阻止内层 bubblewrap 建立命名空间。本部署的 Codex 包装器只在只读容器内的指定 UID、零 capabilities 与 `no-new-privileges` 均成立时接管 AEP 的沙箱参数。代理仅开放配置中的 HTTPS CONNECT 主机，内部网络无直接外部路由。验收使用构建时准备好的 Cargo 缓存并离线运行。[Codex 容器沙箱说明](https://github.com/openai/codex/blob/main/.devcontainer/README.md) · [Docker 内部网络](https://docs.docker.com/reference/cli/docker/network/create/#network-internal-mode---internal)
 
