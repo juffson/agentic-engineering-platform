@@ -78,6 +78,25 @@ pub(super) fn confirm_with(
     ui.click("https-confirm")
 }
 
+pub(super) fn worker_ci(evidence: &Path, pending: &Value) -> Result<()> {
+    let receipt = read(&evidence.join("worker-ci.json"))?;
+    ensure!(
+        receipt["provider"] == "https_worker"
+            && receipt["result"] == "passed"
+            && receipt["run"] == pending["recovered_run"]
+            && receipt["worker"] == pending["worker"]
+            && receipt["candidate"] == pending["candidate"]
+            && receipt["target"] == pending["branch"]
+            && receipt["pr"] == pending["pr"],
+        "Worker acceptance did not match the merge confirmation"
+    );
+    Ok(())
+}
+
+fn failed_after_publication(state: &Value) -> bool {
+    state["pr"].is_u64() && matches!(state["stage"].as_str(), Some("ci" | "worker_ci"))
+}
+
 pub(super) fn run(mut args: Args) -> Result<()> {
     ensure!(
         io::stdin().is_terminal(),
@@ -438,7 +457,7 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
                     && state["task"] == task
                     && state["branch"] == target
                     && state["exit_code"] == 1
-                    && (state["pr"].is_null() || (state["stage"] == "ci" && state["pr"].is_u64())),
+                    && (state["pr"].is_null() || failed_after_publication(&state)),
                 "the saved session is not the scoped failed rehearsal"
             );
             Ok(session)
@@ -533,8 +552,7 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
         println!("Remote task session: {}", dir.display());
 
         let saved_failure = read(&session.join("state.json")).unwrap_or_default();
-        let resume_ci =
-            existing.is_some() && saved_failure["stage"] == "ci" && saved_failure["pr"].is_u64();
+        let resume_ci = existing.is_some() && failed_after_publication(&saved_failure);
         let (pending, old) = if resume_ci {
             let old = saved_failure["old_run"]
                 .as_str()
@@ -772,8 +790,6 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
                 &format!("publish {}", &candidate[..12]),
                 "06-publication-approved",
             )?;
-            await_stage(&mut ui, "等待并核对 GitHub CI", session, 240)?;
-            ui.checkpoint("07-ci-progress")?;
         }
 
         let pending = await_stage(&mut ui, "CI 已通过，待人工确认合并", session, 2800)?;
@@ -803,16 +819,14 @@ pub(super) fn run_remote(mut args: Args) -> Result<()> {
             }
         }
         let number = pending["pr"].as_u64().context("missing GitHub PR")?;
-        let ci = read(&evidence.join("github-ci.json"))?;
+        worker_ci(&evidence, &pending)?;
         ensure!(
-            ci["headRefOid"] == candidate
-                && ci["baseRefName"] == target
-                && ci["mergeStateStatus"] == "CLEAN",
-            "GitHub CI did not match the selected target and candidate"
+            pending["candidate"] == candidate && pending["branch"] == target,
+            "the merge confirmation changed the candidate or target"
         );
         println!(
             "Review PR #{number} and {}",
-            evidence.join("github-ci.json").display()
+            evidence.join("worker-ci.json").display()
         );
         ui.checkpoint("08-ci-passed")?;
         confirm(

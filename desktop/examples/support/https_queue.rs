@@ -1,6 +1,6 @@
 use super::{
     Args, Driver, handoff_fixture,
-    https_pilot::{await_stage, choose, confirm, sessions},
+    https_pilot::{await_stage, choose, confirm, sessions, worker_ci},
 };
 use aep::workspace::{Workspace, git, read};
 use anyhow::{Context, Result, ensure};
@@ -375,8 +375,6 @@ pub(super) fn run(mut args: Args) -> Result<()> {
                 &format!("publish {}", &candidate[..12]),
                 "07-publication-confirmed",
             )?;
-            await_stage(&mut ui, "等待并核对 GitHub CI", &deliver, 180)?;
-            ui.checkpoint("08-ci")?;
             candidate.to_owned()
         } else {
             delivery_state["candidate"]
@@ -386,13 +384,12 @@ pub(super) fn run(mut args: Args) -> Result<()> {
         };
         let pending = await_stage(&mut ui, "CI 已通过，待人工确认合并", &deliver, 2800)?;
         let number = pending["pr"].as_u64().context("missing GitHub PR")?;
-        let ci = read(&evidence.join("github-ci.json"))?;
+        worker_ci(&evidence, &pending)?;
         ensure!(
-            ci["headRefOid"] == candidate
-                && ci["baseRefName"] == plan.deliver.target
-                && ci["mergeStateStatus"] == "CLEAN",
-            "the PR checks do not match the selected candidate"
+            pending["candidate"] == candidate && pending["branch"] == plan.deliver.target,
+            "the merge confirmation changed the candidate or target"
         );
+        ui.checkpoint("08-ci")?;
         println!(
             "Review PR #{number} and its CI receipt in {}",
             evidence.display()

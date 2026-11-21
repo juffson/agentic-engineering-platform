@@ -14,6 +14,7 @@ use aep::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Subcommand};
 use http::Client;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use state::{Attempt, Operation, Reply, Stage, Task, sha};
 use std::{
@@ -143,6 +144,19 @@ enum Action {
         #[arg(long)]
         candidate: String,
     },
+    /// Verify the published PR's acceptance from its original HTTPS Worker.
+    Acceptance {
+        #[arg(long)]
+        ticket: String,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        spec: String,
+        #[arg(long)]
+        candidate: String,
+        #[arg(long)]
+        pr: u64,
+    },
     /// Start the outbound local execution daemon.
     Worker {
         #[arg(long)]
@@ -214,17 +228,24 @@ fn checked_evidence(ws: &Workspace, run: &Attempt, candidate: &str) -> Result<St
         commit(&ws.root, &format!("refs/aep/runs/{}", run.id))? == candidate,
         "local candidate reference changed"
     );
+    let open = |artifact| -> Result<_> {
+        let file = artifact_file(&ws.data, &run.id, artifact)?
+            .context("local approval artifact is missing")?;
+        Ok((file.metadata()?.len(), file))
+    };
+    report_digest(&record, [open(Artifact::Checks)?, open(Artifact::Review)?])
+}
+
+fn report_digest(record: &Value, artifacts: [(u64, impl Read); 2]) -> Result<String> {
     let mut digest = Sha256::new();
-    let metadata = serde_json::to_vec(&record)?;
+    let metadata = serde_json::to_vec(record)?;
     digest.update((metadata.len() as u64).to_be_bytes());
     digest.update(metadata);
     let mut buffer = [0; 16 * 1024];
-    for artifact in [Artifact::Checks, Artifact::Review] {
-        let mut file = artifact_file(&ws.data, &run.id, artifact)?
-            .context("local approval artifact is missing")?;
-        digest.update(file.metadata()?.len().to_be_bytes());
+    for (length, mut artifact) in artifacts {
+        digest.update(length.to_be_bytes());
         loop {
-            let size = file.read(&mut buffer)?;
+            let size = artifact.read(&mut buffer)?;
             if size == 0 {
                 break;
             }
@@ -232,6 +253,79 @@ fn checked_evidence(ws: &Workspace, run: &Attempt, candidate: &str) -> Result<St
         }
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn worker_acceptance(
+    run: &Attempt,
+    pr: u64,
+    candidate: &str,
+    artifacts: evidence::AcceptanceArtifacts<'_>,
+) -> Result<Value> {
+    let approval = run
+        .approval
+        .as_ref()
+        .context("missing publication approval")?;
+    let worker = run.worker.as_deref().context("missing acceptance Worker")?;
+    ensure!(
+        run.stage == Stage::Published
+            && run.pull_request == Some(pr)
+            && approval.spec == run.task.spec
+            && approval.candidate == candidate
+            && run.events.last().is_some_and(|event| matches!(
+                &event.progress,
+                state::Progress::Exit {
+                    outcome: state::Outcome::Passed,
+                    candidate: Some(head),
+                } if head == candidate
+            )),
+        "the PR does not belong to this passing, published Run"
+    );
+    let record: Value = serde_json::from_slice(artifacts.record)?;
+    let digest = report_digest(
+        &record,
+        [artifacts.checks, artifacts.review].map(|data| (data.len() as u64, data)),
+    )?;
+    ensure!(
+        digest == approval.report_sha256,
+        "HTTPS Worker evidence differs from the approved report"
+    );
+    ensure!(
+        record["run_id"] == run.id
+            && record["task"] == run.task.name
+            && record["spec_sha"] == run.task.spec
+            && record["candidate_sha"] == candidate
+            && record["status"] == "awaiting_human_review"
+            && record["check_exit_code"] == 0
+            && record["review_status"] == "findings_recorded"
+            && record["blocking_findings"] == json!([]),
+        "HTTPS Worker report does not match the passing Run"
+    );
+    let checks = record["acceptance"]
+        .as_array()
+        .filter(|checks| !checks.is_empty())
+        .context("Worker report has no acceptance checks")?;
+    ensure!(
+        checks.iter().all(|check| check["status"] == "passed"
+            && check["exit_code"] == 0
+            && check["id"].as_str().is_some_and(|id| !id.is_empty())),
+        "a Worker acceptance check did not pass"
+    );
+    Ok(json!({
+        "provider": "https_worker",
+        "result": "passed",
+        "repository": run.task.repository,
+        "ticket": run.task.ticket,
+        "run": run.id,
+        "task": run.task.name,
+        "worker": worker,
+        "spec": run.task.spec,
+        "candidate": candidate,
+        "target": run.task.target,
+        "baseline": run.task.baseline,
+        "pr": pr,
+        "report_sha256": digest,
+        "checks": checks,
+    }))
 }
 
 fn target(
@@ -502,8 +596,81 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
             let report_sha256 = checked_evidence(&ws, &current, &candidate)?;
             publish(&client, &ws, current, &candidate, report_sha256)?
         }
+        Action::Acceptance {
+            ticket,
+            run,
+            spec,
+            candidate,
+            pr,
+        } => {
+            ensure!(
+                url.starts_with("https://"),
+                "Worker acceptance requires HTTPS"
+            );
+            let current = exact_run(&client, &ticket, &run, &spec, &candidate)?;
+            let packet = client.download(&ticket, &run)?;
+            let receipt = worker_acceptance(
+                &current,
+                pr,
+                &candidate,
+                evidence::acceptance_artifacts(&packet)?,
+            )?;
+            let ws = Workspace::open(repo)?;
+            ensure!(
+                receipt["report_sha256"] == checked_evidence(&ws, &current, &candidate)?,
+                "Studio artifacts differ from the approved Worker report"
+            );
+            target(&ws, &tool_path()?, &current, &candidate)?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+            return Ok(());
+        }
         Action::Serve { .. } | Action::Worker { .. } => unreachable!(),
     };
     println!("{}", serde_json::to_string_pretty(&reply)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::*;
+
+    #[test]
+    fn published_acceptance_requires_the_approved_artifacts_and_pr() -> Result<()> {
+        let candidate = "a".repeat(40);
+        let spec = "b".repeat(40);
+        let record = json!({
+            "run_id":"run-1", "task":"test-task", "spec_sha":spec, "candidate_sha":candidate,
+            "status":"awaiting_human_review", "check_exit_code":0, "review_status":"findings_recorded",
+            "blocking_findings":[], "acceptance":[{"id":"primary","status":"passed","exit_code":0}],
+        });
+        let record_bytes = serde_json::to_vec(&record)?;
+        let checks = b"acceptance passed";
+        let review = b"review complete";
+        let digest = report_digest(
+            &record,
+            [checks.as_slice(), review.as_slice()].map(|bytes| (bytes.len() as u64, bytes)),
+        )?;
+        let run = serde_json::from_value(json!({
+            "id":"run-1", "stage":"published", "worker":"worker-two", "reverify":false,
+            "task":{"ticket":"ticket-1","name":"test-task","repository":"owner/repo",
+                    "spec":spec,"target":"test/task","baseline":"c".repeat(40),
+                    "timeout":60,"max_attempts":3},
+            "approval":{"actor":"operator","approved_at":1,"spec":spec,
+                        "candidate":candidate,"report_sha256":digest},
+            "pull_request":15,
+            "events":[{"sequence":1,"unix_seconds":1,
+                       "progress":{"type":"exit","outcome":"passed","candidate":candidate}}],
+        }))?;
+        let artifacts = |checks| evidence::AcceptanceArtifacts {
+            record: &record_bytes,
+            checks,
+            review,
+        };
+        let receipt = worker_acceptance(&run, 15, &candidate, artifacts(checks))?;
+        assert_eq!(receipt["worker"], "worker-two");
+        assert_eq!(receipt["checks"][0]["id"], "primary");
+        assert!(worker_acceptance(&run, 16, &candidate, artifacts(checks)).is_err());
+        assert!(worker_acceptance(&run, 15, &candidate, artifacts(b"changed")).is_err());
+        Ok(())
+    }
 }

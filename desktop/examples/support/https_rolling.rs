@@ -150,7 +150,7 @@ fn retry_failed_history(ui: &mut Driver<'_>, root: &Path) -> Result<bool> {
     click(ui, "rolling-resume")?;
     let reached_gate = until(
         ui,
-        "the retried GitHub CI or original merge approval",
+        "the retried Worker acceptance or original merge approval",
         2_950,
         |ui| {
             let state = read(&root.join("rolling-state.json")).unwrap_or_default();
@@ -170,7 +170,7 @@ fn retry_failed_history(ui: &mut Driver<'_>, root: &Path) -> Result<bool> {
         ui.reveal("https-pilot-page", "rolling-failure")?;
         ui.checkpoint("history-retry-failure-retained")?;
         println!(
-            "The history retry returned to the same failed rehearsal. GitHub CI is still blocked."
+            "The history retry returned to the same failed rehearsal. Read the retained failure reason in Studio."
         );
     }
     Ok(reached_gate)
@@ -374,7 +374,7 @@ pub(super) fn run(mut args: Args) -> Result<()> {
         if kind == "merge" {
             let role = if index == 1 { "peer" } else { "switched" };
             let ci = format!("rolling-ci-{role}-0");
-            until(&mut ui, "GitHub checks in Studio", 20, |ui| {
+            until(&mut ui, "Worker checks in Studio", 20, |ui| {
                 Ok((!ui.absent(&ci)?).then_some(()))
             })?;
             ui.reveal("https-pilot-page", &ci)?;

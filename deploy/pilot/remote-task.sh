@@ -24,7 +24,7 @@ report() {
         --arg branch "$branch" --arg ticket "$ticket" --arg baseline "$baseline" --arg spec "$spec" \
         --arg candidate "$candidate" --arg old "$old_run" --arg recovered "$recovered_run" --arg pr "$pr" --arg worker "$worker" \
         --arg archive "$archive" --argjson code "${1:-null}" --argjson private "$private" \
-        '{remote:true,stage:$stage,reason:$reason,repository:$repository,private_repository:$private,task:$task,branch:$branch,ticket:$ticket,
+        '{remote:true,ci_provider:"https_worker",stage:$stage,reason:$reason,repository:$repository,private_repository:$private,task:$task,branch:$branch,ticket:$ticket,
           baseline:$baseline,spec:$spec,candidate:$candidate,old_run:$old,recovered_run:$recovered,worker:$worker,
           pr:(if $pr=="" then null else ($pr|tonumber) end),archive:($archive!=""),exit_code:$code}' > "$session/state.tmp"
     mv -f "$session/state.tmp" "$session/state.json"
@@ -499,25 +499,56 @@ pr=$(jq -er --arg spec "$spec" --arg candidate "$candidate" --arg actor "$actor"
 [[ $pr =~ ^[1-9][0-9]*$ ]] || fail "Missing GitHub PR receipt"
 mv -f "$evidence/publication.tmp" "$evidence/publication.json"
 head_branch="aep/pr/$task/$recovered_run"
-checkpoint
-pr_view > "$evidence/github-resume.json"
-if [[ $(jq -er .state "$evidence/github-resume.json") != MERGED ]]; then
-    check_pr "$evidence/github-resume.json"
-    step ci
-    if [[ $mode == retry ]] && failed_rollup "$evidence/github-resume.json"; then
+
+worker_ci() {
+    local snapshot=$1 receipt=$2
+    check_pr "$snapshot"
+    jq -e '
+        .mergeable=="MERGEABLE" and (.mergeStateStatus | IN("CLEAN","UNSTABLE")) and
+        (.reviewDecision | IN("CHANGES_REQUESTED","REVIEW_REQUIRED") | not)
+    ' "$snapshot" >/dev/null || fail "The PR is blocked by GitHub merge or review requirements"
+    retry_read control acceptance --ticket "$ticket" --run "$recovered_run" --spec "$spec" \
+        --candidate "$candidate" --pr "$pr" > "$receipt.tmp" ||
+        fail "Could not verify the HTTPS Worker acceptance; see the Studio log"
+    mv -f "$receipt.tmp" "$receipt"
+}
+
+worker_pr_view() {
+    local snapshot=$1 deadline=$((SECONDS + 120))
+    while :; do
         checkpoint
-        retry_ci "$evidence/github-resume.json"
-        wait_ci 60
-    else
-        wait_ci
-    fi
+        pr_view > "$snapshot.tmp"
+        mv -f "$snapshot.tmp" "$snapshot"
+        if [[ $(jq -er .state "$snapshot") == MERGED ]]; then return; fi
+        check_pr "$snapshot"
+        if jq -e '.mergeable!="UNKNOWN" and .mergeStateStatus!="UNKNOWN"' "$snapshot" >/dev/null; then
+            return
+        fi
+        (( SECONDS < deadline )) || fail "GitHub did not finish evaluating the PR mergeability"
+        sleep 2
+    done
+}
+
+worker_merge_context() {
+    jq -cS --slurpfile acceptance "$2" '
+        {headRefOid,baseRefOid,reviewDecision,latestReviews,acceptance:$acceptance[0]}
+    ' "$1"
+}
+
+checkpoint
+worker_pr_view "$evidence/github-resume.json"
+if [[ $(jq -er .state "$evidence/github-resume.json") != MERGED ]]; then
+    step worker_ci
+    worker_ci "$evidence/github-resume.json" "$evidence/worker-ci.json"
+    worker_merge_context "$evidence/github-resume.json" "$evidence/worker-ci.json" > "$evidence/worker-merge-context.tmp"
+    mv -f "$evidence/worker-merge-context.tmp" "$evidence/worker-merge-context.json"
     step merge_confirmation
     confirm "merge $pr $candidate"
-    pr_view > "$evidence/github-before-merge.json"
-    check_pr "$evidence/github-before-merge.json"
-    ready_rollup "$evidence/github-before-merge.json" || fail "GitHub checks or review are no longer ready"
-    [[ $(approval_context "$evidence/github-ci.json") == "$(approval_context "$evidence/github-before-merge.json")" ]] ||
-        fail "GitHub changed during merge confirmation; review the new state before merging"
+    worker_pr_view "$evidence/github-before-merge.json"
+    worker_ci "$evidence/github-before-merge.json" "$evidence/worker-ci-before-merge.json"
+    [[ $(cat "$evidence/worker-merge-context.json") == "$(worker_merge_context "$evidence/github-before-merge.json" "$evidence/worker-ci-before-merge.json")" ]] ||
+        fail "The PR or Worker acceptance changed during confirmation; review the new state before merging"
+    checkpoint
     step merge
     gh pr merge "$pr" -R "$repository" --merge --match-head-commit "$candidate" ||
         fail "GitHub did not confirm the merge. Retry to reconcile the exact PR"

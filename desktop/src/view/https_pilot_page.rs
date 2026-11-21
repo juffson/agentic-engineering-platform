@@ -76,6 +76,7 @@ pub(super) fn phase(stage: &str) -> (usize, &'static str) {
         "publish_confirmation" => (3, "待人工确认发布"),
         "publication" => (3, "发布固定候选并创建 PR"),
         "ci" => (4, "等待并核对 GitHub CI"),
+        "worker_ci" => (4, "核对 HTTPS Worker 验收回执"),
         "merge_confirmation" => (4, "CI 已通过，待人工确认合并"),
         "merge" => (4, "合并已确认的 PR"),
         "cleanup" => (5, "同步目标分支并清理候选与工作区"),
@@ -838,10 +839,11 @@ impl Studio {
             );
         }
         if let Some(url) = progress.pr_url() {
+            let worker_ci = progress.ci_provider == "https_worker";
             let mut checks = panel().flex_none().child(
                 h_flex()
                     .justify_between()
-                    .child(heading("GitHub CI"))
+                    .child(heading(if worker_ci { "Worker CI" } else { "GitHub CI" }))
                     .child(
                         button(
                             "https-pr",
@@ -852,7 +854,11 @@ impl Studio {
                     ),
             );
             if session.checks.is_empty() {
-                checks = checks.child(caption("等待 GitHub 上报检查"));
+                checks = checks.child(caption(if worker_ci {
+                    "等待核对 Worker 验收回执"
+                } else {
+                    "等待 GitHub 上报检查"
+                }));
             }
             let mut rows = v_flex().gap_2().id("https-checks").test_support();
             for (i, check) in session.checks.iter().enumerate() {

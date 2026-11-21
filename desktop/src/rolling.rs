@@ -3,7 +3,7 @@ pub(crate) use history::History;
 
 use crate::{
     Runner,
-    https_pilot::{Connection, Progress, preview, read_json},
+    https_pilot::{Connection, Progress, ci_checks, preview, read_json},
     https_queue::site_status,
     rolling_gate::Gate,
 };
@@ -188,14 +188,11 @@ impl Delivery {
             return None;
         }
         let evidence = path.join(task.task).join("evidence");
-        let checks: Value = read_json(evidence.join("github-ci.json")).unwrap_or_default();
+        let checks = ci_checks(&evidence, &progress);
         Some(Self {
             role,
             progress,
-            checks: checks["statusCheckRollup"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
+            checks,
             evidence,
         })
     }
@@ -203,6 +200,7 @@ impl Delivery {
     pub fn proofs(&self) -> Vec<(&'static str, PathBuf)> {
         let mut paths = vec![
             ("候选 Diff", self.evidence.join("candidate.diff")),
+            ("Worker CI 回执", self.evidence.join("worker-ci.json")),
             ("CI 验收日志", self.evidence.join("github-acceptance.log")),
             ("合并回执", self.evidence.join("github-merged.json")),
             ("清理回执", self.evidence.join("cleanup.json")),
