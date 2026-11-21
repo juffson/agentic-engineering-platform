@@ -85,6 +85,10 @@ confirm() {
         exit 3
     fi
     checkpoint
+    if [[ -n ${AEP_STUDIO_ROLLING_SESSION:-} && -f $evidence/confirmations.tsv ]] &&
+        awk -F '\t' -v expected="$1" '$2==expected{found=1} END{exit !found}' "$evidence/confirmations.tsv"; then
+        return 0
+    fi
     printf '%s\t%s\n' "$(date -u +%FT%TZ)" "$1" >> "$evidence/confirmations.tsv"
 }
 

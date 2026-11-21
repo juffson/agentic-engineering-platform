@@ -1,7 +1,7 @@
 use super::{
     Args, Driver, LiveKeyStep, handoff_fixture,
-    https_pilot::{await_stage, confirm, confirm_with},
-    https_queue::{Task, dispatch_selected},
+    https_pilot::{confirm, confirm_with, sessions},
+    https_queue::{Task, dispatch_selected, select, until},
 };
 use aep::{
     deploy_keys::{RollingRotation, WorkerKeys},
@@ -23,27 +23,56 @@ fn rolling_session() -> Option<std::path::PathBuf> {
     std::env::var_os("AEP_STUDIO_ROLLING_SESSION").map(Into::into)
 }
 
-fn request_approval(root: &Path, repository: &str, worker: &str, action: Action) -> Result<()> {
-    let gate = Gate {
+fn read_gate(path: &Path) -> Option<Gate> {
+    serde_json::from_reader(fs::File::open(path).ok()?).ok()
+}
+
+fn request_approval(
+    root: &Path,
+    repository: &str,
+    worker: &str,
+    binding: String,
+    action: Action,
+) -> Result<()> {
+    let mut gate = Gate {
         id: uuid::Uuid::new_v4().to_string(),
         repository: repository.into(),
         worker: worker.into(),
+        binding,
         action,
     };
     ensure!(gate.valid(), "invalid Studio approval");
     let path = root.join("gate.json");
-    write_json(&path, &gate)?;
-    let mut answer = String::new();
-    let read = io::stdin().read_line(&mut answer);
-    fs::remove_file(path)?;
-    read?;
-    ensure!(
-        answer == gate.command(),
-        "Studio operator stopped at approval"
-    );
-    let log = root.join("evidence/approvals");
-    fs::create_dir_all(&log)?;
-    write_json(&log.join(format!("{}.json", gate.id)), &gate)
+    if let Some(previous) = read_gate(&path).filter(|old| old.valid() && old.same_scope(&gate)) {
+        gate = previous;
+    }
+    let already_confirmed = fs::read_dir(root.join("evidence/approvals"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            read_gate(&entry.path()).is_some_and(|old| old.valid() && old.same_scope(&gate))
+        });
+    if !already_confirmed {
+        write_json(&path, &gate)?;
+        loop {
+            ensure!(
+                !root.join("pause-request").exists(),
+                "Studio paused at approval"
+            );
+            if let Some(saved) = read_gate(&gate.receipt(root)) {
+                ensure!(saved == gate, "Studio approval scope changed");
+                break;
+            }
+            thread::sleep(Duration::from_millis(180));
+        }
+    } else {
+        println!("Reconciled a previously confirmed Studio action for {worker}");
+    }
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
@@ -211,12 +240,12 @@ pub(super) fn run(mut args: Args) -> Result<()> {
                     && plan.workers.len() >= 2,
                 "unexpected rolling Worker order"
             );
-            ui.reveal("https-pilot-page", "https-key-roll-state")?;
-            ui.checkpoint("02-roll-started")?;
             fs::write(
                 output.join("rotation.json"),
                 serde_json::to_vec_pretty(&plan)?,
             )?;
+            ui.reveal("https-pilot-page", "https-key-roll-state")?;
+            ui.checkpoint("02-roll-started")?;
             println!("Rolling rotation started. Evidence: {}", output.display());
             return Ok(());
         }
@@ -236,6 +265,16 @@ pub(super) fn run(mut args: Args) -> Result<()> {
             );
             checkpoint(&mut ui, &output, "02-roll-staged", &worker, &after)?;
             println!("Rolling key staged. Evidence: {}", output.display());
+            return Ok(());
+        }
+        Some(LiveKeyStep::Verify) => {
+            click(&mut ui, &format!("https-key-verify-{worker}"))?;
+            let after = complete(&mut ui, &status, &state)?;
+            ensure!(
+                after.verified_at.is_some(),
+                "Worker read-only verification failed"
+            );
+            checkpoint(&mut ui, &output, "03-1-active-verified", &worker, &after)?;
             return Ok(());
         }
         Some(LiveKeyStep::ExpectFailure) => {
@@ -306,6 +345,11 @@ pub(super) fn run(mut args: Args) -> Result<()> {
                 &root,
                 &state.repository,
                 &worker,
+                format!(
+                    "{}:{}",
+                    state.installation,
+                    std::env::var("AEP_STUDIO_ROLLING_PLAN")?
+                ),
                 Action::Revoke {
                     old: old.fingerprint.clone(),
                     replacement: current.fingerprint.clone(),
@@ -417,6 +461,110 @@ pub(super) fn run(mut args: Args) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum DeliveryPoint {
+    Publication,
+    Merge,
+    Archive,
+}
+
+fn reached_delivery(
+    ui: &mut Driver<'_>,
+    session: &Path,
+    seconds: u64,
+    point: DeliveryPoint,
+) -> Result<Value> {
+    until(ui, "the saved delivery checkpoint", seconds, |ui| {
+        let state = read(&session.join("state.json")).unwrap_or_default();
+        let label = match state["stage"].as_str() {
+            Some("publish_confirmation") if matches!(point, DeliveryPoint::Publication) => {
+                Some("待人工确认发布")
+            }
+            Some("merge_confirmation") if !matches!(point, DeliveryPoint::Archive) => {
+                Some("CI 已通过，待人工确认合并")
+            }
+            Some("completed") if state["exit_code"] == 0 && state["archive"] == true => {
+                Some("已合并并归档")
+            }
+            _ => None,
+        };
+        ensure!(
+            state["exit_code"].is_null() || label == Some("已合并并归档"),
+            "Saved delivery failed at {}; read {}",
+            state["stage"],
+            session.join("studio.log").display()
+        );
+        Ok(label
+            .filter(|label| {
+                ui.element("https-stage")
+                    .is_ok_and(|element| element.label() == Some(label))
+            })
+            .map(|_| state))
+    })
+}
+
+fn open_delivery(
+    ui: &mut Driver<'_>,
+    parent: &Path,
+    task: &Task,
+    recover: bool,
+) -> Result<std::path::PathBuf> {
+    if recover {
+        let mut existing = sessions(parent).into_iter().filter(|path| {
+            let request = read(&path.join("request.json")).unwrap_or_default();
+            request["task"]["name"] == task.task && request["branch"]["name"] == task.target
+        });
+        if let Some(session) = existing.next() {
+            ensure!(
+                existing.next().is_none(),
+                "multiple saved sessions for the same isolated task"
+            );
+            select(ui, &session)?;
+            let prior = until(ui, "the saved task to become available", 80, |ui| {
+                let state = task.state(&session);
+                if !ui.absent("https-resume")? {
+                    click(ui, "https-resume")?;
+                    return Ok(Some(Some(state)));
+                }
+                Ok((state["stage"] == "completed"
+                    && state["exit_code"] == 0
+                    && state["archive"] == true)
+                    .then_some(None))
+            })?;
+            if let Some(prior) = prior {
+                until(ui, "the resumed task observer", 40, |_| {
+                    Ok((task.state(&session) != prior).then_some(()))
+                })?;
+            }
+            return Ok(session);
+        }
+    }
+    dispatch_selected(ui, parent, task)
+}
+
+fn merge_binding(evidence: &Path, run: &str) -> Result<String> {
+    let ci = read(&evidence.join("github-ci.json"))?;
+    let mut checks = ci["statusCheckRollup"]
+        .as_array()
+        .context("missing GitHub CI")?
+        .clone();
+    checks.sort_by_cached_key(|check| {
+        ["detailsUrl", "targetUrl", "name", "context"]
+            .into_iter()
+            .find_map(|key| check[key].as_str())
+            .unwrap_or_default()
+            .to_owned()
+    });
+    Ok(serde_json::to_string(&serde_json::json!({
+        "run": run,
+        "head": ci["headRefOid"],
+        "base": ci["baseRefOid"],
+        "review": ci["reviewDecision"],
+        "latest_reviews": ci["latestReviews"],
+        "checks": checks,
+    }))?)
+}
+
 fn deliver(
     ui: &mut Driver<'_>,
     ws: &Workspace,
@@ -452,9 +600,9 @@ fn deliver(
         output.join("dispatch-site-status.json"),
         serde_json::to_vec_pretty(&before)?,
     )?;
-    let session = dispatch_selected(ui, &ws.data.join("https-studio"), &task)?;
-    println!("Remote task session: {}", session.display());
     let studio = rolling_session();
+    let session = open_delivery(ui, &ws.data.join("https-studio"), &task, studio.is_some())?;
+    println!("Remote task session: {}", session.display());
     if let Some(root) = &studio {
         let role = std::env::var("AEP_STUDIO_ROLLING_DELIVERY")?;
         ensure!(
@@ -466,7 +614,7 @@ fn deliver(
             &serde_json::json!({"session": session, "task": task.task}),
         )?;
     }
-    let pending = await_stage(ui, "待人工确认发布", &session, 850)?;
+    let pending = reached_delivery(ui, &session, 2_800, DeliveryPoint::Publication)?;
     ensure!(
         pending["worker"] == worker && pending["branch"] == task.target,
         "dispatch did not use the expected Worker or branch"
@@ -503,62 +651,75 @@ fn deliver(
                 .is_some_and(|n| n > 0),
         "remote Run did not contain real implementation, checks and review"
     );
-    ui.checkpoint("03-peer-publication-review")?;
-    println!(
-        "Review {} and the Run report under {}",
-        evidence.join("candidate.diff").display(),
-        evidence.display()
-    );
-    if let Some(root) = &studio {
-        confirm_with(ui, "04-peer-approved", || {
-            request_approval(
-                root,
-                &plan.repository,
-                worker,
-                Action::Publish {
-                    target: task.target.clone(),
-                    candidate: candidate.into(),
-                },
-            )
-        })?;
+    let merge = if pending["stage"] == "publish_confirmation" {
+        ui.checkpoint("03-peer-publication-review")?;
+        println!(
+            "Review {} and the Run report under {}",
+            evidence.join("candidate.diff").display(),
+            evidence.display()
+        );
+        if let Some(root) = &studio {
+            confirm_with(ui, "04-peer-approved", || {
+                request_approval(
+                    root,
+                    &plan.repository,
+                    worker,
+                    run.into(),
+                    Action::Publish {
+                        target: task.target.clone(),
+                        candidate: candidate.into(),
+                    },
+                )
+            })?;
+        } else {
+            confirm(
+                ui,
+                &format!("publish {}", &candidate[..12]),
+                "04-peer-approved",
+            )?;
+        }
+        reached_delivery(ui, &session, 2_800, DeliveryPoint::Merge)?
     } else {
-        confirm(
-            ui,
-            &format!("publish {}", &candidate[..12]),
-            "04-peer-approved",
-        )?;
-    }
-    let merge = await_stage(ui, "CI 已通过，待人工确认合并", &session, 2800)?;
+        pending.clone()
+    };
     ensure!(
-        merge["candidate"] == candidate && merge["worker"] == worker,
+        merge["candidate"] == candidate
+            && merge["worker"] == worker
+            && merge["recovered_run"] == run,
         "CI scope changed"
     );
     let pr = merge["pr"].as_u64().context("missing GitHub PR")?;
-    println!(
-        "Review PR #{pr} and {}",
-        evidence.join("github-ci.json").display()
-    );
-    if let Some(root) = &studio {
-        confirm_with(ui, "05-peer-merge", || {
-            request_approval(
-                root,
-                &plan.repository,
-                worker,
-                Action::Merge {
-                    target: task.target.clone(),
-                    candidate: candidate.into(),
-                    pr,
-                },
-            )
-        })?;
+    let completed = if merge["stage"] == "merge_confirmation" {
+        println!(
+            "Review PR #{pr} and {}",
+            evidence.join("github-ci.json").display()
+        );
+        if let Some(root) = &studio {
+            let binding = merge_binding(&evidence, run)?;
+            confirm_with(ui, "05-peer-merge", || {
+                request_approval(
+                    root,
+                    &plan.repository,
+                    worker,
+                    binding,
+                    Action::Merge {
+                        target: task.target.clone(),
+                        candidate: candidate.into(),
+                        pr,
+                    },
+                )
+            })?;
+        } else {
+            confirm(
+                ui,
+                &format!("merge {pr} {}", &candidate[..12]),
+                "05-peer-merge",
+            )?;
+        }
+        reached_delivery(ui, &session, 240, DeliveryPoint::Archive)?
     } else {
-        confirm(
-            ui,
-            &format!("merge {pr} {}", &candidate[..12]),
-            "05-peer-merge",
-        )?;
-    }
-    let completed = await_stage(ui, "已合并并归档", &session, 240)?;
+        merge
+    };
     ensure!(
         completed["worker"] == worker
             && completed["recovered_run"] == run
