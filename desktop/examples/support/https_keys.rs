@@ -1,9 +1,14 @@
-use super::{Args, Driver, handoff_fixture};
+use super::{
+    Args, Driver, LiveKeyStep, handoff_fixture,
+    https_pilot::{await_stage, confirm},
+    https_queue::{Task, dispatch_selected},
+};
 use aep::{
-    deploy_keys::WorkerKeys,
-    workspace::{Workspace, ident},
+    deploy_keys::{RollingRotation, WorkerKeys},
+    workspace::{Workspace, ident, read},
 };
 use anyhow::{Context, Result, ensure};
+use serde_json::Value;
 use std::{
     fs,
     io::{self, IsTerminal, Write},
@@ -35,20 +40,29 @@ fn complete(
     status: &impl Fn() -> Result<WorkerKeys>,
     before: &WorkerKeys,
 ) -> Result<WorkerKeys> {
+    let after = receipt(ui, status, before)?;
+    let operation = after
+        .last
+        .as_ref()
+        .context("missing Worker operation receipt")?;
+    ensure!(
+        operation.error.is_none(),
+        "{}",
+        operation.error.as_deref().unwrap_or_default()
+    );
+    Ok(after)
+}
+
+fn receipt(
+    ui: &mut Driver<'_>,
+    status: &impl Fn() -> Result<WorkerKeys>,
+    before: &WorkerKeys,
+) -> Result<WorkerKeys> {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         pause(ui)?;
         let after = status()?;
         if after.last != before.last && after.request.is_none() {
-            let receipt = after
-                .last
-                .as_ref()
-                .context("missing Worker operation receipt")?;
-            ensure!(
-                receipt.error.is_none(),
-                "{}",
-                receipt.error.as_deref().unwrap_or_default()
-            );
             return Ok(after);
         }
         ensure!(
@@ -103,7 +117,7 @@ pub(super) fn run(mut args: Args) -> Result<()> {
             .context("missing operator token file")?,
     )?;
     let ca = std::env::var_os("AEP_STUDIO_CONTROL_CA");
-    let status = || -> Result<WorkerKeys> {
+    let snapshot = || -> Result<Value> {
         let mut command = Command::new(&executable);
         command
             .arg("--repo")
@@ -116,11 +130,19 @@ pub(super) fn run(mut args: Args) -> Result<()> {
         }
         let result = command.arg("status").output()?;
         ensure!(result.status.success(), "cannot read the live HTTPS site");
-        let value: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        Ok(serde_json::from_slice(&result.stdout)?)
+    };
+    let status = || -> Result<WorkerKeys> {
+        let value = snapshot()?;
         let keys = value
             .pointer(&format!("/data/deploy_keys/{worker}"))
             .context("selected Worker does not manage Deploy Keys")?;
         Ok(serde_json::from_value(keys.clone())?)
+    };
+    let rotation = || -> Result<Option<RollingRotation>> {
+        Ok(serde_json::from_value(
+            snapshot()?["data"]["key_rotation"].clone(),
+        )?)
     };
     let runner = aep_studio::Runner {
         binary: Some(executable.clone()),
@@ -141,6 +163,88 @@ pub(super) fn run(mut args: Args) -> Result<()> {
     }
     let mut state = status()?;
     checkpoint(&mut ui, &output, "01-worker-keys", &worker, &state)?;
+    match args.https_key_step {
+        Some(LiveKeyStep::Start) => {
+            let previous = rotation()?.map(|plan| plan.id);
+            click(&mut ui, "https-key-roll-start")?;
+            let plan = super::https_queue::until(&mut ui, "a rolling rotation", 30, |_| {
+                Ok(rotation()?
+                    .filter(|plan| Some(&plan.id) != previous.as_ref() && plan.current().is_some()))
+            })?;
+            ensure!(
+                plan.current().is_some_and(|first| first.worker == worker)
+                    && plan.workers.len() >= 2,
+                "unexpected rolling Worker order"
+            );
+            ui.reveal("https-pilot-page", "https-key-roll-state")?;
+            ui.checkpoint("02-roll-started")?;
+            fs::write(
+                output.join("rotation.json"),
+                serde_json::to_vec_pretty(&plan)?,
+            )?;
+            println!("Rolling rotation started. Evidence: {}", output.display());
+            return Ok(());
+        }
+        Some(LiveKeyStep::Stage) => {
+            let plan = rotation()?.context("missing rolling rotation")?;
+            ensure!(
+                plan.current()
+                    .is_some_and(|current| current.worker == worker),
+                "wrong rolling Worker"
+            );
+            click(&mut ui, &format!("https-key-prepare-{worker}"))?;
+            let after = complete(&mut ui, &status, &state)?;
+            ensure!(
+                after.inventory.active == state.inventory.active
+                    && after.inventory.staged.is_some(),
+                "staging changed the original key"
+            );
+            checkpoint(&mut ui, &output, "02-roll-staged", &worker, &after)?;
+            println!("Rolling key staged. Evidence: {}", output.display());
+            return Ok(());
+        }
+        Some(LiveKeyStep::ExpectFailure) => {
+            let before = rotation()?.context("missing rolling rotation")?;
+            ensure!(
+                before
+                    .current()
+                    .is_some_and(|current| current.worker == worker),
+                "wrong rolling Worker"
+            );
+            click(&mut ui, &format!("https-key-install-{worker}"))?;
+            let after = receipt(&mut ui, &status, &state)?;
+            ensure!(
+                after.inventory == state.inventory
+                    && after.last.as_ref().is_some_and(|last| last.error.is_some())
+                    && rotation()? == Some(before),
+                "failed cutover changed the key or advanced the rotation"
+            );
+            super::https_queue::label(
+                &mut ui,
+                &format!("https-key-status-{worker}"),
+                "切换失败 · 保留当前密钥",
+                30,
+            )?;
+            checkpoint(
+                &mut ui,
+                &output,
+                "02-roll-failed-key-preserved",
+                &worker,
+                &after,
+            )?;
+            fs::write(
+                output.join("failure-site-status.json"),
+                serde_json::to_vec_pretty(&snapshot()?)?,
+            )?;
+            println!(
+                "Failed cutover preserved the old key and plan. Evidence: {}",
+                output.display()
+            );
+            return Ok(());
+        }
+        Some(LiveKeyStep::Deliver) => return deliver(&mut ui, &ws, &output, &worker, &snapshot),
+        Some(LiveKeyStep::Provision) | None => (),
+    }
     if args.https_key_revoke {
         ensure!(
             io::stdin().is_terminal(),
@@ -180,8 +284,15 @@ pub(super) fn run(mut args: Args) -> Result<()> {
             after.inventory.retiring.is_none() && after.inventory.active == state.inventory.active,
             "retirement changed the active Deploy Key"
         );
-        click(&mut ui, &format!("https-key-verify-{worker}"))?;
-        state = complete(&mut ui, &status, &after)?;
+        if rotation()?
+            .and_then(|plan| plan.current().cloned())
+            .is_none()
+        {
+            click(&mut ui, &format!("https-key-verify-{worker}"))?;
+            state = complete(&mut ui, &status, &after)?;
+        } else {
+            state = after;
+        }
         ensure!(
             state.verified_at.is_some(),
             "new Deploy Key failed verification after retirement"
@@ -204,7 +315,9 @@ pub(super) fn run(mut args: Args) -> Result<()> {
             )?;
         }
         // A fresh Worker starts with no key. Configure its first key before rotating.
-        let count = if state.inventory.active.is_none() {
+        let count = if matches!(args.https_key_step, Some(LiveKeyStep::Provision)) {
+            usize::from(state.inventory.active.is_none())
+        } else if state.inventory.active.is_none() {
             2
         } else {
             1
@@ -252,6 +365,118 @@ pub(super) fn run(mut args: Args) -> Result<()> {
     }
     println!(
         "Verified Studio Deploy Key operations for {worker}. Evidence: {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn deliver(
+    ui: &mut Driver<'_>,
+    ws: &Workspace,
+    output: &Path,
+    worker: &str,
+    snapshot: &impl Fn() -> Result<Value>,
+) -> Result<()> {
+    ensure!(
+        io::stdin().is_terminal(),
+        "delivery requires an operator terminal"
+    );
+    let task = Task {
+        task: std::env::var("AEP_STUDIO_LIVE_TASK")?,
+        target: std::env::var("AEP_STUDIO_LIVE_TARGET")?,
+    };
+    ident(&task.task, 63)?;
+    ensure!(
+        task.target.starts_with("test/"),
+        "use an isolated test branch"
+    );
+    let before = snapshot()?;
+    let plan: RollingRotation = serde_json::from_value(before["data"]["key_rotation"].clone())?;
+    ensure!(
+        plan.current()
+            .is_some_and(|current| current.worker != worker),
+        "dispatch needs the peer Worker"
+    );
+    ensure!(
+        before["data"]["workers"][worker]["online"] == true,
+        "peer Worker is offline"
+    );
+    fs::write(
+        output.join("dispatch-site-status.json"),
+        serde_json::to_vec_pretty(&before)?,
+    )?;
+    let session = dispatch_selected(ui, &ws.data.join("https-studio"), &task)?;
+    println!("Remote task session: {}", session.display());
+    let pending = await_stage(ui, "待人工确认发布", &session, 850)?;
+    ensure!(
+        pending["worker"] == worker && pending["branch"] == task.target,
+        "dispatch did not use the expected Worker or branch"
+    );
+    let run = pending["recovered_run"]
+        .as_str()
+        .context("missing remote Run")?;
+    let candidate = pending["candidate"]
+        .as_str()
+        .filter(|sha| sha.len() == 40)
+        .context("missing remote candidate")?;
+    let evidence = task.evidence(&session);
+    let report = read(&evidence.join("worker/runs").join(run).join("evidence.json"))?;
+    ensure!(
+        report["candidate_sha"] == candidate
+            && report["check_exit_code"] == 0
+            && report["usage"]["implementer"]["output_tokens"]
+                .as_u64()
+                .is_some_and(|n| n > 0)
+            && report["usage"]["reviewer"]["output_tokens"]
+                .as_u64()
+                .is_some_and(|n| n > 0),
+        "remote Run did not contain real implementation, checks and review"
+    );
+    ui.checkpoint("03-peer-publication-review")?;
+    println!(
+        "Review {} and the Run report under {}",
+        evidence.join("candidate.diff").display(),
+        evidence.display()
+    );
+    confirm(
+        ui,
+        &format!("publish {}", &candidate[..12]),
+        "04-peer-approved",
+    )?;
+    let merge = await_stage(ui, "CI 已通过，待人工确认合并", &session, 2800)?;
+    ensure!(
+        merge["candidate"] == candidate && merge["worker"] == worker,
+        "CI scope changed"
+    );
+    let pr = merge["pr"].as_u64().context("missing GitHub PR")?;
+    println!(
+        "Review PR #{pr} and {}",
+        evidence.join("github-ci.json").display()
+    );
+    confirm(
+        ui,
+        &format!("merge {pr} {}", &candidate[..12]),
+        "05-peer-merge",
+    )?;
+    await_stage(ui, "已合并并归档", &session, 240)?;
+    ui.reveal("https-pilot-page", "https-archive")?;
+    ui.checkpoint("06-peer-archive")?;
+    let cleanup = read(&evidence.join("cleanup.json"))?;
+    ensure!(
+        cleanup["target_synced"] == true && cleanup["candidate_branch_removed"] == true,
+        "incomplete remote cleanup"
+    );
+    fs::copy(
+        session.join(&task.task).join("evidence.tar.gz"),
+        output.join("pilot-evidence.tar.gz"),
+    )?;
+    fs::copy(evidence.join("result.json"), output.join("result.json"))?;
+    fs::write(
+        output.join("archive-site-status.json"),
+        serde_json::to_vec_pretty(&snapshot()?)?,
+    )?;
+    println!(
+        "Verified and archived PR #{pr} on {worker}. Evidence: {}",
         output.display()
     );
     Ok(())

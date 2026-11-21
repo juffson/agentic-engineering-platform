@@ -19,6 +19,20 @@ pub enum Action {
     Revoke,
 }
 
+#[derive(clap::Args)]
+pub struct Command {
+    #[arg(long)]
+    worker: String,
+    #[arg(long)]
+    installation: String,
+    #[arg(long, value_enum)]
+    action: Action,
+    #[arg(long)]
+    fingerprint: Option<String>,
+    #[arg(long)]
+    rotation: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct GitHubKey {
     id: u64,
@@ -52,15 +66,14 @@ fn require_read_only<'a>(keys: &'a [GitHubKey], key: &Key) -> Result<&'a GitHubK
     Ok(remote)
 }
 
-pub fn execute(
-    client: &Client,
-    ws: &Workspace,
-    path: &OsStr,
-    worker: String,
-    installation: String,
-    action: Action,
-    expected: Option<&str>,
-) -> Result<Reply> {
+pub fn execute(client: &Client, ws: &Workspace, path: &OsStr, command: Command) -> Result<Reply> {
+    let Command {
+        worker,
+        installation,
+        action,
+        fingerprint,
+        rotation,
+    } = command;
     ident(&worker, 63)?;
     ident(&installation, 64)?;
     let repository = delivery::repository(ws, path)?;
@@ -73,12 +86,7 @@ pub fn execute(
         }),
         "the selected Worker is offline or its installation changed"
     );
-    let entry = state
-        .deploy_keys
-        .get(&worker)
-        .filter(|entry| entry.repository == repository && entry.installation == installation)
-        .context("the selected Worker does not manage Deploy Keys for this repository")?;
-    let expected = expected.unwrap_or_default().to_owned();
+    let expected = fingerprint.unwrap_or_default();
     let change = match action {
         Action::Prepare => Change::Prepare,
         Action::Install => Change::Activate {
@@ -91,14 +99,13 @@ pub fn execute(
             fingerprint: expected.clone(),
         },
     };
-    change.validate(&entry.inventory)?;
-    ensure!(
-        entry
-            .request
-            .as_ref()
-            .is_none_or(|pending| pending.change == change),
-        "another Deploy Key operation is already pending"
-    );
+    let entry = state.authorize_key_change(
+        &repository,
+        &worker,
+        &installation,
+        rotation.as_deref(),
+        &change,
+    )?;
     let keys_url = format!("repos/{repository}/keys");
     let list = || -> Result<Vec<GitHubKey>> {
         let value = delivery::github(ws, path, &[&keys_url, "--paginate", "--slurp"])?;
@@ -158,18 +165,6 @@ pub fn execute(
                 .retiring
                 .as_ref()
                 .context("missing retiring Deploy Key")?;
-            ensure!(
-                entry.verified_at.is_some(),
-                "verify the new Deploy Key before revoking the old one"
-            );
-            ensure!(
-                state.deploy_keys.iter().all(|(id, peer)| {
-                    id == &worker
-                        || (peer.inventory.active.as_ref() != Some(retiring)
-                            && peer.inventory.staged.as_ref() != Some(retiring))
-                }),
-                "another Worker still uses the old Deploy Key"
-            );
             let before = list()?;
             require_read_only(&before, active)?;
             if let Some(old) = lookup(&before, retiring) {
@@ -200,5 +195,6 @@ pub fn execute(
         worker,
         installation,
         change,
+        rotation,
     })
 }

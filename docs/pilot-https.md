@@ -131,6 +131,12 @@ site="$HOME/.local/state/aep-pilot"
 2. 点「注册只读并切换」。Studio 将公钥注册为只读 Deploy Key，Worker 访问 GitHub 成功后切换。点「验证只读」可重新核对 GitHub 权限和 Worker 的读取结果。
 3. 用新密钥跑一次任务并检查证据。核对待撤销的旧指纹后点「撤销旧密钥」，再点确认。Studio 再查一次生效密钥在 GitHub 上的只读状态，按旧密钥的 GitHub ID 撤销。如果网络中断，重新打开 Studio 可以核对当前阶段并重试。
 
+#### 多 Worker 滚动轮换
+
+当站点内的 Worker 上线并分别配置了独立的 Deploy Key，在 Studio 点「开始滚动轮换」。控制面按 Worker 名称记录顺序，并在 Studio 重开后继续显示进度。当前 Worker 可以完成已经领取的任务，队列的新任务交给其他 Worker。当前 Worker 的置换密钥通过 GitHub 只读权限校验和实际读取验证后，操作员确认撤销旧密钥，计划才推进到下一台。
+
+新密钥读取失败时，当前 Worker 保留原来的生效密钥，计划停在该 Worker，其他 Worker 继续派发。处理失败原因后可以重试同一把待切换密钥。也可以在凭证操作结束后点「停止滚动轮换」，保留已完成的切换和仍待处理的密钥，恢复该 Worker 领取新任务。
+
 已有的命令行配置也可以用于初次部署。下面假设 `repo` 是 `OWNER/REPO`，`key` 是操作员私有目录中的新文件路径。
 
 ```sh

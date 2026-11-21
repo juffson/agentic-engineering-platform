@@ -74,15 +74,13 @@ enum Action {
     },
     Status,
     /// Manage repository-scoped Deploy Keys for one HTTPS Worker installation.
-    DeployKey {
+    DeployKey(deploy_keys::Command),
+    /// Start a rolling Deploy Key rotation for the repository's Workers.
+    KeyRotationStart,
+    /// Stop a rolling rotation after the current operation finishes.
+    KeyRotationStop {
         #[arg(long)]
-        worker: String,
-        #[arg(long)]
-        installation: String,
-        #[arg(long, value_enum)]
-        action: deploy_keys::Action,
-        #[arg(long)]
-        fingerprint: Option<String>,
+        rotation: String,
     },
     /// Pause or resume new Worker leases.
     QueuePause {
@@ -377,25 +375,28 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
     let client = Client::new(&url, false, ca_cert.as_deref())?;
     let reply = match action {
         Action::Status => client.call(Operation::Status)?,
-        Action::DeployKey {
-            worker,
-            installation,
-            action,
-            fingerprint,
-        } => {
+        Action::DeployKey(command) => {
             ensure!(
                 url.starts_with("https://"),
                 "Deploy Key operations require HTTPS"
             );
-            deploy_keys::execute(
-                &client,
-                &Workspace::open(repo)?,
-                &tool_path()?,
-                worker,
-                installation,
-                action,
-                fingerprint.as_deref(),
-            )?
+            deploy_keys::execute(&client, &Workspace::open(repo)?, &tool_path()?, command)?
+        }
+        Action::KeyRotationStart | Action::KeyRotationStop { .. } => {
+            ensure!(
+                url.starts_with("https://"),
+                "Deploy Key operations require HTTPS"
+            );
+            let repository = delivery::repository(&Workspace::open(repo)?, &tool_path()?)?;
+            let operation = match action {
+                Action::KeyRotationStart => Operation::KeyRotationStart { repository },
+                Action::KeyRotationStop { rotation } => Operation::KeyRotationStop {
+                    repository,
+                    rotation,
+                },
+                _ => unreachable!(),
+            };
+            client.call(operation)?
         }
         Action::Collect {
             ticket,

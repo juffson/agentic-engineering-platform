@@ -34,6 +34,15 @@ use std::{
 };
 
 #[derive(Clone, Copy, ValueEnum)]
+enum LiveKeyStep {
+    Provision,
+    Start,
+    Stage,
+    ExpectFailure,
+    Deliver,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum Scenario {
     History,
     Conflict,
@@ -94,6 +103,13 @@ struct Args {
     /// Confirm retirement of the previously rotated key through Studio.
     #[arg(long, requires = "live_https_keys")]
     https_key_revoke: bool,
+    /// Select a checkpoint in the live rolling Deploy Key rehearsal.
+    #[arg(
+        long,
+        requires = "live_https_keys",
+        conflicts_with = "https_key_revoke"
+    )]
+    https_key_step: Option<LiveKeyStep>,
     /// Override the Codex model for both rounds of the live relay
     #[arg(long, requires = "live")]
     codex_model: Option<String>,
