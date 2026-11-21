@@ -2,6 +2,31 @@
 
 试点包含两条入口。Studio 管理本机任务队列、两轮记忆接力、PR、CI 和收尾。需要独立控制面时，用 Rust CLI 派发，并由本地 Worker 主动领取。Studio 可打开该 Worker 的仓库，查看 Run、验收和记忆。控制面跟踪到经人工确认发布的 PR 为止，最终合并由仓库维护者确认。[架构方案与故障验收](https://app.notion.com/p/41a9d9f6f60581d08560fa33ed8c4810)
 
+## 本地计划、验收与交付
+
+在 Studio 打开仓库后选择「本地任务」。填写任务票据、已提交 Spec 的任务目录和 Git 提交，以及本地目标分支。计划固定目标基线、Spec、文件范围和验收编号。先批准计划，再让 Codex 在独立 Worktree 实现，由本地命令验收，最后交给 Claude 审查。失败后可从原票据重试，新的 Run 会带上上一轮的检查状态和阻断意见。原 Run、审查和批准可继续查阅。
+
+核对 Diff、验收日志和审查后，分别确认交付和本地合并。目标工作区须干净且处在计划指定的分支上。合并会复验 Spec、Run、候选引用、目标和证据摘要。若合并回执丢失，可以重试同一个操作。Spec 或目标变化时，修订计划并重新审批。
+
+相同流程也可从空闲的本地验证仓库调用。以下命令中的 SHA 和版本取自上一步输出。检查 `inspect` 的证据后再执行交付批准。
+
+```sh
+aep local plan --ticket market-fix --task market-volume-dedup-rust --spec "$spec" --target main
+aep local approve-plan --ticket market-fix --version 1 --spec "$spec" --baseline "$base"
+aep local run --ticket market-fix
+aep local inspect --ticket market-fix
+aep local approve-delivery --ticket market-fix --version 1 --spec "$spec" --baseline "$base" \
+  --run "$run" --candidate "$candidate" --report-sha256 "$report" \
+  --human-minutes 8 --baseline-minutes 12
+aep local merge --ticket market-fix --version 1 --spec "$spec" --baseline "$base" \
+  --run "$run" --candidate "$candidate"
+aep local report
+```
+
+`plan` 可设置 `--attempts`、`--timeout`、`--codex-model` 和可选的 `--max-tokens`、`--max-cost-micros`。超时预算覆盖单轮 Agent 和验收步骤。用量和费用根据提供方回执累计，在下一次模型调用和交付前检查。费用单位为百万分之一美元，缺失回执单独显示。模型账户额度负责请求执行中的费用上限。人工耗时用实际记录填写。
+
+`cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --scenario local` 通过 Studio 操作一个本地验证仓库，从验收失败、重开和重试一直跑到合并。带 `--output-dir` 和 `--screenshots` 可保存界面证据。
+
 ## 启动控制面和设备
 
 在私有 Docker/Linux VM 里运行完整 HTTPS 试点时，使用[部署与验收手册](pilot-https.md)。下面的直接启动方式适合接入已有代理和沙箱。
@@ -14,6 +39,8 @@ aep control serve --listen 127.0.0.1:8787 \
 ```
 
 服务器绑定回环地址。跨机器试点时，用环境已有的 HTTPS 反向代理暴露 `/v1/control`，并将以下命令的 `--url` 改为该 HTTPS 地址。服务重启必须使用同一状态文件、设备 ID 和授权配置。Worker 的安装标识保存在该克隆的 Git 公共目录，重启时使用相同克隆。控制面存储任务、版本引用、设备和客户端版本、事件、批准与 PR 编号。命令输出、Diff、提示词、模型对话和 SQLite 记忆留在执行设备。
+
+需要上传证据时，可在服务端启用 `--require-evidence-grant` 并在 Worker 配置 `--upload-evidence`。用 `queue-pause --paused true` 暂停派发，提交任务后为回执中的准确 Run 执行 `control evidence-grant --ticket <ticket> --run <run> --seconds 3600`，再恢复队列。批准记录包含操作人、Run、固定证据包范围和到期时间。固定证据包可含日志、审查、记忆库和候选 Git bundle，授权前先核对可发送的数据。Worker 先检查授权再上传，过期后控制面拒绝访问并清理对应的上传文件；授权记录和 Worker 原始证据继续保留。
 
 在执行设备准备试点克隆，安装 Codex CLI 和 Claude Code，配置已批准的模型账号和该仓库的只读访问方式。启动 Worker。关闭 Studio 不会中断它。
 

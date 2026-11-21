@@ -13,6 +13,8 @@ mod https_rolling;
 mod https_workers;
 #[path = "support/lifecycle/mod.rs"]
 mod lifecycle;
+#[path = "support/local.rs"]
+mod local;
 
 use aep::{
     memory::{Key, Kind, Memory},
@@ -51,6 +53,7 @@ enum Scenario {
     Conflict,
     Handoff,
     StudioRelay,
+    Local,
 }
 
 #[derive(Parser)]
@@ -1384,6 +1387,7 @@ fn main() -> Result<()> {
                 Scenario::Conflict,
                 Scenario::Handoff,
                 Scenario::StudioRelay,
+                Scenario::Local,
             ],
         };
         for scenario in scenarios {
@@ -1392,6 +1396,7 @@ fn main() -> Result<()> {
                 Scenario::Conflict => with_fixture(&args, |ui, ws, _| conflict(ui, ws))?,
                 Scenario::Handoff => relay(&args, Clients::Fixture, None)?,
                 Scenario::StudioRelay => studio_relay(&args)?,
+                Scenario::Local => local::run(&args)?,
             }
         }
     }

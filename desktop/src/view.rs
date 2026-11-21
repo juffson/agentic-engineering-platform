@@ -5,6 +5,7 @@ mod https_queue;
 pub(crate) mod https_rolling;
 pub(crate) mod human_review;
 mod lifecycle_page;
+pub(crate) mod local_page;
 mod relay_page;
 mod repository_tasks;
 pub(crate) mod task_authoring;
@@ -200,9 +201,10 @@ impl Studio {
             .hover(|s| s.bg(rgb(SELECTED)))
             .child(icon(name))
             .child(div().flex_1().text_sm().child(label))
-            .when(!matches!(page, Page::Lifecycle | Page::HttpsPilot), |row| {
-                row.child(div().text_xs().child(n.to_string()))
-            })
+            .when(
+                !matches!(page, Page::Lifecycle | Page::HttpsPilot | Page::Local),
+                |row| row.child(div().text_xs().child(n.to_string())),
+            )
             .on_click(cx.listener(move |this, _, w, cx| this.navigate(page, w, cx)))
     }
 
@@ -262,6 +264,7 @@ impl Studio {
                 cx,
             ))
             .child(self.nav(Page::Lifecycle, "隔离全流程", IconName::Play, 0, cx))
+            .child(self.nav(Page::Local, "本地任务", IconName::Play, 0, cx))
             .child(self.nav(Page::HttpsPilot, "HTTPS 试点", IconName::Play, 0, cx))
             .when(
                 self.lifecycle
@@ -606,6 +609,9 @@ impl Render for Studio {
         }
         if self.page == Page::HttpsPilot {
             return self.https_pilot_page(cx);
+        }
+        if self.page == Page::Local {
+            return self.local_page(cx);
         }
         let runs = &self.snapshot.runs;
         let notes = &self.snapshot.notes;

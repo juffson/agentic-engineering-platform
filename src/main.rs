@@ -2,6 +2,7 @@ mod agent;
 mod control;
 mod git;
 use aep::memory::{self, Key, Kind};
+mod local;
 mod run;
 
 use anyhow::{Result, ensure};
@@ -20,6 +21,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Action {
     Control(control::Control),
+    /// Review and deliver a pinned task entirely in the local repository.
+    Local {
+        #[command(subcommand)]
+        action: local::Action,
+    },
     Dispatch {
         #[arg(long)]
         task: String,
@@ -76,6 +82,12 @@ struct Execution {
     reviewer: String,
     #[arg(long, default_value_t=600, value_parser=clap::value_parser!(u64).range(1..))]
     timeout: u64,
+    #[arg(skip)]
+    whole_attempt: bool,
+    #[arg(skip)]
+    feedback_run: Option<String>,
+    #[arg(skip)]
+    budget: Option<local::Budget>,
 }
 #[derive(Args)]
 struct Scope {
@@ -121,6 +133,7 @@ fn app() -> Result<ExitCode> {
     let repo = git::Repo::open(&cli.repo)?;
     match action {
         Action::Control(_) => unreachable!(),
+        Action::Local { action } => return local::execute(&repo, action),
         Action::Dispatch { task, rev, remote } => repo.dispatch(&task, &rev, &remote)?,
         Action::Run {
             mut args,

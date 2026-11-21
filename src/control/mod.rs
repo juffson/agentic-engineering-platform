@@ -5,22 +5,22 @@ mod state;
 mod worker;
 mod worker_keys;
 
-use crate::git::Repo;
+use crate::{
+    git::Repo,
+    run::{approval_digest, report_digest},
+};
 use aep::{
     delivery::{self, Target},
-    studio::{Artifact, artifact_file},
     workspace::{Workspace, commit, git, ident, status, validate_task_target},
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Subcommand};
 use http::Client;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use state::{Attempt, Operation, Reply, Stage, Task, sha};
 use std::{
     ffi::OsString,
     fs::OpenOptions,
-    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -50,6 +50,9 @@ enum Action {
         /// Read additional Worker IDs and unique bearer tokens from a private JSON file.
         #[arg(long)]
         workers: Option<PathBuf>,
+        /// Allow Worker evidence only with an explicit expiring grant.
+        #[arg(long)]
+        require_evidence_grant: bool,
         #[arg(long, default_value_t = 60)]
         lease_seconds: u64,
     },
@@ -105,6 +108,15 @@ enum Action {
         run: String,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Authorize the fixed Worker evidence packet for a specific Run.
+    EvidenceGrant {
+        #[arg(long)]
+        ticket: String,
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        seconds: u64,
     },
     Cancel {
         #[arg(long)]
@@ -228,31 +240,7 @@ fn checked_evidence(ws: &Workspace, run: &Attempt, candidate: &str) -> Result<St
         commit(&ws.root, &format!("refs/aep/runs/{}", run.id))? == candidate,
         "local candidate reference changed"
     );
-    let open = |artifact| -> Result<_> {
-        let file = artifact_file(&ws.data, &run.id, artifact)?
-            .context("local approval artifact is missing")?;
-        Ok((file.metadata()?.len(), file))
-    };
-    report_digest(&record, [open(Artifact::Checks)?, open(Artifact::Review)?])
-}
-
-fn report_digest(record: &Value, artifacts: [(u64, impl Read); 2]) -> Result<String> {
-    let mut digest = Sha256::new();
-    let metadata = serde_json::to_vec(record)?;
-    digest.update((metadata.len() as u64).to_be_bytes());
-    digest.update(metadata);
-    let mut buffer = [0; 16 * 1024];
-    for (length, mut artifact) in artifacts {
-        digest.update(length.to_be_bytes());
-        loop {
-            let size = artifact.read(&mut buffer)?;
-            if size == 0 {
-                break;
-            }
-            digest.update(&buffer[..size]);
-        }
-    }
-    Ok(format!("{:x}", digest.finalize()))
+    approval_digest(&ws.data, &run.id, &record)
 }
 
 fn worker_acceptance(
@@ -425,7 +413,17 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
             device,
             lease_seconds,
             workers,
-        } => return http::serve(listen, state, device, lease_seconds, workers.as_deref()),
+            require_evidence_grant,
+        } => {
+            return http::serve(
+                listen,
+                state,
+                device,
+                lease_seconds,
+                workers.as_deref(),
+                require_evidence_grant,
+            );
+        }
         Action::Worker {
             codex_model,
             sandbox_launcher,
@@ -499,6 +497,25 @@ pub fn execute(repo: &Path, request: Control) -> Result<()> {
         } => {
             evidence::unpack(&output, &run, &client.download(&ticket, &run)?)?;
             return Ok(());
+        }
+        Action::EvidenceGrant {
+            ticket,
+            run,
+            seconds,
+        } => {
+            let ws = Workspace::open(repo)?;
+            let name = git(&ws.root, &["config", "user.name"])?;
+            let email = git(&ws.root, &["config", "user.email"])?;
+            ensure!(
+                !name.trim().is_empty() && !email.trim().is_empty(),
+                "configure the Git approver identity"
+            );
+            client.call(Operation::EvidenceGrant {
+                ticket,
+                run,
+                seconds,
+                actor: format!("{} <{}>", name.trim(), email.trim()),
+            })?
         }
         Action::QueuePause { paused } => client.call(Operation::QueuePause { paused })?,
         Action::QueueMove {

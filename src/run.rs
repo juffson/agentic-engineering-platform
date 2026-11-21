@@ -4,16 +4,21 @@ use crate::{
     git::{Repo, Task, commit, git, ident},
     memory::{Key, Memory},
 };
-use aep::cancel::{Cancellation, Cancelled};
+use aep::{
+    cancel::{Cancellation, Cancelled},
+    studio::{Artifact, artifact_file},
+};
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, DirBuilder, File, OpenOptions, TryLockError},
-    io::{self, Write},
+    io::{self, Read, Write},
     os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     process::ExitCode,
+    time::{Duration, Instant},
 };
 
 pub enum Base<'a> {
@@ -35,6 +40,60 @@ fn directory(repo: &Repo, id: &str) -> Result<PathBuf> {
 }
 pub fn status(repo: &Repo, id: &str) -> Result<Value> {
     aep::workspace::status(&repo.data, id)
+}
+
+pub fn report_digest(record: &Value, artifacts: [(u64, impl Read); 2]) -> Result<String> {
+    let mut digest = Sha256::new();
+    let metadata = serde_json::to_vec(record)?;
+    digest.update((metadata.len() as u64).to_be_bytes());
+    digest.update(metadata);
+    let mut buffer = [0; 16 * 1024];
+    for (length, mut artifact) in artifacts {
+        digest.update(length.to_be_bytes());
+        loop {
+            let size = artifact.read(&mut buffer)?;
+            if size == 0 {
+                break;
+            }
+            digest.update(&buffer[..size]);
+        }
+    }
+    Ok(format!("{digest:x}", digest = digest.finalize()))
+}
+
+pub fn approval_digest(data: &Path, id: &str, record: &Value) -> Result<String> {
+    let open = |artifact| -> Result<_> {
+        let file =
+            artifact_file(data, id, artifact)?.context("local approval artifact is missing")?;
+        Ok((file.metadata()?.len(), file))
+    };
+    report_digest(record, [open(Artifact::Checks)?, open(Artifact::Review)?])
+}
+
+fn retry_feedback(repo: &Repo, args: &Execution, base: &str) -> Result<Option<Value>> {
+    let Some(id) = &args.feedback_run else {
+        return Ok(None);
+    };
+    let record = status(repo, id)?;
+    ensure!(
+        record["task"] == args.task
+            && record["spec_sha"] == base
+            && matches!(
+                record["status"].as_str(),
+                Some("failed" | "cancelled" | "needs_reconciliation")
+            )
+            && record["candidate_sha"].as_str() == args.candidate.as_deref(),
+        "feedback must come from a failed attempt of this exact Spec and candidate"
+    );
+    let checks = record["acceptance"].as_array().map(|checks| {
+        checks
+            .iter()
+            .map(|c| json!({"id":c["id"], "status":c["status"], "exit_code":c["exit_code"]}))
+            .collect::<Vec<_>>()
+    });
+    Ok(Some(
+        json!({"run":id, "checks":checks, "blocking_findings":record["blocking_findings"]}),
+    ))
 }
 fn replay(repo: &Repo, args: &Execution, record: &Value, request: &Value) -> Result<()> {
     ensure!(
@@ -128,11 +187,18 @@ pub fn execute(
     if let Some(m) = model {
         request["codex_model"] = json!(m);
     }
+    if args.whole_attempt {
+        request["whole_attempt"] = json!(true);
+    }
+    if let Some(id) = &args.feedback_run {
+        request["feedback_run"] = json!(id);
+    }
     if path.exists() {
         replay(repo, args, &read(&path)?, &request)?;
         return Ok(ExitCode::SUCCESS);
     }
     let (spec, task) = repo.task(&base, &args.task)?;
+    let feedback = retry_feedback(repo, args, &base)?;
     agent::watch_interrupts()?;
     let work = tempfile::Builder::new()
         .prefix("aep-work-")
@@ -159,6 +225,9 @@ pub fn execute(
             work: &work,
             folder: &folder,
             timeout: args.timeout,
+            deadline: args
+                .whole_attempt
+                .then(|| Instant::now() + Duration::from_secs(args.timeout)),
             run: &id,
             memory,
             require_memory: args.require_memory,
@@ -189,7 +258,14 @@ pub fn execute(
         if implementer.is_some() {
             record["phase"] = json!("implementing");
             save(&folder, &record)?;
-            agents.implement(&key, &spec, &task.allowed_paths, model, &mut record)?;
+            agents.implement(
+                &key,
+                &spec,
+                &task.allowed_paths,
+                model,
+                feedback.as_ref(),
+                &mut record,
+            )?;
             cancellation.check()?;
             git(&work, &["add", "-A"])?;
             if !git(&work, &["diff", "--cached", "--name-only"])?.is_empty() {
@@ -220,10 +296,16 @@ pub fn execute(
             save(&folder, &record)?;
         }
         if args.reviewer == "claude" {
+            if let Some(budget) = &args.budget {
+                budget.check(&mut record, true)?;
+            }
             let diff = git(&repo.root, &["diff", "--no-ext-diff", &base, &head])?;
             record["phase"] = json!("reviewing");
             save(&folder, &record)?;
             agents.review(&key, &spec, &diff, &task.criterion_ids(), &mut record)?;
+        }
+        if let Some(budget) = &args.budget {
+            budget.check(&mut record, false)?;
         }
         Ok(())
     })();
@@ -298,7 +380,7 @@ fn verify_task(agents: &Agents<'_>, task: &Task, record: &mut Value) -> Result<(
             command,
             agents.work,
             log,
-            agents.timeout,
+            agents.remaining_timeout()?,
             None,
             None,
             agents.cancellation,

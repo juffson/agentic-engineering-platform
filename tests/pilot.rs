@@ -749,6 +749,7 @@ esac
             "test-device",
             "--lease-seconds",
             "40",
+            "--require-evidence-grant",
         ])
         .stdout(Stdio::piped())
         .spawn()
@@ -828,6 +829,70 @@ esac
             .unwrap()
             .contains("sensitive-local-log-canary")
     );
+    let private: Value = serde_json::from_slice(&fs::read(&store).unwrap()).unwrap();
+    let fence = private["attempts"][0]["fence"].as_str().unwrap();
+    let url = format!("{endpoint}/v1/evidence/{run}");
+    let http = reqwest::blocking::Client::new();
+    let permission = |proof: &str| {
+        http.head(&url)
+            .bearer_auth(device)
+            .header("x-aep-fence", proof)
+            .send()
+            .unwrap()
+            .status()
+    };
+    let mut packet = b"AEP-EVIDENCE-1\n".to_vec();
+    let canary = b"retention-test-packet";
+    packet.extend((canary.len() as u32).to_be_bytes());
+    packet.extend(canary);
+    for _ in 0..10 {
+        packet.extend(u32::MAX.to_be_bytes());
+    }
+    let upload = || {
+        http.put(&url)
+            .bearer_auth(device)
+            .header("x-aep-fence", fence)
+            .body(packet.clone())
+            .send()
+            .unwrap()
+            .status()
+    };
+    assert_eq!(permission(fence), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(upload(), reqwest::StatusCode::FORBIDDEN);
+    assert!(!store.with_extension("evidence").join(run).exists());
+    assert_eq!(
+        http.get(&url)
+            .bearer_auth(operator)
+            .header("x-aep-ticket", "test")
+            .send()
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    call(&[
+        "evidence-grant",
+        "--ticket",
+        "test",
+        "--run",
+        run,
+        "--seconds",
+        "120",
+    ]);
+    assert_eq!(permission(fence), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(permission("wrong-fence"), reqwest::StatusCode::CONFLICT);
+    assert_eq!(upload(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(upload(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        http.get(&url)
+            .bearer_auth(operator)
+            .header("x-aep-ticket", "test")
+            .send()
+            .unwrap()
+            .bytes()
+            .unwrap()
+            .as_ref(),
+        packet.as_slice()
+    );
 
     let candidate = f.state(run)["candidate_sha"].as_str().unwrap().to_owned();
     let confirmed = [
@@ -886,4 +951,238 @@ esac
             .count(),
         1
     );
+}
+
+fn local_task(f: &Fixture, operation: &[&str]) -> Value {
+    let args = ["local"]
+        .into_iter()
+        .chain(operation.iter().copied())
+        .collect::<Vec<_>>();
+    serde_json::from_str(&ok(f.call(&args))).unwrap()
+}
+
+#[test]
+fn local_plan_review_feedback_approval_and_merge_are_recoverable() {
+    let f = Fixture::new(&["sh", "-ec", "grep -Eq '^(first|corrected)$' result.txt"]);
+    git(&f.repo, &["switch", "-qc", "spec"]);
+    let path = f.repo.join("specs/sample/task.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["criteria"] = json!(["AC-1"]);
+    fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    git(&f.repo, &["commit", "-qam", "numbered acceptance"]);
+    let spec = git(&f.repo, &["rev-parse", "HEAD"]);
+    git(&f.repo, &["switch", "-q", "main"]);
+    git(&f.repo, &["remote", "remove", "origin"]);
+    f.script("gh", "exit 88");
+    f.script(
+        "codex",
+        r#"
+prompt=$(cat)
+while [ "$1" != --output-last-message ]; do shift; done
+printf '{"note":"implemented","question":""}\n' > "$2"
+case "$prompt" in
+    *needs-correction*) test "$(cat result.txt)" = first; printf 'corrected\n' > result.txt ;;
+    *) printf 'first\n' > result.txt ;;
+esac
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":8}}'
+"#,
+    );
+    f.script("claude", r#"
+cat >/dev/null
+case "$(cat result.txt)" in
+first)
+    printf '%s\n' '{"structured_output":{"note":"blocked","question":"","report":"Needs correction","blocking_findings":[{"criterion":"AC-1","file":"result.txt","line":1,"reason":"needs-correction"}]},"usage":{"input_tokens":4,"output_tokens":6},"total_cost_usd":0.001}'
+    ;;
+corrected)
+    printf '%s\n' '{"structured_output":{"note":"corrected","question":"","report":"Passed","blocking_findings":[]},"usage":{"input_tokens":4,"output_tokens":6},"total_cost_usd":0.001}'
+    ;;
+esac
+"#);
+    let proposed = local_task(
+        &f,
+        &[
+            "plan", "--ticket", "issue", "--task", "sample", "--spec", &spec,
+        ],
+    );
+    assert_eq!(proposed["phase"], "plan_pending");
+    assert!(
+        !f.call(&["local", "run", "--ticket", "issue"])
+            .status
+            .success()
+    );
+    let plan = [
+        "--ticket",
+        "issue",
+        "--version",
+        "1",
+        "--spec",
+        &spec,
+        "--baseline",
+        &f.base,
+    ];
+    let approve = ["approve-plan"].into_iter().chain(plan).collect::<Vec<_>>();
+    assert_eq!(local_task(&f, &approve)["phase"], "ready");
+    assert!(
+        !f.call(&["local", "run", "--ticket", "issue"])
+            .status
+            .success()
+    );
+    let red = local_task(&f, &["status", "--ticket", "issue"]);
+    assert_eq!(red["phase"], "retry");
+    assert_eq!(red["run"]["review_status"], "changes_requested");
+    assert_eq!(
+        red["run"]["blocking_findings"][0]["reason"],
+        "needs-correction"
+    );
+    ok(f.call(&["local", "run", "--ticket", "issue"]));
+
+    let green = local_task(&f, &["inspect", "--ticket", "issue"]);
+    assert_eq!(green["phase"], "review_pending");
+    assert_eq!(
+        green["run"]["request"]["feedback_run"],
+        red["run"]["run_id"]
+    );
+    assert_eq!(green["run"]["request"]["whole_attempt"], true);
+    assert!(green["review"]["text"].as_str().unwrap().contains("Passed"));
+    assert!(
+        green["diff"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("+corrected")
+    );
+    assert_eq!(green["usage"]["tokens"], 60);
+    assert_eq!(green["usage"]["unpriced_calls"], 2);
+    let run = green["run"]["run_id"].as_str().unwrap();
+    let candidate = green["run"]["candidate_sha"].as_str().unwrap();
+    let scope = plan
+        .into_iter()
+        .chain(["--run", run, "--candidate", candidate])
+        .collect::<Vec<_>>();
+    let mut merge = vec!["local", "merge"];
+    merge.extend(scope.iter().copied());
+    assert!(!f.call(&merge).status.success());
+
+    let digest = green["report_sha256"].as_str().unwrap();
+    let approve = ["approve-delivery"]
+        .into_iter()
+        .chain(scope)
+        .chain([
+            "--report-sha256",
+            digest,
+            "--human-minutes",
+            "5",
+            "--baseline-minutes",
+            "12",
+        ])
+        .collect::<Vec<_>>();
+    assert_eq!(local_task(&f, &approve)["phase"], "approved");
+    let review_path = f.repo.join(".git/aep/runs").join(run).join("review.txt");
+    let original = fs::read(&review_path).unwrap();
+    fs::write(&review_path, "changed after approval").unwrap();
+    assert!(!f.call(&merge).status.success());
+    fs::write(&review_path, original).unwrap();
+    fs::write(f.repo.join("dirty"), "protect local files").unwrap();
+    assert!(!f.call(&merge).status.success());
+    fs::remove_file(f.repo.join("dirty")).unwrap();
+
+    ok(f.call(&merge));
+    let state_path = f.repo.join(".git/aep/local-tasks/issue.json");
+    let mut persisted: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    persisted["current"]["merged_at"] = Value::Null;
+    fs::write(state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+    ok(f.call(&merge));
+    assert_eq!(git(&f.repo, &["rev-parse", "main"]), candidate);
+    assert_eq!(
+        fs::read_to_string(f.repo.join("result.txt")).unwrap(),
+        "corrected\n"
+    );
+    let report = local_task(&f, &["report"]);
+    assert_eq!(report["tasks"][0]["phase"], "merged");
+    assert_eq!(report["tasks"][0]["versions"][0]["human_minutes"], 5);
+    assert_eq!(report["tasks"][0]["versions"][0]["baseline_minutes"], 12);
+}
+
+#[test]
+fn local_revision_invalidates_plan_and_budget_stops_the_next_client() {
+    let f = Fixture::new(&["true"]);
+    git(&f.repo, &["switch", "-qc", "revision"]);
+    fs::write(f.repo.join("specs/sample/spec.md"), "new requirement").unwrap();
+    git(&f.repo, &["commit", "-qam", "new requirement"]);
+    let revised = git(&f.repo, &["rev-parse", "HEAD"]);
+    git(&f.repo, &["switch", "-q", "main"]);
+    f.script(
+        "codex",
+        r#"
+cat >/dev/null
+while [ "$1" != --output-last-message ]; do shift; done
+printf '{"note":"done","question":""}\n' > "$2"
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":8,"output_tokens":2}}'
+"#,
+    );
+    f.script("claude", "touch \"$FIXTURE/claude-started\"; exit 8");
+    local_task(
+        &f,
+        &[
+            "plan", "--ticket", "limited", "--task", "sample", "--spec", &f.base,
+        ],
+    );
+    let old = [
+        "local",
+        "approve-plan",
+        "--ticket",
+        "limited",
+        "--version",
+        "1",
+        "--spec",
+        &f.base,
+        "--baseline",
+        &f.base,
+    ];
+    ok(f.call(&old));
+    local_task(
+        &f,
+        &[
+            "plan",
+            "--ticket",
+            "limited",
+            "--task",
+            "sample",
+            "--spec",
+            &revised,
+            "--max-tokens",
+            "10",
+            "--revise",
+        ],
+    );
+    assert!(!f.call(&old).status.success());
+    local_task(
+        &f,
+        &[
+            "approve-plan",
+            "--ticket",
+            "limited",
+            "--version",
+            "2",
+            "--spec",
+            &revised,
+            "--baseline",
+            &f.base,
+        ],
+    );
+    assert!(
+        !f.call(&["local", "run", "--ticket", "limited"])
+            .status
+            .success()
+    );
+    assert!(!f.root.join("claude-started").exists());
+    let state = local_task(&f, &["status", "--ticket", "limited"]);
+    assert_eq!(state["phase"], "blocked");
+    assert_eq!(state["reason"], "token budget exhausted");
+    assert!(state["history"][0]["plan_approval"].is_object());
+    assert!(
+        !f.call(&["local", "run", "--ticket", "limited"])
+            .status
+            .success()
+    );
+    assert_eq!(git(&f.repo, &["rev-parse", "main"]), f.base);
 }

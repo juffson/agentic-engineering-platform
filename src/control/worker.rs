@@ -291,15 +291,32 @@ fn sync_run(
     };
     if acknowledged && journal.exit_seen() {
         if options.upload_evidence {
-            let path = folder.join("upload.bin");
-            let packet = if path.try_exists()? {
-                fs::read(&path)?
-            } else {
-                let packet = evidence::pack(repo, folder, &journal.lease)?;
-                evidence::persist(&path, &packet)?;
-                packet
-            };
-            if let Err(error) = client.upload(&journal.lease.run, &journal.lease.fence, packet) {
+            let transfer = (|| -> Result<()> {
+                let lease = &journal.lease;
+                if !client.can_upload(&lease.run, &lease.fence)? {
+                    eprintln!(
+                        "No active evidence grant for {}; evidence stays on this Worker",
+                        lease.run
+                    );
+                    return Ok(());
+                }
+                let path = folder.join("upload.bin");
+                let packet = if path.try_exists()? {
+                    fs::read(&path)?
+                } else {
+                    let packet = evidence::pack(repo, folder, lease)?;
+                    evidence::persist(&path, &packet)?;
+                    packet
+                };
+                if !client.upload(&lease.run, &lease.fence, packet)? {
+                    eprintln!(
+                        "Evidence grant expired for {}; evidence stays on this Worker",
+                        lease.run
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = transfer {
                 if error.is::<Rejected>() {
                     return Err(error).context("terminal evidence requires reconciliation");
                 }

@@ -36,6 +36,7 @@ enum Page {
     PullRequest,
     Lifecycle,
     HttpsPilot,
+    Local,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Filter {
@@ -121,6 +122,8 @@ struct Studio {
     https_rolling_error: Option<String>,
     https_pilot_error: Option<String>,
     https_remote_form: Option<view::https_pilot_page::RemoteForm>,
+    local_tasks: Option<view::local_page::State>,
+    local_polling: bool,
 }
 
 impl Studio {
@@ -199,6 +202,8 @@ impl Studio {
             https_rolling_error: None,
             https_pilot_error: None,
             https_remote_form: None,
+            local_tasks: None,
+            local_polling: false,
         };
         if studio.remember_repository && studio.workspace.is_some() {
             studio.remember_workspace();
@@ -250,7 +255,7 @@ impl Studio {
             return;
         }
         let page = match self.page {
-            Page::Lifecycle | Page::HttpsPilot => self.page,
+            Page::Lifecycle | Page::HttpsPilot | Page::Local => self.page,
             _ => Page::Runs,
         };
         let dialog = cx.prompt_for_paths(PathPromptOptions {
@@ -290,6 +295,7 @@ impl Studio {
         let reopen_https = page == Page::HttpsPilot && self.https_remote_form.is_some();
         self.workspace_generation += 1;
         self.https_remote_form = None;
+        self.local_tasks = None;
         self.https_rolling_form = None;
         self.https_rolling_error = None;
         self.https_queue = None;
@@ -367,6 +373,9 @@ impl Studio {
         }
         if page == Page::HttpsPilot {
             self.load_https_pilot(cx);
+        }
+        if page == Page::Local {
+            self.open_local(window, cx);
         }
         cx.notify();
     }

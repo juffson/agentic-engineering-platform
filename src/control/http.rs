@@ -62,6 +62,7 @@ struct Service {
     workers: BTreeMap<String, String>,
     device: String,
     ttl: u64,
+    require_evidence_grant: bool,
 }
 
 impl Service {
@@ -130,12 +131,36 @@ fn evidence_path(
     id: &str,
     ticket: Option<&str>,
     proof: Option<(&str, &str)>,
-) -> Result<PathBuf> {
-    service
+) -> std::result::Result<PathBuf, StatusCode> {
+    let store = service
         .store
         .lock()
-        .map_err(|_| anyhow::anyhow!("control store is unavailable"))?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let path = store
         .evidence_path(id, ticket, proof)
+        .map_err(|_| StatusCode::CONFLICT)?;
+    if !store.evidence_allowed(id, service.require_evidence_grant, now()) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(path)
+}
+
+fn upload_path(
+    service: &Service,
+    run: &str,
+    headers: &HeaderMap,
+) -> std::result::Result<PathBuf, StatusCode> {
+    let worker = service.worker(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let fence = scope(headers, "x-aep-fence").ok_or(StatusCode::BAD_REQUEST)?;
+    evidence_path(service, run, None, Some((worker, &fence)))
+}
+
+async fn check_upload(
+    State(service): State<Arc<Service>>,
+    RoutePath(run): RoutePath<String>,
+    headers: HeaderMap,
+) -> StatusCode {
+    upload_path(&service, &run, &headers).map_or_else(|status| status, |_| StatusCode::NO_CONTENT)
 }
 
 async fn upload(
@@ -143,14 +168,9 @@ async fn upload(
     RoutePath(run): RoutePath<String>,
     request: Request,
 ) -> Response {
-    let Some(worker) = service.worker(request.headers()) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let Some(fence) = scope(request.headers(), "x-aep-fence") else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let Ok(path) = evidence_path(&service, &run, None, Some((worker, &fence))) else {
-        return StatusCode::CONFLICT.into_response();
+    let path = match upload_path(&service, &run, request.headers()) {
+        Ok(path) => path,
+        Err(status) => return status.into_response(),
     };
     let Ok(bytes) = to_bytes(request.into_body(), evidence::LIMIT).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
@@ -158,23 +178,36 @@ async fn upload(
     if evidence::validate(&bytes).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    match tokio::task::spawn_blocking(move || -> Result<bool> {
+    match tokio::task::spawn_blocking(move || -> Result<StatusCode> {
+        let store = service
+            .store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("control store is unavailable"))?;
+        if !store.evidence_allowed(&run, service.require_evidence_grant, now()) {
+            return Ok(StatusCode::FORBIDDEN);
+        }
+        let exists = || -> Result<StatusCode> {
+            Ok(if fs::read(&path)? == bytes {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::CONFLICT
+            })
+        };
         if path.exists() {
-            return Ok(fs::read(path)? == bytes);
+            return exists();
         }
         fs::create_dir_all(path.parent().context("evidence directory")?)?;
         if let Err(error) = evidence::persist(&path, &bytes) {
             if path.is_file() {
-                return Ok(fs::read(path)? == bytes);
+                return exists();
             }
             return Err(error);
         }
-        Ok(true)
+        Ok(StatusCode::NO_CONTENT)
     })
     .await
     {
-        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Ok(false)) => StatusCode::CONFLICT.into_response(),
+        Ok(Ok(status)) => status.into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -190,8 +223,9 @@ async fn download(
     let Some(ticket) = scope(&headers, "x-aep-ticket") else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Ok(path) = evidence_path(&service, &run, Some(&ticket), None) else {
-        return StatusCode::CONFLICT.into_response();
+    let path = match evidence_path(&service, &run, Some(&ticket), None) {
+        Ok(path) => path,
+        Err(status) => return status.into_response(),
     };
     match tokio::task::spawn_blocking(move || {
         let mut bytes = Vec::new();
@@ -216,6 +250,7 @@ pub fn serve(
     device: String,
     ttl: u64,
     extra_workers: Option<&Path>,
+    require_evidence_grant: bool,
 ) -> Result<()> {
     ensure!(
         listen.ip().is_loopback(),
@@ -254,23 +289,50 @@ pub fn serve(
             workers.insert(id, token);
         }
     }
+    let store = Store::open(db)?;
+    store.purge_expired_evidence(now())?;
+    let service = Arc::new(Service {
+        store: Mutex::new(store),
+        operator,
+        workers,
+        device,
+        ttl,
+        require_evidence_grant,
+    });
     let app = Router::new()
         .route(
             "/v1/control",
             post(command).layer(DefaultBodyLimit::max(16 * 1024)),
         )
-        .route("/v1/evidence/{run}", get(download).put(upload))
-        .with_state(Arc::new(Service {
-            store: Mutex::new(Store::open(db)?),
-            operator,
-            workers,
-            device,
-            ttl,
-        }));
+        .route(
+            "/v1/evidence/{run}",
+            get(download).head(check_upload).put(upload),
+        )
+        .with_state(service.clone());
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(async {
+            tokio::spawn(async move {
+                let mut clock = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    clock.tick().await;
+                    let service = service.clone();
+                    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+                        service
+                            .store
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("control store is unavailable"))?
+                            .purge_expired_evidence(now())
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(())) => (),
+                        Ok(Err(error)) => eprintln!("Evidence retention cleanup: {error:#}"),
+                        Err(error) => eprintln!("Evidence retention cleanup: {error}"),
+                    }
+                }
+            });
             let listener = tokio::net::TcpListener::bind(listen).await?;
             println!("AEP control plane listening on {}", listener.local_addr()?);
             axum::serve(listener, app).await?;
@@ -371,7 +433,26 @@ impl Client {
         Ok(url)
     }
 
-    pub fn upload(&self, run: &str, fence: &str, packet: Vec<u8>) -> Result<()> {
+    pub fn can_upload(&self, run: &str, fence: &str) -> Result<bool> {
+        let response = self
+            .client
+            .head(self.evidence_url(run)?)
+            .bearer_auth(&self.token)
+            .header("x-aep-fence", fence)
+            .send()?;
+        match response.status() {
+            StatusCode::NO_CONTENT => Ok(true),
+            StatusCode::FORBIDDEN => Ok(false),
+            // Older control planes route HEAD to the operator-only GET handler.
+            StatusCode::UNAUTHORIZED => Ok(true),
+            status if status.is_client_error() => {
+                Err(Rejected(format!("evidence preflight rejected: {status}")).into())
+            }
+            _ => Ok(response.error_for_status()?.status().is_success()),
+        }
+    }
+
+    pub fn upload(&self, run: &str, fence: &str, packet: Vec<u8>) -> Result<bool> {
         let response = self
             .client
             .put(self.evidence_url(run)?)
@@ -380,13 +461,16 @@ impl Client {
             .header("x-aep-fence", fence)
             .body(packet)
             .send()?;
+        if response.status() == StatusCode::FORBIDDEN {
+            return Ok(false);
+        }
         if response.status().is_client_error() {
             return Err(
                 Rejected(format!("evidence upload rejected: {}", response.status())).into(),
             );
         }
         response.error_for_status()?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn download(&self, ticket: &str, run: &str) -> Result<Vec<u8>> {

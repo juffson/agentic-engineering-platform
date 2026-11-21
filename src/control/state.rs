@@ -224,6 +224,18 @@ pub struct State {
     pub deploy_keys: std::collections::BTreeMap<String, WorkerKeys>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_rotation: Option<RollingRotation>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub evidence_grants: std::collections::BTreeMap<String, EvidenceGrant>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EvidenceGrant {
+    ticket: String,
+    run: String,
+    actor: String,
+    scope: String,
+    granted_at: u64,
+    expires_at: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -240,6 +252,12 @@ pub enum Operation {
         revise: bool,
     },
     Status,
+    EvidenceGrant {
+        ticket: String,
+        run: String,
+        actor: String,
+        seconds: u64,
+    },
     QueuePause {
         paused: bool,
     },
@@ -928,6 +946,51 @@ impl State {
         self.normalize_queue();
         match operation {
             Operation::Status => Ok(self.snapshot(now, ttl)),
+            Operation::EvidenceGrant {
+                ticket,
+                run,
+                actor,
+                seconds,
+            } => {
+                ident(&run, 64)?;
+                ensure!(
+                    (60..=2_592_000).contains(&seconds),
+                    "evidence retention must be 60 seconds to 30 days"
+                );
+                ensure!(
+                    !actor.trim().is_empty()
+                        && actor.len() <= 120
+                        && !actor.chars().any(char::is_control),
+                    "invalid evidence approver"
+                );
+                ensure!(
+                    self.attempts
+                        .iter()
+                        .any(|entry| entry.id == run && entry.task.ticket == ticket),
+                    "evidence grant must name the exact Run and ticket"
+                );
+                if let Some(existing) = self.evidence_grants.get(&run) {
+                    ensure!(
+                        existing.actor == actor
+                            && existing.expires_at > now
+                            && existing.expires_at.saturating_sub(existing.granted_at) == seconds,
+                        "the Run already has a different or expired grant"
+                    );
+                } else {
+                    self.evidence_grants.insert(
+                        run.clone(),
+                        EvidenceGrant {
+                            ticket,
+                            run,
+                            actor,
+                            scope: "worker-evidence-v1".into(),
+                            granted_at: now,
+                            expires_at: now.saturating_add(seconds),
+                        },
+                    );
+                }
+                Ok(self.snapshot(now, ttl))
+            }
             Operation::KeySync {
                 installation,
                 profile,
@@ -1183,6 +1246,27 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn evidence_allowed(&self, run: &str, require_grant: bool, now: u64) -> bool {
+        self.state
+            .evidence_grants
+            .get(run)
+            .map_or(!require_grant, |grant| grant.expires_at > now)
+    }
+
+    pub fn purge_expired_evidence(&self, now: u64) -> Result<()> {
+        for (id, grant) in &self.state.evidence_grants {
+            if grant.expires_at <= now {
+                ident(id, 64)?;
+                match std::fs::remove_file(self.path.with_extension("evidence").join(id)) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn evidence_path(
         &self,
         id: &str,
@@ -1318,6 +1402,44 @@ mod tests {
             10,
         )?;
         poll(store, 2)
+    }
+
+    #[test]
+    fn evidence_grant_survives_restart_and_expires_only_its_packet() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("control.json");
+        let mut store = Store::open(path.clone())?;
+        let lease = start(&mut store)?;
+        let grant = |ticket: &str| Operation::EvidenceGrant {
+            ticket: ticket.into(),
+            run: lease.run.clone(),
+            actor: "operator".into(),
+            seconds: 60,
+        };
+        assert!(!store.evidence_allowed(&lease.run, true, 3));
+        assert!(
+            store
+                .apply(grant("another-ticket"), "operator", 3, 10)
+                .is_err()
+        );
+        store.apply(grant("pilot"), "operator", 3, 10)?;
+        store.apply(grant("pilot"), "operator", 5, 10)?;
+        drop(store);
+        let store = Store::open(path.clone())?;
+        let directory = path.with_extension("evidence");
+        std::fs::create_dir(&directory)?;
+        let packet = directory.join(&lease.run);
+        let legacy = directory.join("legacy-run");
+        std::fs::write(&packet, b"authorized packet")?;
+        std::fs::write(&legacy, b"legacy packet")?;
+        assert!(store.evidence_allowed(&lease.run, true, 62));
+        store.purge_expired_evidence(62)?;
+        assert!(packet.is_file());
+        assert!(!store.evidence_allowed(&lease.run, false, 63));
+        store.purge_expired_evidence(63)?;
+        assert!(!packet.exists());
+        assert!(legacy.is_file());
+        Ok(())
     }
 
     #[test]
