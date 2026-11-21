@@ -112,11 +112,25 @@ pub(super) fn dispatch_selected(
     })?;
     choose(ui, "https-task-list", &selected)?;
     choose(ui, "https-target-list", &target)?;
-    click(ui, "https-dispatch")?;
-    let created = sessions(parent);
-    let new: Vec<_> = created.difference(&before).collect();
-    ensure!(new.len() == 1, "Studio did not start exactly one task");
-    Ok(new[0].clone())
+    ui.reveal("https-pilot-page", "https-dispatch")?;
+    ui.checkpoint("02-task-target-selected")?;
+    ui.click("https-dispatch")?;
+    until(ui, "Studio to start the selected task", 15, |ui| {
+        let created = sessions(parent);
+        let mut new = created.difference(&before);
+        if let Some(session) = new.next() {
+            ensure!(new.next().is_none(), "Studio started multiple tasks");
+            return Ok(Some(session.clone()));
+        }
+        if !ui.absent("https-action-error")? {
+            let error = ui.element("https-action-error")?;
+            anyhow::bail!(
+                "Studio dispatch failed: {}",
+                error.label().unwrap_or_default()
+            );
+        }
+        Ok(None)
+    })
 }
 
 pub(super) fn select(ui: &mut Driver<'_>, session: &Path) -> Result<()> {
