@@ -304,6 +304,14 @@ fn load(repo: &Repo, ticket: &str) -> Result<Ticket> {
     Ok(record)
 }
 
+pub(crate) fn workflow_memory_scope(
+    repo: &Repo,
+    ticket: &str,
+    head: &str,
+) -> Result<Option<aep::memory::Key>> {
+    Ok(existing(repo, ticket)?
+        .map(|t| aep::memory::Key::new(&t.current.pin.task, &t.current.pin.spec, head)))
+}
 fn existing(repo: &Repo, ticket: &str) -> Result<Option<Ticket>> {
     path(repo, ticket)?
         .try_exists()?

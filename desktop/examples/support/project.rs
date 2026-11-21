@@ -3,7 +3,7 @@ use aep::workspace::read;
 use anyhow::{Result, ensure};
 use std::{fs, process::Command};
 
-fn click(ui: &mut Driver<'_>, id: &str) -> Result<()> {
+pub(super) fn click(ui: &mut Driver<'_>, id: &str) -> Result<()> {
     if !ui.element(id)?.visible() {
         ui.reveal("project-page", id)?;
     }
@@ -41,16 +41,19 @@ pub(super) fn run(args: &Args) -> Result<()> {
         ui.click("project-work-name")?;
         ui.input("任务失败后恢复")?;
         ui.click("project-create-work")?;
-        ui.click("project-stage-note")?;
+        click(&mut ui, "project-stage-note")?;
         ui.input("关闭 Studio 后能恢复上一次执行记录。")?;
-        ui.click("project-next")?;
-        ui.click("project-stage-note")?;
+        click(&mut ui, "project-next")?;
+        click(&mut ui, "project-stage-note")?;
         ui.input("Studio 保存进度，Worker 保留执行回执。")?;
-        ui.click("project-next")?;
+        click(&mut ui, "project-next")?;
+        click(&mut ui, "project-stage-note")?;
+        ui.input("技术方案已确认。")?;
+        click(&mut ui, "project-next")?;
         let catalog = read(&data)?;
         let feature = &catalog["projects"][0]["work"][0];
         ensure!(
-            feature["stage"] == 2 && feature["repositories"].as_array().unwrap().len() == 2,
+            feature["stage"] == 3 && feature["repositories"].as_array().unwrap().len() == 2,
             "workflow did not retain both repositories and its stage"
         );
         let key = worker.canonicalize()?;
@@ -90,7 +93,7 @@ pub(super) fn run(args: &Args) -> Result<()> {
                 String::from_utf8_lossy(&status.stderr)
             );
         }
-        ui.click("project-refresh-work")?;
+        click(&mut ui, "project-refresh-work")?;
         click(&mut ui, "work-task-1")?;
         until(&mut ui, "scoped ticket", 25, |ui| {
             Ok((!ui.absent("local-approve-plan")?).then_some(()))
@@ -112,7 +115,7 @@ pub(super) fn run(args: &Args) -> Result<()> {
         );
         ui.click("back-to-project")?;
         ui.checkpoint("project-development")?;
-        ui.click("project-stage-1")?;
+        click(&mut ui, "project-stage-1")?;
         click(&mut ui, "work-context-0")?;
         ensure!(
             !ui.absent("new-note")?,
@@ -127,7 +130,7 @@ pub(super) fn run(args: &Args) -> Result<()> {
             ui.absent(&feature_button)?,
             "stage filter included an unrelated item"
         );
-        ui.click("project-filter-2")?;
+        ui.click("project-filter-3")?;
         ensure!(
             !ui.absent(&feature_button)?,
             "stage filter lost the active item"
@@ -142,16 +145,23 @@ pub(super) fn run(args: &Args) -> Result<()> {
         ui.click("project-work-name")?;
         ui.input("v1.0")?;
         ui.click("project-create-work")?;
-        for label in ["范围确认", "方案确认", "开发完成", "验收通过", "发布归档"]
-        {
-            ui.click("project-stage-note")?;
+        for label in [
+            "范围确认",
+            "交互确认",
+            "方案确认",
+            "开发完成",
+            "测试通过",
+            "验收通过",
+            "发布归档",
+        ] {
+            click(&mut ui, "project-stage-note")?;
             ui.input(label)?;
-            ui.click("project-next")?;
+            click(&mut ui, "project-next")?;
         }
         let second = read(&data)?;
         ensure!(
-            second["projects"][1]["work"][0]["stage"] == 5
-                && second["projects"][0]["work"][0]["stage"] == 2,
+            second["projects"][1]["work"][0]["stage"] == 7
+                && second["projects"][0]["work"][0]["stage"] == 3,
             "project state leaked"
         );
         ui.frame(|w, _| w.remove_window())?;
@@ -161,7 +171,7 @@ pub(super) fn run(args: &Args) -> Result<()> {
         let id = catalog["active"].as_str().unwrap();
         ui.click(&format!("project-open-{id}"))?;
         ui.click("project-work")?;
-        ui.click("project-stage-1")?;
+        click(&mut ui, "project-stage-1")?;
         ensure!(
             ui.by_label("阶段记录")?.value() == Some("Studio 保存进度，Worker 保留执行回执。"),
             "design record lost after restart"

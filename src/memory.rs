@@ -120,7 +120,7 @@ fn text(s: &str, optional: bool) -> Result<&str> {
 }
 impl Memory {
     /// Browse the workspace without initializing a database or replacing historical notes.
-    pub(crate) fn browse(dir: &Path) -> Result<Vec<Value>> {
+    pub fn browse(dir: &Path) -> Result<Vec<Value>> {
         let path = dir.join("memory.sqlite3");
         if !path.try_exists()? {
             return Ok(Vec::new());
@@ -239,6 +239,13 @@ impl Memory {
             );
         }
         Ok(result)
+    }
+    pub fn project_handoff(&mut self, run: &str, author: &str, body: &str) -> Result<i64> {
+        self.0.query_row("INSERT INTO notes(scope,task,spec_sha,candidate_sha,origin_sha,kind,author,run_id,body,created_at)
+            VALUES('project','','','','','handoff',?1,?2,?3,?4)
+            ON CONFLICT(run_id,author,kind) DO UPDATE SET body=excluded.body WHERE notes.body=excluded.body RETURNING id",
+            params![author,run,text(body,false)?,Utc::now().to_rfc3339()],|r|r.get(0))
+            .context("publish project handoff with a unique attempt ID")
     }
     pub fn publish(&mut self, role: &str, run: &str, k: &Key, payload: &Value) -> Result<Vec<i64>> {
         let field = |name: &str| {

@@ -1,5 +1,7 @@
 use super::*;
-use crate::project::{Kind, Library, Project, STAGES, Work};
+mod agents;
+use crate::project::{Attempt, Kind, Library, Project, Work};
+use aep::workflow::{self, Client, Profile, Role as StageRole, Template};
 use anyhow::{Context as _, ensure};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use std::{collections::BTreeMap, path::Path};
@@ -10,6 +12,7 @@ enum Section {
     Overview,
     Work,
     Repositories,
+    Memory,
 }
 pub(crate) struct Board {
     library: Library,
@@ -23,7 +26,17 @@ pub(crate) struct Board {
     note: Entity<TextareaState>,
     note_key: Option<(String, usize)>,
     viewing: usize,
-    filter_stage: Option<usize>,
+    filter_stage: Option<(Template, usize)>,
+    template: Template,
+    client: Client,
+    model: Entity<InputState>,
+    executable: Entity<InputState>,
+    check_command: Entity<InputState>,
+    polling: bool,
+    log_view: Option<(String, &'static str, u64)>,
+    memories: Vec<Value>,
+    editing_memory: Option<i64>,
+    memory_note: Entity<TextareaState>,
     pub(crate) error: Option<String>,
     statuses: BTreeMap<PathBuf, String>,
     generation: u64,
@@ -73,11 +86,29 @@ impl Board {
             creating_work: false,
             repo_path: cx.new(|cx| InputState::new(window, cx).placeholder("本地 Git 仓库路径")),
             note: cx.new(|cx| {
-                TextareaState::new(window, cx).placeholder("填写本阶段的结论、交付物或证据位置…")
+                TextareaState::new(window, cx)
+                    .placeholder("给阶段 Agent 的任务说明，或人工确认的结论…")
             }),
             note_key: None,
             viewing: 0,
             filter_stage: None,
+            template: Template::Software,
+            client: Client::Claude,
+            model: cx
+                .new(|cx| InputState::new(window, cx).placeholder("模型 ID · 留空使用 CLI 默认")),
+            check_command: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("仅本阶段允许 Claude 执行的验收命令（可选）")
+            }),
+            executable: cx
+                .new(|cx| InputState::new(window, cx).placeholder("可执行文件路径 · 默认自动查找")),
+            polling: false,
+            log_view: None,
+            memories: vec![],
+            editing_memory: None,
+            memory_note: cx.new(|cx| {
+                TextareaState::new(window, cx).placeholder("写下对项目内所有阶段有效的决定…")
+            }),
             error,
             statuses: BTreeMap::new(),
             generation: 0,
@@ -152,6 +183,13 @@ impl Studio {
         self.board.filter_stage = None;
         self.board.error = None;
         self.board.creating_work = false;
+        if section == Section::Memory {
+            self.board.editing_memory = None;
+            self.board
+                .memory_note
+                .update(cx, |s, cx| s.set_value("", window, cx));
+            self.refresh_project_memory(cx);
+        }
         if section == Section::Work {
             self.load_stage(window, cx);
             self.refresh_work(cx);
@@ -168,7 +206,7 @@ impl Studio {
     }
     fn load_stage(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if let Some(work) = self.board.library.project().and_then(Project::selected) {
-            self.show_stage(work.stage.min(STAGES.len() - 1), w, cx);
+            self.show_stage(work.stage.min(work.template.stages().len() - 1), w, cx);
         }
     }
     fn show_stage(&mut self, stage: usize, w: &mut Window, cx: &mut Context<Self>) {
@@ -180,7 +218,10 @@ impl Studio {
             self.board
                 .note
                 .update(cx, |input, cx| input.set_value(&work.notes[stage], w, cx));
+            let profile = work.profile(stage);
+            self.fill_profile(profile, w, cx);
             self.board.note_key = Some(key);
+            self.watch_agents(cx);
         }
         self.board.viewing = stage;
         cx.notify();
@@ -189,13 +230,21 @@ impl Studio {
         let Some((id, stage)) = self.board.note_key.clone() else {
             return;
         };
-        let value = self.board.note.read(cx).value().to_string();
+        let mut value = self.board.note.read(cx).value().to_string();
+        if advance {
+            match self.reviewed_result(stage) {
+                Ok(Some(result)) if value.trim().is_empty() => value = result,
+                Ok(_) => (),
+                Err(e) => {
+                    self.board.error = Some(format!("{e:#}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         if self.change_board(cx, |lib| {
             let work = lib.project_mut()?.selected_mut()?;
-            ensure!(
-                work.id == id && stage <= work.stage,
-                "事项已更新，请重新打开"
-            );
+            ensure!(work.id == id, "事项已更新，请重新打开");
             if advance {
                 ensure!(work.stage == stage, "仅可完成当前阶段");
                 ensure!(!value.trim().is_empty(), "请先填写阶段结论");
@@ -211,7 +260,8 @@ impl Studio {
     fn create_work(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let name = self.board.new_work.read(cx).value().to_string();
         let kind = self.board.kind;
-        if self.change_board(cx, |lib| lib.project_mut()?.add_work(&name, kind)) {
+        let template = self.board.template;
+        if self.change_board(cx, |lib| lib.project_mut()?.add_work(&name, kind, template)) {
             self.board
                 .new_work
                 .update(cx, |field, cx| field.set_value("", w, cx));
@@ -340,8 +390,17 @@ impl Studio {
                 if let Some(ticket) = ticket {
                     self.focus_project_ticket(
                         ticket,
-                        ["spec", "spec", "implementation", "checks", "review"]
-                            [self.board.viewing.min(4)],
+                        self.board
+                            .library
+                            .project()
+                            .and_then(Project::selected)
+                            .and_then(|item| item.template.stages().get(self.board.viewing))
+                            .map_or("spec", |s| match s.role {
+                                StageRole::Build => "implementation",
+                                StageRole::Test => "checks",
+                                StageRole::Accept | StageRole::Deliver => "review",
+                                StageRole::Plan => "spec",
+                            }),
                         w,
                         cx,
                     );
@@ -465,6 +524,13 @@ impl Studio {
                     cx,
                 ))
                 .child(self.section_button(
+                    "project-memory",
+                    "项目记忆",
+                    Section::Memory,
+                    IconName::BookOpen,
+                    cx,
+                ))
+                .child(self.section_button(
                     "project-repos",
                     "关联仓库",
                     Section::Repositories,
@@ -501,11 +567,13 @@ impl Studio {
             let mut head = v_flex().gap_1().child(caption(match self.board.section {
                 Section::Overview => "项目概览",
                 Section::Work => "项目 / 开发事项",
+                Section::Memory => "项目 / 共享记忆",
                 _ => "项目 / 关联仓库",
             }));
             let title = match self.board.section {
                 Section::Overview => p.name.clone(),
                 Section::Work => "开发事项".into(),
+                Section::Memory => "项目记忆".into(),
                 _ => "关联仓库".into(),
             };
             head = head.child(heading(title).text_2xl());
@@ -529,7 +597,7 @@ impl Studio {
                     let finished = p
                         .work
                         .iter()
-                        .filter(|work| work.stage == STAGES.len())
+                        .filter(|work| work.stage >= work.template.stages().len())
                         .count();
                     page = page
                         .child(
@@ -561,6 +629,7 @@ impl Studio {
                                 ),
                         );
                 }
+                Section::Memory => page = page.child(self.memory_board(cx)),
                 Section::Repositories => page = page.child(self.repositories(p, cx)),
                 Section::Work => {
                     if self.board.creating_work {
@@ -577,47 +646,48 @@ impl Studio {
     }
 
     fn template_panel(&self, p: &Project, cx: &Context<Self>) -> Div {
-        let mut row = h_flex().gap_2();
-        for (i, (stage, _)) in STAGES.iter().enumerate() {
-            let count = p.work.iter().filter(|work| work.stage == i).count();
-            row = row.child(
-                v_flex()
-                    .id(format!("project-filter-{i}"))
-                    .test_support()
-                    .role(Role::Button)
-                    .aria_label(*stage)
-                    .tab_stop(true)
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(LINE)))
-                    .flex_1()
-                    .min_w_0()
-                    .gap_3()
-                    .px_3()
-                    .py_3()
-                    .rounded_md()
-                    .border_t_2()
-                    .border_color(rgb([MINT, BLUE, 0xb6b0de, AMBER, 0x8cc9bc][i]))
-                    .bg(rgb(if self.board.filter_stage == Some(i) {
-                        SELECTED
-                    } else {
-                        CANVAS
-                    }))
-                    .child(t(*stage, FG).font_semibold())
-                    .child(caption(format!("{count} 个事项")))
+        let mut result = panel().flex_none().child(heading("开发工作流"));
+        for template in [Template::Software, Template::Game, Template::Legacy] {
+            if template != Template::Software
+                && !p.work.iter().any(|item| item.template == template)
+            {
+                continue;
+            }
+            let mut row = h_flex().gap_1().flex_wrap();
+            for (i, stage) in template.stages().iter().enumerate() {
+                let count = p
+                    .work
+                    .iter()
+                    .filter(|item| item.template == template && item.stage == i)
+                    .count();
+                let filter = Some((template, i));
+                let id = if template == Template::Software {
+                    format!("project-filter-{i}")
+                } else {
+                    format!("project-filter-{template:?}-{i}")
+                };
+                if i > 0 {
+                    row = row.child(caption("›"));
+                }
+                row = row.child(
+                    button(
+                        id,
+                        format!("{} · {count}", stage.name),
+                        self.board.filter_stage == filter,
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.board.filter_stage = if this.board.filter_stage == Some(i) {
+                        this.board.filter_stage = if this.board.filter_stage == filter {
                             None
                         } else {
-                            Some(i)
+                            filter
                         };
                         cx.notify();
                     })),
-            );
+                );
+            }
+            result = result.child(caption(template.label())).child(row);
         }
-        panel()
-            .flex_none()
-            .child(heading("软件开发工作流"))
-            .child(row)
+        result
     }
     fn library_view(&self, cx: &Context<Self>) -> Div {
         let mut rows = v_flex().gap_2();
@@ -682,16 +752,40 @@ impl Studio {
                 })),
             );
         }
+        let mut templates = h_flex().gap_2();
+        for template in [Template::Software, Template::Game] {
+            templates = templates.child(
+                button(
+                    format!("work-template-{template:?}"),
+                    template.label(),
+                    self.board.template == template,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.board.template = template;
+                    cx.notify();
+                })),
+            );
+        }
         panel()
             .flex_none()
             .child(heading("新建开发事项"))
+            .child(templates)
+            .child(caption(
+                self.board
+                    .template
+                    .stages()
+                    .iter()
+                    .map(|s| s.name)
+                    .collect::<Vec<_>>()
+                    .join("  ›  "),
+            ))
             .child(types)
             .child(input_field("project-work-name", &self.board.new_work))
             .child(
                 h_flex()
                     .gap_2()
                     .child(
-                        primary("project-create-work", "使用软件开发流程")
+                        primary("project-create-work", "创建开发事项")
                             .on_click(cx.listener(|this, _, w, cx| this.create_work(w, cx))),
                     )
                     .child(
@@ -710,9 +804,15 @@ impl Studio {
             .work
             .iter()
             .rev()
-            .filter(|work| filter.is_none_or(|stage| work.stage == stage))
+            .filter(|work| {
+                filter.is_none_or(|(template, stage)| {
+                    work.template == template && work.stage == stage
+                })
+            })
             .collect();
-        let name = filter.map_or("项目事项", |stage| STAGES[stage].0);
+        let name = filter.map_or("项目事项", |(template, stage)| {
+            template.stages()[stage].name
+        });
         let mut bar = h_flex()
             .justify_between()
             .child(heading(format!("{name}  ·  {}", hits.len())));
@@ -824,34 +924,70 @@ impl Studio {
     }
     fn work_detail(&self, p: &Project, work: &Work, cx: &Context<Self>) -> Div {
         let mut steps = h_flex().gap_2().flex_wrap();
-        let viewing = self.board.viewing.min(STAGES.len() - 1);
-        for (i, (stage, _)) in STAGES.iter().enumerate() {
-            let label = if i < work.stage {
-                format!("✓ {stage}")
+        let stages = work.template.stages();
+        let viewing = self.board.viewing.min(stages.len() - 1);
+        for (i, stage) in stages.iter().enumerate() {
+            let profile = work.profile(i);
+            let state = if i < work.stage {
+                "✓ "
+            } else if i == work.stage {
+                "● "
             } else {
-                stage.to_string()
+                ""
             };
-            if i <= work.stage {
-                steps = steps.child(
-                    button(format!("project-stage-{i}"), label, i == viewing)
-                        .on_click(cx.listener(move |this, _, w, cx| this.show_stage(i, w, cx))),
-                );
+            let tint = if i < work.stage {
+                MINT
+            } else if i == work.stage {
+                BLUE
             } else {
-                steps = steps.child(caption(label).px_2().py_1());
-            }
+                MUTED
+            };
+            let model = if profile.model.is_empty() {
+                profile.client.label().to_owned()
+            } else {
+                format!("{} · {}", profile.client.label(), profile.model)
+            };
+            steps = steps.child(
+                v_flex()
+                    .id(format!("project-stage-{i}"))
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(format!("{} · {model}", stage.name))
+                    .tab_stop(true)
+                    .cursor_pointer()
+                    .min_w(px(92.))
+                    .flex_1()
+                    .gap_1()
+                    .py_2()
+                    .px_2()
+                    .rounded_md()
+                    .bg(rgb(if i == viewing { SELECTED } else { CANVAS }))
+                    .border_t_2()
+                    .border_color(rgb(if i == viewing {
+                        MINT
+                    } else if i <= work.stage {
+                        tint
+                    } else {
+                        LINE
+                    }))
+                    .child(t(format!("{state}{}", stage.name), tint).font_semibold())
+                    .child(caption(model).truncate())
+                    .hover(|s| s.bg(rgb(SELECTED)))
+                    .on_click(cx.listener(move |this, _, w, cx| this.show_stage(i, w, cx))),
+            );
         }
         let mut detail = panel()
             .flex_none()
             .child(
                 h_flex()
                     .gap_2()
-                    .child(chip(work.kind.label(), BLUE))
+                    .child(chip(work.template.label(), BLUE))
                     .child(heading(work.name.clone()))
                     .child(chip(work.stage_name(), MINT)),
             )
             .child(steps)
-            .child(heading(STAGES[viewing].0))
-            .child(caption(STAGES[viewing].1))
+            .child(heading(stages[viewing].name))
+            .child(caption(stages[viewing].brief))
             .child(
                 div().id("project-stage-note").test_support().child(
                     Textarea::new(&self.board.note)
@@ -867,7 +1003,7 @@ impl Studio {
             actions = actions.child(
                 primary(
                     "project-next",
-                    if viewing + 1 == STAGES.len() {
+                    if viewing + 1 == stages.len() {
                         "确认完成交付"
                     } else {
                         "完成并进入下一阶段"
@@ -880,8 +1016,15 @@ impl Studio {
             actions = actions.child(
                 button("project-reopen-stage", "返回此阶段跟进", false).on_click(cx.listener(
                     move |this, _, w, cx| {
+                        if this.has_running_agent() {
+                            this.board.error = Some("请先等待当前 CLI 完成，或取消执行".into());
+                            cx.notify();
+                            return;
+                        }
                         if this.change_board(cx, |lib| {
-                            lib.project_mut()?.selected_mut()?.stage = viewing;
+                            let item = lib.project_mut()?.selected_mut()?;
+                            item.stage = viewing;
+                            item.current_attempt.retain(|s, _| *s < viewing);
                             Ok(())
                         }) {
                             this.load_stage(w, cx);
@@ -890,7 +1033,9 @@ impl Studio {
                 )),
             );
         }
-        detail = detail.child(actions);
+        detail = detail
+            .child(actions)
+            .child(self.agent_panel(p, work, viewing, cx));
         let mut repos = panel().flex_none().child(
             h_flex()
                 .justify_between()
@@ -919,9 +1064,9 @@ impl Studio {
                         .map_or("正在读取…", String::as_str)
                         .to_owned(),
                 ));
-                let (context_label, context_page) = match viewing {
-                    0 | 1 => ("仓库记忆", Page::Memory),
-                    2 => ("仓库接力", Page::Relay),
+                let (context_label, context_page) = match stages[viewing].role {
+                    StageRole::Plan => ("仓库记忆", Page::Memory),
+                    StageRole::Build => ("仓库接力", Page::Relay),
                     _ => ("运行证据", Page::Runs),
                 };
                 let context_repo = path.clone();
@@ -937,13 +1082,12 @@ impl Studio {
                 row = row.child(
                     button(
                         format!("work-task-{i}"),
-                        [
-                            "任务 Spec",
-                            "任务计划",
-                            "实现进度",
-                            "验收与审查",
-                            "交付记录",
-                        ][viewing],
+                        match stages[viewing].role {
+                            StageRole::Plan => "任务 Spec",
+                            StageRole::Build => "实现进度",
+                            StageRole::Test => "验收与审查",
+                            StageRole::Accept | StageRole::Deliver => "交付记录",
+                        },
                         true,
                     )
                     .on_click(cx.listener(move |this, _, w, cx| {

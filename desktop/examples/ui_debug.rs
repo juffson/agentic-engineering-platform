@@ -17,6 +17,8 @@ mod lifecycle;
 mod local;
 #[path = "support/project.rs"]
 mod project;
+#[path = "support/workflows.rs"]
+mod workflows;
 
 use aep::{
     memory::{Key, Kind, Memory},
@@ -52,6 +54,7 @@ enum LiveKeyStep {
 #[derive(Clone, Copy, ValueEnum)]
 enum Scenario {
     Project,
+    Workflows,
     History,
     Conflict,
     Handoff,
@@ -62,7 +65,7 @@ enum Scenario {
 #[derive(Parser)]
 #[command(
     about = "Exercise AEP Studio in a temporary Git workspace, using an offscreen GPUI window",
-    group(ArgGroup::new("live").args(["live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
+    group(ArgGroup::new("live").args(["live_project_workflow","live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
 )]
 struct Args {
     /// Run just one scenario (default: all)
@@ -83,6 +86,12 @@ struct Args {
     /// Also save PNGs from the platform's offscreen renderer
     #[arg(long, requires = "output_dir")]
     screenshots: bool,
+    /// Exercise all seven software stages with the installed Codex, Claude and ZCode clients.
+    #[arg(long, requires="output_dir",conflicts_with_all=["scenario","script","repo"])]
+    live_project_workflow: bool,
+    /// ZCode provider/model or provider/model@reasoning-level for the testing stage.
+    #[arg(long, requires = "live_project_workflow")]
+    zcode_model: Option<String>,
     /// Run two rounds with real Codex and Claude and capture evidence and PNGs
     #[arg(long, requires = "output_dir", conflicts_with_all = ["scenario", "script", "repo"])]
     live_relay: bool,
@@ -1348,6 +1357,9 @@ fn main() -> Result<()> {
     if let Some(dir) = &args.output_dir {
         fs::create_dir_all(dir)?;
     }
+    if args.live_project_workflow {
+        return workflows::live(&mut args);
+    }
     if args.live_relay {
         let output = args
             .output_dir
@@ -1392,6 +1404,7 @@ fn main() -> Result<()> {
                 Scenario::StudioRelay,
                 Scenario::Local,
                 Scenario::Project,
+                Scenario::Workflows,
             ],
         };
         for scenario in scenarios {
@@ -1400,6 +1413,7 @@ fn main() -> Result<()> {
                 Scenario::Conflict => with_fixture(&args, |ui, ws, _| conflict(ui, ws))?,
                 Scenario::Handoff => relay(&args, Clients::Fixture, None)?,
                 Scenario::StudioRelay => studio_relay(&args)?,
+                Scenario::Workflows => workflows::run(&args)?,
                 Scenario::Project => project::run(&args)?,
                 Scenario::Local => local::run(&args)?,
             }

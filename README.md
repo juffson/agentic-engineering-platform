@@ -25,7 +25,23 @@ macOS 上可用 Rust 桌面端浏览执行记录、写入和修订共享记忆�
 open "desktop/target/AEP Studio.app"
 ```
 
-从「项目库」创建或打开项目，在「关联仓库」中选择一个或多个本地 Git 仓库。点击「新建事项」选择功能或版本，按需求定义、方案设计、开发实现、测试审查和发布归档五个阶段跟进。每个事项可以选择参与的仓库、记录阶段结论，也可以回到已完成的阶段。阶段由项目成员确认，仓库任务进度从对应的 AEP 票据读取。
+从「项目库」创建或打开项目，在「关联仓库」中选择一个或多个本地 Git 仓库。新建功能或版本时可选择开发模板。
+
+| 模板 | 阶段 |
+| --- | --- |
+| 软件开发 | 产品需求 → 交互设计 → 技术方案 → 开发实现 → 测试验证 → 独立验收 → 交付归档 |
+| 游戏开发 | 玩法需求 → 影响分析 → 环境预检 → 游戏实现 → 运行验证 → 玩家验收 → 交付归档 |
+
+点击流程图中的阶段，可预先选择 Codex、Claude、ZCode 或自定义 CLI、模型和工作仓库。Studio 显示检测到的程序路径，也可填写自己的可执行文件。模型留空使用客户端当前配置。ZCode 支持显式的 `provider/model` 或 `provider/model@推理档位`。自定义 CLI 从标准输入读任务，在标准输出写交付物，指定模型时接收 `--model`。Claude 可在当前阶段单独允许一条精确的验收命令。
+
+填写阶段说明并点击「运行阶段 Agent」。同一事项在每个仓库使用独立的本地工作树，后续阶段继续使用其中的文件。「执行档案」保留提示词、答复、原始日志和记忆回执。「项目记忆」可查看和修订 Agent 的交接，新的阶段会读取当前版本及本事项已确认的交付物。测试和独立验收需要返回通过结论。核对结果后，点击「完成并进入下一阶段」或「确认完成交付」。运行期间可以关闭 Studio，重新打开后继续查看、取消或重试。已有五阶段事项保留经典流程。
+
+可在支持 Metal 的 macOS 上复验两套模板。游戏场景使用可重复的本机测试替身，覆盖预检失败、重开重试和记忆修订。软件场景调用本机已配置的三个真实模型客户端，在输出目录中创建独立测试仓库并保存七个阶段的回执。可以追加 `--codex-model` 和 `--zcode-model` 选择账号可用的模型。
+
+```sh
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --scenario workflows --screenshots --output-dir /tmp/aep-game-workflow
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --live-project-workflow --screenshots --output-dir /tmp/aep-software-workflow
+```
 
 在事项下点击仓库的阶段入口，可创建独立的本地交付任务，或关联该仓库已有的任务。完整的运行记录、共享记忆、接力和试点工具可从「关联仓库」进入。项目库保存在本机的 `~/Library/Application Support/AEP Studio/projects.json`，任务与证据保存在对应仓库。首次启动也可以用已有仓库建立初始项目。
 

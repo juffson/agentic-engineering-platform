@@ -4,6 +4,8 @@ mod git;
 use aep::memory::{self, Key, Kind};
 mod local;
 mod run;
+mod workflow_stage;
+mod zcode_stage;
 
 use anyhow::{Result, ensure};
 use clap::{Args, Parser, Subcommand};
@@ -20,6 +22,18 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    #[command(hide = true)]
+    ZcodeStage {
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Run a single configured model CLI in a project workflow.
+    WorkflowStage {
+        #[arg(long)]
+        request: PathBuf,
+    },
     Control(control::Control),
     /// Review and deliver a pinned task entirely in the local repository.
     Local {
@@ -124,6 +138,14 @@ enum MemoryAction {
 fn app() -> Result<ExitCode> {
     let cli = Cli::parse();
     let action = match cli.command {
+        Action::ZcodeStage { binary, request } => {
+            zcode_stage::run(&binary, &request)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Action::WorkflowStage { request } => {
+            workflow_stage::execute(&request)?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Action::Control(request) => {
             control::execute(&cli.repo, request)?;
             return Ok(ExitCode::SUCCESS);
@@ -132,7 +154,9 @@ fn app() -> Result<ExitCode> {
     };
     let repo = git::Repo::open(&cli.repo)?;
     match action {
-        Action::Control(_) => unreachable!(),
+        Action::Control(_) | Action::ZcodeStage { .. } | Action::WorkflowStage { .. } => {
+            unreachable!()
+        }
         Action::Local { action } => return local::execute(&repo, action),
         Action::Dispatch { task, rev, remote } => repo.dispatch(&task, &rev, &remote)?,
         Action::Run {

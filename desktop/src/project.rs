@@ -7,14 +7,16 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const STAGES: [(&str, &str); 5] = [
-    ("需求定义", "记录用户目标、范围和验收标准"),
-    ("方案设计", "记录技术方案、涉及仓库和接口约定"),
-    ("开发实现", "跟进各仓库的实现任务和代码变更"),
-    ("测试审查", "核对验收结果、审查意见和遗留问题"),
-    ("发布归档", "记录发布版本、交付范围和证据位置"),
-];
+use aep::workflow::{Client, Profile, Template};
+use std::collections::BTreeMap;
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Attempt {
+    pub id: String,
+    pub stage: usize,
+    pub profile: Profile,
+    pub repository: Option<PathBuf>,
+}
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Kind {
     Feature,
@@ -36,12 +38,38 @@ pub struct Work {
     pub name: String,
     pub kind: Kind,
     pub stage: usize,
-    pub notes: [String; STAGES.len()],
+    pub notes: Vec<String>,
+    #[serde(default)]
+    pub template: Template,
+    #[serde(default)]
+    pub profiles: BTreeMap<usize, Profile>,
+    #[serde(default)]
+    pub targets: BTreeMap<usize, PathBuf>,
+    #[serde(default)]
+    pub attempts: Vec<Attempt>,
+    #[serde(default)]
+    pub current_attempt: BTreeMap<usize, String>,
     pub repositories: Vec<PathBuf>,
 }
 impl Work {
     pub fn stage_name(&self) -> &'static str {
-        STAGES.get(self.stage).map_or("已交付", |s| s.0)
+        self.template
+            .stages()
+            .get(self.stage)
+            .map_or("已交付", |s| s.name)
+    }
+    pub fn profile(&self, stage: usize) -> Profile {
+        self.profiles
+            .get(&stage)
+            .cloned()
+            .unwrap_or_else(|| Profile::for_stage(&self.template.stages()[stage]))
+    }
+    pub fn target(&self, stage: usize) -> Option<PathBuf> {
+        self.targets
+            .get(&stage)
+            .filter(|p| self.repositories.contains(p))
+            .or_else(|| self.repositories.first())
+            .cloned()
     }
     pub fn include(&mut self, path: &Path) {
         if !self.repositories.iter().any(|repo| repo == path) {
@@ -65,6 +93,8 @@ pub struct Project {
     pub repositories: Vec<PathBuf>,
     pub work: Vec<Work>,
     pub selected: Option<String>,
+    #[serde(default)]
+    pub cli_defaults: Vec<Profile>,
 }
 impl Project {
     pub fn selected(&self) -> Option<&Work> {
@@ -78,7 +108,10 @@ impl Project {
             .find(|w| Some(&w.id) == self.selected.as_ref())
             .context("请选择开发事项")
     }
-    pub fn add_work(&mut self, name: &str, kind: Kind) -> Result<()> {
+    pub fn preset(&self, client: Client) -> Option<&Profile> {
+        self.cli_defaults.iter().find(|p| p.client == client)
+    }
+    pub fn add_work(&mut self, name: &str, kind: Kind, template: Template) -> Result<()> {
         ensure!(!name.trim().is_empty(), "请填写事项名称");
         let id = Uuid::new_v4().simple().to_string();
         self.selected = Some(id.clone());
@@ -88,9 +121,19 @@ impl Project {
             name: name.trim().into(),
             kind,
             stage: 0,
-            notes: Default::default(),
+            notes: vec![String::new(); template.stages().len()],
+            template,
+            profiles: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            attempts: vec![],
+            current_attempt: BTreeMap::new(),
             repositories: Vec::new(),
         };
+        for (i, stage) in template.stages().iter().enumerate() {
+            if let Some(profile) = self.preset(Profile::for_stage(stage).client) {
+                work.profiles.insert(i, profile.clone());
+            }
+        }
         for path in &self.repositories {
             work.include(path);
         }
@@ -137,6 +180,7 @@ impl Library {
             repositories,
             work: vec![],
             selected: None,
+            cli_defaults: vec![],
         });
         self.active = Some(id);
         Ok(())
@@ -167,6 +211,16 @@ impl Library {
 mod tests {
     use super::*;
 
+    #[test]
+    fn existing_five_stage_work_keeps_its_original_phase_and_notes() -> Result<()> {
+        let old = serde_json::json!({"id":"legacy","name":"旧版本","stage":2,"kind":"Feature","notes":["需求","方案","","",""],"repositories":[]});
+        let item: Work = serde_json::from_value(old)?;
+        assert_eq!(item.template, Template::Legacy);
+        assert_eq!(item.stage_name(), "开发实现");
+        assert_eq!(item.notes[1], "方案");
+        assert_eq!(item.profile(2).client, Client::Codex);
+        Ok(())
+    }
     #[test]
     fn parallel_windows_cannot_replace_a_newer_project() -> Result<()> {
         let temp = tempfile::tempdir()?;
