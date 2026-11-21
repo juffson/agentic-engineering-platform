@@ -5,4 +5,4 @@ Implement the Rust function in `specs/{task}/normalize.rs`. It receives nonnegat
 - AC-1: zero and one second round-trip to 0 and 1,000 milliseconds.
 - AC-2: conversion supports the full input range. Widen before multiplying so u32::MAX converts to 4,294,967,295,000 milliseconds.
 
-AEP runs independent verification after Codex returns. This trial deliberately pauses that command while simulating a lost connection. For a local smoke test, use `binary=$(mktemp)` to allocate an executable path under the Worker's configured temporary directory. Compile `specs/{task}/acceptance.rs` with `rustc --edition=2024 --test -o "$binary"`, run `"$binary"`, then remove it. Keep the engineering handoff brief.
+AEP runs independent verification after Codex returns. For a local smoke test, use `binary=$(mktemp)` to allocate an executable path under the Worker's configured temporary directory. Compile `specs/{task}/acceptance.rs` with `rustc --edition=2024 --test -o "$binary"`, run `"$binary"`, then remove it. Keep the engineering handoff brief.

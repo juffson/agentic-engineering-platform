@@ -412,6 +412,16 @@ fn deliver(
         pending["worker"] == worker && pending["branch"] == task.target,
         "dispatch did not use the expected Worker or branch"
     );
+    if let Some(plan) = std::env::var_os("AEP_STUDIO_ROLLING_TASK_PLAN") {
+        let expected = read(Path::new(&plan))?;
+        ensure!(
+            pending["task"] == expected["task"]
+                && pending["branch"] == expected["target"]
+                && pending["baseline"] == expected["baseline"]
+                && pending["spec"] == expected["spec"],
+            "the selected Spec or isolated target changed"
+        );
+    }
     let run = pending["recovered_run"]
         .as_str()
         .context("missing remote Run")?;
@@ -424,6 +434,8 @@ fn deliver(
     ensure!(
         report["candidate_sha"] == candidate
             && report["check_exit_code"] == 0
+            && report["implementation_source"] == "codex"
+            && report["reviewer"] == "claude"
             && report["usage"]["implementer"]["output_tokens"]
                 .as_u64()
                 .is_some_and(|n| n > 0)
@@ -458,7 +470,17 @@ fn deliver(
         &format!("merge {pr} {}", &candidate[..12]),
         "05-peer-merge",
     )?;
-    await_stage(ui, "已合并并归档", &session, 240)?;
+    let completed = await_stage(ui, "已合并并归档", &session, 240)?;
+    ensure!(
+        completed["worker"] == worker
+            && completed["recovered_run"] == run
+            && completed["archive"] == true,
+        "archive does not belong to the verified Worker Run"
+    );
+    fs::write(
+        output.join("session-state.json"),
+        serde_json::to_vec_pretty(&completed)?,
+    )?;
     ui.reveal("https-pilot-page", "https-archive")?;
     ui.checkpoint("06-peer-archive")?;
     let cleanup = read(&evidence.join("cleanup.json"))?;

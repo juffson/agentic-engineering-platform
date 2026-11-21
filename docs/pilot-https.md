@@ -137,6 +137,16 @@ site="$HOME/.local/state/aep-pilot"
 
 新密钥读取失败时，当前 Worker 保留原来的生效密钥，计划停在该 Worker，其他 Worker 继续派发。处理失败原因后可以重试同一把待切换密钥。也可以在凭证操作结束后点「停止滚动轮换」，保留已完成的切换和仍待处理的密钥，恢复该 Worker 领取新任务。
 
+在已有私有站点重复演练时，从能访问该站点 Docker 和 HTTPS 回环端口的主机运行以下命令。站点须有两台在线空闲的 Worker，分别配置已安装的只读 Deploy Key、Codex 和 Claude 凭证，并开启证据上传。终端使用有权管理该私有仓库 Deploy Key 和 PR 的 GitHub CLI 登录。
+
+```sh
+./deploy/pilot/rolling-keys.sh --site "$site_name" --repo "$repo" --access-dir "$site_access"
+```
+
+`$site_access` 是原站点包含 `ca.pem` 和 `operator` 的目录。每次运行从仓库默认分支的当前提交创建两条独立的 `test/https-rolling-*` 分支和两条固定 Spec 引用。命令会让第一台 Worker 的待切换密钥短暂不可用，验证旧密钥保留，再还原待切换密钥。第二台在故障状态下完成一个任务，第一台重试成功并撤销旧密钥后完成另一个任务。最后继续轮换第二台。每次撤销、发布和合并都要核对终端显示的指纹或提交 SHA，输入确认码后才会触发 Studio 的确认按钮。
+
+证据包包含失败与重试截图、两台 Worker 的派发记录、GitHub 合并回执和两份任务归档，默认写入源码仓库 Git 目录的 `aep/https-rolling/`，可用 `--output-dir` 指定私有目录。中途退出时，命令会恢复临时移开的待切换密钥并打包已取得的证据。已提交的轮换和任务可从输出中指明的工作副本在 Studio 查看。
+
 已有的命令行配置也可以用于初次部署。下面假设 `repo` 是 `OWNER/REPO`，`key` 是操作员私有目录中的新文件路径。
 
 ```sh
