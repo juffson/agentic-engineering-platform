@@ -2,6 +2,8 @@
 
 AEP 的首个试点把 Git 中的需求、隔离工作区中的代码改动和针对同一提交的验收证据连起来。GitHub 保存任务和 PR，执行器在本地运行。示例只使用合成行情数据。
 
+游戏工程扩展的设计以 PokeOriginal 为第一个接入项目。先看[现有游戏制作工具与交付流程](docs/game-aep/pokeoriginal-workflow.md)，再看[Game AEP 设计、试点与验收](docs/game-aep/design.md)。
+
 ## 从一次派发到一个可审查的提交
 
 需要 macOS 或 Linux、Git、Rust 1.89+、Cargo 和 C 编译器（用于编译内置 SQLite）。在仓库根目录安装 CLI，然后验证已派发的 Rust 行情示例。
