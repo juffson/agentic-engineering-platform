@@ -1052,6 +1052,30 @@ esac
     );
     assert_eq!(green["usage"]["tokens"], 60);
     assert_eq!(green["usage"]["unpriced_calls"], 2);
+    let previous = red["run"]["run_id"].as_str().unwrap();
+    let history = local_task(&f, &["inspect", "--ticket", "issue", "--run", previous]);
+    assert_eq!(history["phase"], "history");
+    assert_eq!(history["historical"], true);
+    assert_eq!(history["run"]["review_status"], "changes_requested");
+    assert!(
+        history["review"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Needs correction")
+    );
+    assert!(history["report_sha256"].is_null());
+    assert!(
+        !f.call(&[
+            "local",
+            "inspect",
+            "--ticket",
+            "issue",
+            "--run",
+            "unrelated"
+        ])
+        .status
+        .success()
+    );
     let run = green["run"]["run_id"].as_str().unwrap();
     let candidate = green["run"]["candidate_sha"].as_str().unwrap();
     let scope = plan
@@ -1100,6 +1124,117 @@ esac
     assert_eq!(report["tasks"][0]["phase"], "merged");
     assert_eq!(report["tasks"][0]["versions"][0]["human_minutes"], 5);
     assert_eq!(report["tasks"][0]["versions"][0]["baseline_minutes"], 12);
+}
+
+#[test]
+fn local_authoring_freezes_the_target_and_retains_previous_specs() {
+    let f = Fixture::new(&["true"]);
+    git(&f.repo, &["remote", "remove", "origin"]);
+    f.script("gh", "exit 88");
+    assert_eq!(
+        local_task(&f, &["targets"]),
+        json!([{
+            "name": "main", "sha": f.base, "checked_out": true,
+        }])
+    );
+    let draft = f.root.join("draft.json");
+    let mut content = json!({
+        "name": "authored", "spec": "# Original\n",
+        "manifest": {"title": "Studio task", "allowed_paths": ["result.txt"], "check": ["true"]},
+    });
+    fs::write(&draft, content.to_string()).unwrap();
+    let author = |baseline: &str, version: Option<&str>| {
+        let mut args = vec![
+            "local",
+            "author",
+            "--ticket",
+            "studio",
+            "--target",
+            "main",
+            "--baseline",
+            baseline,
+            "--draft",
+            draft.to_str().unwrap(),
+        ];
+        if let Some(version) = version {
+            args.extend(["--version", version]);
+        }
+        f.call(&args)
+    };
+    let parse = |result| serde_json::from_str::<Value>(&ok(result)).unwrap();
+
+    fs::write(f.repo.join("unrelated.txt"), "staged by operator").unwrap();
+    git(&f.repo, &["add", "unrelated.txt"]);
+    let checkout = git(&f.repo, &["status", "--porcelain"]);
+    let first = parse(author(&f.base, None));
+    assert_eq!(first["phase"], "plan_pending");
+    let spec = first["current"]["spec"].as_str().unwrap();
+    assert_eq!(parse(author(&f.base, None))["current"], first["current"]);
+    assert_eq!(git(&f.repo, &["status", "--porcelain"]), checkout);
+    assert_eq!(git(&f.repo, &["rev-parse", "HEAD"]), f.base);
+    assert_eq!(
+        git(&f.repo, &["diff", "--name-only", &f.base, spec]),
+        "specs/authored/spec.md\nspecs/authored/task.json",
+    );
+    local_task(
+        &f,
+        &[
+            "approve-plan",
+            "--ticket",
+            "studio",
+            "--version",
+            "1",
+            "--spec",
+            spec,
+            "--baseline",
+            &f.base,
+        ],
+    );
+
+    git(&f.repo, &["commit", "-qm", "Advance local target"]);
+    let new_base = git(&f.repo, &["rev-parse", "main"]);
+    content["spec"] = json!("# Revised\n");
+    fs::write(&draft, content.to_string()).unwrap();
+    assert!(!author(&f.base, Some("1")).status.success());
+    assert_eq!(
+        local_task(&f, &["status", "--ticket", "studio"])["phase"],
+        "ready"
+    );
+    let revised = parse(author(&new_base, Some("1")));
+    let new_spec = revised["current"]["spec"].as_str().unwrap();
+    assert_eq!(revised["current"]["version"], 2);
+    assert_eq!(revised["phase"], "plan_pending");
+    assert!(revised["history"][0]["plan_approval"].is_object());
+    assert_eq!(
+        parse(author(&new_base, Some("1")))["current"],
+        revised["current"]
+    );
+    for sha in [spec, new_spec] {
+        assert_eq!(
+            git(
+                &f.repo,
+                &["rev-parse", &format!("refs/aep/local-specs/{sha}")]
+            ),
+            sha
+        );
+    }
+    assert_eq!(
+        git(&f.repo, &["show", &format!("{new_spec}:unrelated.txt")]),
+        "staged by operator",
+    );
+    let history = local_task(&f, &["inspect", "--ticket", "studio", "--version", "1"]);
+    assert_eq!(history["phase"], "history");
+    assert_eq!(history["latest_version"], 2);
+    assert_eq!(history["proposal"]["spec"], "# Original\n");
+    assert_eq!(
+        local_task(&f, &["inspect", "--ticket", "studio"])["proposal"]["spec"],
+        "# Revised\n",
+    );
+    content["spec"] = json!("# Stale editor\n");
+    fs::write(&draft, content.to_string()).unwrap();
+    assert!(!author(&new_base, Some("1")).status.success());
+    assert_eq!(git(&f.repo, &["rev-parse", "HEAD"]), new_base);
+    assert!(git(&f.repo, &["status", "--porcelain"]).is_empty());
 }
 
 #[test]

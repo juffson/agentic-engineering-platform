@@ -4,11 +4,15 @@
 
 ## 本地计划、验收与交付
 
-在 Studio 打开仓库后选择「本地任务」。填写任务票据、已提交 Spec 的任务目录和 Git 提交，以及本地目标分支。计划固定目标基线、Spec、文件范围和验收编号。先批准计划，再让 Codex 在独立 Worktree 实现，由本地命令验收，最后交给 Claude 审查。失败后可从原票据重试，新的 Run 会带上上一轮的检查状态和阻断意见。原 Run、审查和批准可继续查阅。
+在 Studio 打开仓库后选择「本地任务」。填写任务票据，从列表选本地目标分支，点击「编写 Spec」。填写任务 ID、标题、Spec、允许修改的文件和验收命令，也可以从已有 Spec 提交生成计划。保存时固定目标提交、Spec、文件范围和验收编号。新写的 Spec 保存在仓库的 `refs/aep/local-specs/` 中，当前工作区、暂存区和目标分支保持原样。
+
+先批准计划，再让 Codex 在独立 Worktree 实现，由本地命令验收，最后交给 Claude 审查。失败后可从原票据重试，新的 Run 会带上上一轮的检查状态和阻断意见。点击历史计划版本或 Run 可查阅对应 Spec、实现日志、验收和审查；点击「当前计划」可回到待审批的版本。用「修订 Spec」也可修改 Codex 模型。新版本须重新批准计划，之前的批准留在原版本。
 
 核对 Diff、验收日志和审查后，分别确认交付和本地合并。目标工作区须干净且处在计划指定的分支上。合并会复验 Spec、Run、候选引用、目标和证据摘要。若合并回执丢失，可以重试同一个操作。Spec 或目标变化时，修订计划并重新审批。
 
 相同流程也可从空闲的本地验证仓库调用。以下命令中的 SHA 和版本取自上一步输出。检查 `inspect` 的证据后再执行交付批准。
+
+`aep local targets` 列出目标分支和基线。编写新 Spec 时运行 `aep local author --ticket market-fix --target main --baseline "$base" --draft draft.json`，其中 JSON 包含 `name`、`spec` 和 `manifest`（与 `task.json` 格式相同）。修订时再传入 `--version` 指定当前版本。`aep local inspect --ticket market-fix --version 1 --run "$run"` 可查看历史证据。下面用现有 Spec 提交演示同一交付流程。
 
 ```sh
 aep local plan --ticket market-fix --task market-volume-dedup-rust --spec "$spec" --target main
@@ -25,7 +29,7 @@ aep local report
 
 `plan` 可设置 `--attempts`、`--timeout`、`--codex-model` 和可选的 `--max-tokens`、`--max-cost-micros`。超时预算覆盖单轮 Agent 和验收步骤。用量和费用根据提供方回执累计，在下一次模型调用和交付前检查。费用单位为百万分之一美元，缺失回执单独显示。模型账户额度负责请求执行中的费用上限。人工耗时用实际记录填写。
 
-`cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --scenario local` 通过 Studio 操作一个本地验证仓库，从验收失败、重开和重试一直跑到合并。带 `--output-dir` 和 `--screenshots` 可保存界面证据。
+`cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --scenario local` 通过 Studio 操作一个本地验证仓库，覆盖创建、修订、验收失败、重开、重试、查阅历史和合并。带 `--output-dir` 和 `--screenshots` 可保存界面和两次 Run 的归档。
 
 ## 启动控制面和设备
 

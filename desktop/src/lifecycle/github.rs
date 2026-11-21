@@ -1,7 +1,4 @@
-use aep::{
-    task::TaskManifest,
-    workspace::{Workspace, commit, git, ident, validate_task_target},
-};
+use aep::workspace::{Workspace, commit, git, validate_task_target};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,61 +36,39 @@ pub(crate) struct Branch {
     pub sha: String,
 }
 
-#[derive(Deserialize, Serialize)]
-pub(crate) struct Draft {
-    pub name: String,
-    pub spec: String,
-    pub manifest: TaskManifest,
-}
+pub(crate) use aep::task::TaskDraft as Draft;
 
-impl Draft {
-    pub(crate) fn validate(&self) -> Result<()> {
-        ident(&self.name, 63).context("任务 ID 只支持小写字母、数字和连字符，最多 63 个字符")?;
-        ensure!(!self.spec.trim().is_empty(), "请填写 Spec");
-        self.manifest
-            .validate()
-            .context("请检查允许修改的文件和验收命令")
+fn commit_draft(draft: &Draft, ws: &Workspace, branch: &Branch) -> Result<String> {
+    let reference = format!("refs/heads/aep-task/{}", draft.name);
+    ensure!(
+        remote_ref(ws, &reference)?.is_empty(),
+        "任务 ID 已经派发，请使用新的 ID"
+    );
+    git(&ws.root, &["switch", "--detach"])?;
+    let specs = ws.root.join("specs");
+    match fs::symlink_metadata(&specs) {
+        Ok(metadata) => ensure!(metadata.is_dir(), "specs 必须是仓库内的普通目录"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&specs)?,
+        Err(error) => return Err(error.into()),
     }
-
-    pub(crate) fn write_files(&self, dir: &Path) -> Result<()> {
-        self.validate()?;
-        fs::create_dir(dir).context("任务目录已存在，或无法创建任务目录")?;
-        fs::write(dir.join("spec.md"), &self.spec)?;
-        save(dir, "task.json", &self.manifest)
-    }
-
-    fn commit(&self, ws: &Workspace, branch: &Branch) -> Result<String> {
-        let reference = format!("refs/heads/aep-task/{}", self.name);
-        ensure!(
-            remote_ref(ws, &reference)?.is_empty(),
-            "任务 ID 已经派发，请使用新的 ID"
-        );
-        git(&ws.root, &["switch", "--detach"])?;
-        let specs = ws.root.join("specs");
-        match fs::symlink_metadata(&specs) {
-            Ok(metadata) => ensure!(metadata.is_dir(), "specs 必须是仓库内的普通目录"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&specs)?,
-            Err(error) => return Err(error.into()),
-        }
-        self.write_files(&specs.join(&self.name))?;
-        git(&ws.root, &["add", "--", &format!("specs/{}", self.name)])?;
-        git(
-            &ws.root,
-            &[
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "commit",
-                "-m",
-                &format!("Specify {}", self.name),
-            ],
-        )?;
-        let spec = commit(&ws.root, "HEAD")?;
-        git(&ws.root, &["update-ref", "refs/aep/lifecycle/spec", &spec])?;
-        git(&ws.root, &["switch", "--no-guess", "--", &branch.name])?;
-        Ok(spec)
-    }
+    draft.write_files(&specs.join(&draft.name))?;
+    git(&ws.root, &["add", "--", &format!("specs/{}", draft.name)])?;
+    git(
+        &ws.root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-m",
+            &format!("Specify {}", draft.name),
+        ],
+    )?;
+    let spec = commit(&ws.root, "HEAD")?;
+    git(&ws.root, &["update-ref", "refs/aep/lifecycle/spec", &spec])?;
+    git(&ws.root, &["switch", "--no-guess", "--", &branch.name])?;
+    Ok(spec)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -304,7 +279,7 @@ impl Fixture {
                     (task.name, spec, false)
                 }
                 TaskSource::New(draft) => {
-                    let spec = draft.commit(&ws, &branch)?;
+                    let spec = commit_draft(&draft, &ws, &branch)?;
                     (draft.name, spec, true)
                 }
             };
@@ -706,6 +681,7 @@ fn ready_checks(pr: &Value) -> Result<Option<&[Value]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aep::task::TaskManifest;
 
     #[test]
     fn prepared_task_keeps_checkout_and_remote_at_their_original_state() -> Result<()> {
@@ -764,7 +740,7 @@ mod tests {
         assert!(draft.validate().is_err());
         draft.manifest.allowed_paths = vec!["src/workspace.rs".into()];
         draft.validate()?;
-        let sha = draft.commit(&ws, &branch)?;
+        let sha = commit_draft(&draft, &ws, &branch)?;
         validate_task_target(&repo, &branch.sha, &sha, &draft.name)?;
         let manifest: TaskManifest = serde_json::from_str(&git(
             &repo,

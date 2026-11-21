@@ -1,6 +1,11 @@
+use super::task_authoring::DraftFields;
 use super::*;
+use crate::lifecycle::{Branch, Draft};
 use anyhow::{Context as _, ensure};
-use std::process::Command;
+use std::{
+    io::{Seek, Write},
+    process::{Command, Stdio},
+};
 
 const FIELDS: [(&str, &str, &str); 5] = [
     ("ticket", "任务票据", "如 volume-fix"),
@@ -9,9 +14,10 @@ const FIELDS: [(&str, &str, &str); 5] = [
     ("target", "本地目标分支", "main"),
     ("model", "Codex 模型", "可选，默认使用本机配置"),
 ];
-const TABS: [(&str, &str); 4] = [
+const TABS: [(&str, &str); 5] = [
     ("spec", "Spec"),
     ("diff", "Diff"),
+    ("implementation", "实现日志"),
     ("checks", "验收"),
     ("review", "审查"),
 ];
@@ -20,6 +26,9 @@ pub(crate) struct State {
     fields: [Entity<InputState>; FIELDS.len()],
     rows: Vec<Value>,
     selected: Option<String>,
+    inspection: Inspection,
+    targets: Vec<Branch>,
+    authoring: Option<Authoring>,
     detail: Value,
     tab: &'static str,
     loading: bool,
@@ -28,7 +37,34 @@ pub(crate) struct State {
     error: Option<String>,
 }
 
-fn call(ws: &Workspace, runner: &Runner, args: &[String]) -> Result<Vec<u8>> {
+#[derive(Clone, Default, Eq, PartialEq)]
+struct Inspection {
+    version: Option<u64>,
+    run: Option<String>,
+}
+
+struct Authoring {
+    ticket: String,
+    target: Branch,
+    version: Option<u64>,
+    model: Entity<InputState>,
+    fields: DraftFields,
+}
+
+fn call(
+    ws: &Workspace,
+    runner: &Runner,
+    args: &[String],
+    payload: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let stdin = if let Some(bytes) = payload {
+        let mut draft = tempfile::tempfile()?;
+        draft.write_all(bytes)?;
+        draft.rewind()?;
+        Stdio::from(draft)
+    } else {
+        Stdio::null()
+    };
     let output = Command::new(runner.binary()?)
         .current_dir(&ws.root)
         .arg("local")
@@ -37,6 +73,7 @@ fn call(ws: &Workspace, runner: &Runner, args: &[String]) -> Result<Vec<u8>> {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env_remove(aep::CONTROL_OPERATOR_TOKEN)
         .env_remove(aep::CONTROL_DEVICE_TOKEN)
+        .stdin(stdin)
         .output()
         .context("运行 AEP 本地任务命令")?;
     ensure!(
@@ -58,6 +95,7 @@ fn label(phase: &str) -> (&str, u32) {
         "approved" => ("待合并", MINT),
         "merge_pending" => ("待核对合并", AMBER),
         "merged" => ("已合并", MINT),
+        "history" => ("历史证据", MUTED),
         _ => ("载入中", MUTED),
     }
 }
@@ -70,6 +108,9 @@ impl Studio {
                     .map(|(_, _, hint)| cx.new(|cx| InputState::new(window, cx).placeholder(hint))),
                 rows: Vec::new(),
                 selected: None,
+                inspection: Inspection::default(),
+                targets: Vec::new(),
+                authoring: None,
                 detail: Value::Null,
                 tab: "spec",
                 loading: false,
@@ -114,20 +155,34 @@ impl Studio {
         let runner = self.runner.clone();
         let selected = state.selected.clone();
         let requested = selected.clone();
+        let inspection = state.inspection.clone();
+        let requested_scope = inspection.clone();
         let generation = self.workspace_generation;
         let job = cx.background_executor().spawn(async move {
             let rows =
-                serde_json::from_slice::<Vec<Value>>(&call(&ws, &runner, &["list".into()])?)?;
-            let detail = if let Some(ticket) = selected {
-                serde_json::from_slice(&call(
-                    &ws,
-                    &runner,
-                    &["inspect".into(), "--ticket".into(), ticket],
-                )?)?
+                serde_json::from_slice::<Vec<Value>>(&call(&ws, &runner, &["list".into()], None)?)?;
+            let targets = serde_json::from_slice::<Vec<Branch>>(&call(
+                &ws,
+                &runner,
+                &["targets".into()],
+                None,
+            )?)?;
+            let detail = if let Some(ticket) =
+                selected.filter(|ticket| rows.iter().any(|row| row["ticket"] == *ticket))
+            {
+                let mut args = vec!["inspect".into(), "--ticket".into(), ticket];
+                if let Some(version) = inspection.version {
+                    args.extend(["--version".into(), version.to_string()]);
+                }
+                if let Some(run) = inspection.run {
+                    args.extend(["--run".into(), run]);
+                }
+                call(&ws, &runner, &args, None)
+                    .and_then(|bytes| Ok(serde_json::from_slice(&bytes)?))
             } else {
-                Value::Null
+                Ok(Value::Null)
             };
-            Ok::<_, anyhow::Error>((rows, detail))
+            Ok::<_, anyhow::Error>((rows, targets, detail))
         });
         cx.spawn(async move |this, cx| {
             let result = job.await;
@@ -140,10 +195,17 @@ impl Studio {
                 };
                 state.loading = false;
                 match result {
-                    Ok((rows, detail)) => {
+                    Ok((rows, targets, detail)) => {
                         state.rows = rows;
-                        if state.selected == requested {
-                            state.detail = detail;
+                        state.targets = targets;
+                        if state.selected == requested && state.inspection == requested_scope {
+                            match detail {
+                                Ok(detail) => state.detail = detail,
+                                Err(error) if state.error.is_none() => {
+                                    state.error = Some(format!("{error:#}"));
+                                }
+                                Err(_) => {}
+                            }
                         }
                     }
                     Err(error) => state.error = Some(format!("{error:#}")),
@@ -159,6 +221,7 @@ impl Studio {
         operation: &'static str,
         ticket: String,
         args: Vec<String>,
+        payload: Option<Vec<u8>>,
         cx: &mut Context<Self>,
     ) {
         let (Some(state), Some(ws)) = (&mut self.local_tasks, self.workspace.clone()) else {
@@ -177,6 +240,7 @@ impl Studio {
         }
         if state.selected.as_deref() != Some(&ticket) {
             state.selected = Some(ticket);
+            state.inspection = Inspection::default();
             state.detail = Value::Null;
             state.tab = "spec";
         }
@@ -186,7 +250,7 @@ impl Studio {
         let job = cx.background_executor().spawn(async move {
             let mut command = vec![operation.to_owned()];
             command.extend(args);
-            call(&ws, &runner, &command).map(|_| ())
+            call(&ws, &runner, &command, payload.as_deref()).map(|_| ())
         });
         cx.spawn(async move |this, cx| {
             let result = job.await;
@@ -202,7 +266,12 @@ impl Studio {
                 } else {
                     state.operation = None;
                 }
-                state.error = result.err().map(|error| format!("{error:#}"));
+                state.error = result.as_ref().err().map(|error| format!("{error:#}"));
+                if result.is_ok() && matches!(operation, "author" | "plan") {
+                    state.authoring = None;
+                    state.inspection = Inspection::default();
+                    state.detail = Value::Null;
+                }
                 studio.refresh_local(cx);
                 cx.notify();
             });
@@ -248,7 +317,136 @@ impl Studio {
         if let Some(model) = model {
             args.extend(["--codex-model".into(), model]);
         }
-        self.local_command("plan", ticket, args, cx);
+        self.local_command("plan", ticket, args, None, cx);
+    }
+
+    fn edit_local_spec(&mut self, revise: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.local_tasks else {
+            return;
+        };
+        let setup = (|| -> Result<_> {
+            if revise {
+                let detail = &state.detail;
+                ensure!(detail["historical"] != true, "请先打开当前计划");
+                let plan = &detail["current"];
+                let proposal = &detail["proposal"];
+                let draft = Draft {
+                    name: string(plan, "task").into(),
+                    spec: string(proposal, "spec").into(),
+                    manifest: serde_json::from_value(proposal["manifest"].clone())?,
+                };
+                let version = plan["version"].as_u64().context("缺少当前计划版本")?;
+                return Ok((
+                    string(detail, "ticket").to_owned(),
+                    string(plan, "target").to_owned(),
+                    Some(version),
+                    plan["codex_model"].as_str().map(str::to_owned),
+                    Some(draft),
+                ));
+            }
+            let ticket = state.fields[0].read(cx).value().trim().to_owned();
+            ensure!(!ticket.is_empty(), "请填写任务票据");
+            let target = state.fields[3].read(cx).value().trim().to_owned();
+            let target = if target.is_empty() {
+                "main".into()
+            } else {
+                target
+            };
+            let model = state.fields[4].read(cx).value().trim().to_owned();
+            Ok((
+                ticket,
+                target,
+                None,
+                (!model.is_empty()).then_some(model),
+                None,
+            ))
+        })();
+        let result = setup.and_then(|(ticket, target, version, model, draft)| {
+            let target = state
+                .targets
+                .iter()
+                .find(|branch| branch.name == target)
+                .cloned()
+                .context("请选择已存在的本地目标分支")?;
+            let fields = DraftFields::new(draft.as_ref(), window, cx);
+            let model = cx.new(|cx| {
+                let mut field = InputState::new(window, cx).placeholder("默认使用本机配置");
+                if let Some(model) = &model {
+                    field.set_value(model, window, cx);
+                }
+                field
+            });
+            Ok(Authoring {
+                ticket,
+                target,
+                version,
+                model,
+                fields,
+            })
+        });
+        match result {
+            Ok(editor) => {
+                state.authoring = Some(editor);
+                state.error = None;
+            }
+            Err(error) => state.error = Some(format!("{error:#}")),
+        }
+        cx.notify();
+    }
+
+    fn save_local_spec(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.local_tasks else {
+            return;
+        };
+        let Some(editor) = &state.authoring else {
+            return;
+        };
+        let draft = editor.fields.draft(cx).and_then(|draft| {
+            ensure!(draft.manifest.title.is_some(), "请填写任务标题");
+            Ok(serde_json::to_vec(&draft)?)
+        });
+        let payload = match draft {
+            Ok(payload) => payload,
+            Err(error) => {
+                state.error = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        let ticket = editor.ticket.clone();
+        let mut args = vec![
+            "--ticket".into(),
+            ticket.clone(),
+            "--target".into(),
+            editor.target.name.clone(),
+            "--baseline".into(),
+            editor.target.sha.clone(),
+        ];
+        if let Some(version) = editor.version {
+            args.extend(["--version".into(), version.to_string()]);
+        }
+        let model = editor.model.read(cx).value().trim().to_owned();
+        if model.is_empty() {
+            args.push("--default-codex-model".into());
+        } else {
+            args.extend(["--codex-model".into(), model]);
+        }
+        self.local_command("author", ticket, args, Some(payload), cx);
+    }
+
+    fn select_local_evidence(&mut self, inspection: Inspection, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.local_tasks {
+            state.tab = if inspection.run.is_some() {
+                "checks"
+            } else {
+                "spec"
+            };
+            state.inspection = inspection;
+            state.detail = Value::Null;
+            state.error = None;
+        }
+        self.refresh_local(cx);
+        cx.notify();
     }
 
     fn local_page_action(&mut self, operation: &'static str, cx: &mut Context<Self>) {
@@ -256,6 +454,9 @@ impl Studio {
             return;
         };
         let detail = &state.detail;
+        if detail["historical"] == true {
+            return;
+        }
         let ticket = string(detail, "ticket").to_owned();
         let mut args = vec!["--ticket".into(), ticket.clone()];
         if matches!(operation, "approve-plan" | "approve-delivery" | "merge") {
@@ -284,7 +485,7 @@ impl Studio {
                 string(detail, "report_sha256").into(),
             ]);
         }
-        self.local_command(operation, ticket, args, cx);
+        self.local_command(operation, ticket, args, None, cx);
     }
 
     pub(super) fn local_page(&self, cx: &mut Context<Self>) -> Div {
@@ -314,19 +515,120 @@ impl Studio {
                 ),
             );
         }
+        if !state.targets.is_empty() {
+            let mut choices = h_flex().gap_2().flex_wrap();
+            for branch in &state.targets {
+                let name = branch.name.clone();
+                choices = choices.child(
+                    button(
+                        format!("local-target-{name}"),
+                        name.clone(),
+                        name == state.fields[3].read(cx).value().trim(),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(state) = &this.local_tasks {
+                            state.fields[3]
+                                .update(cx, |input, cx| input.set_value(&name, window, cx));
+                        }
+                        cx.notify();
+                    })),
+                );
+            }
+            form = form.child(caption("本地分支")).child(
+                div()
+                    .id("local-target-options")
+                    .test_support()
+                    .max_h(px(96.))
+                    .overflow_y_scroll()
+                    .child(choices),
+            );
+        }
         let mut controls = h_flex().gap_2();
         if state.operation.is_none() {
             controls = controls
+                .child(button("local-new-spec", "编写 Spec", true).on_click(
+                    cx.listener(|this, _, window, cx| this.edit_local_spec(false, window, cx)),
+                ))
                 .child(
-                    button("local-plan", "生成计划", true)
+                    button("local-plan", "从已有提交生成计划", false)
                         .on_click(cx.listener(|this, _, _, cx| this.propose_local(false, cx))),
                 )
                 .child(
-                    button("local-revise", "修订计划", false)
+                    button("local-revise", "用已有提交修订", false)
                         .on_click(cx.listener(|this, _, _, cx| this.propose_local(true, cx))),
                 );
         }
-        page = page.child(form.child(controls));
+        if let Some(editor) = &state.authoring {
+            let saving = state.operation.is_some();
+            let mut editor_view = panel()
+                .flex_none()
+                .child(heading(if editor.version.is_some() {
+                    "修订本地 Spec"
+                } else {
+                    "编写本地 Spec"
+                }))
+                .child(field("票据", &editor.ticket))
+                .child(field("目标分支", &editor.target.name))
+                .child(field("目标提交", &editor.target.sha));
+            if let Some(target) = state
+                .targets
+                .iter()
+                .find(|branch| branch.name == editor.target.name && branch.sha != editor.target.sha)
+                && !saving
+            {
+                let target = target.clone();
+                editor_view = editor_view.child(
+                    h_flex()
+                        .gap_2()
+                        .child(caption("目标已更新，核对后可采用新基线。"))
+                        .child(
+                            button("local-update-baseline", "采用当前目标", false).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    if let Some(editor) = this
+                                        .local_tasks
+                                        .as_mut()
+                                        .and_then(|state| state.authoring.as_mut())
+                                    {
+                                        editor.target = target.clone();
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
+                        ),
+                );
+            }
+            editor_view = editor_view.child(editor.fields.render(saving, true)).child(
+                v_flex().gap_1().child(caption("Codex 模型（可选）")).child(
+                    div().id("local-author-model").test_support().child(
+                        Input::new(&editor.model)
+                            .aria_label("Codex 模型")
+                            .disabled(saving),
+                    ),
+                ),
+            );
+            if !saving {
+                editor_view = editor_view.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            button("local-save-spec", "保存 Spec 与计划", true)
+                                .on_click(cx.listener(|this, _, _, cx| this.save_local_spec(cx))),
+                        )
+                        .child(button("local-cancel-spec", "返回任务", false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(state) = &mut this.local_tasks {
+                                    state.authoring = None;
+                                    state.error = None;
+                                }
+                                cx.notify();
+                            }),
+                        )),
+                );
+            }
+            page = page.child(editor_view);
+        } else {
+            page = page.child(form.child(controls));
+        }
         if let Some(error) = &state.error {
             page = page.child(detail_text("local-command-error", error));
         }
@@ -348,6 +650,7 @@ impl Studio {
                                 move |this, _, _, cx| {
                                     if let Some(state) = &mut this.local_tasks {
                                         state.selected = Some(ticket.clone());
+                                        state.inspection = Inspection::default();
                                         state.detail = Value::Null;
                                         state.tab = "spec";
                                         state.error = None;
@@ -385,7 +688,75 @@ impl Studio {
             .child(field("目标", string(pin, "target")))
             .child(field("基线", string(pin, "baseline")))
             .child(field("Spec", string(pin, "spec")));
-        if let Some(sha) = detail["run"]["candidate_sha"].as_str() {
+        if let Some(model) = pin["codex_model"].as_str() {
+            review = review.child(field("Codex 模型", model));
+        }
+        if let Some(actor) = pin["plan_approval"]["actor"].as_str() {
+            review = review.child(field("计划批准人", actor));
+        }
+        if !pin["delivery"]["approval"].is_null()
+            && detail["run"]["run_id"] == pin["delivery"]["run"]
+        {
+            review = review.child(field(
+                "交付批准人",
+                string(&pin["delivery"]["approval"], "actor"),
+            ));
+        }
+        if phase == "merged" {
+            review = review.child(
+                div()
+                    .id("local-merge-receipt")
+                    .test_support()
+                    .child(field("已合并提交", string(&pin["delivery"], "candidate"))),
+            );
+        }
+        if let Some(versions) = detail["history"]
+            .as_array()
+            .filter(|versions| !versions.is_empty())
+        {
+            let mut choices = h_flex().gap_2().flex_wrap();
+            choices = choices.child(
+                button(
+                    "local-current-version",
+                    "当前计划",
+                    detail["historical"] != true,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.select_local_evidence(Inspection::default(), cx)
+                })),
+            );
+            for version in versions
+                .iter()
+                .filter_map(|version| version["version"].as_u64())
+            {
+                choices = choices.child(
+                    button(
+                        format!("local-version-{version}"),
+                        format!("版本 {version}"),
+                        pin["version"] == version,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_local_evidence(
+                            Inspection {
+                                version: Some(version),
+                                run: None,
+                            },
+                            cx,
+                        )
+                    })),
+                );
+            }
+            review = review.child(choices);
+        } else if detail["historical"] == true {
+            review = review.child(h_flex().child(
+                button("local-current-version", "返回当前 Run", true).on_click(cx.listener(
+                    |this, _, _, cx| this.select_local_evidence(Inspection::default(), cx),
+                )),
+            ));
+        }
+        if phase != "merged"
+            && let Some(sha) = detail["run"]["candidate_sha"].as_str()
+        {
             review = review.child(field("变更提交", sha));
         }
         if let Some(tokens) = detail["usage"]["tokens"]
@@ -407,11 +778,40 @@ impl Studio {
         }
         if let Some(runs) = detail["runs"].as_array() {
             for run in runs {
-                let (description, tone) = status(string(run, "status"));
+                let id = string(run, "id").to_owned();
+                let (description, tone) = if pin["delivery"]["run"] == id {
+                    if !pin["merged_at"].is_null() {
+                        label("merged")
+                    } else if !pin["merging"].is_null() {
+                        label("merge_pending")
+                    } else {
+                        label("approved")
+                    }
+                } else {
+                    status(string(run, "status"))
+                };
+                let version = pin["version"].as_u64();
                 review = review.child(
                     h_flex()
                         .gap_2()
-                        .child(caption(string(run, "id")))
+                        .child(
+                            button(
+                                format!("local-run-evidence-{id}"),
+                                id.clone(),
+                                id == string(&detail["run"], "run_id"),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.select_local_evidence(
+                                        Inspection {
+                                            version,
+                                            run: Some(id.clone()),
+                                        },
+                                        cx,
+                                    )
+                                },
+                            )),
+                        )
                         .child(chip(description, tone)),
                 );
             }
@@ -428,7 +828,7 @@ impl Studio {
             _ => None,
         };
         if let Some((op, title)) = action
-            && (state.operation.is_none() || op == "cancel")
+            && ((state.operation.is_none() && state.authoring.is_none()) || op == "cancel")
         {
             review =
                 review.child(h_flex().child(
@@ -436,6 +836,16 @@ impl Studio {
                         cx.listener(move |this, _, _, cx| this.local_page_action(op, cx)),
                     ),
                 ));
+        }
+        if !matches!(phase, "running" | "history" | "merge_pending")
+            && state.operation.is_none()
+            && state.authoring.is_none()
+        {
+            review = review.child(h_flex().child(
+                button("local-edit-spec", "修订 Spec", false).on_click(
+                    cx.listener(|this, _, window, cx| this.edit_local_spec(true, window, cx)),
+                ),
+            ));
         }
         page = page.child(review);
         let mut tabs = h_flex().gap_2().flex_wrap();

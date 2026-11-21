@@ -1,3 +1,5 @@
+mod author;
+
 use crate::{
     Execution,
     git::{Repo, commit, git, ident},
@@ -48,6 +50,10 @@ pub(crate) enum Action {
         #[arg(long)]
         codex_model: Option<String>,
     },
+    /// Write or revise a local Spec without changing the checkout or index.
+    Author(author::Request),
+    /// List local target branches and their current commits.
+    Targets,
     /// Approve this exact task plan before starting an agent.
     ApprovePlan {
         #[command(flatten)]
@@ -78,6 +84,10 @@ pub(crate) enum Action {
     Inspect {
         #[arg(long)]
         ticket: String,
+        #[arg(long)]
+        version: Option<u64>,
+        #[arg(long)]
+        run: Option<String>,
     },
     /// Approve the exact Run, Spec, baseline, candidate and evidence.
     ApproveDelivery {
@@ -294,6 +304,60 @@ fn load(repo: &Repo, ticket: &str) -> Result<Ticket> {
     Ok(record)
 }
 
+fn existing(repo: &Repo, ticket: &str) -> Result<Option<Ticket>> {
+    path(repo, ticket)?
+        .try_exists()?
+        .then(|| load(repo, ticket))
+        .transpose()
+}
+
+fn propose(
+    repo: &Repo,
+    ticket: String,
+    pin: Pin,
+    prior: Option<Ticket>,
+    revise: bool,
+) -> Result<Ticket> {
+    pin.check_target(repo)?;
+    let record = if let Some(mut saved) = prior {
+        if saved.current.pin != pin {
+            ensure!(
+                revise,
+                "ticket already pins a different plan; explicitly revise it"
+            );
+            ensure!(
+                saved.current.merging.is_none() || saved.current.merged_at.is_some(),
+                "reconcile the pending merge before revising"
+            );
+            let next = Plan::propose(pin, saved.current.version + 1);
+            saved
+                .history
+                .push(std::mem::replace(&mut saved.current, next));
+        }
+        saved
+    } else {
+        Ticket {
+            ticket,
+            current: Plan::propose(pin, 1),
+            history: Vec::new(),
+        }
+    };
+    let pin_spec = |spec: &str| {
+        git(
+            &repo.root,
+            &["update-ref", &format!("refs/aep/local-specs/{spec}"), spec],
+        )
+    };
+    for version in &record.history {
+        if commit(&repo.root, &version.pin.spec).is_ok() {
+            pin_spec(&version.pin.spec)?;
+        }
+    }
+    pin_spec(&record.current.pin.spec)?;
+    save(repo, &record)?;
+    Ok(record)
+}
+
 fn lock(repo: &Repo, ticket: &str) -> Result<File> {
     ident(ticket, 63)?;
     DirBuilder::new()
@@ -435,19 +499,53 @@ impl Budget {
     }
 }
 
-fn view(repo: &Repo, ticket: &Ticket, inspect: bool) -> Result<Value> {
-    let plan = &ticket.current;
+#[derive(Default)]
+struct Inspection<'a> {
+    version: Option<u64>,
+    run: Option<&'a str>,
+}
+
+fn view(repo: &Repo, ticket: &Ticket, inspection: Option<Inspection<'_>>) -> Result<Value> {
+    let requested_version = inspection.as_ref().and_then(|scope| scope.version);
+    let plan = match requested_version {
+        Some(version) if version != ticket.current.version => ticket
+            .history
+            .iter()
+            .find(|plan| plan.version == version)
+            .context("unknown task plan version")?,
+        _ => &ticket.current,
+    };
     let records = plan.records(repo)?;
-    let mut all = records.clone();
-    for older in &ticket.history {
-        all.extend(older.records(repo)?);
+    let mut all = Vec::new();
+    for version in ticket
+        .history
+        .iter()
+        .chain(std::iter::once(&ticket.current))
+    {
+        if version.version == plan.version {
+            all.extend(records.iter().cloned());
+        } else {
+            all.extend(version.records(repo)?);
+        }
     }
     let current_usage = usage(&records);
-    let last = records.last().cloned().unwrap_or_default();
+    let requested_run = inspection.as_ref().and_then(|scope| scope.run);
+    let historical = plan.version != ticket.current.version
+        || requested_run.is_some_and(|run| plan.attempts.last().map(String::as_str) != Some(run));
+    let last = match requested_run {
+        Some(run) => records
+            .iter()
+            .find(|record| record["run_id"] == run)
+            .cloned()
+            .context("Run does not belong to the selected task version")?,
+        None => records.last().cloned().unwrap_or_default(),
+    };
     let branch_block = last["budget_blocked"]
         .as_str()
         .or_else(|| blocked(&plan.pin, &current_usage, false));
-    let phase = if plan.merged_at.is_some() {
+    let phase = if historical {
+        "history"
+    } else if plan.merged_at.is_some() {
         "merged"
     } else if plan.merging.is_some() {
         "merge_pending"
@@ -472,6 +570,8 @@ fn view(repo: &Repo, ticket: &Ticket, inspect: bool) -> Result<Value> {
         "ticket":ticket.ticket,
         "current":plan,
         "history":ticket.history,
+        "historical":historical,
+        "latest_version":ticket.current.version,
         "phase":phase,
         "reason":branch_block.or_else(|| (phase=="blocked").then_some("attempt budget exhausted")),
         "run":last,
@@ -483,12 +583,16 @@ fn view(repo: &Repo, ticket: &Ticket, inspect: bool) -> Result<Value> {
         "total_usage":usage(&all),
         "elapsed_seconds":plan.delivery.as_ref().map(|approval| approval.approval.at.saturating_sub(plan.created_at)),
     });
-    if inspect {
+    if inspection.is_some() {
         let (spec, manifest) = repo.task(&plan.pin.spec, &plan.pin.task)?;
         result["proposal"] =
             json!({"spec":spec,"manifest":manifest,"implementer":"codex","reviewer":"claude"});
         if let Some(id) = last["run_id"].as_str() {
-            for (field, artifact) in [("checks", Artifact::Checks), ("review", Artifact::Review)] {
+            for (field, artifact) in [
+                ("implementation", Artifact::Implementation),
+                ("checks", Artifact::Checks),
+                ("review", Artifact::Review),
+            ] {
                 if let Some(item) = preview(&repo.data, id, artifact)? {
                     result[field] = json!({"text":item.text,"truncated":item.truncated});
                 }
@@ -511,7 +615,8 @@ fn view(repo: &Repo, ticket: &Ticket, inspect: bool) -> Result<Value> {
                 }
                 result["diff"] = json!({"text":&diff[..end],"truncated":end<diff.len()});
             }
-            if last["status"] == "awaiting_human_review"
+            if !historical
+                && last["status"] == "awaiting_human_review"
                 && last["review_status"] == "findings_recorded"
             {
                 result["report_sha256"] = json!(run::approval_digest(&repo.data, id, &last)?);
@@ -536,7 +641,7 @@ fn list(repo: &Repo) -> Result<Vec<Value>> {
             && let Some(id) = path.file_stem().and_then(|name| name.to_str())
         {
             let record = load(repo, id)?;
-            let row = view(repo, &record, false)?;
+            let row = view(repo, &record, None)?;
             tasks.push(json!({"ticket":id,"task":record.current.pin.task,"target":record.current.pin.target,"phase":row["phase"]}));
         }
     }
@@ -731,12 +836,14 @@ fn print(value: &impl Serialize) -> Result<ExitCode> {
 pub(crate) fn execute(repo: &Repo, action: Action) -> Result<ExitCode> {
     let record = match action {
         Action::List => return print(&list(repo)?),
+        Action::Targets => return print(&author::targets(repo)?),
+        Action::Author(request) => author::create(repo, request)?,
         Action::Report => {
             let mut tasks = Vec::new();
             for row in list(repo)? {
                 let id = row["ticket"].as_str().context("missing ticket")?;
                 let ticket = load(repo, id)?;
-                let status = view(repo, &ticket, false)?;
+                let status = view(repo, &ticket, None)?;
                 let mut versions = Vec::new();
                 for plan in ticket
                     .history
@@ -757,8 +864,21 @@ pub(crate) fn execute(repo: &Repo, action: Action) -> Result<ExitCode> {
             }
             return print(&json!({"tasks":tasks}));
         }
-        Action::Status { ticket } => return print(&view(repo, &load(repo, &ticket)?, false)?),
-        Action::Inspect { ticket } => return print(&view(repo, &load(repo, &ticket)?, true)?),
+        Action::Status { ticket } => return print(&view(repo, &load(repo, &ticket)?, None)?),
+        Action::Inspect {
+            ticket,
+            version,
+            run,
+        } => {
+            return print(&view(
+                repo,
+                &load(repo, &ticket)?,
+                Some(Inspection {
+                    version,
+                    run: run.as_deref(),
+                }),
+            )?);
+        }
         Action::Run { ticket, rerun } => return start(repo, &ticket, rerun),
         Action::Cancel { ticket, run } => {
             let current = load(repo, &ticket)?.current;
@@ -798,32 +918,8 @@ pub(crate) fn execute(repo: &Repo, action: Action) -> Result<ExitCode> {
                 attempts,
                 (max_tokens, max_cost_micros, codex_model),
             )?;
-            let record = if path(repo, &ticket)?.try_exists()? {
-                let mut saved = load(repo, &ticket)?;
-                if saved.current.pin != pin {
-                    ensure!(
-                        revise,
-                        "ticket already pins a different plan; explicitly revise it"
-                    );
-                    ensure!(
-                        saved.current.merging.is_none() || saved.current.merged_at.is_some(),
-                        "reconcile the pending merge before revising"
-                    );
-                    let next = Plan::propose(pin, saved.current.version + 1);
-                    saved
-                        .history
-                        .push(std::mem::replace(&mut saved.current, next));
-                }
-                saved
-            } else {
-                Ticket {
-                    ticket,
-                    current: Plan::propose(pin, 1),
-                    history: Vec::new(),
-                }
-            };
-            save(repo, &record)?;
-            record
+            let prior = existing(repo, &ticket)?;
+            propose(repo, ticket, pin, prior, revise)?
         }
         Action::ApprovePlan { plan } => {
             let _guard = lock(repo, &plan.ticket)?;
@@ -881,5 +977,5 @@ pub(crate) fn execute(repo: &Repo, action: Action) -> Result<ExitCode> {
             merge(repo, load(repo, &delivery.plan.ticket)?, &delivery)?
         }
     };
-    print(&view(repo, &record, false)?)
+    print(&view(repo, &record, None)?)
 }

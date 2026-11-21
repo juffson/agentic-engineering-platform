@@ -6,6 +6,11 @@ use gpui_kit::component::input::{Textarea, TextareaState};
 
 pub(crate) struct Authoring {
     pub(super) branch: lifecycle::Branch,
+    fields: DraftFields,
+}
+
+pub(super) struct DraftFields {
+    locked_name: bool,
     task: Entity<InputState>,
     title: Entity<InputState>,
     spec: Entity<TextareaState>,
@@ -13,17 +18,15 @@ pub(crate) struct Authoring {
     check: Entity<TextareaState>,
 }
 
-impl Authoring {
+impl DraftFields {
     pub(super) fn new(
-        branch: lifecycle::Branch,
+        initial: Option<&lifecycle::Draft>,
         window: &mut Window,
         cx: &mut Context<Studio>,
     ) -> Self {
-        let task = cx.new(|cx| InputState::new(window, cx).placeholder("如 improve-task-errors"));
-        task.focus_handle(cx).focus(window, cx);
-        Self {
-            branch,
-            task,
+        let mut fields = Self {
+            locked_name: initial.is_some(),
+            task: cx.new(|cx| InputState::new(window, cx).placeholder("如 improve-task-errors")),
             title: cx.new(|cx| InputState::new(window, cx)),
             spec: cx
                 .new(|cx| TextareaState::new(window, cx).placeholder("描述范围、要求和验收标准")),
@@ -32,7 +35,43 @@ impl Authoring {
             check: cx.new(|cx| {
                 TextareaState::new(window, cx).placeholder("[\"cargo\",\"test\",\"--locked\"]")
             }),
+        };
+        if let Some(draft) = initial {
+            fields.set_draft(draft, window, cx);
         }
+        if fields.locked_name {
+            fields.title.focus_handle(cx).focus(window, cx);
+        } else {
+            fields.task.focus_handle(cx).focus(window, cx);
+        }
+        fields
+    }
+
+    fn set_draft(
+        &mut self,
+        draft: &lifecycle::Draft,
+        window: &mut Window,
+        cx: &mut Context<Studio>,
+    ) {
+        let manifest = &draft.manifest;
+        let acceptance = serde_json::json!({
+            "check": manifest.check,
+            "criteria": manifest.criteria,
+            "checks": manifest.checks,
+        });
+        self.task
+            .update(cx, |field, cx| field.set_value(&draft.name, window, cx));
+        self.title.update(cx, |field, cx| {
+            field.set_value(manifest.title.as_deref().unwrap_or(""), window, cx)
+        });
+        self.spec
+            .update(cx, |field, cx| field.set_value(&draft.spec, window, cx));
+        self.paths.update(cx, |field, cx| {
+            field.set_value(manifest.allowed_paths.join("\n"), window, cx)
+        });
+        self.check.update(cx, |field, cx| {
+            field.set_value(acceptance.to_string(), window, cx)
+        });
     }
 
     pub(super) fn draft(&self, cx: &App) -> Result<lifecycle::Draft> {
@@ -83,7 +122,7 @@ impl Authoring {
         Ok(draft)
     }
 
-    pub(super) fn fields(&self, ws: &Workspace, preparing: bool) -> Div {
+    pub(super) fn render(&self, preparing: bool, require_title: bool) -> Div {
         let text_field = |id, label, field, height| {
             v_flex().gap_1().child(caption(label)).child(
                 div().id(id).test_support().child(
@@ -94,10 +133,8 @@ impl Authoring {
                 ),
             )
         };
-        panel()
-            .child(field("仓库", &ws.root.display().to_string()))
-            .child(field("目标分支", &self.branch.name))
-            .child(field("目标提交", &self.branch.sha))
+        v_flex()
+            .gap_3()
             .child(
                 h_flex()
                     .gap_3()
@@ -111,7 +148,7 @@ impl Authoring {
                                 div().id("task-author-name").test_support().child(
                                     Input::new(&self.task)
                                         .aria_label("任务 ID")
-                                        .disabled(preparing),
+                                        .disabled(preparing || self.locked_name),
                                 ),
                             ),
                     )
@@ -120,7 +157,11 @@ impl Authoring {
                             .gap_1()
                             .flex_1()
                             .min_w_0()
-                            .child(caption("标题（可选）"))
+                            .child(caption(if require_title {
+                                "标题"
+                            } else {
+                                "标题（可选）"
+                            }))
                             .child(
                                 div().id("task-author-title").test_support().child(
                                     Input::new(&self.title)
@@ -151,6 +192,31 @@ impl Authoring {
             .child(caption(
                 "填写 JSON 命令数组，或填写带验收项编号和多个检查的 JSON 对象。",
             ))
+    }
+}
+
+impl Authoring {
+    pub(super) fn new(
+        branch: lifecycle::Branch,
+        window: &mut Window,
+        cx: &mut Context<Studio>,
+    ) -> Self {
+        Self {
+            branch,
+            fields: DraftFields::new(None, window, cx),
+        }
+    }
+
+    pub(super) fn draft(&self, cx: &App) -> Result<lifecycle::Draft> {
+        self.fields.draft(cx)
+    }
+
+    pub(super) fn fields(&self, ws: &Workspace, preparing: bool) -> Div {
+        panel()
+            .child(field("仓库", &ws.root.display().to_string()))
+            .child(field("目标分支", &self.branch.name))
+            .child(field("目标提交", &self.branch.sha))
+            .child(self.fields.render(preparing, false))
     }
 
     pub(super) fn render(&self, ws: &Workspace, preparing: bool, cx: &Context<Studio>) -> Div {

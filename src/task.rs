@@ -1,9 +1,9 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fs, path::Path};
 
 /// Files an implementation may change and the argument vector used for acceptance.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskManifest {
     pub title: Option<String>,
     pub allowed_paths: Vec<String>,
@@ -14,12 +14,40 @@ pub struct TaskManifest {
     pub checks: Vec<Check>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Check {
     pub id: String,
     pub criteria: Vec<String>,
     pub command: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct TaskDraft {
+    pub name: String,
+    pub spec: String,
+    pub manifest: TaskManifest,
+}
+
+impl TaskDraft {
+    pub fn validate(&self) -> Result<()> {
+        crate::workspace::ident(&self.name, 63)
+            .context("任务 ID 只支持小写字母、数字和连字符，最多 63 个字符")?;
+        ensure!(!self.spec.trim().is_empty(), "请填写 Spec");
+        self.manifest
+            .validate()
+            .context("请检查允许修改的文件和验收命令")
+    }
+
+    pub fn write_files(&self, dir: &Path) -> Result<()> {
+        self.validate()?;
+        fs::create_dir(dir).context("任务目录已存在，或无法创建任务目录")?;
+        fs::write(dir.join("spec.md"), &self.spec)?;
+        let file = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer_pretty(file.as_file(), &self.manifest)?;
+        file.persist(dir.join("task.json"))?;
+        Ok(())
+    }
 }
 
 fn valid_command(command: &[String]) -> bool {
