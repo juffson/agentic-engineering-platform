@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Template {
     #[default]
     Legacy,
@@ -49,10 +49,11 @@ impl Template {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Client {
     Codex,
     Claude,
+    #[value(name = "zcode")]
     ZCode,
     Custom,
 }
@@ -75,7 +76,7 @@ impl Client {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Profile {
     pub client: Client,
     pub executable: String,
@@ -165,8 +166,17 @@ impl Profile {
         Ok(())
     }
 }
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalSession {
+    pub session: String,
+    pub workspace: PathBuf,
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalSession>,
+    #[serde(default)]
+    pub prior_runs: Vec<(usize, String)>,
     pub project: String,
     pub work: String,
     pub template: Template,

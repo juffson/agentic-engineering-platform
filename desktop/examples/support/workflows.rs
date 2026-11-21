@@ -235,6 +235,61 @@ echo "已核对玩家验收记录，交付 frost-83。""#,
                 serde_json::to_vec_pretty(&final_state)?,
             )?;
         }
+        // A separate shell registers and finishes an already-running client while Studio stays open.
+        let bin = runner.binary.as_ref().unwrap();
+        let cli = |args: &[&str]| -> Result<serde_json::Value> {
+            let out = std::process::Command::new(bin)
+                .current_dir(&repo)
+                .arg("project")
+                .arg("--home")
+                .arg(&catalog)
+                .args(args)
+                .output()?;
+            ensure!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Ok(serde_json::from_slice(&out.stdout)?)
+        };
+        cli(&["add-work", "独立会话交接"])?;
+        ui.click("project-work")?;
+        let claim = cli(&[
+            "claim",
+            "--stage",
+            "1",
+            "--client",
+            "zcode",
+            "--session",
+            "existing-zcode-workspace",
+        ])?;
+        let attempt = claim["attempt"].as_str().unwrap();
+        until(&mut ui, "external session visible in Studio", 15, |ui| {
+            Ok((!ui.absent(&format!("workflow-stop-{attempt}"))?).then_some(()))
+        })?;
+        fs::write(repo.join("prd.txt"), "在原会话确认恢复范围。")?;
+        cli(&[
+            "submit",
+            "--attempt",
+            attempt,
+            "--session",
+            "existing-zcode-workspace",
+            "--summary",
+            "已确认恢复范围",
+            "--file",
+            "prd.txt",
+            "--artifact",
+            "prd.txt",
+        ])?;
+        until(&mut ui, "external receipt visible", 15, |ui| {
+            Ok((!ui.absent("workflow-run")?).then_some(()))
+        })?;
+        ui.checkpoint("external-session-handoff")?;
+        click(&mut ui, "project-next")?;
+        ensure!(
+            cli(&["status"])?["stage"] == 2,
+            "Studio and CLI disagree about the approved stage"
+        );
         Ok(())
     })();
     if result.is_err() {

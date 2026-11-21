@@ -593,6 +593,7 @@ impl Studio {
 impl Render for Studio {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.page == Page::Project {
+            self.watch_project_catalog(window, cx);
             return self.project_page(cx);
         }
         self.lifecycle_frame(window, cx);

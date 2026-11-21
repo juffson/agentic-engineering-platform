@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
 };
 
 pub(crate) fn storage() -> Option<PathBuf> {
-    env::home_dir().map(|home| home.join("Library/Application Support/AEP Studio"))
+    aep::project::catalog_dir()
 }
 
 pub(crate) fn last_path() -> Option<PathBuf> {

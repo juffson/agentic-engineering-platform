@@ -71,20 +71,39 @@ fn command_receipts(stdout: &Path) -> Result<Vec<Value>> {
     }
     Ok(commands.into())
 }
-fn perform(
+pub(crate) fn context(
     req: &Request,
-    stage: &Stage,
     dir: &Path,
+    cwd: &Path,
+    since: Option<i64>,
+) -> Result<aep::handoff::Packet> {
+    let work = dir
+        .parent()
+        .and_then(Path::parent)
+        .context("missing work")?;
+    let mut packet = preview(req, work, cwd, since)?;
+    if since.is_none() {
+        packet.text.push_str(&format!(
+            "\n本次档案 {}。前序执行的 result.txt 和 evidence.json 位于同级执行目录。",
+            dir.display()
+        ));
+    }
+    Ok(packet)
+}
+pub(crate) fn preview(
+    req: &Request,
     work: &Path,
-    id: &str,
-    stop: &Cancellation,
-    record: &mut Value,
-) -> Result<()> {
-    req.profile.validate()?;
-    let cwd = workspace(work, req.repository.as_deref())?;
-    let mut memory = Memory::open(work.parent().context("missing project directory")?)?;
+    cwd: &Path,
+    since: Option<i64>,
+) -> Result<aep::handoff::Packet> {
+    let memory = Memory::open(work.parent().context("missing project directory")?)?;
+    let previous = req.prior_runs.last().map(|(_, id)| id.as_str());
+    if let Some(cursor) = since {
+        ensure!(cursor >= 0, "记忆游标必须大于等于零");
+        return aep::handoff::packet(req, &memory.workflow_delta(previous, cursor)?, &[], since);
+    }
     let key = Key::new("", "", "");
-    let notes = memory.context(&key, None)?;
+    let notes = memory.workflow_context(previous)?;
     let repo_notes = if let Some(repo) = &req.repository {
         let repo = crate::git::Repo::open(repo)?;
         if repo.data.join("memory.sqlite3").is_file() {
@@ -95,7 +114,7 @@ fn perform(
                     crate::local::workflow_memory_scope(
                         &repo,
                         id,
-                        &aep::workspace::commit(&cwd, "HEAD")?,
+                        &aep::workspace::commit(cwd, "HEAD").unwrap_or_default(),
                     )
                 })
                 .transpose()?
@@ -107,45 +126,37 @@ fn perform(
     } else {
         vec![]
     };
-    let gate = matches!(stage.role, Role::Accept | Role::Test);
-    let write = stage.role == Role::Build;
-    let mut prompt = format!(
-        "AEP Studio 项目：{}\n开发事项：{}\n流程：{} · {}\n阶段职责：{}\n本次说明：{}\n人工已确认的本事项交付物（按阶段顺序）：{}\n项目共享记忆：{}\n当前仓库及关联票据的适用记忆：{}\n工作目录：{}\n{} 不要推送、合并、发布或创建 PR。直接返回本阶段的交付物、证据和给下一位 Agent 的交接。{}",
-        req.project,
-        req.work,
-        req.template.label(),
-        stage.name,
-        stage.brief,
-        req.brief,
-        serde_json::to_string(&req.approved)?,
-        serde_json::to_string(&notes)?,
-        serde_json::to_string(&repo_notes)?,
-        cwd.display(),
-        if write {
-            "仅在当前事项工作区实施改动。"
-        } else {
-            "本阶段保留已有实现，仅检查或验证，在回复中记录结果。"
-        },
-        if gate {
-            "最后单独一行写 AEP: PASS 或 AEP: BLOCKED。未验证必要标准时必须 BLOCKED。"
-        } else {
-            ""
-        }
-    );
-    if !req.profile.check_command.is_empty() {
-        prompt.push_str(&format!(
-            "\n本阶段已允许精确执行以下验收命令，请原样单独运行并报告结果：{}",
-            req.profile.check_command
-        ));
-    }
+    aep::handoff::packet(req, &notes, &repo_notes, None)
+}
+fn perform(
+    req: &Request,
+    stage: &Stage,
+    dir: &Path,
+    work: &Path,
+    id: &str,
+    stop: &Cancellation,
+    record: &mut Value,
+) -> Result<()> {
+    req.profile.validate()?;
+    let cwd = workspace(work, req.repository.as_deref())?;
+    let packet = context(req, dir, &cwd, None)?;
+    let prompt = packet.text;
     fs::write(dir.join("prompt.txt"), &prompt)?;
     record["workspace"] = json!(cwd);
-    record["read_memory"] = json!(notes.iter().map(|v| &v["id"]).collect::<Vec<_>>());
-    record["read_repository_memory"] =
-        json!(repo_notes.iter().map(|v| &v["id"]).collect::<Vec<_>>());
+    record["prompt_bytes"] = json!(prompt.len());
+    record["read_memory"] = json!(packet.project_ids);
+    record["read_repository_memory"] = json!(packet.repo_ids);
+    let gate = matches!(stage.role, Role::Test | Role::Accept);
+    let write = stage.role == Role::Build;
     save(dir, record)?;
     let profile = &req.profile;
     let bin = profile.program(&std::env::var_os("PATH").unwrap_or_default())?;
+    let bundled_zcode = bin == Path::new(aep::workflow::ZCODE_APP)
+        || (profile.client == Client::ZCode
+            && bin
+                .canonicalize()
+                .is_ok_and(|p| p == Path::new(aep::workflow::ZCODE_APP)));
+    let bridge = profile.client == Client::ZCode && (bundled_zcode || !profile.model.is_empty());
     let mut args = vec![bin.display().to_string()];
     if bin == Path::new(aep::workflow::ZCODE_APP)
         && std::env::var_os("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE").is_none()
@@ -193,7 +204,7 @@ fn perform(
                 .map(String::from),
             );
         }
-        Client::ZCode if !profile.model.is_empty() => {
+        Client::ZCode if bridge => {
             args = vec![
                 std::env::current_exe()?.display().to_string(),
                 "zcode-stage".into(),
@@ -234,7 +245,7 @@ fn perform(
     if profile.client == Client::Codex {
         args.push("-".into());
     }
-    if profile.client == Client::ZCode && profile.model.is_empty() {
+    if profile.client == Client::ZCode && !bridge {
         args.push(dir.join("prompt.txt").display().to_string());
     }
     let stdout = dir.join("stdout.log");
@@ -249,6 +260,10 @@ fn perform(
         stop,
     )?;
     record["exit_code"] = json!(code);
+    if dir.join("session.json").is_file() {
+        let native = aep::workspace::read(&dir.join("session.json"))?;
+        record["native_session"] = native;
+    }
     if profile.client == Client::Codex {
         record["commands"] = json!(command_receipts(&stdout)?);
     }
@@ -300,10 +315,16 @@ fn perform(
             &profile.model
         }
     );
-    let summary = format!("{} · {}\n{}", req.work, stage.name, result.trim())
-        .chars()
-        .take(TEXT_LIMIT)
-        .collect::<String>();
+    let mut memory = Memory::open(work.parent().context("missing project directory")?)?;
+    let summary = format!(
+        "{} · {}\n{}",
+        req.work,
+        stage.name,
+        aep::handoff::summary(&result)
+    )
+    .chars()
+    .take(TEXT_LIMIT)
+    .collect::<String>();
     record["written_memory"] = json!(memory.project_handoff(id, &author, &summary)?);
     record["status"] = json!("succeeded");
     record["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
@@ -322,6 +343,10 @@ pub fn execute(request: &Path) -> Result<()> {
         .and_then(|v| v.to_str())
         .context("missing attempt ID")?;
     let req: Request = serde_json::from_reader(fs::File::open(&request)?)?;
+    ensure!(
+        req.external.is_none(),
+        "外部会话已领取此阶段，请用 project submit 交回结果"
+    );
     let stage = req
         .template
         .stages()
@@ -361,4 +386,44 @@ pub fn execute(request: &Path) -> Result<()> {
         save(dir, &record)?;
     }
     result
+}
+
+/// Read native counters without conflating cached and uncached tokens across providers.
+pub(crate) fn metrics(dir: &Path) -> Result<Value> {
+    let e = aep::workflow::evidence(dir)?;
+    let profile = &e["profile"];
+    let elapsed = e["started_at"]
+        .as_str()
+        .zip(e["finished_at"].as_str())
+        .and_then(|(a, b)| {
+            Some(
+                (chrono::DateTime::parse_from_rfc3339(b).ok()?
+                    - chrono::DateTime::parse_from_rfc3339(a).ok()?)
+                .num_milliseconds(),
+            )
+        });
+    let mut usage = serde_json::Map::new();
+    if e["mode"] != "external"
+        && matches!(profile["client"].as_str(), Some("Codex" | "Claude"))
+        && dir.join("stdout.log").is_file()
+    {
+        for line in BufReader::new(fs::File::open(dir.join("stdout.log"))?).lines() {
+            if let Ok(value) = serde_json::from_str::<Value>(&line?)
+                && (value["type"] == "turn.completed" || value["type"] == "result")
+                && let Some(row) = value["usage"].as_object()
+            {
+                for (k, v) in row {
+                    if let Some(n) = v.as_u64()
+                        && k.ends_with("tokens")
+                    {
+                        let prev = usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+                        usage.insert(k.clone(), json!(prev.saturating_add(n)));
+                    }
+                }
+            }
+        }
+    }
+    Ok(
+        json!({"attempt":e["run_id"],"stage":e["stage"],"client":profile["client"],"status":e["status"],"mode":e["mode"].as_str().unwrap_or("managed"),"elapsed_ms":elapsed,"prompt_bytes":dir.join("prompt.txt").metadata().ok().map(|m|m.len()),"provider_usage":(!usage.is_empty()).then_some(usage)}),
+    )
 }

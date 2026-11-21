@@ -1,6 +1,6 @@
 use super::*;
 mod agents;
-use crate::project::{Attempt, Kind, Library, Project, Work};
+use aep::project::{Kind, Library, Project, Work};
 use aep::workflow::{self, Client, Profile, Role as StageRole, Template};
 use anyhow::{Context as _, ensure};
 use gpui_kit::component::input::{Textarea, TextareaState};
@@ -33,6 +33,7 @@ pub(crate) struct Board {
     executable: Entity<InputState>,
     check_command: Entity<InputState>,
     polling: bool,
+    catalog_polling: bool,
     log_view: Option<(String, &'static str, u64)>,
     memories: Vec<Value>,
     editing_memory: Option<i64>,
@@ -103,6 +104,7 @@ impl Board {
             executable: cx
                 .new(|cx| InputState::new(window, cx).placeholder("可执行文件路径 · 默认自动查找")),
             polling: false,
+            catalog_polling: false,
             log_view: None,
             memories: vec![],
             editing_memory: None,
@@ -183,6 +185,16 @@ impl Studio {
         self.board.filter_stage = None;
         self.board.error = None;
         self.board.creating_work = false;
+        if let Some(dir) = self.board.dir.as_deref() {
+            match Library::open(dir) {
+                Ok(latest) if latest.revision != self.board.library.revision => {
+                    self.board.library = latest;
+                    self.board.note_key = None;
+                }
+                Err(e) => self.board.error = Some(e.to_string()),
+                _ => (),
+            }
+        }
         if section == Section::Memory {
             self.board.editing_memory = None;
             self.board
@@ -1042,7 +1054,7 @@ impl Studio {
                 .child(heading("事项仓库与任务"))
                 .child(
                     button("project-refresh-work", "刷新进度", false)
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh_work(cx))),
+                        .on_click(cx.listener(|this, _, w, cx| this.section(Section::Work, w, cx))),
                 ),
         );
         if p.repositories.is_empty() {

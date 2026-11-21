@@ -3,6 +3,7 @@ mod control;
 mod git;
 use aep::memory::{self, Key, Kind};
 mod local;
+mod project_cli;
 mod run;
 mod workflow_stage;
 mod zcode_stage;
@@ -22,6 +23,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Manage Studio projects, run a stage or exchange handoffs with independent sessions.
+    Project(project_cli::Options),
     #[command(hide = true)]
     ZcodeStage {
         #[arg(long)]
@@ -138,6 +141,10 @@ enum MemoryAction {
 fn app() -> Result<ExitCode> {
     let cli = Cli::parse();
     let action = match cli.command {
+        Action::Project(opt) => {
+            project_cli::execute(opt, &cli.repo)?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Action::ZcodeStage { binary, request } => {
             zcode_stage::run(&binary, &request)?;
             return Ok(ExitCode::SUCCESS);
@@ -154,7 +161,10 @@ fn app() -> Result<ExitCode> {
     };
     let repo = git::Repo::open(&cli.repo)?;
     match action {
-        Action::Control(_) | Action::ZcodeStage { .. } | Action::WorkflowStage { .. } => {
+        Action::Project(_)
+        | Action::Control(_)
+        | Action::ZcodeStage { .. }
+        | Action::WorkflowStage { .. } => {
             unreachable!()
         }
         Action::Local { action } => return local::execute(&repo, action),

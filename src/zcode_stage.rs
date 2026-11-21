@@ -1,5 +1,4 @@
-//! ZCode's headless prompt uses the current model. For an explicit model, start
-//! an isolated app-server session and verify its selected provider before sending.
+//! Use the installed ZCode app-server with its native settings or a pinned model.
 use aep::workflow::{Request, Role, ZCODE_APP};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -44,7 +43,9 @@ fn final_message(reply: &Value) -> Result<String> {
 pub fn run(binary: &Path, request: &Path) -> Result<()> {
     let dir = request.parent().context("缺少执行目录")?;
     let req: Request = serde_json::from_reader(fs::File::open(request)?)?;
-    let selection = req.profile.zcode_selection()?;
+    let selection = (!req.profile.model.is_empty())
+        .then(|| req.profile.zcode_selection())
+        .transpose()?;
     let mode = match req
         .template
         .stages()
@@ -57,7 +58,10 @@ pub fn run(binary: &Path, request: &Path) -> Result<()> {
         _ => "plan",
     };
     let mut server = Command::new(binary);
-    if binary == Path::new(ZCODE_APP)
+    if (binary == Path::new(ZCODE_APP)
+        || binary
+            .canonicalize()
+            .is_ok_and(|p| p == Path::new(ZCODE_APP)))
         && std::env::var_os("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE").is_none()
     {
         server.env(
@@ -77,9 +81,13 @@ pub fn run(binary: &Path, request: &Path) -> Result<()> {
         let output = BufReader::new(child.stdout.take().context("ZCode stdout")?);
         let cwd = std::env::current_dir()?;
         let session = format!("sess_{}", uuid::Uuid::new_v4().simple());
+        let mut create = json!({"sessionId":session,"workspace":{"workspaceKey":cwd,"workspacePath":cwd},"titleGenerationEnabled":false,"mode":mode});
+        if let Some(model) = &selection {
+            create["model"] = model.clone();
+        }
         send(
             &mut input,
-            json!({"id":1,"method":"session/create","params":{"sessionId":session,"workspace":{"workspaceKey":cwd,"workspacePath":cwd},"model":selection,"titleGenerationEnabled":false,"mode":mode}}),
+            json!({"id":1,"method":"session/create","params":create}),
         )?;
         for line in output.lines() {
             let line = line?;
@@ -119,11 +127,18 @@ pub fn run(binary: &Path, request: &Path) -> Result<()> {
             match msg["id"].as_u64() {
                 Some(1) => {
                     let actual = &result["settings"]["model"]["current"];
-                    ensure!(
-                        actual["providerId"] == selection["providerId"]
-                            && actual["modelId"] == selection["modelId"],
-                        "ZCode 未选中指定模型"
-                    );
+                    if let Some(model) = &selection {
+                        ensure!(
+                            actual["providerId"] == model["providerId"]
+                                && actual["modelId"] == model["modelId"],
+                            "ZCode 未选中指定模型"
+                        );
+                    }
+                    aep::project::save_json(
+                        dir,
+                        "session.json",
+                        &json!({"client":"ZCode","transport":"app-server","session":session}),
+                    )?;
                     fs::write(
                         dir.join("zcode-model.json"),
                         serde_json::to_vec_pretty(actual)?,
@@ -133,10 +148,16 @@ pub fn run(binary: &Path, request: &Path) -> Result<()> {
                         json!({"id":2,"method":"session/subscribe","params":{"sessionId":session,"deliveryKind":"desktop-continuous"}}),
                     )?;
                 }
-                Some(2) => send(
-                    &mut input,
-                    json!({"id":3,"method":"session/send","params":{"sessionId":session,"content":fs::read_to_string(dir.join("prompt.txt"))?,"modelSelection":selection}}),
-                )?,
+                Some(2) => {
+                    let mut params = json!({"sessionId":session,"content":fs::read_to_string(dir.join("prompt.txt"))?});
+                    if let Some(model) = &selection {
+                        params["modelSelection"] = model.clone();
+                    }
+                    send(
+                        &mut input,
+                        json!({"id":3,"method":"session/send","params":params}),
+                    )?;
+                }
                 Some(3) => ensure!(result["accepted"] == true, "ZCode 未接受请求"),
                 Some(4) => {
                     println!("{}", final_message(result)?);

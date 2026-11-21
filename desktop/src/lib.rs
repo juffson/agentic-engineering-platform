@@ -3,7 +3,6 @@ mod github_pr;
 mod https_pilot;
 mod https_queue;
 pub mod lifecycle;
-mod project;
 mod publish;
 mod recent;
 mod relay;

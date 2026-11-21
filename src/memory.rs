@@ -240,6 +240,22 @@ impl Memory {
         }
         Ok(result)
     }
+    /// Current project decisions plus the incoming work-specific handoff.
+    pub fn workflow_context(&self, previous: Option<&str>) -> Result<Vec<Value>> {
+        let mut query=self.0.prepare("SELECT n.* FROM notes n WHERE scope='project' AND (author='manual' OR run_id=?1)
+            AND NOT EXISTS(SELECT 1 FROM notes s WHERE s.replaces=n.id)
+            ORDER BY CASE WHEN run_id=?1 THEN 0 WHEN kind='decision' THEN 1 ELSE 2 END,id DESC LIMIT 32")?;
+        Ok(query
+            .query_map([previous], note)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub fn workflow_delta(&self, previous: Option<&str>, since: i64) -> Result<Vec<Value>> {
+        let mut stmt=self.0.prepare("SELECT n.* FROM notes n WHERE scope='project' AND id>?2 AND (author='manual' OR run_id=?1)
+            AND NOT EXISTS(SELECT 1 FROM notes s WHERE s.replaces=n.id) ORDER BY id LIMIT 33")?;
+        Ok(stmt
+            .query_map(params![previous, since], note)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
     pub fn project_handoff(&mut self, run: &str, author: &str, body: &str) -> Result<i64> {
         self.0.query_row("INSERT INTO notes(scope,task,spec_sha,candidate_sha,origin_sha,kind,author,run_id,body,created_at)
             VALUES('project','','','','','handoff',?1,?2,?3,?4)

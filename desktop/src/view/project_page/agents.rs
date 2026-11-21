@@ -1,19 +1,18 @@
 use super::*;
-use aep::{cancel::Cancellation, workflow::Request};
+use aep::handoff::busy;
 use std::{
     fs,
-    os::unix::{fs::DirBuilderExt, process::CommandExt},
+    os::unix::process::CommandExt,
     process::{Command, Stdio},
 };
 
-fn busy(state: &Value) -> bool {
-    matches!(state["status"].as_str(), Some("running" | "initializing"))
-}
 fn phase(v: &Value) -> &str {
     match v["status"].as_str() {
         Some("succeeded") => "已完成",
         Some("initializing") => "启动中",
         Some("running") => "运行中",
+        Some("claimed") => "独立会话进行中",
+        Some("blocked") => "阻塞",
         Some("cancelled") => "已取消",
         Some("failed") => "失败",
         Some("needs_reconciliation" | "unstarted") => "已中断",
@@ -202,6 +201,99 @@ impl Studio {
         );
         Ok(Some(fs::read_to_string(d.join("result.txt"))?))
     }
+    pub(in crate::view) fn watch_project_catalog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.board.catalog_polling {
+            return;
+        }
+        let Some(dir) = self.board.dir.clone() else {
+            return;
+        };
+        self.board.catalog_polling = true;
+        let path = dir.join("projects.json");
+        let stamp = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
+        let mut last = None;
+        let mut last_memory = None;
+        let executor = cx.background_executor().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                executor.timer(Duration::from_secs(2)).await;
+                let active = this.update_in(cx, |this, w, cx| {
+                    if this.page != Page::Project {
+                        this.board.catalog_polling = false;
+                        return false;
+                    }
+                    let current = stamp(&path);
+                    if current != last {
+                        last = current;
+                        if let Ok(latest) = Library::open(&dir)
+                            && latest.revision != this.board.library.revision
+                        {
+                            let draft = this
+                                .board
+                                .library
+                                .project()
+                                .and_then(Project::selected)
+                                .is_some_and(|item| {
+                                    let s = this.board.viewing;
+                                    item.notes.get(s).is_some_and(|n| {
+                                        n != this.board.note.read(cx).value().as_str()
+                                            || item.profile(s) != this.chosen_profile(cx)
+                                    })
+                                });
+                            let selected =
+                                latest.project().and_then(Project::selected).map(|i| &i.id);
+                            let switched = selected
+                                != this
+                                    .board
+                                    .library
+                                    .project()
+                                    .and_then(Project::selected)
+                                    .map(|i| &i.id);
+                            let follow = switched
+                                || this
+                                    .board
+                                    .library
+                                    .project()
+                                    .and_then(Project::selected)
+                                    .is_none_or(|item| {
+                                        this.board.viewing
+                                            == item.stage.min(item.notes.len().saturating_sub(1))
+                                    });
+                            this.board.library = latest;
+                            if this.board.section == Section::Work && (!draft || switched) {
+                                this.board.note_key = None;
+                                if follow {
+                                    this.load_stage(w, cx);
+                                } else {
+                                    this.show_stage(this.board.viewing, w, cx);
+                                }
+                            }
+                            this.watch_agents(cx);
+                            cx.notify();
+                        }
+                    }
+                    if this.board.section == Section::Memory
+                        && let Ok(dir) = this.project_memory_dir()
+                    {
+                        let current = stamp(&dir.join("memory.sqlite3"));
+                        if current != last_memory {
+                            last_memory = current;
+                            this.refresh_project_memory(cx);
+                        }
+                    }
+                    true
+                });
+                if !active.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
     pub(super) fn watch_agents(&mut self, cx: &mut Context<Self>) {
         if self.board.polling || !self.has_running_agent() {
             return;
@@ -234,76 +326,32 @@ impl Studio {
         ensure!(!self.has_running_agent(), "此事项已有 CLI 正在运行");
         let profile = self.chosen_profile(cx);
         profile.validate()?;
-        let repo = work.target(i);
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let d = self.attempt_path(&id).context("找不到项目库")?;
-        let mut approved = vec![];
-        for (j, s) in work.template.stages()[..i].iter().enumerate() {
-            let mut note = work.notes[j].chars().take(4800).collect::<String>();
-            if let Some(prev) = work
-                .current_attempt
-                .get(&j)
-                .and_then(|id| self.attempt_path(id))
-            {
-                let path = prev.join("result.txt");
-                let result = fs::read_to_string(&path)
-                    .with_context(|| format!("读取前序交付物 {}", path.display()))?;
-                if !work.notes[j].trim().eq(result.trim()) {
-                    note.push_str(&format!(
-                        "\nAgent 交付物（以人工记录为准）：{}",
-                        result.chars().take(3200).collect::<String>()
-                    ));
-                }
-                let evidence = workflow::evidence(&prev)?;
-                if let Some(commands) = evidence["commands"].as_array().filter(|c| !c.is_empty()) {
-                    note.push_str(&format!(
-                        "\n执行器记录的命令和退出码：{}",
-                        serde_json::to_string(commands)?
-                    ));
-                }
-                note.push_str(&format!(
-                    "\n完整交付物：{}\n原始日志：{}",
-                    path.display(),
-                    prev.join("stdout.log").display()
-                ));
-            }
-            approved.push((s.name.to_string(), note));
-        }
+        let work_id = work.id.clone();
+        let repository = work.target(i);
+        let home = self.board.dir.clone().context("找不到项目库")?;
         let brief = self.board.note.read(cx).value().to_string();
-        let req = Request {
-            project: p.name.clone(),
-            work: work.name.clone(),
-            template: work.template,
-            stage: i,
-            profile: profile.clone(),
-            repository: repo.clone(),
-            ticket: repo.as_deref().map(|r| work.ticket(r)),
-            brief: brief.clone(),
-            approved,
-        };
         let binary = self.runner.binary()?;
         let path = self.runner.path()?;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&d)?;
-        crate::lifecycle::save(&d, "request.json", &req)?;
+        let mut folder = None;
         if !self.change_board(cx, |lib| {
             let p = lib.project_mut()?;
             Self::remember_profile(p, i, &profile)?;
-            let item = p.selected_mut()?;
-            item.notes[i] = brief;
-            item.attempts.push(Attempt {
-                id: id.clone(),
-                stage: i,
-                profile,
-                repository: repo,
-            });
-            item.current_attempt.insert(i, id);
+            folder = Some(p.reserve(
+                &home,
+                &work_id,
+                i,
+                aep::handoff::Assignment {
+                    profile,
+                    brief,
+                    repository,
+                    external: None,
+                },
+            )?);
             Ok(())
         }) {
             return Ok(());
         }
+        let d = folder.context("未创建运行记录")?;
         let supervisor = fs::File::create(d.join("supervisor.log"))?;
         match Command::new(binary)
             .env("PATH", path)
@@ -538,6 +586,29 @@ impl Studio {
             )),
         );
         if i == work.stage && !self.has_running_agent() {
+            if let Some(home) = &self.board.dir {
+                let quote = |text: &str| format!("'{}'", text.replace('\'', "'\"'\"'"));
+                let profile = self.chosen_profile(cx);
+                let mut cmd = format!(
+                    "aep project --home {} --project {} --work {} claim --stage {} --client {}",
+                    quote(&home.display().to_string()),
+                    p.id,
+                    work.id,
+                    i + 1,
+                    format!("{:?}", profile.client).to_lowercase()
+                );
+                if !profile.model.is_empty() {
+                    cmd.push_str(&format!(" --model {}", quote(&profile.model)));
+                }
+                cmd.push_str(r#" --session "${AEP_SESSION_ID:?请先设置本机会话名或 ID}""#);
+                actions = actions.child(
+                    button("workflow-claim-command", "复制独立会话领取命令", false).on_click(
+                        cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(cmd.clone()));
+                        }),
+                    ),
+                );
+            }
             let label = if work.current_attempt.contains_key(&i) {
                 "重新执行"
             } else {
@@ -580,6 +651,15 @@ impl Studio {
                         .map(basename)
                         .unwrap_or_else(|| "项目文件".into())
                 )));
+            if let Some(session) = ev["session"].as_str() {
+                bar = bar.child(caption(format!("独立会话 · {session}")));
+            }
+            if let Some(session) = ev
+                .pointer("/native_session/session")
+                .and_then(Value::as_str)
+            {
+                bar = bar.child(caption(format!("ZCode app-server · {session}")));
+            }
             let expanded = self
                 .board
                 .log_view
@@ -619,17 +699,23 @@ impl Studio {
             }
             if busy(&ev) {
                 let id = a.id.clone();
-                let data = d.parent().unwrap().parent().unwrap().to_owned();
+                let attempt = d.clone();
                 bar = bar.child(
-                    button(format!("workflow-stop-{id}"), "取消执行", false).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            if let Err(e) = Cancellation::new(&data, &id).and_then(|s| s.request())
-                            {
-                                this.board.error = Some(e.to_string());
-                            }
-                            cx.notify();
+                    button(
+                        format!("workflow-stop-{id}"),
+                        if ev["status"] == "claimed" {
+                            "取消领取"
+                        } else {
+                            "取消执行"
                         },
-                    )),
+                        false,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Err(e) = aep::handoff::cancel(&attempt) {
+                            this.board.error = Some(e.to_string());
+                        }
+                        cx.notify();
+                    })),
                 );
             }
             content = content.child(bar);

@@ -7,9 +7,29 @@ use std::{
 };
 use uuid::Uuid;
 
-use aep::workflow::{Client, Profile, Template};
+use crate::workflow::{Client, Profile, Template};
 use std::collections::BTreeMap;
 
+pub fn catalog_dir() -> Option<PathBuf> {
+    std::env::var_os("AEP_PROJECT_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::home_dir().map(|home| {
+                if cfg!(target_os = "macos") {
+                    home.join("Library/Application Support/AEP Studio")
+                } else {
+                    home.join(".local/share/aep-studio")
+                }
+            })
+        })
+}
+pub fn save_json(dir: &Path, name: &str, value: &impl Serialize) -> Result<()> {
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    serde_json::to_writer_pretty(&mut file, value)?;
+    file.as_file().sync_all()?;
+    file.persist(dir.join(name))?;
+    Ok(())
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Attempt {
     pub id: String,
@@ -143,7 +163,7 @@ impl Project {
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Library {
-    pub(crate) revision: u64,
+    pub revision: u64,
     pub active: Option<String>,
     pub projects: Vec<Project>,
 }
@@ -185,7 +205,11 @@ impl Library {
         self.active = Some(id);
         Ok(())
     }
-    pub fn change(&mut self, dir: &Path, edit: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+    pub fn change<T>(
+        &mut self,
+        dir: &Path,
+        edit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         fs::create_dir_all(dir)?;
         let lock = fs::OpenOptions::new()
             .create(true)
@@ -198,12 +222,12 @@ impl Library {
             *self = next;
             anyhow::bail!("项目已在另一窗口更新，已重新载入，请核对后重试");
         }
-        edit(&mut next)?;
+        let value = edit(&mut next)?;
         next.revision += 1;
-        crate::lifecycle::save(dir, "projects.json", &next)?;
+        save_json(dir, "projects.json", &next)?;
         *self = next;
         lock.unlock()?;
-        Ok(())
+        Ok(value)
     }
 }
 

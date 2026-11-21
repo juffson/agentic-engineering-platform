@@ -36,6 +36,40 @@ open "desktop/target/AEP Studio.app"
 
 填写阶段说明并点击「运行阶段 Agent」。同一事项在每个仓库使用独立的本地工作树，后续阶段继续使用其中的文件。「执行档案」保留提示词、答复、原始日志和记忆回执。「项目记忆」可查看和修订 Agent 的交接，新的阶段会读取当前版本及本事项已确认的交付物。测试和独立验收需要返回通过结论。核对结果后，点击「完成并进入下一阶段」或「确认完成交付」。运行期间可以关闭 Studio，重新打开后继续查看、取消或重试。已有五阶段事项保留经典流程。
 
+#### 在已有 Agent 会话里交接
+
+`aep project` 与 Studio 使用同一份项目库。项目决策和交接摘要存在每个项目自己的 SQLite 中，完整的阶段结果、执行回执和主动提交的文件按执行 ID 归档。默认给下一位 Agent 的内容包括当前职责、阶段说明、有效决策、上游交接摘要和档案位置。可用 `project memory get ID` 读取完整记忆。
+
+在其中一个 Git 工作区建立项目和事项后，可把当前工作树绑定到它们。绑定存于该工作树的 Git 元数据目录。多个工作树可以绑定不同事项。
+
+```sh
+aep project create 支付平台 --repository "$PWD"
+aep project add-work 对账单导出
+aep project bind
+aep project context
+```
+
+在已经打开的 Claude、Codex、ZCode 或其他终端会话中，领取时填写会话名或原客户端的会话 ID。会话继续在自己的工作目录工作。Studio 事项页面也可复制领取命令。外部会话只需能执行本机的 `aep`。
+
+```sh
+aep project claim --stage 1 --client claude --session prd-design
+```
+
+领取返回 `attempt`、`context` 和项目记忆游标 `next_since`。在下列命令中将 `RUN_ID` 和 `CURSOR` 替换成回执值。`context --since` 只返回本次领取适用的项目记忆变更，`has_more` 为真时用新的游标继续读。已领取的阶段可以重复查询。没有变更时交接文本为空。
+
+```sh
+aep project context --attempt RUN_ID --since CURSOR
+aep project submit --attempt RUN_ID --session prd-design --file prd.md --summary '范围已定，AC-1 涵盖空对账单，下一步设计导出交互。' --artifact prd.md
+aep project show --attempt RUN_ID --artifact prd.md
+aep project advance --stage 1
+```
+
+`--artifact` 可重复，路径相对于领取时的工作目录，文件以提交当时的内容归档。测试与独立验收通过时在结果末行写 `AEP: PASS`，有阻断时用 `submit --blocked` 提交原因。取消外部领取会关闭该次交接，原客户端独立运行。失败或取消后用 `claim --retry` 重新领取。
+
+直接从命令行托管模型时，用 `project configure --stage N` 设置客户端、模型、工作仓库和说明，再用 `project run` 执行当前阶段。人工步骤可用 `advance --stage N --note '结论'` 完成。`list` 跨项目查看当前负责人，`status` 查看事项和历次执行，`metrics` 查看每次执行的实际输入字节数、耗时和客户端返回的用量字段。外部会话的推理用量由原客户端记录。
+
+默认共用本机 Studio 项目库。需要单独存储时，在启动 Studio 和 CLI 前设置相同的绝对目录 `AEP_PROJECT_HOME`，CLI 也接受 `--home`。在其他目录中可用 `--project` 和 `--work` 指定名称或 ID。上述本地交接要求参与方可访问同一份项目库和档案。
+
 可在支持 Metal 的 macOS 上复验两套模板。游戏场景使用可重复的本机测试替身，覆盖预检失败、重开重试和记忆修订。软件场景调用本机已配置的三个真实模型客户端，在输出目录中创建独立测试仓库并保存七个阶段的回执。可以追加 `--codex-model` 和 `--zcode-model` 选择账号可用的模型。
 
 ```sh
