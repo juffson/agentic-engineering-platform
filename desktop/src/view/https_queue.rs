@@ -116,9 +116,65 @@ impl Studio {
         cx: &Context<Self>,
     ) -> Div {
         let mut section = v_flex().gap_2().child(heading("Worker Deploy Key"));
+        let current = snapshot
+            .key_rotation
+            .as_ref()
+            .and_then(|plan| plan.current());
+        let editable = !site.busy && site.error.is_none();
+        if let Some(plan) = &snapshot.key_rotation {
+            let text = if let Some(worker) = current {
+                format!(
+                    "正在轮换 {}/{} · {}",
+                    plan.next + 1,
+                    plan.workers.len(),
+                    worker.worker
+                )
+            } else if plan.stopped {
+                format!("轮换已停止 · {}/{} 已完成", plan.next, plan.workers.len())
+            } else {
+                format!("滚动轮换已完成 · {} 台 Worker", plan.workers.len())
+            };
+            section = section.child(detail_text("https-key-roll-state", &text));
+            if let Some(worker) = current
+                && editable
+                && snapshot
+                    .deploy_keys
+                    .get(&worker.worker)
+                    .is_some_and(|entry| entry.request.is_none())
+            {
+                let id = plan.id.clone();
+                section = section.child(
+                    button("https-key-roll-stop", "停止滚动轮换", false).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.https_queue_action(Action::StopRotation(id.clone()), cx)
+                        },
+                    )),
+                );
+            }
+        }
+        if current.is_none()
+            && editable
+            && snapshot.deploy_keys.len() >= 2
+            && snapshot.deploy_keys.iter().all(|(worker, entry)| {
+                entry.inventory.active.is_some()
+                    && entry.inventory.staged.is_none()
+                    && entry.inventory.retiring.is_none()
+                    && entry.request.is_none()
+                    && snapshot
+                        .workers
+                        .get(worker)
+                        .is_some_and(|worker| worker.online)
+            })
+        {
+            section = section.child(
+                button("https-key-roll-start", "开始滚动轮换", true).on_click(cx.listener(
+                    move |this, _, _, cx| this.https_queue_action(Action::StartRotation, cx),
+                )),
+            );
+        }
         for (worker, entry) in &snapshot.deploy_keys {
-            let ready = !site.busy
-                && site.error.is_none()
+            let ready = editable
+                && current.is_none_or(|current| current.worker == *worker)
                 && entry.request.is_none()
                 && snapshot
                     .workers
@@ -128,6 +184,27 @@ impl Studio {
                 format!("https-key-scope-{worker}"),
                 &format!("{} · {worker}", entry.repository),
             ));
+            if let Some(plan) = &snapshot.key_rotation
+                && let Some((index, _)) = plan
+                    .workers
+                    .iter()
+                    .enumerate()
+                    .find(|(_, item)| item.worker == *worker)
+            {
+                let label = if index < plan.next {
+                    "轮换已完成"
+                } else if plan.stopped {
+                    "轮换已停止"
+                } else if index == plan.next {
+                    "当前轮换 · 新任务交给其他 Worker"
+                } else {
+                    "等待轮换"
+                };
+                card = card.child(detail_text(
+                    format!("https-key-roll-worker-{worker}"),
+                    label,
+                ));
+            }
             for (slot, label, key) in [
                 ("active", "生效密钥", entry.inventory.active.as_ref()),
                 ("staged", "待切换密钥", entry.inventory.staged.as_ref()),
@@ -146,6 +223,14 @@ impl Studio {
             }
             let status = if entry.request.is_some() {
                 "等待 Worker 空闲后执行凭证操作"
+            } else if current.is_some_and(|current| current.worker == *worker)
+                && entry.inventory.staged.is_some()
+                && entry
+                    .last
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.error.is_some())
+            {
+                "切换失败 · 保留当前密钥"
             } else if entry.verified_at.is_some() {
                 "上次验证通过 · GitHub 只读 · Worker 可读取"
             } else if entry.inventory.active.is_some() {
@@ -167,6 +252,8 @@ impl Studio {
                 let command = |action| KeyCommand {
                     worker: worker.clone(),
                     installation: entry.installation.clone(),
+                    rotation: current
+                        .and_then(|_| snapshot.key_rotation.as_ref().map(|plan| plan.id.clone())),
                     action,
                 };
                 let mut buttons = h_flex().gap_2().flex_wrap();

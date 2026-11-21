@@ -78,20 +78,7 @@ pub(super) fn label(ui: &mut Driver<'_>, id: &str, text: &str, seconds: u64) -> 
 }
 
 pub(super) fn dispatch(ui: &mut Driver<'_>, parent: &Path, task: &Task) -> Result<PathBuf> {
-    let before = sessions(parent);
-    click(ui, "https-real-mode")?;
-    let selected = format!("https-task-{}", task.task);
-    let target = format!("https-target-{}", task.target);
-    until(ui, &selected, 90, |ui| {
-        Ok((!ui.absent(&selected)? && !ui.absent(&target)?).then_some(()))
-    })?;
-    choose(ui, "https-task-list", &selected)?;
-    choose(ui, "https-target-list", &target)?;
-    click(ui, "https-dispatch")?;
-    let created = sessions(parent);
-    let new: Vec<_> = created.difference(&before).collect();
-    ensure!(new.len() == 1, "Studio did not start exactly one task");
-    let session = new[0].clone();
+    let session = dispatch_selected(ui, parent, task)?;
     until(ui, "the paused Run to queue", 120, |_| {
         let state = task.state(&session);
         ensure!(
@@ -109,6 +96,41 @@ pub(super) fn dispatch(ui: &mut Driver<'_>, parent: &Path, task: &Task) -> Resul
         Ok(None)
     })?;
     Ok(session)
+}
+
+pub(super) fn dispatch_selected(
+    ui: &mut Driver<'_>,
+    parent: &Path,
+    task: &Task,
+) -> Result<PathBuf> {
+    let before = sessions(parent);
+    click(ui, "https-real-mode")?;
+    let selected = format!("https-task-{}", task.task);
+    let target = format!("https-target-{}", task.target);
+    until(ui, &selected, 90, |ui| {
+        Ok((!ui.absent(&selected)? && !ui.absent(&target)?).then_some(()))
+    })?;
+    choose(ui, "https-task-list", &selected)?;
+    choose(ui, "https-target-list", &target)?;
+    ui.reveal("https-pilot-page", "https-dispatch")?;
+    ui.checkpoint("02-task-target-selected")?;
+    ui.click("https-dispatch")?;
+    until(ui, "Studio to start the selected task", 15, |ui| {
+        let created = sessions(parent);
+        let mut new = created.difference(&before);
+        if let Some(session) = new.next() {
+            ensure!(new.next().is_none(), "Studio started multiple tasks");
+            return Ok(Some(session.clone()));
+        }
+        if !ui.absent("https-action-error")? {
+            let error = ui.element("https-action-error")?;
+            anyhow::bail!(
+                "Studio dispatch failed: {}",
+                error.label().unwrap_or_default()
+            );
+        }
+        Ok(None)
+    })
 }
 
 pub(super) fn select(ui: &mut Driver<'_>, session: &Path) -> Result<()> {

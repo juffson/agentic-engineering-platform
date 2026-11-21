@@ -4,7 +4,7 @@ use crate::{
 };
 use aep::{
     delivery::slug,
-    deploy_keys::WorkerKeys,
+    deploy_keys::{RollingRotation, WorkerKeys},
     workspace::{Workspace, git},
 };
 use anyhow::{Context, Result, ensure};
@@ -91,6 +91,8 @@ pub(crate) struct Snapshot {
     pub workers: BTreeMap<String, Worker>,
     #[serde(default)]
     pub deploy_keys: BTreeMap<String, WorkerKeys>,
+    #[serde(default)]
+    pub key_rotation: Option<RollingRotation>,
     pub attempts: Vec<Run>,
 }
 
@@ -139,6 +141,8 @@ pub(crate) enum Action {
     },
     Cancel(Run),
     DeployKey(KeyCommand),
+    StartRotation,
+    StopRotation(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,6 +157,7 @@ pub(crate) enum KeyAction {
 pub(crate) struct KeyCommand {
     pub worker: String,
     pub installation: String,
+    pub rotation: Option<String>,
     pub action: KeyAction,
 }
 
@@ -245,7 +250,12 @@ pub(crate) fn perform(
                     .data
                     .deploy_keys
                     .values()
-                    .all(|entry| entry.repository == repository),
+                    .all(|entry| entry.repository == repository)
+                && reply
+                    .data
+                    .key_rotation
+                    .as_ref()
+                    .is_none_or(|plan| plan.repository == repository),
             "控制面属于另一个仓库"
         );
         Ok(reply.data)
@@ -283,6 +293,10 @@ pub(crate) fn perform(
                     "--stage",
                     &run.stage,
                 ])?,
+                Action::StartRotation => command(&["key-rotation-start"])?,
+                Action::StopRotation(rotation) => {
+                    command(&["key-rotation-stop", "--rotation", &rotation])?
+                }
                 Action::DeployKey(key) => {
                     let (operation, fingerprint) = match &key.action {
                         KeyAction::Prepare => ("prepare", None),
@@ -301,6 +315,9 @@ pub(crate) fn perform(
                     ];
                     if let Some(fingerprint) = fingerprint {
                         argv.extend(["--fingerprint", fingerprint]);
+                    }
+                    if let Some(rotation) = &key.rotation {
+                        argv.extend(["--rotation", rotation]);
                     }
                     command(&argv)?
                 }

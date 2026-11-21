@@ -146,3 +146,28 @@ pub struct WorkerKeys {
     pub last: Option<Receipt>,
     pub verified_at: Option<u64>,
 }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RotationWorker {
+    pub worker: String,
+    pub installation: String,
+    pub original: String,
+    pub replacement: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RollingRotation {
+    pub id: String,
+    pub repository: String,
+    pub workers: Vec<RotationWorker>,
+    pub next: usize,
+    pub stopped: bool,
+}
+
+impl RollingRotation {
+    pub fn current(&self) -> Option<&RotationWorker> {
+        (!self.stopped)
+            .then(|| self.workers.get(self.next))
+            .flatten()
+    }
+}

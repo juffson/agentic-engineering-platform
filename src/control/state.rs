@@ -1,6 +1,8 @@
 //! Single-project control-plane state. Only identifiers and execution summaries cross the wire.
 use aep::{
-    deploy_keys::{Change, Inventory, Receipt, Request, WorkerKeys},
+    deploy_keys::{
+        Change, Inventory, Receipt, Request, RollingRotation, RotationWorker, WorkerKeys,
+    },
     workspace::ident,
 };
 use anyhow::{Context, Result, ensure};
@@ -220,6 +222,8 @@ pub struct State {
     pub queue: Queue,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub deploy_keys: std::collections::BTreeMap<String, WorkerKeys>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_rotation: Option<RollingRotation>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -292,6 +296,15 @@ pub enum Operation {
         worker: String,
         installation: String,
         change: Change,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotation: Option<String>,
+    },
+    KeyRotationStart {
+        repository: String,
+    },
+    KeyRotationStop {
+        repository: String,
+        rotation: String,
     },
     Renew {
         run: String,
@@ -558,6 +571,164 @@ impl State {
         })
     }
 
+    fn start_key_rotation(&mut self, repository: String, now: u64, ttl: u64) -> Result<()> {
+        ensure!(
+            self.key_rotation
+                .as_ref()
+                .and_then(RollingRotation::current)
+                .is_none(),
+            "a rolling Deploy Key rotation is already active"
+        );
+        ensure!(
+            self.deploy_keys.len() >= 2,
+            "rolling rotation needs at least two configured Workers"
+        );
+        let mut public_keys = std::collections::HashSet::new();
+        let mut workers = Vec::with_capacity(self.deploy_keys.len());
+        for (worker, entry) in &self.deploy_keys {
+            ensure!(
+                entry.repository == repository,
+                "the selected repository does not match the Workers"
+            );
+            let key = entry
+                .inventory
+                .active
+                .as_ref()
+                .context("set up each Worker's Deploy Key first")?;
+            ensure!(
+                public_keys.insert(&key.public),
+                "each Worker must have its own Deploy Key"
+            );
+            ensure!(
+                entry.request.is_none()
+                    && entry.inventory.staged.is_none()
+                    && entry.inventory.retiring.is_none(),
+                "finish pending Deploy Key operations before starting a rolling rotation"
+            );
+            ensure!(
+                self.workers
+                    .get(worker)
+                    .is_some_and(|device| now.saturating_sub(device.last_seen) < ttl),
+                "bring each configured Worker online before starting a rolling rotation"
+            );
+            workers.push(RotationWorker {
+                worker: worker.clone(),
+                installation: entry.installation.clone(),
+                original: key.fingerprint.clone(),
+                replacement: None,
+            });
+        }
+        self.key_rotation = Some(RollingRotation {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            repository,
+            workers,
+            next: 0,
+            stopped: false,
+        });
+        Ok(())
+    }
+
+    pub fn authorize_key_change(
+        &self,
+        repository: &str,
+        worker: &str,
+        installation: &str,
+        rotation: Option<&str>,
+        change: &Change,
+    ) -> Result<&WorkerKeys> {
+        let entry = self
+            .deploy_keys
+            .get(worker)
+            .filter(|entry| entry.repository == repository && entry.installation == installation)
+            .context("the Worker does not manage Deploy Keys for this repository")?;
+        if let Some((plan, current)) = self
+            .key_rotation
+            .as_ref()
+            .and_then(|plan| plan.current().map(|current| (plan, current)))
+        {
+            ensure!(
+                rotation == Some(plan.id.as_str())
+                    && current.worker == worker
+                    && current.installation == installation,
+                "use the current Worker in this rolling Deploy Key rotation"
+            );
+            match change {
+                Change::Prepare | Change::Activate { .. } => ensure!(
+                    entry
+                        .inventory
+                        .active
+                        .as_ref()
+                        .is_some_and(|key| key.fingerprint == current.original),
+                    "the current Worker's original Deploy Key changed"
+                ),
+                Change::Forget { fingerprint } => ensure!(
+                    *fingerprint == current.original
+                        && entry
+                            .inventory
+                            .active
+                            .as_ref()
+                            .is_some_and(|key| key.fingerprint != current.original),
+                    "activate a verified replacement before retiring this Worker's original key"
+                ),
+                Change::Verify { .. } => (),
+            }
+        } else {
+            ensure!(
+                rotation.is_none(),
+                "the rolling Deploy Key rotation changed"
+            );
+        }
+        change.validate(&entry.inventory)?;
+        ensure!(
+            entry
+                .request
+                .as_ref()
+                .is_none_or(|request| request.change == *change),
+            "a Deploy Key operation is already pending"
+        );
+        if let Change::Activate { .. } = change {
+            let staged = &entry
+                .inventory
+                .staged
+                .as_ref()
+                .context("missing staged Deploy Key")?
+                .public;
+            ensure!(
+                self.deploy_keys.iter().all(|(id, peer)| id == worker
+                    || [
+                        &peer.inventory.active,
+                        &peer.inventory.staged,
+                        &peer.inventory.retiring
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .all(|key| &key.public != staged)),
+                "each Worker must have its own Deploy Key"
+            );
+        }
+        if let Change::Forget { .. } = change {
+            ensure!(
+                entry.verified_at.is_some(),
+                "verify the new Deploy Key before revoking the old one"
+            );
+            let old = &entry
+                .inventory
+                .retiring
+                .as_ref()
+                .context("missing retiring Deploy Key")?
+                .public;
+            ensure!(
+                self.deploy_keys.iter().all(|(id, peer)| id == worker
+                    || [&peer.inventory.active, &peer.inventory.staged]
+                        .into_iter()
+                        .flatten()
+                        .all(|key| &key.public != old)),
+                "another Worker still uses the old Deploy Key"
+            );
+        }
+        Ok(entry)
+    }
+
     fn key_sync(
         &mut self,
         device: &str,
@@ -605,6 +776,7 @@ impl State {
         if entry.inventory.active != inventory.active {
             entry.verified_at = None;
         }
+        let mut retired = None;
         if let Some(receipt) = receipt
             && entry
                 .request
@@ -618,9 +790,31 @@ impl State {
             if receipt.error.is_some() && matches!(request.change, Change::Verify { .. }) {
                 entry.verified_at = None;
             }
+            if receipt.error.is_none()
+                && let Change::Forget { fingerprint } = request.change
+                && inventory.retiring.is_none()
+                && inventory.active == entry.inventory.active
+                && entry.verified_at.is_some()
+            {
+                retired = inventory
+                    .active
+                    .as_ref()
+                    .map(|key| (fingerprint, key.fingerprint.clone()));
+            }
             entry.last = Some(receipt);
         }
         entry.inventory = inventory;
+        if let Some((old, replacement)) = retired
+            && let Some(plan) = &mut self.key_rotation
+            && plan.current().is_some_and(|current| {
+                current.worker == device
+                    && current.installation == entry.installation
+                    && current.original == old
+            })
+        {
+            plan.workers[plan.next].replacement = Some(replacement);
+            plan.next += 1;
+        }
         Ok(Reply::KeyWork(if idle {
             entry.request.clone()
         } else {
@@ -651,7 +845,15 @@ impl State {
         }
         let next = self.queue.order.iter().find_map(|id| {
             self.attempts.iter().position(|run| {
-                run.id == *id && run.worker.as_deref().is_none_or(|owner| owner == device)
+                run.id == *id
+                    && match run.worker.as_deref() {
+                        Some(owner) => owner == device,
+                        None => self
+                            .key_rotation
+                            .as_ref()
+                            .and_then(RollingRotation::current)
+                            .is_none_or(|current| current.worker != device),
+                    }
             })
         });
         let Some(index) = next else {
@@ -741,6 +943,7 @@ impl State {
                 worker,
                 installation,
                 change,
+                rotation,
             } => {
                 ensure!(
                     self.workers.get(&worker).is_some_and(|device| {
@@ -749,25 +952,44 @@ impl State {
                     }),
                     "the selected Worker is offline or its installation changed"
                 );
+                self.authorize_key_change(
+                    &repository,
+                    &worker,
+                    &installation,
+                    rotation.as_deref(),
+                    &change,
+                )?;
                 let entry = self
                     .deploy_keys
                     .get_mut(&worker)
-                    .filter(|entry| {
-                        entry.repository == repository && entry.installation == installation
-                    })
-                    .context("the Worker does not manage Deploy Keys for this repository")?;
-                if let Some(request) = &entry.request {
-                    ensure!(
-                        request.change == change,
-                        "a Deploy Key operation is already pending"
-                    );
-                } else {
-                    change.validate(&entry.inventory)?;
+                    .context("missing Worker Deploy Keys")?;
+                if entry.request.is_none() {
                     entry.request = Some(Request {
                         id: uuid::Uuid::new_v4().simple().to_string(),
                         change,
                     });
                 }
+                Ok(self.snapshot(now, ttl))
+            }
+            Operation::KeyRotationStart { repository } => {
+                self.start_key_rotation(repository, now, ttl)?;
+                Ok(self.snapshot(now, ttl))
+            }
+            Operation::KeyRotationStop {
+                repository,
+                rotation,
+            } => {
+                let plan = self
+                    .key_rotation
+                    .as_mut()
+                    .filter(|plan| plan.id == rotation && plan.repository == repository)
+                    .context("the rolling Deploy Key rotation changed")?;
+                let current = plan.current().context("the rotation is already finished")?;
+                ensure!(
+                    self.deploy_keys[&current.worker].request.is_none(),
+                    "wait for the current Deploy Key operation to finish"
+                );
+                plan.stopped = true;
                 Ok(self.snapshot(now, ttl))
             }
             Operation::QueuePause { paused } => {
@@ -1099,6 +1321,202 @@ mod tests {
     }
 
     #[test]
+    fn rolling_key_failure_preserves_the_key_and_keeps_the_peer_dispatching() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("control.json");
+        let mut store = Store::open(path.clone())?;
+        let profile = Profile {
+            codex: "codex 1".into(),
+            claude: "claude 1".into(),
+        };
+        let sync = |id: &str, inventory, receipt| Operation::KeySync {
+            installation: format!("install-{id}"),
+            profile: profile.clone(),
+            repository: "owner/repo".into(),
+            inventory,
+            receipt,
+        };
+        let poll = |id: &str| Operation::Poll {
+            installation: format!("install-{id}"),
+            profile: profile.clone(),
+        };
+        let key = |number: char| aep::deploy_keys::Key {
+            public: format!("ssh-ed25519 {}", number.to_string().repeat(64)),
+            fingerprint: format!("SHA256:{}", number.to_string().repeat(43)),
+        };
+        let old = key('a');
+        let first = Inventory {
+            active: Some(old.clone()),
+            ..Inventory::default()
+        };
+        let peer = Inventory {
+            active: Some(key('b')),
+            ..Inventory::default()
+        };
+        let new = key('c');
+        let staged = Inventory {
+            staged: Some(new.clone()),
+            ..first.clone()
+        };
+        let request = |id: &str, change, rotation| Operation::KeyRequest {
+            repository: "owner/repo".into(),
+            worker: id.into(),
+            installation: format!("install-{id}"),
+            change,
+            rotation,
+        };
+        let ack = |work: Request, error: Option<&str>| {
+            Some(Receipt {
+                id: work.id,
+                error: error.map(str::to_owned),
+            })
+        };
+        let work = |reply| match reply {
+            Reply::KeyWork(Some(request)) => Ok(request),
+            _ => anyhow::bail!("missing Deploy Key operation"),
+        };
+        store.apply(sync("a", first.clone(), None), "a", 1, 30)?;
+        store.apply(sync("b", peer.clone(), None), "b", 1, 30)?;
+        store.apply(
+            Operation::KeyRotationStart {
+                repository: "owner/repo".into(),
+            },
+            "operator",
+            2,
+            30,
+        )?;
+        let rotation = store
+            .state
+            .key_rotation
+            .as_ref()
+            .map(|plan| plan.id.clone());
+        assert!(
+            store
+                .apply(
+                    request("b", Change::Prepare, rotation.clone()),
+                    "operator",
+                    3,
+                    30
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .apply(request("a", Change::Prepare, None), "operator", 3, 30)
+                .is_err()
+        );
+        store.apply(
+            request("a", Change::Prepare, rotation.clone()),
+            "operator",
+            3,
+            30,
+        )?;
+        let prepare = work(store.apply(sync("a", first.clone(), None), "a", 4, 30)?)?;
+        store.apply(sync("a", staged.clone(), ack(prepare, None)), "a", 5, 30)?;
+        let activate = Change::Activate {
+            fingerprint: new.fingerprint.clone(),
+        };
+        store.apply(
+            request("a", activate.clone(), rotation.clone()),
+            "operator",
+            6,
+            30,
+        )?;
+        let failed = work(store.apply(sync("a", staged.clone(), None), "a", 7, 30)?)?;
+        store.apply(
+            sync("a", staged.clone(), ack(failed, Some("read failed"))),
+            "a",
+            8,
+            30,
+        )?;
+        drop(store);
+        let mut store = Store::open(path)?;
+        assert_eq!(store.state.deploy_keys["a"].inventory.active, first.active);
+        assert_eq!(
+            store
+                .state
+                .key_rotation
+                .as_ref()
+                .unwrap()
+                .current()
+                .unwrap()
+                .worker,
+            "a"
+        );
+        store.apply(
+            Operation::Dispatch {
+                task: task(),
+                revise: false,
+            },
+            "operator",
+            9,
+            30,
+        )?;
+        assert!(matches!(
+            store.apply(poll("a"), "a", 10, 30)?,
+            Reply::Polled(None)
+        ));
+        assert!(matches!(
+            store.apply(poll("b"), "b", 10, 30)?,
+            Reply::Polled(Some(_))
+        ));
+        let retire = Change::Forget {
+            fingerprint: old.fingerprint.clone(),
+        };
+        assert!(
+            store
+                .apply(
+                    request("a", retire.clone(), rotation.clone()),
+                    "operator",
+                    11,
+                    30
+                )
+                .is_err()
+        );
+        store.apply(request("a", activate, rotation.clone()), "operator", 11, 30)?;
+        let retry = work(store.apply(sync("a", staged, None), "a", 12, 30)?)?;
+        let switched = Inventory {
+            active: Some(new.clone()),
+            retiring: Some(old),
+            staged: None,
+        };
+        store.apply(sync("a", switched.clone(), ack(retry, None)), "a", 13, 30)?;
+        store.apply(request("a", retire, rotation.clone()), "operator", 14, 30)?;
+        let forget = work(store.apply(sync("a", switched, None), "a", 15, 30)?)?;
+        store.apply(
+            sync(
+                "a",
+                Inventory {
+                    active: Some(new.clone()),
+                    ..Inventory::default()
+                },
+                ack(forget, None),
+            ),
+            "a",
+            16,
+            30,
+        )?;
+        let plan = store.state.key_rotation.as_ref().unwrap();
+        assert_eq!(plan.current().unwrap().worker, "b");
+        assert_eq!(
+            plan.workers[0].replacement.as_deref(),
+            Some(new.fingerprint.as_str())
+        );
+        assert_eq!(store.state.deploy_keys["b"].inventory, peer);
+        assert!(
+            store
+                .apply(
+                    request("a", Change::Prepare, rotation.clone()),
+                    "operator",
+                    17,
+                    30
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn deploy_key_requests_are_scoped_and_survive_restart_before_activation() -> Result<()> {
         let root = tempfile::tempdir()?;
         let file = root.path().join("control.json");
@@ -1119,6 +1537,7 @@ mod tests {
             worker: "device".into(),
             installation: "installation-1".into(),
             change,
+            rotation: None,
         };
         let empty = Inventory::default();
         store.apply(sync(empty.clone(), None), "device", 1, 10)?;
