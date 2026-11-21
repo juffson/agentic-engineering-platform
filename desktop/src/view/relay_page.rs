@@ -3,13 +3,29 @@ use crate::{
     relay::{self, Relay, Round},
     task_queue::{Action, State},
 };
+use aep::project::RecordKind;
 
 impl Studio {
+    pub(in crate::view) fn select_relay_record(
+        &mut self,
+        id: &str,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(record) = self.relays.iter().find(|r| r.id == id) {
+            self.relay_id = Some(record.id.clone());
+            self.relay_task = None;
+            self.relay_error = None;
+            self.relay_model
+                .update(cx, |s, cx| s.set_value(&record.model, w, cx));
+            cx.notify();
+        }
+    }
     pub(super) fn relay_page(&self, cx: &Context<Self>) -> Div {
-        let picked = self
-            .relays
-            .iter()
-            .find(|relay| Some(&relay.id) == self.relay_id.as_ref());
+        let picked = self.relays.iter().find(|relay| {
+            Some(&relay.id) == self.relay_id.as_ref()
+                && self.record_visible(RecordKind::Relay, &relay.id)
+        });
         let task = self
             .relay_tasks
             .iter()
@@ -71,9 +87,19 @@ impl Studio {
         if self.relays.is_empty() {
             list = list.child(caption("此仓库暂无接力记录。"));
         }
+        if self.context_work().is_some() {
+            list = list.child(self.record_picker(RecordKind::Relay, cx));
+        }
         for relay in &self.relays {
+            if !self.record_visible(RecordKind::Relay, &relay.id) {
+                if let Some(choice) =
+                    self.record_choice(RecordKind::Relay, &relay.id, &relay.task.name, cx)
+                {
+                    list = list.child(choice);
+                }
+                continue;
+            }
             let id = relay.id.clone();
-            let model = relay.model.clone();
             let summary = if relay.active(&self.snapshot) {
                 ("运行中", MINT)
             } else if relay
@@ -111,12 +137,7 @@ impl Studio {
                             .child(caption(id.get(6..14).unwrap_or(&id).to_owned())),
                     )
                     .on_click(cx.listener(move |this, _, w, cx| {
-                        this.relay_id = Some(id.clone());
-                        this.relay_task = None;
-                        this.relay_error = None;
-                        this.relay_model
-                            .update(cx, |input, cx| input.set_value(&model, w, cx));
-                        cx.notify();
+                        this.select_relay_record(&id, w, cx);
                     })),
             );
         }
@@ -131,10 +152,11 @@ impl Studio {
             .min_h_0()
             .p_5()
             .gap_3();
-        let pending = self
+        let job = self
             .current_queue_job()
-            .is_some_and(|job| job.state.active());
-        if let Some(job) = self.current_queue_job() {
+            .filter(|j| self.record_visible(RecordKind::Relay, &j.relay));
+        let pending = job.is_some_and(|job| job.state.active());
+        if let Some(job) = job {
             if pending {
                 detail = detail
                     .child(

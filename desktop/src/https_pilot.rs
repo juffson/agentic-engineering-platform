@@ -108,15 +108,12 @@ impl Progress {
     }
 }
 
-#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
-pub(crate) struct Connection {
-    pub endpoint: String,
-    pub ca: Option<PathBuf>,
-    pub operator_file: PathBuf,
-}
+pub(crate) use aep::project::HttpsSite as Connection;
 
 #[derive(Deserialize, Serialize)]
 struct Request {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
     #[serde(default)]
     ticket: String,
     task: Task,
@@ -273,6 +270,8 @@ impl Session {
         task: TaskSource,
         branch: Branch,
         connection: Connection,
+        project: Option<String>,
+        link: impl FnOnce(&Path) -> Result<()>,
     ) -> Result<Self> {
         let mut session = Self::allocate(source)?;
         session.remote = true;
@@ -287,12 +286,14 @@ impl Session {
             }
         };
         let request = Request {
+            project,
             ticket: format!("https-task-{}", uuid::Uuid::new_v4().simple()),
             task,
             branch,
             connection,
         };
         serde_json::to_writer(File::create(session.root.join("request.json"))?, &request)?;
+        link(&session.root)?;
         session.launch_saved(source, runner, false)
     }
 
@@ -422,7 +423,9 @@ impl Session {
 
     pub fn saved_connection(source: &Workspace) -> Option<Connection> {
         Self::roots(source).into_iter().find_map(|root| {
-            read_json::<Request>(root.join("request.json")).map(|request| request.connection)
+            read_json::<Request>(root.join("request.json"))
+                .filter(|request| request.project.is_none())
+                .map(|request| request.connection)
         })
     }
 
@@ -723,6 +726,14 @@ mod tests {
         assert_eq!(entries[0].progress.reason, "acceptance exited 44");
         assert!(Session::entries(&other).is_empty());
         assert!(Session::open(&other, root.clone()).is_none());
+
+        assert!(Session::saved_connection(&source).is_some());
+        let request_path = root.join("request.json");
+        let mut scoped: Request = serde_json::from_reader(File::open(&request_path)?)?;
+        scoped.project = Some("project-a".into());
+        serde_json::to_writer(File::create(&request_path)?, &scoped)?;
+        assert!(Session::saved_connection(&source).is_none());
+        assert_eq!(Session::entries(&source).len(), 1);
 
         let owner = File::create(root.join("operator.lock"))?;
         owner.try_lock()?;

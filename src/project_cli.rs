@@ -4,7 +4,7 @@ use aep::{
     cancel::Cancellation,
     handoff,
     memory::{Key, Kind as MemoryKind, Memory},
-    project::{self, Kind, Library, Project, Work, save_json},
+    project::{self, HttpsSite, Kind, Library, Project, RecordKind, Work, save_json},
     workflow::{self, Client, ExternalSession, Request, Template},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -79,6 +79,42 @@ enum Action {
         template: Template,
         #[arg(long)]
         release: bool,
+    },
+    /// Send or update a short handoff to another item in this project.
+    Handoff {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        note: String,
+    },
+    /// Link an existing repository relay or remote HTTPS session to this work item.
+    LinkRecord {
+        #[arg(long)]
+        repository: PathBuf,
+        #[arg(value_enum)]
+        kind: RecordKind,
+        id: String,
+    },
+    /// Remove a work item reference while keeping the repository archive.
+    UnlinkRecord {
+        #[arg(long)]
+        repository: PathBuf,
+        #[arg(value_enum)]
+        kind: RecordKind,
+        id: String,
+    },
+    /// Read or configure the project HTTPS connection for a repository.
+    Site {
+        #[arg(long)]
+        repository: PathBuf,
+        #[arg(long, requires = "operator_file", conflicts_with = "clear")]
+        endpoint: Option<String>,
+        #[arg(long, requires = "endpoint")]
+        operator_file: Option<PathBuf>,
+        #[arg(long, requires = "endpoint")]
+        ca: Option<PathBuf>,
+        #[arg(long)]
+        clear: bool,
     },
     Status,
     /// Configure a stage without starting a model. Stage numbers start at 1.
@@ -346,7 +382,7 @@ fn view(work: &Work, project: &Project, dir: &Path) -> Result<Value> {
         attempts.push(json!({"id":a.id,"stage":a.stage+1,"status":e["status"],"session":e["session"],"client":a.profile.client,"model":a.profile.model,"error":e["error"]}));
     }
     Ok(
-        json!({"project":project.id,"work":work.id,"name":work.name,"template":work.template,"stage_name":work.stage_name(),"stage":(work.stage<work.notes.len()).then_some(work.stage+1),"repositories":work.repositories,"stages":work.template.stages().iter().enumerate().map(|(i,s)|json!({"stage":i+1,"name":s.name,"profile":work.profile(i),"attempt":work.current_attempt.get(&i)})).collect::<Vec<_>>(),"attempts":attempts}),
+        json!({"project":project.id,"work":work.id,"name":work.name,"template":work.template,"stage_name":work.stage_name(),"stage":(work.stage<work.notes.len()).then_some(work.stage+1),"repositories":work.repositories,"records":work.records,"handoffs":work.handoffs,"stages":work.template.stages().iter().enumerate().map(|(i,s)|json!({"stage":i+1,"name":s.name,"profile":work.profile(i),"attempt":work.current_attempt.get(&i)})).collect::<Vec<_>>(),"attempts":attempts}),
     )
 }
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -620,6 +656,7 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
                         "请先从事项中移出仓库"
                     );
                     p.repositories.retain(|r| r != &repo);
+                    p.https_sites.remove(&repo);
                 }
                 Ok(())
             })?;
@@ -655,6 +692,56 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             };
             c.edit_project(|p| p.add_work(&name, kind, template))?;
             print(&json!({"project":c.project()?.id,"work":c.project()?.selected}))
+        }
+        Action::Handoff { to, note } => {
+            let source = c.work()?.id.clone();
+            let to = item(c.project()?, Some(&to))?.id.clone();
+            c.edit_project(|p| p.handoff(&source, &to, &note))?;
+            print(&json!({"from": source, "to": to}))
+        }
+        Action::LinkRecord {
+            repository,
+            kind,
+            id,
+        } => {
+            let ws = aep::workspace::Workspace::open(&repository)?;
+            kind.verify(&ws, &id)?;
+            let work = c.work()?.id.clone();
+            c.edit_project(|p| p.link_record(&work, &ws.root, kind, &id))?;
+            print(&json!({"kind":kind, "id": id}))
+        }
+        Action::UnlinkRecord {
+            repository,
+            kind,
+            id,
+        } => {
+            let repo = root(&repository)?;
+            c.edit_work(|w| w.unlink_record(&repo, kind, &id))?;
+            print(&json!({"unlinked":id}))
+        }
+        Action::Site {
+            repository,
+            endpoint,
+            operator_file,
+            ca,
+            clear,
+        } => {
+            let root = root(&repository)?;
+            ensure!(
+                c.project()?.repositories.contains(&root),
+                "仓库未关联到此项目"
+            );
+            if clear || endpoint.is_some() {
+                let site = endpoint
+                    .zip(operator_file)
+                    .map(|(endpoint, operator_file)| HttpsSite {
+                        endpoint,
+                        ca,
+                        operator_file,
+                    });
+                c.edit_project(|p| p.configure_site(&root, site))?;
+            }
+            print(&c.project()?.https_sites.get(&root))
         }
         Action::Status => print(&view(c.work()?, c.project()?, &c.dir)?),
         Action::Metrics => {

@@ -281,3 +281,166 @@ printf '%s\n' '{"id":4,"result":{"messages":[{"info":{"role":"assistant"},"parts
     assert!(session["session"].as_str().unwrap().starts_with("sess_"));
     Ok(())
 }
+
+#[test]
+fn directed_handoffs_and_site_overrides_are_scoped_to_the_selected_project() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let repo = tmp.path().join("repo");
+    let home = tmp.path().join("library");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()?
+            .success()
+    );
+    let api = |args: &[&str]| call(&home, &repo, args);
+    api(&["create", "first", "--repository", "."])?;
+    api(&["add-work", "source"])?;
+    api(&["add-work", "target"])?;
+    api(&[
+        "--work",
+        "source",
+        "handoff",
+        "--to",
+        "target",
+        "--note",
+        "superseded message",
+    ])?;
+    api(&[
+        "--work",
+        "source",
+        "handoff",
+        "--to",
+        "target",
+        "--note",
+        "current decision",
+    ])?;
+    let handoffs = api(&["--work", "target", "status"])?;
+    assert_eq!(handoffs["handoffs"].as_array().unwrap().len(), 1);
+    let claim = api(&[
+        "--work",
+        "target",
+        "claim",
+        "--stage",
+        "1",
+        "--session",
+        "reader",
+    ])?;
+    let packet = claim["context"].as_str().unwrap();
+    assert!(packet.contains("current decision") && !packet.contains("superseded message"));
+    assert!(
+        !api(&["--work", "source", "context"])?["context"]
+            .as_str()
+            .unwrap()
+            .contains("current decision")
+    );
+    let operator = tmp.path().join("operator");
+    fs::write(&operator, "fixture-only-token-content")?;
+    let token_path = operator.to_str().unwrap();
+    api(&[
+        "site",
+        "--repository",
+        ".",
+        "--endpoint",
+        "https://localhost:4242",
+        "--operator-file",
+        token_path,
+    ])?;
+    assert!(
+        !invoke(
+            &home,
+            &repo,
+            &[
+                "site",
+                "--repository",
+                ".",
+                "--endpoint",
+                "https://localhost:4242/wrong",
+                "--operator-file",
+                token_path
+            ]
+        )?
+        .status
+        .success()
+    );
+    let record = aep::workspace::Workspace::open(&repo)?
+        .data
+        .join("relays/relay-old");
+    fs::create_dir_all(&record)?;
+    fs::write(record.join("relay.json"), "{}")?;
+    assert!(
+        !invoke(
+            &home,
+            &repo,
+            &[
+                "--work",
+                "source",
+                "link-record",
+                "--repository",
+                ".",
+                "relay",
+                "relay-old"
+            ]
+        )?
+        .status
+        .success()
+    );
+    fs::write(
+        record.join("relay.json"),
+        br#"{"id":"relay-old","task":{"name":"archived"},"attempts":[]}"#,
+    )?;
+    api(&[
+        "--work",
+        "source",
+        "link-record",
+        "--repository",
+        ".",
+        "relay",
+        "relay-old",
+    ])?;
+    assert!(
+        !invoke(
+            &home,
+            &repo,
+            &[
+                "--work",
+                "target",
+                "link-record",
+                "--repository",
+                ".",
+                "relay",
+                "relay-old"
+            ]
+        )?
+        .status
+        .success()
+    );
+    api(&[
+        "--work",
+        "source",
+        "unlink-record",
+        "--repository",
+        ".",
+        "relay",
+        "relay-old",
+    ])?;
+    assert!(record.join("relay.json").is_file());
+    api(&["create", "second", "--repository", "."])?;
+    api(&["add-work", "target"])?;
+    assert!(api(&["site", "--repository", "."])?.is_null());
+    assert!(
+        !api(&["context"])?["context"]
+            .as_str()
+            .unwrap()
+            .contains("current decision")
+    );
+    assert_eq!(
+        api(&["--project", "first", "site", "--repository", "."])?["endpoint"],
+        "https://localhost:4242"
+    );
+    assert!(
+        !fs::read_to_string(home.join("projects.json"))?.contains("fixture-only-token-content")
+    );
+    Ok(())
+}

@@ -210,7 +210,7 @@ impl Studio {
     }
 
     fn rail(&self, cx: &Context<Self>) -> Div {
-        if self.context_work().is_some() {
+        if self.context_work().is_some() || self.in_settings() {
             return self.project_rail(cx);
         }
         let repo = self

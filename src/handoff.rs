@@ -102,6 +102,23 @@ pub fn packet(
         stage.brief,
         clip(req.brief.trim(), 850)
     );
+    let mut remaining = 850usize;
+    for h in req.handoffs.iter().rev() {
+        if remaining < 120 {
+            break;
+        }
+        let line = clip(
+            &format!(
+                "\n事项交接 · {} / {}：{}",
+                clip(&h.name, 90),
+                h.stage,
+                h.note
+            ),
+            remaining.min(480),
+        );
+        remaining -= line.len();
+        text.push_str(&line);
+    }
     let mut left = 850;
     for (label, note) in req
         .approved
@@ -160,6 +177,7 @@ pub struct Assignment {
 impl Work {
     pub fn request(&self, project: &str, stage: usize, assignment: Assignment) -> Request {
         Request {
+            handoffs: self.handoffs.clone(),
             project: project.to_owned(),
             work: self.name.clone(),
             template: self.template,

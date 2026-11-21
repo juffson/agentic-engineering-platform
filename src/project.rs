@@ -50,8 +50,113 @@ impl Kind {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpsSite {
+    pub endpoint: String,
+    pub ca: Option<PathBuf>,
+    pub operator_file: PathBuf,
+}
+
+impl HttpsSite {
+    pub fn validate(&self) -> Result<()> {
+        let origin = url::Url::parse(&self.endpoint).context("请填写有效的控制面地址")?;
+        ensure!(
+            origin.scheme() == "https"
+                && origin.host().is_some()
+                && origin.username().is_empty()
+                && origin.password().is_none()
+                && origin.query().is_none()
+                && origin.fragment().is_none()
+                && origin.path() == "/",
+            "请填写 HTTPS 控制面地址，只包含主机和可选端口"
+        );
+        ensure!(
+            self.operator_file.is_absolute() && self.operator_file.is_file(),
+            "请选择操作员令牌文件的绝对路径"
+        );
+        ensure!(
+            self.ca
+                .as_ref()
+                .is_none_or(|p| p.is_absolute() && p.is_file()),
+            "请填写 CA 证书文件的绝对路径"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordKind {
+    Relay,
+    Https,
+}
+
+impl RecordKind {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Relay => "relay",
+            Self::Https => "https",
+        }
+    }
+
+    pub fn verify(self, ws: &crate::workspace::Workspace, id: &str) -> Result<()> {
+        ensure!(
+            !id.is_empty()
+                && id.len() <= 100
+                && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
+            "记录 ID 无效"
+        );
+        let (prefix, dir, file) = match self {
+            Self::Relay => ("relay-", "relays", "relay.json"),
+            Self::Https => ("studio-", "https-studio", "request.json"),
+        };
+        ensure!(id.starts_with(prefix), "记录 ID 与类型不匹配");
+        let record = crate::workspace::read(&ws.data.join(dir).join(id).join(file))
+            .context("无法读取此仓库中的执行记录")?;
+        ensure!(
+            record["task"]["name"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty()),
+            "记录缺少任务名称"
+        );
+        match self {
+            Self::Relay => ensure!(
+                record["id"] == id && record["attempts"].is_array(),
+                "接力记录身份或轮次无效"
+            ),
+            Self::Https => ensure!(
+                record["branch"]["name"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+                    && serde_json::from_value::<HttpsSite>(record).is_ok(),
+                "HTTPS 任务缺少目标分支或连接信息"
+            ),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WorkRecord {
+    pub repository: PathBuf,
+    pub kind: RecordKind,
+    pub id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WorkHandoff {
+    pub from: String,
+    pub name: String,
+    pub stage: String,
+    pub note: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Work {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub records: Vec<WorkRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoffs: Vec<WorkHandoff>,
     #[serde(default)]
     pub tickets: std::collections::BTreeMap<PathBuf, String>,
     pub id: String,
@@ -72,6 +177,17 @@ pub struct Work {
     pub repositories: Vec<PathBuf>,
 }
 impl Work {
+    pub fn has_record(&self, repo: &Path, kind: RecordKind, id: &str) -> bool {
+        self.records
+            .iter()
+            .any(|r| r.repository == repo && r.kind == kind && r.id == id)
+    }
+    pub fn unlink_record(&mut self, repo: &Path, kind: RecordKind, id: &str) -> Result<()> {
+        ensure!(self.has_record(repo, kind, id), "事项未关联此记录");
+        self.records
+            .retain(|r| r.repository != repo || r.kind != kind || r.id != id);
+        Ok(())
+    }
     pub fn stage_name(&self) -> &'static str {
         self.template
             .stages()
@@ -108,6 +224,8 @@ impl Work {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Project {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub https_sites: BTreeMap<PathBuf, HttpsSite>,
     pub id: String,
     pub name: String,
     pub repositories: Vec<PathBuf>,
@@ -117,6 +235,69 @@ pub struct Project {
     pub cli_defaults: Vec<Profile>,
 }
 impl Project {
+    pub fn configure_site(&mut self, repo: &Path, site: Option<HttpsSite>) -> Result<()> {
+        ensure!(
+            self.repositories.iter().any(|r| r == repo),
+            "仓库未关联到此项目"
+        );
+        if let Some(site) = site {
+            site.validate()?;
+            self.https_sites.insert(repo.into(), site);
+        } else {
+            self.https_sites.remove(repo);
+        }
+        Ok(())
+    }
+
+    pub fn link_record(
+        &mut self,
+        work: &str,
+        repo: &Path,
+        kind: RecordKind,
+        id: &str,
+    ) -> Result<()> {
+        ensure!(
+            !self
+                .work
+                .iter()
+                .any(|w| w.id != work && w.has_record(repo, kind, id)),
+            "该记录已关联本项目的另一事项"
+        );
+        let item = self.work_by_id_mut(work)?;
+        ensure!(
+            item.repositories.iter().any(|r| r == repo),
+            "仓库未纳入当前事项"
+        );
+        if !item.has_record(repo, kind, id) {
+            item.records.push(WorkRecord {
+                repository: repo.into(),
+                kind,
+                id: id.into(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn handoff(&mut self, from: &str, to: &str, note: &str) -> Result<()> {
+        let note = note.trim();
+        ensure!(from != to, "请选择另一开发事项");
+        ensure!(
+            !note.is_empty() && note.chars().count() <= 500,
+            "请填写 1 至 500 字的交接摘要"
+        );
+        let source = self.work_by_id_mut(from)?;
+        let entry = WorkHandoff {
+            from: from.into(),
+            name: source.name.clone(),
+            stage: source.stage_name().into(),
+            note: note.into(),
+        };
+        let target = self.work_by_id_mut(to)?;
+        target.handoffs.retain(|h| h.from != from);
+        target.handoffs.push(entry);
+        Ok(())
+    }
+
     pub fn selected(&self) -> Option<&Work> {
         self.work
             .iter()
@@ -136,6 +317,8 @@ impl Project {
         let id = Uuid::new_v4().simple().to_string();
         self.selected = Some(id.clone());
         let mut work = Work {
+            records: vec![],
+            handoffs: vec![],
             tickets: Default::default(),
             id,
             name: name.trim().into(),
@@ -195,6 +378,7 @@ impl Library {
         );
         let id = Uuid::new_v4().simple().to_string();
         self.projects.push(Project {
+            https_sites: BTreeMap::new(),
             id: id.clone(),
             name: name.into(),
             repositories,

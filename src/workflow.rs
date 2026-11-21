@@ -173,6 +173,8 @@ pub struct ExternalSession {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoffs: Vec<crate::project::WorkHandoff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external: Option<ExternalSession>,
     #[serde(default)]

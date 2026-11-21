@@ -1,47 +1,20 @@
+use super::project_page::SiteFields;
 use super::task_authoring::Authoring;
 use super::*;
 use crate::{
     Page,
-    https_pilot::{Artifact as Proof, Connection, Progress, Session, TaskSource},
+    https_pilot::{Artifact as Proof, Progress, Session, TaskSource},
     lifecycle::{self, Choices},
 };
-use anyhow::{Context as _, ensure};
+use aep::project::RecordKind;
+use anyhow::Context as _;
 
 pub(crate) struct RemoteForm {
     source: Workspace,
-    endpoint: Entity<InputState>,
-    ca: Entity<InputState>,
-    operator_file: Entity<InputState>,
+    site: SiteFields,
+    choice_request: uuid::Uuid,
     choices: Option<Choices>,
     authoring: Option<Authoring>,
-}
-
-impl RemoteForm {
-    fn connection(&self, cx: &App) -> Result<Connection> {
-        let endpoint = self.endpoint.read(cx).value().trim().to_owned();
-        let ca = self.ca.read(cx).value().trim().to_owned();
-        let token = self.operator_file.read(cx).value().trim().to_owned();
-        ensure!(
-            endpoint.starts_with("https://"),
-            "远程控制面需要 HTTPS 地址"
-        );
-        let operator_file = PathBuf::from(token);
-        ensure!(
-            operator_file.is_absolute() && operator_file.is_file(),
-            "请选择操作员令牌文件的绝对路径"
-        );
-        let ca = (!ca.is_empty()).then(|| PathBuf::from(ca));
-        ensure!(
-            ca.as_ref()
-                .is_none_or(|path| path.is_absolute() && path.is_file()),
-            "请填写 CA 证书文件的绝对路径"
-        );
-        Ok(Connection {
-            endpoint,
-            ca,
-            operator_file,
-        })
-    }
 }
 
 const PROOFS: [(Proof, &str, &str); 8] = [
@@ -117,13 +90,16 @@ pub(super) fn check_state(check: &Value) -> (&str, u32) {
 impl Studio {
     pub(super) fn https_source(&self) -> Option<Workspace> {
         let ws = self.workspace.as_ref()?;
+        if self.in_settings() || self.context_work().is_some() {
+            return Some(ws.clone());
+        }
         self.lifecycle
             .as_ref()
             .and_then(|fixture| Workspace::open(&fixture.source).ok())
             .or_else(|| Some(ws.clone()))
     }
 
-    fn select_https_session(&mut self, source: &Workspace, root: PathBuf) {
+    pub(in crate::view) fn select_https_session(&mut self, source: &Workspace, root: PathBuf) {
         if self
             .https_pilot
             .as_ref()
@@ -149,22 +125,44 @@ impl Studio {
         let Some(source) = self.https_source() else {
             return;
         };
-        if let Some(session) = self
-            .https_pilot
-            .as_mut()
-            .filter(|s| s.source == source.root)
-        {
-            session.refresh();
+        self.https_sessions = Session::entries(&source);
+        let selected = self.https_pilot.as_ref().filter(|s| {
+            s.source == source.root
+                && self.record_visible(
+                    RecordKind::Https,
+                    s.root
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or_default(),
+                )
+        });
+        if selected.is_some() {
+            self.https_pilot.as_mut().unwrap().refresh();
         } else {
             if let Some(previous) = self.https_pilot.take().filter(Session::active) {
                 self.https_background.push(previous);
             }
-            if let Some(root) = Session::latest(&source) {
+            let root = if self.context_work().is_some() {
+                self.https_sessions
+                    .iter()
+                    .find(|s| {
+                        self.record_visible(
+                            RecordKind::Https,
+                            s.root
+                                .file_name()
+                                .and_then(|f| f.to_str())
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .map(|s| s.root.clone())
+            } else {
+                Session::latest(&source)
+            };
+            if let Some(root) = root {
                 self.select_https_session(&source, root);
             }
             self.https_pilot_error = None;
         }
-        self.https_sessions = Session::entries(&source);
         self.load_rolling_history(&source);
         self.restore_https_queue(&source, cx);
         self.poll_https(cx);
@@ -295,19 +293,17 @@ impl Studio {
         let Some(source) = self.https_source() else {
             return;
         };
-        let mut input = |name, placeholder| {
-            let value = std::env::var(name).unwrap_or_default();
-            cx.new(|cx| {
-                let mut state = InputState::new(window, cx).placeholder(placeholder);
-                state.set_value(&value, window, cx);
-                state
-            })
+        let connection = if self.in_settings() || self.context_work().is_some() {
+            self.project_site(&source.root)
+                .cloned()
+                .or_else(|| crate::https_queue::Site::restore(&source).map(|s| s.connection))
+        } else {
+            None
         };
         self.https_remote_form = Some(RemoteForm {
+            site: SiteFields::new(connection.as_ref(), window, cx),
             source,
-            endpoint: input("AEP_STUDIO_CONTROL_URL", "https://control.example.org"),
-            ca: input("AEP_STUDIO_CONTROL_CA", "系统信任的证书可留空"),
-            operator_file: input("AEP_STUDIO_CONTROL_OPERATOR_FILE", "/path/to/operator"),
+            choice_request: uuid::Uuid::nil(),
             choices: None,
             authoring: None,
         });
@@ -320,6 +316,8 @@ impl Studio {
         };
         self.https_pilot_error = None;
         form.choices = None;
+        let request = uuid::Uuid::new_v4();
+        form.choice_request = request;
         let source = form.source.clone();
         let runner = self.runner.clone();
         let generation = self.workspace_generation;
@@ -330,7 +328,10 @@ impl Studio {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 if this.workspace_generation == generation
-                    && let Some(form) = this.https_remote_form.as_mut()
+                    && let Some(form) = this
+                        .https_remote_form
+                        .as_mut()
+                        .filter(|f| f.choice_request == request)
                 {
                     match result {
                         Ok(choices) => form.choices = Some(choices),
@@ -353,7 +354,8 @@ impl Studio {
         };
         let source = form.source.clone();
         let result = form
-            .connection(cx)
+            .site
+            .read(cx)
             .and_then(|connection| self.set_https_queue(source, connection, cx));
         self.https_pilot_error = result.err().map(|error| format!("{error:#}"));
         cx.notify();
@@ -364,7 +366,7 @@ impl Studio {
             return;
         };
         let prepared = (|| {
-            let connection = form.connection(cx)?;
+            let connection = form.site.read(cx)?;
             let (task, branch) = if let Some(authoring) = &form.authoring {
                 (
                     TaskSource::Draft(authoring.draft(cx)?),
@@ -381,7 +383,23 @@ impl Studio {
         })();
         let result = prepared.and_then(|(source, task, branch, connection)| {
             self.set_https_queue(source.clone(), connection.clone(), cx)?;
-            Session::launch_remote(&source, &self.runner, task, branch, connection)
+            let runner = self.runner.clone();
+            let project = self.execution_project_id();
+            Session::launch_remote(
+                &source,
+                &runner,
+                task,
+                branch,
+                connection,
+                project,
+                |root| {
+                    let id = root
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .context("远程记录 ID 无效")?;
+                    self.attach_work_record(RecordKind::Https, id, cx)
+                },
+            )
         });
         if result.is_ok() {
             self.https_remote_form = None;
@@ -403,14 +421,6 @@ impl Studio {
     }
 
     fn https_remote_form(&self, form: &RemoteForm, cx: &Context<Self>) -> Div {
-        let input = |label, state| {
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(caption(label))
-                .child(Input::new(state).aria_label(label))
-        };
         let mut contents = panel()
             .flex_none()
             .child(heading(if form.authoring.is_some() {
@@ -424,9 +434,9 @@ impl Studio {
                 contents.child(
                     h_flex()
                         .gap_2()
-                        .child(button("https-change-repo", "选择仓库…", false).on_click(
+                        .when(self.context_work().is_none() && !self.in_settings(),|row| row.child(button("https-change-repo", "选择仓库…", false).on_click(
                             cx.listener(|this, _, window, cx| this.choose_repo(window, cx)),
-                        ))
+                        )))
                         .child(
                             button("https-refresh-choices", "刷新任务和分支", false).on_click(
                                 cx.listener(|this, _, _, cx| this.load_https_remote_choices(cx)),
@@ -434,17 +444,11 @@ impl Studio {
                         ),
                 )
             })
-            .child(input("HTTPS 控制面", &form.endpoint))
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(input("CA 证书路径", &form.ca))
-                    .child(input("操作员令牌文件路径", &form.operator_file)),
-            )
-            .child(
+            .child(form.site.render())
+            .when(self.context_work().is_none(), |card| card.child(
                 button("https-connect-queue", "连接队列", false)
                     .on_click(cx.listener(|this, _, _, cx| this.connect_remote_queue(cx))),
-            );
+            ));
         if let Some(authoring) = &form.authoring {
             return contents.child(authoring.fields(&form.source, false)).child(
                 h_flex()
@@ -556,7 +560,17 @@ impl Studio {
     }
 
     fn https_session_list(&self, cx: &Context<Self>) -> Div {
-        let panel = panel().flex_none().child(heading("仓库的 HTTPS 任务"));
+        let scoped = self.context_work().is_some();
+        let panel = panel()
+            .flex_none()
+            .child(heading(if scoped {
+                "事项的 HTTPS 任务"
+            } else {
+                "仓库的 HTTPS 任务"
+            }))
+            .when(scoped, |p| {
+                p.child(self.record_picker(RecordKind::Https, cx))
+            });
         let mut list = v_flex()
             .id("https-session-list")
             .test_support()
@@ -569,6 +583,14 @@ impl Studio {
         for entry in &self.https_sessions {
             let root = entry.root.clone();
             let id = root.file_name().unwrap_or_default().to_string_lossy();
+            if !self.record_visible(RecordKind::Https, &id) {
+                if let Some(choice) =
+                    self.record_choice(RecordKind::Https, &id, &entry.progress.task, cx)
+                {
+                    list = list.child(choice);
+                }
+                continue;
+            }
             let task = &entry.progress.task;
             let branch = &entry.progress.branch;
             let (_, message) = phase(&entry.progress.stage);
@@ -610,12 +632,31 @@ impl Studio {
     }
 
     pub(super) fn https_pilot_page(&self, cx: &Context<Self>) -> Div {
-        let session = self.https_pilot.as_ref();
+        if let Some(page) = self.infrastructure_page(cx) {
+            return page;
+        }
+        let scoped = self.context_work().is_some();
+        let session = self.https_pilot.as_ref().filter(|s| {
+            self.record_visible(
+                RecordKind::Https,
+                s.root
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or_default(),
+            )
+        });
         let running = session.is_some_and(Session::active);
         let header = h_flex()
             .justify_between()
             .gap_3()
-            .child(heading("HTTPS 试点").text_2xl())
+            .child(
+                heading(if scoped {
+                    "HTTPS 远程任务"
+                } else {
+                    "HTTPS 控制面"
+                })
+                .text_2xl(),
+            )
             .child(
                 h_flex()
                     .gap_2()
@@ -627,7 +668,7 @@ impl Studio {
                         )
                         .on_click(cx.listener(|this, _, w, cx| this.open_https_remote(w, cx))),
                     )
-                    .when(!self.rolling_busy(), |row| {
+                    .when(!scoped && !self.rolling_busy(), |row| {
                         row.child(
                             button(
                                 "https-rolling-mode",
@@ -639,7 +680,7 @@ impl Studio {
                             ),
                         )
                     })
-                    .when(!running, |row| {
+                    .when(!scoped && !running, |row| {
                         row.child(
                             button("https-start", "启动隔离试点", true)
                                 .on_click(cx.listener(|this, _, _, cx| this.start_https_pilot(cx))),
@@ -657,17 +698,21 @@ impl Studio {
             .gap_3()
             .p_5()
             .child(header)
-            .child(caption("在独立 HTTPS 站点和 GitHub 测试分支运行 Codex、Claude 与断线恢复。发布和合并分别确认。"));
+            .child(caption(if scoped {
+                "查看当前事项的 Worker 派发、恢复、人工确认和归档。"
+            } else {
+                "管理远程任务、Worker 队列、凭证及隔离演练。"
+            }));
         if let Some(error) = &self.https_pilot_error {
             page = page.child(detail_text("https-action-error", error).text_color(rgb(RED)));
         }
-        if let Some(rolling) = self.rolling_panel(cx) {
+        if !scoped && let Some(rolling) = self.rolling_panel(cx) {
             page = page.child(rolling);
         }
         if let Some(form) = &self.https_remote_form {
             page = page.child(self.https_remote_form(form, cx));
         }
-        if let Some(site) = &self.https_queue {
+        if !scoped && let Some(site) = &self.https_queue {
             page = page.child(self.https_queue_panel(site, cx));
         }
         page = page.child(self.https_session_list(cx));
@@ -676,7 +721,14 @@ impl Studio {
                 .size_full()
                 .bg(rgb(CANVAS))
                 .child(self.rail(cx))
-                .child(page.child(panel().child(t("从本地 AEP 源码仓库启动 deploy/pilot/live.sh。需要 Docker 和已登录的 GitHub、Codex 与 Claude。", FG))));
+                .child(page.child(panel().child(t(
+                    if scoped {
+                        "可关联已有远程记录，或通过「真实任务」派发新任务。"
+                    } else {
+                        "通过「真实任务」配置连接并派发，或启动隔离试点。"
+                    },
+                    FG,
+                ))));
         };
         let progress = &session.progress;
         let (index, message) = phase(&progress.stage);

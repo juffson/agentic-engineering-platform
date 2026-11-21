@@ -1,8 +1,11 @@
 use super::*;
 mod agents;
+mod collaboration;
 use aep::project::{Kind, Library, Project, Work};
 use aep::workflow::{self, Client, Profile, Role as StageRole, Template};
 use anyhow::{Context as _, ensure};
+pub(in crate::view) use collaboration::SiteFields;
+use collaboration::{InfraView, SiteEditor, WorkDesk};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use std::{collections::BTreeMap, path::Path};
 
@@ -12,10 +15,15 @@ enum Section {
     Overview,
     Work,
     Repositories,
+    Settings,
     Memory,
 }
 pub(crate) struct Board {
     library: Library,
+    site_editor: Option<SiteEditor>,
+    infra_view: Option<InfraView>,
+    desk: Option<WorkDesk>,
+    pick_record: bool,
     dir: Option<PathBuf>,
     section: Section,
     new_project: Entity<InputState>,
@@ -79,6 +87,10 @@ impl Board {
         };
         Self {
             library,
+            site_editor: None,
+            infra_view: None,
+            desk: None,
+            pick_record: false,
             dir,
             section,
             new_project: cx.new(|cx| InputState::new(window, cx).placeholder("项目名称")),
@@ -182,6 +194,9 @@ impl Studio {
     fn section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.page = Page::Project;
         self.board.section = section;
+        self.board.site_editor = None;
+        self.board.infra_view = None;
+        self.board.pick_record = false;
         self.board.filter_stage = None;
         self.board.error = None;
         self.board.creating_work = false;
@@ -390,6 +405,13 @@ impl Studio {
     ) {
         match Workspace::open(path) {
             Ok(ws) => {
+                self.board.pick_record = false;
+                self.board.infra_view = None;
+                self.https_remote_form = None;
+                if page == Page::Relay {
+                    self.relay_id = None;
+                    self.relay_task = None;
+                }
                 if self
                     .workspace
                     .as_ref()
@@ -548,12 +570,27 @@ impl Studio {
                     Section::Repositories,
                     IconName::Folder,
                     cx,
+                ))
+                .child(self.section_button(
+                    "project-settings",
+                    "项目设置",
+                    Section::Settings,
+                    IconName::Settings,
+                    cx,
                 ));
         }
         if self.page != Page::Project {
             rail = rail.child(div().flex_1()).child(
-                button("back-to-project", "返回开发事项", true)
-                    .on_click(cx.listener(|this, _, w, cx| this.return_to_project(w, cx))),
+                button(
+                    "back-to-project",
+                    if self.in_settings() {
+                        "返回项目设置"
+                    } else {
+                        "返回开发事项"
+                    },
+                    true,
+                )
+                .on_click(cx.listener(|this, _, w, cx| this.return_to_project(w, cx))),
             );
         }
         rail
@@ -580,12 +617,14 @@ impl Studio {
                 Section::Overview => "项目概览",
                 Section::Work => "项目 / 开发事项",
                 Section::Memory => "项目 / 共享记忆",
+                Section::Settings => "项目 / 设置",
                 _ => "项目 / 关联仓库",
             }));
             let title = match self.board.section {
                 Section::Overview => p.name.clone(),
                 Section::Work => "开发事项".into(),
                 Section::Memory => "项目记忆".into(),
+                Section::Settings => "项目设置".into(),
                 _ => "关联仓库".into(),
             };
             head = head.child(heading(title).text_2xl());
@@ -642,12 +681,19 @@ impl Studio {
                         );
                 }
                 Section::Memory => page = page.child(self.memory_board(cx)),
+                Section::Settings => page = page.child(self.project_settings(p, cx)),
                 Section::Repositories => page = page.child(self.repositories(p, cx)),
                 Section::Work => {
                     if self.board.creating_work {
                         page = page.child(self.work_form(cx));
                     } else if let Some(work) = p.selected() {
-                        page = page.child(self.work_detail(p, work, cx));
+                        let collab = self.board.desk.as_ref().is_some_and(|d| d.work == work.id);
+                        page = page.child(self.work_tabs(work, collab, cx));
+                        if collab {
+                            page = page.child(self.work_collaboration(p, work, cx));
+                        } else {
+                            page = page.child(self.work_detail(p, work, cx));
+                        }
                     }
                     page = page.child(self.work_list(p, cx));
                 }
@@ -889,23 +935,15 @@ impl Studio {
         );
         for (i, path) in p.repositories.iter().enumerate() {
             let mut tools = h_flex().gap_2().flex_wrap();
-            for (label, page) in [
-                ("本地任务", Page::Local),
-                ("运行记录", Page::Runs),
-                ("共享记忆", Page::Memory),
-                ("两轮接力", Page::Relay),
-                ("隔离全流程", Page::Lifecycle),
-                ("HTTPS 试点", Page::HttpsPilot),
-            ] {
-                let path = path.clone();
-                tools = tools.child(
-                    button(format!("project-tool-{i}-{label}"), label, false).on_click(
-                        cx.listener(move |this, _, w, cx| {
-                            this.project_tool(&path, page, None, w, cx)
-                        }),
-                    ),
-                );
-            }
+            let configure = path.clone();
+            tools = tools.child(
+                button(format!("repo-settings-{i}"), "仓库执行设置", false).on_click(cx.listener(
+                    move |this, _, w, cx| {
+                        this.section(Section::Settings, w, cx);
+                        this.edit_site(&configure, w, cx);
+                    },
+                )),
+            );
             let unlink = path.clone();
             tools = tools.child(
                 button(format!("project-unlink-{i}"), "解除关联", false).on_click(cx.listener(
@@ -920,6 +958,7 @@ impl Studio {
                                 anyhow::bail!("请先从事项「{}」移出这个仓库", work.name);
                             }
                             project.repositories.retain(|path| path != &unlink);
+                            project.https_sites.remove(&unlink);
                             Ok(())
                         });
                     },

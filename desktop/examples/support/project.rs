@@ -1,13 +1,53 @@
 use super::{Args, Driver, fixture, handoff_fixture, https_queue::until};
+use aep::workspace::Workspace;
 use aep::workspace::read;
 use anyhow::{Result, ensure};
-use std::{fs, process::Command};
+use serde_json::{Value, json};
+use std::{fs, path::Path, process::Command};
 
 pub(super) fn click(ui: &mut Driver<'_>, id: &str) -> Result<()> {
     if !ui.element(id)?.visible() {
         ui.reveal("project-page", id)?;
     }
     ui.click(id)
+}
+fn archived_records(ws: &Workspace, operator: &Path) -> Result<()> {
+    let https = ws.data.join("https-studio/studio-existing");
+    let relay = ws.data.join("relays/relay-existing");
+    fs::create_dir_all(&https)?;
+    fs::create_dir_all(&relay)?;
+    let connection =
+        json!({"endpoint":"https://127.0.0.1:9123","operator_file":operator,"ca":null});
+    fs::write(
+        https.parent().unwrap().join("queue-site.json"),
+        serde_json::to_vec(&connection)?,
+    )?;
+    let mut request = connection;
+    request["ticket"] = json!("https-task-existing");
+    request["task"] = json!({"name":"resume-task","sha":"0123456789abcdef"});
+    request["branch"] = json!({"name":"test/archive","sha":"0123456789abcdef"});
+    fs::write(https.join("request.json"), serde_json::to_vec(&request)?)?;
+    fs::write(
+        https.join("state.json"),
+        br#"{"stage":"remote_outage","reason":"fixture outage","exit_code":4}"#,
+    )?;
+    fs::write(relay.join("relay.json"),br#"{"id":"relay-existing","task":{"name":"resume-task","sha":"0123456789abcdef"},"model":"archive-model","attempts":[]}"#)?;
+    fs::write(relay.join("owner.lock"), "")?;
+    Ok(())
+}
+fn project_cli(binary: &Path, repo: &Path, home: &Path, args: &[&str]) -> Result<Value> {
+    let r = Command::new(binary)
+        .current_dir(repo)
+        .args(["project", "--home"])
+        .arg(home)
+        .args(args)
+        .output()?;
+    ensure!(
+        r.status.success(),
+        "project CLI: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    Ok(serde_json::from_slice(&r.stdout)?)
 }
 pub(super) fn run(args: &Args) -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -165,7 +205,7 @@ pub(super) fn run(args: &Args) -> Result<()> {
             "project state leaked"
         );
         ui.frame(|w, _| w.remove_window())?;
-        ui = Driver::open_with_runner(&ws, args, runner)?;
+        ui = Driver::open_with_runner(&ws, args, runner.clone())?;
         ui.click("back-to-project")?;
         ui.click("project-library")?;
         let id = catalog["active"].as_str().unwrap();
@@ -175,6 +215,138 @@ pub(super) fn run(args: &Args) -> Result<()> {
         ensure!(
             ui.by_label("阶段记录")?.value() == Some("Studio 保存进度，Worker 保留执行回执。"),
             "design record lost after restart"
+        );
+        let home = data.parent().unwrap();
+        let worker_ws = Workspace::open(&worker)?;
+        let operator = root.path().join("operator");
+        fs::write(&operator, "fixture-operator-file-only")?;
+        archived_records(&worker_ws, &operator)?;
+        ui.click("project-settings")?;
+        click(&mut ui, "settings-edit-1")?;
+        ensure!(
+            ui.by_label("HTTPS 控制面")?.value() == Some("https://127.0.0.1:9123"),
+            "legacy site missing"
+        );
+        click(&mut ui, "site-endpoint")?;
+        ui.replace_focused("https://127.0.0.1:9135")?;
+        click(&mut ui, "settings-save")?;
+        ensure!(
+            project_cli(&binary, &worker, home, &["site", "--repository", "."])?["endpoint"]
+                == "https://127.0.0.1:9135",
+            "project site not saved"
+        );
+        ensure!(
+            read(&worker_ws.data.join("https-studio/queue-site.json"))?["endpoint"]
+                == "https://127.0.0.1:9123",
+            "legacy connection overwritten"
+        );
+        ui.checkpoint("project-settings")?;
+        click(&mut ui, "settings-workers-1")?;
+        ensure!(
+            !ui.absent("https-pilot-page")?
+                && ui.element("https-queue-endpoint")?.label() == Some("https://127.0.0.1:9135")
+                && ui.absent("https-start")?,
+            "missing HTTPS infrastructure"
+        );
+        ui.click("back-to-project")?;
+        ensure!(!ui.absent("settings-edit-1")?, "wrong return destination");
+        click(&mut ui, "settings-rotation-1")?;
+        ensure!(
+            !ui.absent("https-rolling-mode")? && ui.absent("https-start")?,
+            "wrong rotation destination"
+        );
+        ui.click("back-to-project")?;
+        ui.click("project-work")?;
+        ui.click("project-new-work")?;
+        ui.click("project-work-name")?;
+        ui.input("发布前验收")?;
+        ui.click("project-create-work")?;
+        let receiver = read(&data)?["projects"][0]["selected"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        click(&mut ui, &feature_button)?;
+        click(&mut ui, "work-collab-tab")?;
+        click(&mut ui, &format!("handoff-to-{receiver}"))?;
+        click(&mut ui, "work-handoff-note")?;
+        ui.input("沿用原票据重试，验收见 receipt.rs。")?;
+        click(&mut ui, "work-send-handoff")?;
+        click(&mut ui, "work-https-1")?;
+        ensure!(
+            ui.absent("https-stage")?
+                && ui.absent("https-start")?
+                && ui.absent("https-rolling-mode")?,
+            "unrelated session or infrastructure exposed"
+        );
+        ui.click("pick-https-record")?;
+        ui.click("link-studio-existing")?;
+        ensure!(
+            !ui.absent("https-stage")? && !ui.absent("https-resume")?,
+            "linked HTTPS session missing"
+        );
+        ui.checkpoint("work-https-history")?;
+        ui.click("back-to-project")?;
+        click(&mut ui, "work-relay-1")?;
+        until(&mut ui, "relay catalog", 20, |ui| {
+            Ok((!ui.absent("pick-relay-record")?).then_some(()))
+        })?;
+        ui.click("pick-relay-record")?;
+        until(&mut ui, "existing relay", 20, |ui| {
+            Ok((!ui.absent("link-relay-existing")?).then_some(()))
+        })?;
+        ui.click("link-relay-existing")?;
+        ensure!(
+            ui.by_label("Codex 模型")?.value() == Some("archive-model"),
+            "linked record lost its configured model"
+        );
+        ensure!(!ui.absent("relay-existing")?, "linked relay missing");
+        ui.click("back-to-project")?;
+        click(&mut ui, &format!("project-item-{receiver}"))?;
+        click(&mut ui, "work-collab-tab")?;
+        ui.checkpoint("work-handoff-inbox")?;
+        let packet = project_cli(&binary, &worker, home, &["--work", &receiver, "context"])?;
+        ensure!(
+            packet["context"]
+                .as_str()
+                .unwrap()
+                .contains("沿用原票据重试"),
+            "handoff missing from CLI"
+        );
+        click(&mut ui, "work-https-1")?;
+        ensure!(
+            ui.absent("https-session-studio-existing")? && ui.absent("https-resume")?,
+            "other item's HTTPS session leaked"
+        );
+        ui.click("back-to-project")?;
+        click(&mut ui, "work-relay-1")?;
+        ensure!(ui.absent("relay-existing")?, "other item's relay leaked");
+        let saved = project_cli(
+            &binary,
+            &worker,
+            home,
+            &["--work", feature["id"].as_str().unwrap(), "status"],
+        )?;
+        ensure!(
+            saved["records"].as_array().unwrap().len() == 2,
+            "associations missing"
+        );
+        ui.frame(|w, _| w.remove_window())?;
+        ui = Driver::open_with_runner(&ws, args, runner)?;
+        ui.click("back-to-project")?;
+        ui.click("project-work")?;
+        click(&mut ui, &feature_button)?;
+        click(&mut ui, "work-collab-tab")?;
+        click(&mut ui, "work-https-1")?;
+        ensure!(!ui.absent("https-resume")?, "linked session not restored");
+        ui.click("back-to-project")?;
+        // A mistaken link can be removed without touching the original evidence.
+        click(&mut ui, "unlink-https-0")?;
+        ensure!(
+            worker_ws
+                .data
+                .join("https-studio/studio-existing/request.json")
+                .is_file(),
+            "unlink deleted evidence"
         );
         if let Some(dir) = &args.output_dir {
             fs::write(

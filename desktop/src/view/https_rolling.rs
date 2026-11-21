@@ -162,12 +162,14 @@ impl Studio {
         if self.rolling_busy() || self.https_rolling_form.is_some() {
             return;
         }
-        let access = std::env::var_os("AEP_STUDIO_CONTROL_OPERATOR_FILE")
-            .map(PathBuf::from)
+        let access = self
+            .https_source()
+            .and_then(|ws| self.project_site(&ws.root).map(|s| s.operator_file.clone()))
+            .or_else(|| std::env::var_os("AEP_STUDIO_CONTROL_OPERATOR_FILE").map(PathBuf::from))
             .or_else(|| {
                 self.https_queue
                     .as_ref()
-                    .map(|site| site.connection.operator_file.clone())
+                    .map(|s| s.connection.operator_file.clone())
             })
             .and_then(|path| path.parent().map(|parent| parent.display().to_string()))
             .or_else(|| {

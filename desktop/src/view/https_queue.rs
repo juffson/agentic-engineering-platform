@@ -7,12 +7,16 @@ use std::time::Instant;
 
 impl Studio {
     pub(super) fn restore_https_queue(&mut self, source: &Workspace, cx: &mut Context<Self>) {
-        if self
+        let connection = self
+            .project_site(&source.root)
+            .cloned()
+            .or_else(|| Site::restore(source).map(|s| s.connection));
+        let current = self
             .https_queue
             .as_ref()
-            .is_none_or(|site| site.source.root != source.root)
-        {
-            self.https_queue = Site::restore(source);
+            .map(|s| (&s.source.root, &s.connection));
+        if current != connection.as_ref().map(|c| (&source.root, c)) {
+            self.https_queue = connection.map(|c| Site::new(source.clone(), c));
         }
         self.poll_https_queue(cx);
     }
@@ -31,17 +35,21 @@ impl Studio {
             return Ok(());
         }
         let site = Site::new(source, connection);
-        site.save()?;
+        if !self.in_settings() && self.context_work().is_none() {
+            site.save()?;
+        }
         self.https_queue = Some(site);
         self.poll_https_queue(cx);
         Ok(())
     }
 
     pub(super) fn poll_https_queue(&mut self, cx: &mut Context<Self>) {
-        if self.https_queue.as_ref().is_some_and(|site| {
-            site.checked
-                .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(2))
-        }) {
+        if self.context_work().is_none()
+            && self.https_queue.as_ref().is_some_and(|site| {
+                site.checked
+                    .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(2))
+            })
+        {
             self.https_queue_action(Action::Status, cx);
         }
     }

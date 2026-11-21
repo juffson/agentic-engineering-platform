@@ -458,11 +458,21 @@ impl Studio {
         if self.relay_launching {
             return;
         }
-        if let Some(session) = self.lifecycle.as_ref().filter(|session| session.real_task) {
-            self.enqueue_round(session.initial_relay_id(), task_queue::Action::Start, cx);
+        let queued = self
+            .lifecycle
+            .as_ref()
+            .filter(|s| s.real_task)
+            .map(|s| s.initial_relay_id());
+        let id = queued.clone().unwrap_or_else(relay::new_id);
+        if let Err(e) = self.attach_work_record(aep::project::RecordKind::Relay, &id, cx) {
+            self.relay_error = Some(e.to_string());
+            cx.notify();
             return;
         }
-        let id = relay::new_id();
+        if queued.is_some() {
+            self.enqueue_round(id, task_queue::Action::Start, cx);
+            return;
+        }
         self.relay_id = Some(id.clone());
         self.relay_task = None;
         self.submit_relay(cx, move |ws, runner, model| {
