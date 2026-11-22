@@ -309,7 +309,7 @@ impl Studio {
                         },
                     )
                     .when(pending && !active && !self.lifecycle_preparing, |card| {
-                        card.child(self.relay_model_input()).child(
+                        card.child(self.relay_model_input(cx)).child(
                             button("dispatch-task-and-start", "派发并加入队列", true).on_click(
                                 cx.listener(|this, _, _, cx| this.dispatch_and_start(cx)),
                             ),
@@ -323,7 +323,11 @@ impl Studio {
                                 row.child(
                                     button("lifecycle-open-relay", "查看接力与日志", true)
                                         .on_click(cx.listener(move |this, _, w, cx| {
-                                            this.relay_id = relay_id.clone();
+                                            if let Some(id) = &relay_id {
+                                                this.select_relay_record(id, w, cx);
+                                            } else {
+                                                this.relay_id = None;
+                                            }
                                             if this.relay_id.is_none() {
                                                 this.relay_task = this
                                                     .lifecycle

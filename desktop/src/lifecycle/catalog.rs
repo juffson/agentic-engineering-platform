@@ -357,7 +357,7 @@ mod tests {
                 name: "test".into(),
                 sha: "spec".into(),
             },
-            model: String::new(),
+            agents: Default::default(),
             attempts: vec![attempt(Round::First, "first")],
             busy: true,
         };

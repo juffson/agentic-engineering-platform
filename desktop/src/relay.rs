@@ -1,3 +1,4 @@
+use aep::workflow::Client;
 use aep::{
     cancel::{Cancellation, Cancelled},
     studio::{Artifact, Run, Snapshot, preview},
@@ -36,9 +37,9 @@ pub(crate) enum Round {
 pub(crate) fn phase_label(name: &str) -> &'static str {
     match name {
         "preparing" => "准备工作区",
-        "implementing" => "Codex 实现",
+        "implementing" => "实现中",
         "checking" => "运行验收",
-        "reviewing" => "Claude 审查",
+        "reviewing" => "审查中",
         "complete" => "等待人工审查",
         _ => "启动执行器",
     }
@@ -91,11 +92,42 @@ impl Attempt {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct RelayAgents {
+    pub implementer: Client,
+    pub reviewer: Client,
+    // Keep the existing serialized Codex model field for older relay and queue records.
+    pub model: String,
+    pub zcode_model: String,
+}
+
+impl RelayAgents {
+    pub fn matches_evidence(&self, run: &serde_json::Value) -> bool {
+        matches!(self.implementer, Client::Codex | Client::ZCode)
+            && matches!(self.reviewer, Client::Claude | Client::ZCode)
+            && run["implementation_source"] == self.implementer.binary()
+            && run["reviewer"] == self.reviewer.binary()
+    }
+}
+
+impl Default for RelayAgents {
+    fn default() -> Self {
+        Self {
+            implementer: Client::Codex,
+            reviewer: Client::Claude,
+            model: String::new(),
+            zcode_model: String::new(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Relay {
     pub id: String,
     pub task: Task,
-    pub model: String,
+    #[serde(flatten)]
+    pub agents: RelayAgents,
     pub attempts: Vec<Attempt>,
     #[serde(skip)]
     pub busy: bool,
@@ -372,12 +404,18 @@ impl Lease {
             .is_some_and(|relay| relay.attempts.iter().any(|attempt| attempt.id == id)))
     }
 
-    pub fn start(&self, ws: &Workspace, runner: &Runner, task: Task, model: String) -> Result<()> {
+    pub fn start(
+        &self,
+        ws: &Workspace,
+        runner: &Runner,
+        task: Task,
+        agents: RelayAgents,
+    ) -> Result<()> {
         ensure!(self.read()?.is_none(), "此接力已存在");
         let mut relay = Relay {
             id: self.id.clone(),
             task,
-            model,
+            agents,
             attempts: Vec::new(),
             busy: false,
         };
@@ -398,7 +436,7 @@ impl Lease {
         runner: &Runner,
         round: Round,
         decision: Option<i64>,
-        model: String,
+        agents: RelayAgents,
     ) -> Result<()> {
         let mut relay = self.read()?.context("找不到接力记录")?;
         let snapshot = Snapshot::load(ws);
@@ -424,7 +462,7 @@ impl Lease {
         } else {
             None
         };
-        relay.model = model;
+        relay.agents = agents;
         launch(
             ws,
             runner,
@@ -442,11 +480,11 @@ pub(crate) fn start(
     runner: &Runner,
     id: String,
     task: Task,
-    model: String,
+    agents: RelayAgents,
 ) -> Result<()> {
     Lease::acquire(ws, &id)?
         .context("此接力正在执行")?
-        .start(ws, runner, task, model)
+        .start(ws, runner, task, agents)
 }
 
 pub(crate) fn advance(
@@ -455,11 +493,11 @@ pub(crate) fn advance(
     id: &str,
     round: Round,
     decision: Option<i64>,
-    model: String,
+    agents: RelayAgents,
 ) -> Result<()> {
     Lease::acquire(ws, id)?
         .context("此接力正在执行")?
-        .advance(ws, runner, round, decision, model)
+        .advance(ws, runner, round, decision, agents)
 }
 
 fn attempt_id(relay: &str, round: Round, completed: usize) -> String {
@@ -517,9 +555,9 @@ fn launch(
                 "--base",
                 &relay.task.sha,
                 "--implementer",
-                "codex",
+                relay.agents.implementer.binary(),
                 "--reviewer",
-                "claude",
+                relay.agents.reviewer.binary(),
                 "--shared-memory",
                 "--run-id",
                 &run_id,
@@ -531,8 +569,13 @@ fn launch(
             .stdin(Stdio::from(owner.try_clone()?))
             .stdout(log.try_clone()?)
             .stderr(log.try_clone()?);
-        if !relay.model.is_empty() {
-            command.args(["--codex-model", &relay.model]);
+        if relay.agents.implementer == Client::Codex && !relay.agents.model.is_empty() {
+            command.args(["--codex-model", &relay.agents.model]);
+        }
+        if [relay.agents.implementer, relay.agents.reviewer].contains(&Client::ZCode)
+            && !relay.agents.zcode_model.is_empty()
+        {
+            command.args(["--zcode-model", &relay.agents.zcode_model]);
         }
         if let Some(resume) = resume {
             command.args(["--resume-from", resume]);
@@ -600,6 +643,27 @@ impl Runner {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn old_and_mixed_relay_profiles_round_trip() -> Result<()> {
+        let legacy =
+            serde_json::json!({"id":"r","task":{"name":"t","sha":"s"},"model":"old","attempts":[]});
+        let mut relay: Relay = serde_json::from_value(legacy)?;
+        assert_eq!(relay.agents.model, "old");
+        assert_eq!(relay.agents.implementer, Client::Codex);
+        assert_eq!(relay.agents.reviewer, Client::Claude);
+        relay.agents.reviewer = Client::ZCode;
+        relay.agents.zcode_model = "team/model@high".into();
+        let restored: Relay = serde_json::from_slice(&serde_json::to_vec(&relay)?)?;
+        assert_eq!(restored.agents, relay.agents);
+        assert!(restored.agents.matches_evidence(
+            &serde_json::json!({"implementation_source":"codex","reviewer":"zcode"})
+        ));
+        assert!(!restored.agents.matches_evidence(
+            &serde_json::json!({"implementation_source":"codex","reviewer":"claude"})
+        ));
+        Ok(())
+    }
 
     #[test]
     fn executor_holds_the_relay_lease_after_studio_drops_it() -> Result<()> {

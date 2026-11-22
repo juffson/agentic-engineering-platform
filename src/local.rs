@@ -741,6 +741,7 @@ fn start(repo: &Repo, id: &str, rerun: bool) -> Result<ExitCode> {
         run::Base::Local(&pin.spec),
         Some("codex"),
         pin.codex_model.as_deref(),
+        None,
     )?;
     if let Some(reason) = blocked(&pin, &usage(&ticket.current.records(repo)?), false) {
         bail!("{reason}");

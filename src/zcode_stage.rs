@@ -9,6 +9,128 @@ use std::{
     process::{Command, Stdio},
 };
 
+/// Run one prompt through a ZCode app-server session and return the final assistant reply.
+/// Session and model evidence are saved into `dir`.
+pub fn converse(
+    binary: &Path,
+    dir: &Path,
+    mode: &str,
+    model: Option<&Value>,
+    prompt: &str,
+) -> Result<String> {
+    let mut server = Command::new(binary);
+    if (binary == Path::new(ZCODE_APP)
+        || binary
+            .canonicalize()
+            .is_ok_and(|p| p == Path::new(ZCODE_APP)))
+        && std::env::var_os("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE").is_none()
+    {
+        server.env(
+            "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+            "/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json",
+        );
+    }
+    let mut child = server
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("启动 ZCode app-server")?;
+    // The outer supervisor owns this process group and its deadline/cancel marker.
+    let talk = (|| -> Result<String> {
+        let mut input = child.stdin.take().context("ZCode stdin")?;
+        let output = BufReader::new(child.stdout.take().context("ZCode stdout")?);
+        let cwd = std::env::current_dir()?;
+        let session = format!("sess_{}", uuid::Uuid::new_v4().simple());
+        let mut create = json!({"sessionId":session,"workspace":{"workspaceKey":cwd,"workspacePath":cwd},"titleGenerationEnabled":false,"mode":mode});
+        if let Some(model) = model {
+            create["model"] = model.clone();
+        }
+        send(
+            &mut input,
+            json!({"id":1,"method":"session/create","params":create}),
+        )?;
+        for line in output.lines() {
+            let line = line?;
+            let msg: Value = serde_json::from_str(&line).context("无效的 ZCode 协议响应")?;
+            if let Some(method) = msg["method"].as_str() {
+                if !msg["id"].is_null() {
+                    let answer = match method {
+                        "session/requestRuntimePreferences" => {
+                            json!({"nativeSearchEnhancementsEnabled":false})
+                        }
+                        "interaction/requestOfficialMcpAuthHeaders" => json!({}),
+                        "session/readReplyLanguage" => json!({"language":null}),
+                        _ => bail!("ZCode 需要客户端交互 {method}，请核对本机工具权限后重试"),
+                    };
+                    send(&mut input, json!({"id":msg["id"],"result":answer}))?;
+                } else if method == "session/event" && msg["params"]["sessionId"] == session {
+                    let e = &msg["params"];
+                    match e["type"].as_str() {
+                        Some("turn.failed") => bail!("ZCode: {}", e["payload"]["error"]),
+                        Some("turn.completed") => send(
+                            &mut input,
+                            json!({"id":4,"method":"session/messages","params":{"sessionId":session,"limit":24}}),
+                        )?,
+                        Some("permission.requested" | "userInput.requested") => {
+                            bail!("ZCode 等待工具权限或用户输入，请核对本机设置后重试")
+                        }
+                        Some("turn.started" | "tool.updated") => eprintln!("ZCode · {}", e["type"]),
+                        _ => (),
+                    }
+                }
+                continue;
+            }
+            if let Some(error) = msg["error"]["message"].as_str() {
+                bail!("ZCode: {error}")
+            }
+            let result = &msg["result"];
+            match msg["id"].as_u64() {
+                Some(1) => {
+                    let actual = &result["settings"]["model"]["current"];
+                    if let Some(model) = &model {
+                        ensure!(
+                            actual["providerId"] == model["providerId"]
+                                && actual["modelId"] == model["modelId"],
+                            "ZCode 未选中指定模型"
+                        );
+                    }
+                    aep::project::save_json(
+                        dir,
+                        "session.json",
+                        &json!({"client":"ZCode","transport":"app-server","session":session}),
+                    )?;
+                    fs::write(
+                        dir.join("zcode-model.json"),
+                        serde_json::to_vec_pretty(actual)?,
+                    )?;
+                    send(
+                        &mut input,
+                        json!({"id":2,"method":"session/subscribe","params":{"sessionId":session,"deliveryKind":"desktop-continuous"}}),
+                    )?;
+                }
+                Some(2) => {
+                    let mut params = json!({"sessionId":session,"content":prompt});
+                    if let Some(selection) = model {
+                        params["modelSelection"] = selection.clone();
+                    }
+                    send(
+                        &mut input,
+                        json!({"id":3,"method":"session/send","params":params}),
+                    )?;
+                }
+                Some(3) => ensure!(result["accepted"] == true, "ZCode 未接受请求"),
+                Some(4) => return final_message(result),
+                _ => (),
+            }
+        }
+        bail!("ZCode 在返回交付物之前退出")
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    talk
+}
+
 fn send(out: &mut impl Write, v: Value) -> Result<()> {
     serde_json::to_writer(&mut *out, &v)?;
     writeln!(out)?;
@@ -57,118 +179,10 @@ pub fn run(binary: &Path, request: &Path) -> Result<()> {
         Role::Test | Role::Accept => "guarded",
         _ => "plan",
     };
-    let mut server = Command::new(binary);
-    if (binary == Path::new(ZCODE_APP)
-        || binary
-            .canonicalize()
-            .is_ok_and(|p| p == Path::new(ZCODE_APP)))
-        && std::env::var_os("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE").is_none()
-    {
-        server.env(
-            "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
-            "/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json",
-        );
-    }
-    let mut child = server
-        .arg("app-server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("启动 ZCode app-server")?;
-    // The outer supervisor owns this process group and its deadline/cancel marker.
-    let result = (|| -> Result<()> {
-        let mut input = child.stdin.take().context("ZCode stdin")?;
-        let output = BufReader::new(child.stdout.take().context("ZCode stdout")?);
-        let cwd = std::env::current_dir()?;
-        let session = format!("sess_{}", uuid::Uuid::new_v4().simple());
-        let mut create = json!({"sessionId":session,"workspace":{"workspaceKey":cwd,"workspacePath":cwd},"titleGenerationEnabled":false,"mode":mode});
-        if let Some(model) = &selection {
-            create["model"] = model.clone();
-        }
-        send(
-            &mut input,
-            json!({"id":1,"method":"session/create","params":create}),
-        )?;
-        for line in output.lines() {
-            let line = line?;
-            let msg: Value = serde_json::from_str(&line).context("无效的 ZCode 协议响应")?;
-            if let Some(method) = msg["method"].as_str() {
-                if !msg["id"].is_null() {
-                    let answer = match method {
-                        "session/requestRuntimePreferences" => {
-                            json!({"nativeSearchEnhancementsEnabled":false})
-                        }
-                        "interaction/requestOfficialMcpAuthHeaders" => json!({}),
-                        "session/readReplyLanguage" => json!({"language":null}),
-                        _ => bail!("ZCode 需要客户端交互 {method}，请核对本机工具权限后重试"),
-                    };
-                    send(&mut input, json!({"id":msg["id"],"result":answer}))?;
-                } else if method == "session/event" && msg["params"]["sessionId"] == session {
-                    let e = &msg["params"];
-                    match e["type"].as_str() {
-                        Some("turn.failed") => bail!("ZCode: {}", e["payload"]["error"]),
-                        Some("turn.completed") => send(
-                            &mut input,
-                            json!({"id":4,"method":"session/messages","params":{"sessionId":session,"limit":24}}),
-                        )?,
-                        Some("permission.requested" | "userInput.requested") => {
-                            bail!("ZCode 等待工具权限或用户输入，请核对本机设置后重试")
-                        }
-                        Some("turn.started" | "tool.updated") => eprintln!("ZCode · {}", e["type"]),
-                        _ => (),
-                    }
-                }
-                continue;
-            }
-            if let Some(error) = msg["error"]["message"].as_str() {
-                bail!("ZCode: {error}")
-            }
-            let result = &msg["result"];
-            match msg["id"].as_u64() {
-                Some(1) => {
-                    let actual = &result["settings"]["model"]["current"];
-                    if let Some(model) = &selection {
-                        ensure!(
-                            actual["providerId"] == model["providerId"]
-                                && actual["modelId"] == model["modelId"],
-                            "ZCode 未选中指定模型"
-                        );
-                    }
-                    aep::project::save_json(
-                        dir,
-                        "session.json",
-                        &json!({"client":"ZCode","transport":"app-server","session":session}),
-                    )?;
-                    fs::write(
-                        dir.join("zcode-model.json"),
-                        serde_json::to_vec_pretty(actual)?,
-                    )?;
-                    send(
-                        &mut input,
-                        json!({"id":2,"method":"session/subscribe","params":{"sessionId":session,"deliveryKind":"desktop-continuous"}}),
-                    )?;
-                }
-                Some(2) => {
-                    let mut params = json!({"sessionId":session,"content":fs::read_to_string(dir.join("prompt.txt"))?});
-                    if let Some(model) = &selection {
-                        params["modelSelection"] = model.clone();
-                    }
-                    send(
-                        &mut input,
-                        json!({"id":3,"method":"session/send","params":params}),
-                    )?;
-                }
-                Some(3) => ensure!(result["accepted"] == true, "ZCode 未接受请求"),
-                Some(4) => {
-                    println!("{}", final_message(result)?);
-                    return Ok(());
-                }
-                _ => (),
-            }
-        }
-        bail!("ZCode 在返回交付物之前退出")
-    })();
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+    let prompt = fs::read_to_string(dir.join("prompt.txt"))?;
+    println!(
+        "{}",
+        converse(binary, dir, mode, selection.as_ref(), &prompt)?
+    );
+    Ok(())
 }

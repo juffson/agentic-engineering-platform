@@ -109,19 +109,17 @@ pub fn save(out: &Path, name: &str, data: &impl Serialize) -> Result<()> {
 pub fn verify_reference(ws: &Workspace, run: &str, next: &Value, reference: &str) -> Result<()> {
     let folder = ws.data.join("runs").join(run);
     let handoff = read(&folder.join("handoff.json"))?;
-    let review = read(&folder.join("review-result.json"))?;
+    let review = fs::read_to_string(folder.join("review.txt"))?;
     ensure!(
         handoff["note"]
             .as_str()
             .is_some_and(|s| s.contains(reference))
             && handoff["question"] == "",
-        "Codex did not acknowledge the decision reference and close the question"
+        "Implementer did not acknowledge the decision reference and close the question"
     );
     ensure!(
-        review["structured_output"]["report"]
-            .as_str()
-            .is_some_and(|s| s.contains(reference)),
-        "Claude's report did not quote the decision reference"
+        review.contains(reference),
+        "Review report did not quote the decision reference"
     );
     let spec = next["spec_sha"].as_str().context("spec SHA")?;
     let candidate = next["candidate_sha"].as_str().context("candidate SHA")?;
@@ -158,13 +156,23 @@ pub fn export_runs<'a>(
             "review.txt",
             "review.log",
             "review-result.json",
+            "zcode-review-result.txt",
+            "zcode-review.log",
+            "zcode-edit/session.json",
+            "zcode-edit/zcode-model.json",
+            "zcode-edit/zcode-selection.json",
+            "zcode-plan/session.json",
+            "zcode-plan/zcode-model.json",
+            "zcode-plan/zcode-selection.json",
             "publication.json",
             "merge.json",
             "cleanup.json",
         ] {
             let path = source.join(file);
             if path.try_exists()? {
-                fs::copy(path, output.join(file))?;
+                let destination = output.join(file);
+                fs::create_dir_all(destination.parent().context("archive directory")?)?;
+                fs::copy(path, destination)?;
             }
         }
     }
@@ -232,8 +240,7 @@ impl Fixture {
                 && next["spec_sha"] == self.spec
                 && first_run["candidate_sha"] == next["requested_candidate_sha"]
                 && next["request"]["require_memory"] == decision_id
-                && next["implementation_source"] == "codex"
-                && next["reviewer"] == "claude",
+                && relay.agents.matches_evidence(&next),
             "第二轮与固定的候选、决策或客户端不一致"
         );
         let snapshot = aep::studio::Snapshot::load(ws);

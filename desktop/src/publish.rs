@@ -69,7 +69,7 @@ fn candidate(ws: &Workspace, relay_id: &str, id: &str) -> Result<Value> {
     ensure!(
         record["status"] == "awaiting_human_review"
             && record["check_exit_code"] == 0
-            && record["reviewer"] == "claude"
+            && relay.agents.matches_evidence(&record)
             && record["review_status"] == "findings_recorded"
             && record["task"] == relay.task.name
             && record["spec_sha"] == relay.task.sha,

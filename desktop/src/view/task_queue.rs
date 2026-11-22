@@ -68,9 +68,6 @@ impl Studio {
                         let changed = queue != this.task_queue;
                         let active = queue.running() != 0 || changed;
                         this.task_queue = queue;
-                        if this.page == Page::Relay && this.relay_id.is_none() {
-                            this.relay_id = this.current_queue_job().map(|job| job.relay.clone());
-                        }
                         if active && this.lifecycle.is_none() && this.page == Page::Lifecycle {
                             this.load_task_sessions(cx);
                         } else if active && this.lifecycle.is_some() {
@@ -107,7 +104,7 @@ impl Studio {
             cx.notify();
             return;
         };
-        let model = self.relay_model.read(cx).value().trim().to_owned();
+        let model = self.relay_agents(cx);
         let workspace = self.workspace_generation;
         let generation = self.queue_generation;
         self.relay_launching = true;

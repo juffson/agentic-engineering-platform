@@ -221,9 +221,11 @@ impl Fixture {
         );
         let user = gh(&source, &["api", "--hostname", "github.com", "user"])?;
         let actor = field(&user, "login")?.to_owned();
-        for (key, cli) in [("Codex", "codex"), ("Claude Code", "claude")] {
-            command(cli, &source, &["--version"])
-                .with_context(|| format!("install {key} before running the live workflow"))?;
+        if !studio {
+            for (key, cli) in [("Codex", "codex"), ("Claude Code", "claude")] {
+                command(cli, &source, &["--version"])
+                    .with_context(|| format!("install {key} before running the live workflow"))?;
+            }
         }
         let checkout = root.join("workspace/repo");
         fs::create_dir_all(checkout.parent().context("workspace directory")?)?;

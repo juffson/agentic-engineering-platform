@@ -1,9 +1,10 @@
 use super::*;
+use crate::relay::RelayAgents;
 use crate::{
     relay::{self, Relay, Round},
     task_queue::{Action, State},
 };
-use aep::project::RecordKind;
+use aep::{project::RecordKind, workflow::Client};
 
 impl Studio {
     pub(in crate::view) fn select_relay_record(
@@ -16,8 +17,8 @@ impl Studio {
             self.relay_id = Some(record.id.clone());
             self.relay_task = None;
             self.relay_error = None;
-            self.relay_model
-                .update(cx, |s, cx| s.set_value(&record.model, w, cx));
+            let agents = record.agents.clone();
+            self.set_relay_agents(&agents, w, cx);
             cx.notify();
         }
     }
@@ -77,8 +78,7 @@ impl Studio {
                     this.relay_task = Some(name.clone());
                     this.relay_id = None;
                     this.relay_error = None;
-                    this.relay_model
-                        .update(cx, |input, cx| input.set_value("", w, cx));
+                    this.set_relay_agents(&RelayAgents::default(), w, cx);
                     cx.notify();
                 })),
             );
@@ -192,10 +192,8 @@ impl Studio {
                 .child(
                     panel()
                         .child(heading("第一轮"))
-                        .child(caption(
-                            "Codex 实现，Claude 审查。运行会使用本机的模型账户和任务验收命令。",
-                        ))
-                        .child(self.relay_model_input())
+                        .child(caption("运行使用本机 CLI 账号和任务的验收命令。"))
+                        .child(self.relay_model_input(cx))
                         .when(!self.relay_launching && !pending, |card| {
                             card.child(button("start-relay", "发起第一轮", true).on_click(
                                 cx.listener(move |this, _, _, cx| {
@@ -245,12 +243,75 @@ impl Studio {
             )
     }
 
-    pub(super) fn relay_model_input(&self) -> Div {
-        v_flex().gap_1().child(caption("Codex 模型（可选）")).child(
-            Input::new(&self.relay_model)
-                .id("relay-model")
-                .aria_label("Codex 模型"),
-        )
+    pub(crate) fn relay_agents(&self, cx: &App) -> RelayAgents {
+        RelayAgents {
+            implementer: self.relay_implementer,
+            reviewer: self.relay_reviewer,
+            model: self.relay_model.read(cx).value().trim().to_owned(),
+            zcode_model: self.relay_zcode_model.read(cx).value().trim().to_owned(),
+        }
+    }
+
+    pub(crate) fn set_relay_agents(
+        &mut self,
+        agents: &RelayAgents,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.relay_implementer = agents.implementer;
+        self.relay_reviewer = agents.reviewer;
+        self.relay_model
+            .update(cx, |s, cx| s.set_value(&agents.model, w, cx));
+        self.relay_zcode_model
+            .update(cx, |s, cx| s.set_value(&agents.zcode_model, w, cx));
+    }
+
+    pub(super) fn relay_model_input(&self, cx: &Context<Self>) -> Div {
+        let mut form = v_flex().gap_1();
+        for (role, label, selected, default) in [
+            (
+                "implementer",
+                "实现端",
+                self.relay_implementer,
+                Client::Codex,
+            ),
+            ("reviewer", "审查端", self.relay_reviewer, Client::Claude),
+        ] {
+            let mut row = h_flex().gap_2().child(caption(label));
+            for client in [default, Client::ZCode] {
+                row = row.child(
+                    button(
+                        format!("relay-{role}-{}", client.binary()),
+                        client.label(),
+                        selected == client,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if role == "implementer" {
+                            this.relay_implementer = client;
+                        } else {
+                            this.relay_reviewer = client;
+                        }
+                        cx.notify();
+                    })),
+                );
+            }
+            form = form.child(row);
+        }
+        if self.relay_implementer == Client::Codex {
+            form = form.child(caption("Codex 模型（可选）")).child(
+                Input::new(&self.relay_model)
+                    .id("relay-model")
+                    .aria_label("Codex 模型"),
+            );
+        }
+        if [self.relay_implementer, self.relay_reviewer].contains(&Client::ZCode) {
+            form = form.child(caption("ZCode 模型（两端共用，可选）")).child(
+                Input::new(&self.relay_zcode_model)
+                    .id("relay-zcode-model")
+                    .aria_label("ZCode 模型"),
+            );
+        }
+        form
     }
 
     fn relay_round(&self, relay: &Relay, round: Round, cx: &Context<Self>) -> Div {
@@ -263,6 +324,19 @@ impl Studio {
             return card.child(caption("尚未发起"));
         };
         let run = relay.run(round, &self.snapshot);
+        if let Some(run) = run {
+            let request = &run.record["request"];
+            if let (Some(implementation), Some(review)) =
+                (request["source"].as_str(), request["reviewer"].as_str())
+            {
+                card = card.child(caption(format!(
+                    "实现端 {implementation}  ·  审查端 {review}"
+                )));
+                if let Some(model) = request["zcode_model"].as_str() {
+                    card = card.child(field("ZCode 模型", model));
+                }
+            }
+        }
         let (progress, tone) = match run.map(|run| run.text("status")) {
             Some("awaiting_human_review") if attempt.finalized() => ("合并与收尾已完成", MINT),
             Some("awaiting_human_review") if attempt.merged() => ("GitHub PR 已合并", MINT),
@@ -404,7 +478,7 @@ impl Studio {
     fn relay_controls(&self, relay: &Relay, cx: &Context<Self>) -> Div {
         let id = relay.id.clone();
         if !relay::passed(relay.run(Round::First, &self.snapshot)) {
-            return panel().child(self.relay_model_input()).child(
+            return panel().child(self.relay_model_input(cx)).child(
                 button("retry-relay-first", "重试第一轮", true).on_click(cx.listener(
                     move |this, _, _, cx| {
                         this.advance_relay(id.clone(), Action::RetryFirst, cx);
@@ -483,7 +557,7 @@ impl Studio {
             );
         }
         if !decisions.is_empty() {
-            card = card.child(self.relay_model_input());
+            card = card.child(self.relay_model_input(cx));
         }
         let action = if relay.latest(Round::Second).is_some() {
             "用此决策重试第二轮"

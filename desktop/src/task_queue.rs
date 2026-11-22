@@ -1,6 +1,6 @@
 use crate::{
     Runner, lifecycle,
-    relay::{Lease, Round, Task},
+    relay::{Lease, RelayAgents, Round, Task},
 };
 use aep::{
     cancel::{Cancellation, Cancelled},
@@ -69,7 +69,8 @@ pub(crate) struct Job {
     spec: String,
     pub relay: String,
     pub action: Action,
-    model: String,
+    #[serde(flatten)]
+    agents: RelayAgents,
     pub state: State,
     attempt: Option<String>,
     enqueued_at_ms: u128,
@@ -269,7 +270,7 @@ pub(crate) fn enqueue(
     fixture: &lifecycle::Fixture,
     relay: String,
     action: Action,
-    model: String,
+    agents: RelayAgents,
 ) -> Result<()> {
     let root = lifecycle::root(ws).context("找不到任务工作区")?;
     let sessions = source.data.join("lifecycle");
@@ -298,7 +299,7 @@ pub(crate) fn enqueue(
         spec: fixture.spec.clone(),
         relay,
         action,
-        model,
+        agents,
         state: State::Waiting,
         attempt: None,
         enqueued_at_ms: now(),
@@ -401,13 +402,17 @@ fn run(checkout: &Checkout, runner: &Runner, job: &Job) -> Result<()> {
                     name: job.task.clone(),
                     sha: job.spec.clone(),
                 },
-                job.model.clone(),
+                job.agents.clone(),
             )
         }
-        Action::RetryFirst => lease.advance(ws, runner, Round::First, None, job.model.clone()),
-        Action::Second { decision } => {
-            lease.advance(ws, runner, Round::Second, Some(decision), job.model.clone())
-        }
+        Action::RetryFirst => lease.advance(ws, runner, Round::First, None, job.agents.clone()),
+        Action::Second { decision } => lease.advance(
+            ws,
+            runner,
+            Round::Second,
+            Some(decision),
+            job.agents.clone(),
+        ),
     }
 }
 
@@ -581,7 +586,7 @@ mod tests {
             &fixture,
             format!("relay-{id}"),
             Action::Start,
-            String::new(),
+            RelayAgents::default(),
         )?;
         Ok(root)
     }
@@ -645,7 +650,7 @@ mod tests {
                 &fixture,
                 "relay-studio-a".into(),
                 Action::Start,
-                String::new(),
+                RelayAgents::default(),
             )
             .is_err()
         );
@@ -673,7 +678,7 @@ mod tests {
             &relay,
             "relay.json",
             &serde_json::json!({
-                "id": job.relay, "task": {"name": job.task, "sha": job.spec}, "model": job.model,
+                "id": job.relay, "task": {"name": job.task, "sha": job.spec}, "model": job.agents.model,
                 "attempts":[{"id":attempt,"round":"First","decision":null}]
             }),
         )?;
@@ -791,7 +796,7 @@ mod tests {
             &fixture,
             "relay-studio-a".into(),
             Action::Start,
-            String::new(),
+            RelayAgents::default(),
         )?;
         set_paused(&source, false)?;
         let mut reopened = Queue::read(&source)?;

@@ -169,13 +169,14 @@ aep dispatch --task <task> --rev <reviewed-sha>
 
 ### 客户端执行
 
-已在本地配置 Codex CLI 和 Claude Code、且仓库内容获准发送给对应模型供应商时，可选择实际客户端。该模式使用各自的模型账户与额度。
+已在本地配置 Codex CLI、Claude Code 或 ZCode、且仓库内容获准发送给对应模型供应商时，可选择实际客户端。该模式使用各自的模型账户与额度。实现端可选 Codex 或 ZCode，审查端可选 Claude 或 ZCode。
 
 ```sh
 aep run --task market-volume-dedup-rust --implementer codex --reviewer claude
+aep run --task market-volume-dedup-rust --implementer zcode --reviewer manual
 ```
 
-Codex 在独立 Worktree 生成候选提交。Claude 接收该版本的 Spec 和 Diff，禁用工具，审查文本保存在同一次运行的 `review.txt`。人工在 GitHub 查看 Diff、CI 和审查意见并决定是否批准。选用现有候选提交时可单独加 `--reviewer claude`。默认走人工审查，不会调用模型。协议测试用本地替身验证适配器调用，不消耗模型额度。
+Codex 在独立 Worktree 生成候选提交。Claude 接收该版本的 Spec 和 Diff，禁用工具，审查文本保存在同一次运行的 `review.txt`。ZCode 实现端以编辑模式执行附件中的任务，审查端以计划模式只读核对 Spec 与 Diff。指定模型时 ZCode 改走本机 app-server 会话并锁定所选模型。人工在 GitHub 查看 Diff、CI 和审查意见并决定是否批准。选用现有候选提交时可单独加 `--reviewer claude` 或 `--reviewer zcode`。默认走人工审查，不会调用模型。协议测试用本地替身验证适配器调用，不消耗模型额度。
 
 ### 两个 Agent 如何共享记忆
 
@@ -188,7 +189,9 @@ aep run --task market-volume-dedup-rust --implementer codex --reviewer claude --
 aep status --run-id market-handoff-001
 ```
 
-如果本机配置的模型不在当前 Codex 账号的可用列表中，可在上述 `run` 命令加上 `--codex-model <模型名>`。该选择只对这次 Run 生效，并记入执行证据。
+Studio 的「两轮接力」可分别选择实现端（Codex 或 ZCode）和审查端（Claude 或 ZCode）。第二轮或重试前可以更换客户端。两端都选 ZCode 时共用一个模型配置，各自在独立会话中执行。模型框留空使用 headless 默认配置，填写 `provider/model@档位` 会通过 app-server 锁定模型。模型与档位需已在本机 ZCode 配置；需要交互授权时，请查看该轮执行日志。已保存的接力和本地队列会保留所选配置，旧记录沿用 Codex 实现、Claude 审查。
+
+如果本机配置的模型不在当前 Codex 账号的可用列表中，可在上述 `run` 命令加上 `--codex-model <模型名>`。该选择只对这次 Run 生效，并记入执行证据。ZCode 的实现端或审查端可用 `--zcode-model provider/model` 或 `provider/model@推理档位` 指定模型，同样只对本次 Run 生效并记入证据。ZCode 的交接摘要和未决问题由最终答复末行的 `AEP-RELAY: {json}` 返回，验收通过后与 Codex 的结构化交接进入同一发布链路，审查端同样按 criterion、文件和行号校验阻断发现。
 
 | 范围 | 适合记录的内容 | 何时会被选中 |
 | --- | --- | --- |

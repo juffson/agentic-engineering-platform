@@ -7,8 +7,9 @@ use crate::{
 use aep::{
     cancel::{Cancellation, Cancelled},
     studio::{Artifact, artifact_file},
+    workflow::{Client, Profile},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -139,8 +140,40 @@ pub fn execute(
     args: &Execution,
     base: Base<'_>,
     implementer: Option<&str>,
-    model: Option<&str>,
+    codex_model: Option<&str>,
+    zcode_model: Option<&str>,
 ) -> Result<ExitCode> {
+    let implementer_client = match implementer {
+        None => None,
+        Some("codex") => Some(Client::Codex),
+        Some("zcode") => Some(Client::ZCode),
+        Some(other) => bail!("unsupported implementer client {other}"),
+    };
+    let reviewer_client = match args.reviewer.as_str() {
+        "manual" => None,
+        "claude" => Some(Client::Claude),
+        "zcode" => Some(Client::ZCode),
+        other => bail!("unsupported reviewer client {other}"),
+    };
+    ensure!(
+        codex_model.is_none() || implementer_client == Some(Client::Codex),
+        "--codex-model 需要 Codex 实现端"
+    );
+    ensure!(
+        zcode_model.is_none()
+            || implementer_client == Some(Client::ZCode)
+            || reviewer_client == Some(Client::ZCode),
+        "--zcode-model 需要 ZCode 实现端或审查端"
+    );
+    if let Some(model) = zcode_model {
+        Profile {
+            client: Client::ZCode,
+            executable: String::new(),
+            model: model.to_owned(),
+            check_command: String::new(),
+        }
+        .validate()?;
+    }
     let id = args
         .run_id
         .clone()
@@ -171,7 +204,7 @@ pub fn execute(
     };
     let source = implementer.unwrap_or("candidate");
     ensure!(
-        args.require_memory.is_none() || implementer.is_some() || args.reviewer == "claude",
+        args.require_memory.is_none() || implementer_client.is_some() || reviewer_client.is_some(),
         "required memory needs a model client"
     );
     let mut request = json!({
@@ -184,8 +217,11 @@ pub fn execute(
     if let Some(id) = args.require_memory {
         request["require_memory"] = json!(id);
     }
-    if let Some(m) = model {
+    if let Some(m) = codex_model {
         request["codex_model"] = json!(m);
+    }
+    if let Some(m) = zcode_model {
+        request["zcode_model"] = json!(m);
     }
     if args.whole_attempt {
         request["whole_attempt"] = json!(true);
@@ -229,6 +265,9 @@ pub fn execute(
                 .whole_attempt
                 .then(|| Instant::now() + Duration::from_secs(args.timeout)),
             run: &id,
+            implementer: implementer_client.unwrap_or(Client::Codex),
+            reviewer: reviewer_client.unwrap_or(Client::Claude),
+            zcode_model: zcode_model.map(str::to_owned),
             memory,
             require_memory: args.require_memory,
             cancellation: &cancellation,
@@ -262,7 +301,10 @@ pub fn execute(
                 &key,
                 &spec,
                 &task.allowed_paths,
-                model,
+                match implementer_client {
+                    Some(Client::ZCode) => zcode_model,
+                    _ => codex_model,
+                },
                 feedback.as_ref(),
                 &mut record,
             )?;
@@ -295,7 +337,7 @@ pub fn execute(
             agents.handoff(&key, &mut record)?;
             save(&folder, &record)?;
         }
-        if args.reviewer == "claude" {
+        if reviewer_client.is_some() {
             if let Some(budget) = &args.budget {
                 budget.check(&mut record, true)?;
             }

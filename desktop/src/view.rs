@@ -616,6 +616,12 @@ impl Render for Studio {
             return editor.render(ws, cx);
         }
         if self.page == Page::Relay {
+            if self.relay_id.is_none()
+                && self.relay_task.is_none()
+                && let Some(id) = self.current_queue_job().map(|job| job.relay.clone())
+            {
+                self.select_relay_record(&id, window, cx);
+            }
             return self.relay_page(cx);
         }
         if self.page == Page::Review {

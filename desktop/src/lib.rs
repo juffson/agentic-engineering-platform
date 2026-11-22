@@ -84,6 +84,9 @@ struct Studio {
     relay_id: Option<String>,
     relay_tasks: Vec<relay::Task>,
     relay_task: Option<String>,
+    relay_implementer: aep::workflow::Client,
+    relay_reviewer: aep::workflow::Client,
+    relay_zcode_model: Entity<InputState>,
     relay_model: Entity<InputState>,
     relay_error: Option<String>,
     tasks_loading: bool,
@@ -170,6 +173,12 @@ impl Studio {
             relay_id: None,
             relay_tasks: Vec::new(),
             relay_task: None,
+            relay_implementer: aep::workflow::Client::Codex,
+            relay_reviewer: aep::workflow::Client::Claude,
+            relay_zcode_model: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("provider/model[@档位] · 留空使用 ZCode 默认模型")
+            }),
             relay_model: cx
                 .new(|cx| InputState::new(window, cx).placeholder("由 Codex 本机配置决定")),
             relay_error: None,
@@ -346,8 +355,7 @@ impl Studio {
         self.relay_launching = false;
         self.review = None;
         self.pull_request = None;
-        self.relay_model
-            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.set_relay_agents(&relay::RelayAgents::default(), window, cx);
         self.loading = false;
         self.attach_task_queue(cx);
         self.navigate(page, window, cx);
@@ -509,7 +517,7 @@ impl Studio {
     fn submit_relay(
         &mut self,
         cx: &mut Context<Self>,
-        run: impl FnOnce(&Workspace, &Runner, String) -> Result<()> + Send + 'static,
+        run: impl FnOnce(&Workspace, &Runner, relay::RelayAgents) -> Result<()> + Send + 'static,
     ) {
         if self.relay_launching {
             return;
@@ -518,7 +526,7 @@ impl Studio {
             return;
         };
         let runner = self.runner.clone();
-        let model = self.relay_model.read(cx).value().trim().to_owned();
+        let model = self.relay_agents(cx);
         let generation = self.workspace_generation;
         self.relay_launching = true;
         self.relay_error = None;

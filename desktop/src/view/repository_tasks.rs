@@ -109,9 +109,7 @@ impl Studio {
                             _ => {
                                 if let Some(relay) = progress.relay {
                                     let id = relay.id;
-                                    this.relay_model.update(cx, |input, cx| {
-                                        input.set_value(relay.model.clone(), window, cx)
-                                    });
+                                    this.set_relay_agents(&relay.agents, window, cx);
                                     let second = relay
                                         .attempts
                                         .into_iter()

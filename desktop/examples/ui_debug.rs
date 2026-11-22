@@ -512,8 +512,11 @@ fn checked_run(ws: &Workspace, id: &str) -> Result<Value> {
     let record = status(&ws.data, id)?;
     ensure!(
         record["status"] == "awaiting_human_review"
-            && record["implementation_source"] == "codex"
-            && record["reviewer"] == "claude"
+            && matches!(
+                record["implementation_source"].as_str(),
+                Some("codex" | "zcode")
+            )
+            && matches!(record["reviewer"].as_str(), Some("claude" | "zcode"))
             && record["review_status"] == "findings_recorded"
             && record["check_exit_code"] == 0
             && record["approved"] == false,
@@ -753,6 +756,14 @@ fn studio_relay(args: &Args) -> Result<()> {
             "revision did not become a decision"
         );
         let decision = decision["id"].as_i64().context("decision ID")?;
+        for control in ["relay-implementer-zcode", "relay-reviewer-zcode"] {
+            ui.reveal("relay-detail", control)?;
+            ui.click(control)?;
+        }
+        ensure!(
+            !ui.absent("relay-zcode-model")? && ui.absent("relay-model")?,
+            "wrong model fields for two ZCode clients"
+        );
         let advance = format!("relay-continue-{decision}");
         ui.reveal("relay-detail", &advance)?;
         ui.checkpoint("studio-relay-decision")?;
@@ -762,6 +773,10 @@ fn studio_relay(args: &Args) -> Result<()> {
             .as_str()
             .context("second run ID")?;
         let second_run = checked_run(&ws, second)?;
+        ensure!(
+            second_run["request"]["source"] == "zcode" && second_run["reviewer"] == "zcode",
+            "second round ignored Studio client selection"
+        );
         ensure!(
             first_run["spec_sha"] == second_run["spec_sha"]
                 && first_run["candidate_sha"] == second_run["requested_candidate_sha"]
@@ -831,8 +846,9 @@ fn verify_publication(
     );
     ui.click("review-report")?;
     ensure!(
-        ui.element("review-content")?.label() == Some("Reviewed and verified the conversion.\n"),
-        "final review did not show Claude's report"
+        ui.element("review-content")?.label()
+            == Some("Reviewed the conversion and revised decision.\n"),
+        "final review did not show the second-round ZCode report"
     );
     ui.click("review-diff")?;
     ensure!(

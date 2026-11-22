@@ -134,6 +134,7 @@ pub fn studio_runner(root: &Path) -> Result<aep_studio::Runner> {
     for (name, script) in [
         ("codex", include_str!("handoff/studio-codex.sh")),
         ("claude", include_str!("handoff/studio-claude.sh")),
+        ("zcode", include_str!("handoff/studio-zcode.sh")),
         ("git", include_str!("handoff/studio-git.sh")),
         ("gh", include_str!("handoff/studio-gh.sh")),
     ] {
