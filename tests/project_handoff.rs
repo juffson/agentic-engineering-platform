@@ -444,3 +444,224 @@ fn directed_handoffs_and_site_overrides_are_scoped_to_the_selected_project() -> 
     );
     Ok(())
 }
+
+#[test]
+fn status_summarizes_https_records() -> Result<()> {
+    use serde_json::json;
+    let tmp = tempfile::tempdir()?;
+    let home = tmp.path().join("library");
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo)?;
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()?
+            .success()
+    );
+    let repo = repo.canonicalize()?;
+    let api = |args: &[&str]| call(&home, &repo, args);
+    api(&["create", "summary", "--repository", "."])?;
+    api(&["add-work", "other"])?;
+    api(&["add-work", "current"])?;
+    assert_eq!(api(&["status"])?["https"], json!([]));
+    let parent = aep::workspace::Workspace::open(&repo)?
+        .data
+        .join("https-studio");
+    let operator = tmp.path().join("operator-token");
+    let ca = tmp.path().join("private-ca");
+    fs::write(&operator, "fixture-token-content")?;
+    fs::write(&ca, "fixture-ca-content")?;
+    let request = json!({
+        "task":{"name":"task-one","secret":"nested-request-secret"},
+        "branch":{"name":"feature/one"}, "ticket":"https-task-one",
+        "endpoint":"https://localhost:4242/", "operator_file":operator, "ca":ca,
+        "extra":"request-secret"
+    });
+    let state = json!({"stage":"remote_checking","exit_code":1,"pr":42,
+        "reason":"验收未通过", "extra":"state-secret", "task":"wrong-task"});
+    let ids = [
+        "studio-good",
+        "studio-pending",
+        "studio-bad-request",
+        "studio-bad-state",
+        "studio-missing",
+        "studio-site",
+        "studio-token",
+        "studio-ca",
+        "studio-long",
+        "studio-unlinked",
+        "studio-other",
+    ];
+    for id in ids {
+        let dir = parent.join(id);
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("request.json"), serde_json::to_vec(&request)?)?;
+        fs::write(dir.join("state.json"), serde_json::to_vec(&state)?)?;
+        if id == "studio-unlinked" {
+            continue;
+        }
+        let work = if id == "studio-other" {
+            "other"
+        } else {
+            "current"
+        };
+        api(&[
+            "--work",
+            work,
+            "link-record",
+            "--repository",
+            ".",
+            "https",
+            id,
+        ])?;
+    }
+    fs::remove_file(parent.join("studio-pending/state.json"))?;
+    fs::write(parent.join("studio-bad-request/request.json"), b"{broken")?;
+    fs::write(parent.join("studio-bad-state/state.json"), b"[]")?;
+    fs::remove_dir_all(parent.join("studio-missing"))?;
+    for (id, secret) in [
+        ("studio-site", "localhost:4242"),
+        ("studio-token", operator.to_str().unwrap()),
+        ("studio-ca", ca.to_str().unwrap()),
+    ] {
+        let mut value = state.clone();
+        // Sensitive content after the display limit must still hide the entire reason.
+        value["reason"] = json!(format!("{} {secret}", "错".repeat(205)));
+        fs::write(
+            parent.join(id).join("state.json"),
+            serde_json::to_vec(&value)?,
+        )?;
+    }
+    let mut long = state.clone();
+    long["reason"] = json!("错".repeat(205));
+    fs::write(
+        parent.join("studio-long/state.json"),
+        serde_json::to_vec(&long)?,
+    )?;
+    // Persisted historical references can be invalid; status must not follow them.
+    let catalog = home.join("projects.json");
+    let mut library: Value = serde_json::from_slice(&fs::read(&catalog)?)?;
+    let records = library["projects"][0]["work"][1]["records"]
+        .as_array_mut()
+        .unwrap();
+    records.push(json!({"repository":repo,"kind":"https","id":"../studio-unlinked"}));
+    records.push(json!({"repository":repo,"kind":"relay","id":"relay-ignored"}));
+    fs::write(&catalog, serde_json::to_vec(&library)?)?;
+    let before = fs::read(&catalog)?;
+    let original_request = fs::read(parent.join("studio-good/request.json"))?;
+    let original_state = fs::read(parent.join("studio-good/state.json"))?;
+    let status = api(&["status"])?;
+    assert_eq!(
+        status["records"],
+        library["projects"][0]["work"][1]["records"]
+    );
+    let summaries = status["https"].as_array().unwrap();
+    assert_eq!(summaries.len(), 10);
+    let entry = |id: &str| summaries.iter().find(|s| s["id"] == id).unwrap();
+    assert_eq!(
+        entry("studio-good"),
+        &json!({"id":"studio-good","repository":repo,
+        "task":"task-one","branch":"feature/one","ticket":"https-task-one",
+        "stage":"remote_checking","exit_code":1,"pr":42,"reason":"验收未通过"})
+    );
+    assert_eq!(
+        entry("studio-pending"),
+        &json!({"id":"studio-pending","repository":repo,
+        "task":"task-one","branch":"feature/one","ticket":"https-task-one"})
+    );
+    for id in [
+        "studio-bad-request",
+        "studio-bad-state",
+        "../studio-unlinked",
+    ] {
+        assert_eq!(entry(id), &json!({"id":id,"error":"corrupt"}));
+    }
+    assert_eq!(
+        entry("studio-missing"),
+        &json!({"id":"studio-missing","error":"missing"})
+    );
+    for id in ["studio-site", "studio-token", "studio-ca"] {
+        assert_eq!(entry(id)["reason"], "已隐藏");
+    }
+    assert_eq!(entry("studio-long")["reason"], "错".repeat(200));
+    let output = serde_json::to_string(&status)?;
+    for secret in [
+        "localhost:4242",
+        operator.to_str().unwrap(),
+        ca.to_str().unwrap(),
+        "operator_file",
+        "fixture-token-content",
+        "request-secret",
+        "state-secret",
+        "nested-request-secret",
+    ] {
+        assert!(!output.contains(secret));
+    }
+    assert_eq!(fs::read(&catalog)?, before);
+    assert_eq!(
+        fs::read(parent.join("studio-good/request.json"))?,
+        original_request
+    );
+    assert_eq!(
+        fs::read(parent.join("studio-good/state.json"))?,
+        original_state
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn status_summarizes_https_records_confines_symlinks() -> Result<()> {
+    use aep::project::RecordKind;
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir()?;
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo)?;
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()?
+            .success()
+    );
+    let data = aep::workspace::Workspace::open(&repo)?.data;
+    let parent = data.join("https-studio");
+    fs::create_dir_all(&parent)?;
+    let outside = tmp.path().join("outside");
+    fs::create_dir(&outside)?;
+    fs::write(
+        outside.join("request.json"),
+        br#"{"task":{"name":"outside"},"branch":{"name":"outside"}}"#,
+    )?;
+    symlink(&outside, parent.join("studio-dir"))?;
+    // A link to a different record inside the same archive also crosses the item boundary.
+    let sibling = parent.join("studio-other");
+    fs::create_dir(&sibling)?;
+    fs::copy(outside.join("request.json"), sibling.join("request.json"))?;
+    symlink(&sibling, parent.join("studio-alias"))?;
+    let dir = parent.join("studio-file");
+    fs::create_dir(&dir)?;
+    symlink(outside.join("request.json"), dir.join("request.json"))?;
+    for id in ["studio-dir", "studio-file", "studio-alias"] {
+        assert_eq!(
+            RecordKind::Https.summary(&repo, id),
+            serde_json::json!({"id":id,"error":"corrupt"})
+        );
+    }
+    fs::remove_file(dir.join("request.json"))?;
+    fs::copy(outside.join("request.json"), dir.join("request.json"))?;
+    fs::write(outside.join("state.json"), b"{}")?;
+    symlink(outside.join("state.json"), dir.join("state.json"))?;
+    assert_eq!(
+        RecordKind::Https.summary(&repo, "studio-file")["error"],
+        "corrupt"
+    );
+    fs::remove_dir_all(&parent)?;
+    symlink(&outside, &parent)?;
+    assert_eq!(
+        RecordKind::Https.summary(&repo, "studio-dir")["error"],
+        "corrupt"
+    );
+    Ok(())
+}

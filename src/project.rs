@@ -92,6 +92,106 @@ pub enum RecordKind {
 }
 
 impl RecordKind {
+    /// Read only the linked record, without exposing connection fields or read errors.
+    pub fn summary(self, repository: &Path, id: &str) -> serde_json::Value {
+        use serde_json::json;
+
+        #[derive(Deserialize)]
+        struct Name {
+            name: String,
+        }
+        #[derive(Deserialize)]
+        struct Request {
+            task: Name,
+            branch: Name,
+            ticket: Option<String>,
+            endpoint: Option<String>,
+            ca: Option<String>,
+            operator_file: Option<String>,
+        }
+        #[derive(Default, Deserialize)]
+        struct State {
+            stage: Option<String>,
+            exit_code: Option<i32>,
+            pr: Option<u64>,
+            reason: Option<String>,
+        }
+        // Keep each record and its JSON files at their own archive paths.
+        fn confined(parent: &Path, name: &str) -> std::result::Result<PathBuf, &'static str> {
+            let path = parent.join(name);
+            if fs::symlink_metadata(&path)
+                .map_err(|_| "missing")?
+                .is_symlink()
+            {
+                return Err("corrupt");
+            }
+            Ok(path)
+        }
+        fn read<T: serde::de::DeserializeOwned>(
+            path: &Path,
+        ) -> std::result::Result<T, &'static str> {
+            if !fs::symlink_metadata(path).map_err(|_| "missing")?.is_file() {
+                return Err("corrupt");
+            }
+            let file = fs::File::open(path).map_err(|_| "missing")?;
+            serde_json::from_reader(std::io::BufReader::new(file)).map_err(|_| "corrupt")
+        }
+        let summarize = || -> std::result::Result<serde_json::Value, &'static str> {
+            if self != Self::Https
+                || !id.starts_with("studio-")
+                || id.len() > 100
+                || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            {
+                return Err("corrupt");
+            }
+            let ws = crate::workspace::Workspace::open(repository).map_err(|_| "missing")?;
+            if fs::symlink_metadata(&ws.data)
+                .map_err(|_| "missing")?
+                .is_symlink()
+            {
+                return Err("corrupt");
+            }
+            let parent = confined(&ws.data, "https-studio")?;
+            let dir = confined(&parent, id)?;
+            let req: Request = read(&confined(&dir, "request.json")?)?;
+            let mut summary = json!({"id":id,"repository":repository,
+                "task":req.task.name,"branch":req.branch.name,"ticket":req.ticket});
+            // Only an absent state is optional; unreadable or malformed state is an error.
+            match fs::symlink_metadata(dir.join("state.json")) {
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(summary),
+                Err(_) => return Err("missing"),
+                Ok(_) => {}
+            }
+            let state: State = read(&confined(&dir, "state.json")?)?;
+            let reason = state.reason.map(|reason| {
+                let site = req
+                    .endpoint
+                    .as_deref()
+                    .and_then(|s| url::Url::parse(s).ok());
+                let sensitive = [
+                    req.endpoint.as_deref(),
+                    site.as_ref().and_then(|s| s.host_str()),
+                    req.ca.as_deref(),
+                    req.operator_file.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|s| !s.is_empty() && reason.contains(s));
+                if sensitive {
+                    "已隐藏".to_owned()
+                } else {
+                    reason.chars().take(200).collect()
+                }
+            });
+            summary["stage"] = json!(state.stage);
+            summary["exit_code"] = json!(state.exit_code);
+            summary["pr"] = json!(state.pr);
+            summary["reason"] = json!(reason);
+            Ok(summary)
+        };
+        summarize().unwrap_or_else(|error| json!({"id":id,"error":error}))
+    }
+
     pub fn key(self) -> &'static str {
         match self {
             Self::Relay => "relay",
