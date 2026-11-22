@@ -1,12 +1,12 @@
 //! Use the installed ZCode app-server with its native settings or a pinned model.
-use aep::workflow::{Request, Role, ZCODE_APP};
+use aep::workflow::{Request, Role};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 /// Run one prompt through a ZCode app-server session and return the final assistant reply.
@@ -18,20 +18,7 @@ pub fn converse(
     model: Option<&Value>,
     prompt: &str,
 ) -> Result<String> {
-    let mut server = Command::new(binary);
-    if (binary == Path::new(ZCODE_APP)
-        || binary
-            .canonicalize()
-            .is_ok_and(|p| p == Path::new(ZCODE_APP)))
-        && std::env::var_os("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE").is_none()
-    {
-        server.env(
-            "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
-            "/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json",
-        );
-    }
-    let mut child = server
-        .arg("app-server")
+    let mut child = aep::zcode_catalog::app_server(binary)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -55,14 +42,7 @@ pub fn converse(
             let msg: Value = serde_json::from_str(&line).context("无效的 ZCode 协议响应")?;
             if let Some(method) = msg["method"].as_str() {
                 if !msg["id"].is_null() {
-                    let answer = match method {
-                        "session/requestRuntimePreferences" => {
-                            json!({"nativeSearchEnhancementsEnabled":false})
-                        }
-                        "interaction/requestOfficialMcpAuthHeaders" => json!({}),
-                        "session/readReplyLanguage" => json!({"language":null}),
-                        _ => bail!("ZCode 需要客户端交互 {method}，请核对本机工具权限后重试"),
-                    };
+                    let answer = aep::zcode_catalog::client_response(method)?;
                     send(&mut input, json!({"id":msg["id"],"result":answer}))?;
                 } else if method == "session/event" && msg["params"]["sessionId"] == session {
                     let e = &msg["params"];

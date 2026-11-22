@@ -18,6 +18,7 @@ impl Studio {
             self.relay_task = None;
             self.relay_error = None;
             let agents = record.agents.clone();
+            self.relay_form_round = None;
             self.set_relay_agents(&agents, w, cx);
             cx.notify();
         }
@@ -78,7 +79,8 @@ impl Studio {
                     this.relay_task = Some(name.clone());
                     this.relay_id = None;
                     this.relay_error = None;
-                    this.set_relay_agents(&RelayAgents::default(), w, cx);
+                    this.relay_form_round = None;
+                    this.reset_relay_agents(w, cx);
                     cx.notify();
                 })),
             );
@@ -243,6 +245,35 @@ impl Studio {
             )
     }
 
+    pub(crate) fn reset_relay_agents(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let agents = RelayAgents {
+            zcode_model: self.relay_project_default(),
+            ..Default::default()
+        };
+        self.set_relay_agents(&agents, w, cx);
+    }
+    pub(super) fn sync_relay_form(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(relay) = self
+            .relays
+            .iter()
+            .find(|r| Some(&r.id) == self.relay_id.as_ref())
+        else {
+            return;
+        };
+        let second = relay.latest(Round::Second).is_some()
+            || relay::passed(relay.run(Round::First, &self.snapshot));
+        let round = if second { Round::Second } else { Round::First };
+        let key = (relay.id.clone(), round);
+        if self.relay_form_round.as_ref() == Some(&key) {
+            return;
+        }
+        let mut agents = relay.agents.clone();
+        if second && relay.latest(Round::Second).is_none() {
+            agents.zcode_model = self.relay_project_default();
+        }
+        self.relay_form_round = Some(key);
+        self.set_relay_agents(&agents, w, cx);
+    }
     pub(crate) fn relay_agents(&self, cx: &App) -> RelayAgents {
         RelayAgents {
             implementer: self.relay_implementer,
@@ -258,6 +289,9 @@ impl Studio {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if [agents.implementer, agents.reviewer].contains(&Client::ZCode) {
+            self.ensure_zcode_catalog(cx);
+        }
         self.relay_implementer = agents.implementer;
         self.relay_reviewer = agents.reviewer;
         self.relay_model
@@ -291,6 +325,9 @@ impl Studio {
                         } else {
                             this.relay_reviewer = client;
                         }
+                        if client == Client::ZCode {
+                            this.ensure_zcode_catalog(cx);
+                        }
                         cx.notify();
                     })),
                 );
@@ -305,11 +342,7 @@ impl Studio {
             );
         }
         if [self.relay_implementer, self.relay_reviewer].contains(&Client::ZCode) {
-            form = form.child(caption("ZCode 模型（两端共用，可选）")).child(
-                Input::new(&self.relay_zcode_model)
-                    .id("relay-zcode-model")
-                    .aria_label("ZCode 模型"),
-            );
+            form = form.child(self.relay_zcode_picker(cx));
         }
         form
     }

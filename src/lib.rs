@@ -13,3 +13,4 @@ pub mod workflow;
 
 pub mod handoff;
 pub mod project;
+pub mod zcode_catalog;

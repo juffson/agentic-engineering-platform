@@ -622,6 +622,7 @@ impl Render for Studio {
             {
                 self.select_relay_record(&id, window, cx);
             }
+            self.sync_relay_form(window, cx);
             return self.relay_page(cx);
         }
         if self.page == Page::Review {

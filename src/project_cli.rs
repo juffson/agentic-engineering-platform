@@ -47,6 +47,15 @@ struct Routing {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// List providers, models and reasoning levels available to the local ZCode app.
+    ZcodeModels,
+    /// Show or update this project's ZCode default.
+    ZcodeDefault {
+        #[arg(long, conflicts_with = "clear")]
+        model: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// Create a Studio project and optionally associate local Git repositories.
     Create {
         name: String,
@@ -552,6 +561,29 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             .or(bound_work),
     };
     match opt.action {
+        Action::ZcodeModels => print(&aep::zcode_catalog::discover(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )?),
+        Action::ZcodeDefault { model, clear } => {
+            if let Some(model) = model {
+                let catalog =
+                    aep::zcode_catalog::discover(&std::env::var_os("PATH").unwrap_or_default())?;
+                ensure!(
+                    catalog.iter().any(|m| m.accepts(&model)),
+                    "本机 ZCode 未提供此模型或档位"
+                );
+                c.edit_project(|p| {
+                    p.set_zcode_default(model);
+                    Ok(())
+                })?;
+            } else if clear {
+                c.edit_project(|p| {
+                    p.set_zcode_default(String::new());
+                    Ok(())
+                })?;
+            }
+            print(&json!({"project":c.project()?.id,"model":c.project()?.zcode_default()}))
+        }
         Action::List => {
             let mut projects = vec![];
             for p in &c.library.projects {

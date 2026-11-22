@@ -1,6 +1,7 @@
 use super::*;
 mod agents;
 mod collaboration;
+mod zcode;
 use aep::project::{Kind, Library, Project, Work};
 use aep::workflow::{self, Client, Profile, Role as StageRole, Template};
 use anyhow::{Context as _, ensure};
@@ -20,6 +21,9 @@ enum Section {
 }
 pub(crate) struct Board {
     library: Library,
+    zcode_catalog: Option<Result<Vec<aep::zcode_catalog::Model>, String>>,
+    zcode_loading: bool,
+    zcode_draft: Option<(String, String)>,
     site_editor: Option<SiteEditor>,
     infra_view: Option<InfraView>,
     desk: Option<WorkDesk>,
@@ -78,6 +82,9 @@ impl Board {
         };
         Self {
             library,
+            zcode_catalog: None,
+            zcode_loading: false,
+            zcode_draft: None,
             site_editor: None,
             infra_view: None,
             desk: None,
@@ -274,6 +281,10 @@ impl Studio {
                 Err(e) => self.board.error = Some(e.to_string()),
                 _ => (),
             }
+        }
+        self.board.zcode_draft = None;
+        if section == Section::Settings {
+            self.ensure_zcode_catalog(cx);
         }
         if section == Section::Memory {
             self.board.editing_memory = None;

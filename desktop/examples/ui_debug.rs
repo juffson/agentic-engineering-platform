@@ -687,10 +687,29 @@ fn studio_relay(args: &Args) -> Result<()> {
     let runner = handoff_fixture::studio_runner(fixture.path())?;
     git(&ws.root, &["branch", "-M", "main"])?;
     git(&ws.root, &["push", "origin", "HEAD:refs/heads/main"])?;
+    let home = ws.data.join("studio-projects");
+    let mut library = aep::project::Library::open(&home)?;
+    library.change(&home, |lib| {
+        lib.create("relay defaults", vec![ws.root.clone()])?;
+        lib.project_mut()?.set_zcode_default("team/qa@high".into());
+        Ok(())
+    })?;
     let mut ui = Driver::open_with_runner(&ws, args, runner.clone())?;
     let result = (|| {
         ui.click("两轮接力")?;
         ui.click("relay-task-handoff")?;
+        ui.click("relay-reviewer-zcode")?;
+        ensure!(
+            ui.by_label("ZCode 模型")?.value() == Some("team/qa@high"),
+            "first round default missing"
+        );
+        ui.click("round-zcode-provider-0")?;
+        ui.click("round-zcode-level-0")?;
+        ensure!(
+            ui.by_label("ZCode 模型")?.value() == Some("team/qa@low"),
+            "first round override missing"
+        );
+        ui.click("relay-reviewer-claude")?;
         let fail = fixture.path().join("bin/fail-check");
         fs::write(&fail, [])?;
         ui.click("start-relay")?;
@@ -763,6 +782,20 @@ fn studio_relay(args: &Args) -> Result<()> {
         ensure!(
             !ui.absent("relay-zcode-model")? && ui.absent("relay-model")?,
             "wrong model fields for two ZCode clients"
+        );
+        ensure!(
+            ui.by_label("ZCode 模型")?.value() == Some("team/qa@high"),
+            "first round override leaked into second"
+        );
+        ui.reveal("relay-detail", "round-zcode-native")?;
+        ui.click("round-zcode-native")?;
+        ensure!(
+            aep::project::Library::open(&home)?
+                .project()
+                .unwrap()
+                .zcode_default()
+                == "team/qa@high",
+            "round changed project defaults"
         );
         let advance = format!("relay-continue-{decision}");
         ui.reveal("relay-detail", &advance)?;

@@ -163,9 +163,13 @@ impl Studio {
     }
 
     pub(super) fn project_settings(&self, p: &Project, cx: &Context<Self>) -> Div {
-        let mut body = v_flex().gap_3().child(heading("执行环境")).child(caption(
-            "每个关联仓库可指定 HTTPS 控制面。未指定时沿用这个仓库已有的站点连接。",
-        ));
+        let mut body = v_flex()
+            .gap_3()
+            .child(self.project_zcode_settings(p, cx))
+            .child(heading("执行环境"))
+            .child(caption(
+                "每个关联仓库可指定 HTTPS 控制面。未指定时沿用这个仓库已有的站点连接。",
+            ));
         if p.repositories.is_empty() {
             return body.child(
                 button("settings-add-repo", "关联第一个仓库", true).on_click(

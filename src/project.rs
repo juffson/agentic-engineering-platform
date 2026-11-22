@@ -410,6 +410,25 @@ impl Project {
             .find(|w| Some(&w.id) == self.selected.as_ref())
             .context("请选择开发事项")
     }
+    pub fn zcode_default(&self) -> &str {
+        self.preset(Client::ZCode).map_or("", |p| p.model.as_str())
+    }
+    pub fn set_zcode_default(&mut self, model: String) {
+        if let Some(profile) = self
+            .cli_defaults
+            .iter_mut()
+            .find(|p| p.client == Client::ZCode)
+        {
+            profile.model = model;
+        } else if !model.is_empty() {
+            self.cli_defaults.push(Profile {
+                client: Client::ZCode,
+                model,
+                executable: String::new(),
+                check_command: String::new(),
+            });
+        }
+    }
     pub fn preset(&self, client: Client) -> Option<&Profile> {
         self.cli_defaults.iter().find(|p| p.client == client)
     }

@@ -189,7 +189,9 @@ aep run --task market-volume-dedup-rust --implementer codex --reviewer claude --
 aep status --run-id market-handoff-001
 ```
 
-Studio 的「两轮接力」可分别选择实现端（Codex 或 ZCode）和审查端（Claude 或 ZCode）。第二轮或重试前可以更换客户端。两端都选 ZCode 时共用一个模型配置，各自在独立会话中执行。模型框留空使用 headless 默认配置，填写 `provider/model@档位` 会通过 app-server 锁定模型。模型与档位需已在本机 ZCode 配置；需要交互授权时，请查看该轮执行日志。已保存的接力和本地队列会保留所选配置，旧记录沿用 Codex 实现、Claude 审查。
+Studio 的「两轮接力」可分别选择实现端（Codex 或 ZCode）和审查端（Claude 或 ZCode）。第二轮或重试前可以更换客户端。两端都选 ZCode 时共用一个模型配置，各自在独立会话中执行。在「项目设置 → ZCode 项目默认模型」选择本机 provider、模型和推理档位，点击「保存项目默认」。每轮从项目默认开始，可在该轮改选或点「使用客户端默认」；重试会保留该轮已用的配置。「刷新本机模型」从本机 ZCode 的 app-server 重新读取可选项。选定模型后会通过 app-server 锁定它。模型与档位需已在本机 ZCode 配置；需要交互授权时，请查看该轮执行日志。已保存的接力和本地队列会保留所选配置，旧记录沿用 Codex 实现、Claude 审查。
+
+CLI 可用 `aep project zcode-models` 列出本机选项，`aep project zcode-default` 查看项目默认，`aep project zcode-default --model provider/model@档位` 保存，`--clear` 清除。
 
 如果本机配置的模型不在当前 Codex 账号的可用列表中，可在上述 `run` 命令加上 `--codex-model <模型名>`。该选择只对这次 Run 生效，并记入执行证据。ZCode 的实现端或审查端可用 `--zcode-model provider/model` 或 `provider/model@推理档位` 指定模型，同样只对本次 Run 生效并记入证据。ZCode 的交接摘要和未决问题由最终答复末行的 `AEP-RELAY: {json}` 返回，验收通过后与 Codex 的结构化交接进入同一发布链路，审查端同样按 criterion、文件和行号校验阻断发现。
 

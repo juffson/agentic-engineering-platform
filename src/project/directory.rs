@@ -45,6 +45,16 @@ pub struct DirectoryProject {
     pub bound_work: bool,
 }
 
+impl Project {
+    pub fn includes_workspace(&self, ws: &Workspace) -> bool {
+        self.repositories.contains(&ws.root)
+            || self
+                .repositories
+                .iter()
+                .any(|path| Workspace::open(path).is_ok_and(|other| other.data == ws.data))
+    }
+}
+
 impl DirectoryProject {
     pub fn resolve(
         ws: &Workspace,
@@ -112,11 +122,7 @@ impl DirectoryProject {
                 matches = library
                     .projects
                     .iter()
-                    .filter(|p| {
-                        p.repositories.iter().any(|path| {
-                            Workspace::open(path).is_ok_and(|other| other.data == ws.data)
-                        })
-                    })
+                    .filter(|p| p.includes_workspace(ws))
                     .collect();
             }
             if !matches

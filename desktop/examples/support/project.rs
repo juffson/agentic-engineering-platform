@@ -58,9 +58,17 @@ pub(super) fn run(args: &Args) -> Result<()> {
     let (ws, _) = fixture(&client)?;
     fixture(&worker)?;
     let binary = handoff_fixture::build_runner()?;
+    let clients = root.path().join("bin");
+    fs::create_dir(&clients)?;
+    fs::write(
+        clients.join("zcode"),
+        include_str!("handoff/studio-zcode.sh"),
+    )?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(clients.join("zcode"), fs::Permissions::from_mode(0o700))?;
     let runner = aep_studio::Runner {
         binary: Some(binary.clone()),
-        client_bin: None,
+        client_bin: Some(clients),
     };
     let data = ws.data.join("studio-projects/projects.json");
     let mut ui = Driver::open_with_runner(&ws, args, runner.clone())?;
@@ -231,6 +239,22 @@ pub(super) fn run(args: &Args) -> Result<()> {
         fs::write(&operator, "fixture-operator-file-only")?;
         archived_records(&worker_ws, &operator)?;
         ui.click("project-settings")?;
+        click(&mut ui, "project-zcode-provider-2")?;
+        click(&mut ui, "project-zcode-provider-0")?;
+        click(&mut ui, "project-zcode-model-1")?;
+        ensure!(
+            ui.absent("project-zcode-level-0")?,
+            "stale reasoning levels after switching model"
+        );
+        click(&mut ui, "project-zcode-model-0")?;
+        click(&mut ui, "project-zcode-level-0")?;
+        click(&mut ui, "project-zcode-save")?;
+        ensure!(
+            project_cli(&binary, &client, home, &["zcode-default"])?["model"] == "team/qa@low",
+            "wrong project ZCode default"
+        );
+        ui.checkpoint("project-zcode-default")?;
+
         click(&mut ui, "settings-edit-1")?;
         ensure!(
             ui.by_label("HTTPS 控制面")?.value() == Some("https://127.0.0.1:9123"),

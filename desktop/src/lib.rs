@@ -86,6 +86,7 @@ struct Studio {
     relay_task: Option<String>,
     relay_implementer: aep::workflow::Client,
     relay_reviewer: aep::workflow::Client,
+    relay_form_round: Option<(String, relay::Round)>,
     relay_zcode_model: Entity<InputState>,
     relay_model: Entity<InputState>,
     relay_error: Option<String>,
@@ -175,6 +176,7 @@ impl Studio {
             relay_task: None,
             relay_implementer: aep::workflow::Client::Codex,
             relay_reviewer: aep::workflow::Client::Claude,
+            relay_form_round: None,
             relay_zcode_model: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("provider/model[@档位] · 留空使用 ZCode 默认模型")
@@ -355,7 +357,8 @@ impl Studio {
         self.relay_launching = false;
         self.review = None;
         self.pull_request = None;
-        self.set_relay_agents(&relay::RelayAgents::default(), window, cx);
+        self.relay_form_round = None;
+        self.reset_relay_agents(window, cx);
         self.loading = false;
         self.attach_task_queue(cx);
         self.navigate(page, window, cx);
