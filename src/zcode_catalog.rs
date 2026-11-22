@@ -48,6 +48,9 @@ impl Model {
         level.map_or_else(|| base.clone(), |l| format!("{base}@{l}"))
     }
     pub fn default_selection(&self) -> String {
+        if desktop_plan(&self.id.provider_id).is_some() {
+            return self.selection(None);
+        }
         let levels = &self.reasoning.levels;
         self.selection(
             self.reasoning
@@ -58,6 +61,9 @@ impl Model {
         )
     }
     pub fn accepts(&self, selection: &str) -> bool {
+        if desktop_plan(&self.id.provider_id).is_some() {
+            return selection == self.selection(None);
+        }
         (self.reasoning.levels.is_empty() && selection == self.selection(None))
             || self
                 .reasoning
@@ -290,10 +296,15 @@ pub fn discover(path: &OsStr) -> Result<Vec<Model>> {
     Ok(models)
 }
 
-pub fn workspace_url(path: &str) -> String {
-    let mut url = url::Url::parse("zcode://workspace/open").expect("static workspace URL");
-    url.query_pairs_mut().append_pair("path", path);
-    url.into()
+/// Old project defaults can include a level from the manual desktop composer.
+pub fn effective_selection(selection: &str) -> &str {
+    if let Some((provider, _)) = selection.split_once('/')
+        && desktop_plan(provider).is_some()
+        && let Some((model, _)) = selection.rsplit_once('@')
+    {
+        return model;
+    }
+    selection
 }
 
 #[cfg(test)]
@@ -320,8 +331,9 @@ mod tests {
         }});
         let models = desktop_models(&local, &builtin);
         assert_eq!(models.len(), 3);
-        assert!(models[0].accepts(&format!("{start}/flash@max")));
-        assert!(models[1].accepts(&format!("{individual}/flash@low")));
+        assert_eq!(models[0].default_selection(), format!("{start}/flash"));
+        assert!(!models[0].accepts(&format!("{start}/flash@max")));
+        assert!(models[1].accepts(&format!("{individual}/flash")));
         assert!(models[2].accepts(&format!("{individual}/extra")));
     }
 }

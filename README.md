@@ -191,9 +191,19 @@ aep status --run-id market-handoff-001
 
 Studio 的「两轮接力」可分别选择实现端（Codex 或 ZCode）和审查端（Claude 或 ZCode）。第二轮或重试前可以更换客户端。两端都选 ZCode 时共用一个模型配置，各自在独立会话中执行。在「项目设置 → ZCode 项目默认模型」选择本机 provider、模型和推理档位，点击「保存项目默认」。每轮从项目默认开始，可在该轮改选或点「使用客户端默认」；重试会保留该轮已用的配置。「刷新本机模型」会读取本机 CLI 模型目录以及 ZCode 桌面已配置的 BigModel Start Plan、个人 Coding Plan 模型和推理档位。模型与档位需已在本机 ZCode 配置；需要交互授权时，请查看该轮执行日志。已保存的接力和本地队列会保留所选配置，旧记录沿用 Codex 实现、Claude 审查。
 
-选择 BigModel 桌面方案后，在本轮卡片点击「复制审查任务并打开 ZCode」（实现端为「复制实现任务并打开 ZCode」）。在打开的目录新建桌面任务，核对方案、模型和档位后粘贴发送。实现任务使用本轮隔离工作区，审查任务在项目下读取已固定的 Spec、Diff 和共享记忆。CLI 用户可在本轮的 `zcode-edit/desktop-request.json` 或 `zcode-plan/desktop-request.json` 中找到相同的目录和派发文本。
+使用 BigModel 桌面方案时，先安装 AEP 的 ZCode 扩展。在 AEP 仓库根目录运行：
 
-Studio 会自动收取桌面答复。回执按工作区、本次派发、桌面任务和对话轮次匹配，并逐条核对主对话实际记录的 provider、模型和推理档位。模型不符时本轮失败，诊断保存在运行目录。接力卡片显示桌面任务 ID、实际模型和交接摘要。桌面回执保存在对应角色目录的 `session.json` 中。该流程在 macOS 的 ZCode 3.19.1 上验证。
+```sh
+zcode=/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
+"$zcode" plugins marketplace add "$PWD/integrations/zcode"
+"$zcode" plugins install aep-studio@aep-local
+```
+
+打开 ZCode，在插件详情页给 aep-studio 授予会话权限。若已打开的 ZCode 尚未载入插件，可重新打开。之后在 Studio 为每轮选择方案和模型，点击开始即可。官方扩展按 ZCode 的新任务默认权限在对应本地项目中创建任务并发送本轮 Spec、Diff 和共享记忆。实现任务使用隔离工作区。桌面方案使用模型默认推理档位，旧配置中的手选档位在新派发时也按默认处理。普通 CLI 模型仍可指定档位。
+
+开始第二轮时，Studio 会把第一轮的运行 ID 与起始提交一起传给执行器。实现端和审查端都能读到该轮已发布的交接与审查记录，即使第二轮产生了新提交。记忆仍受任务、Spec 和大小上限约束，输入编号可在 `evidence.json` 的 `memory_inputs` 核对。
+
+每轮的 `zcode-edit` 或 `zcode-plan` 目录保留派发请求、扩展创建回执和最终回执。Studio 按目录、派发消息、会话和主对话用量核对方案与模型，再展示任务 ID、实际推理档位和交接摘要。
 
 CLI 可用 `aep project zcode-models` 列出本机选项，`aep project zcode-default` 查看项目默认，`aep project zcode-default --model provider/model@档位` 保存，`--clear` 清除。
 

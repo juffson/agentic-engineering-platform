@@ -171,6 +171,7 @@ pub struct Agents<'a> {
     pub zcode_model: Option<String>,
     pub memory: Option<Memory>,
     pub require_memory: Option<i64>,
+    pub handoff_from_run: Option<&'a str>,
     pub cancellation: &'a Cancellation,
 }
 impl Agents<'_> {
@@ -191,7 +192,12 @@ impl Agents<'_> {
         note: Option<&str>,
     ) -> Result<String> {
         if let Some(db) = &self.memory {
-            let entries = db.context_with_required(key, Some(self.run), self.require_memory)?;
+            let entries = db.context_with_handoff(
+                key,
+                Some(self.run),
+                self.require_memory,
+                self.handoff_from_run,
+            )?;
             record["memory_inputs"][role] =
                 json!(entries.iter().map(|n| &n["id"]).collect::<Vec<_>>());
             save(self.folder, record)?;

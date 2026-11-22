@@ -25,7 +25,8 @@ pub fn converse(
             .and_then(aep::zcode_catalog::desktop_plan)
             .is_some()
     {
-        return crate::zcode_desktop::converse(dir, desktop_workspace, mode, model, prompt)
+        let selection = json!({"providerId":model["providerId"], "modelId":model["modelId"]});
+        return crate::zcode_desktop::converse(dir, desktop_workspace, mode, &selection, prompt)
             .inspect_err(|e| {
                 let _ = aep::project::save_json(
                     dir,

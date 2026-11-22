@@ -729,6 +729,7 @@ fn start(repo: &Repo, id: &str, rerun: bool) -> Result<ExitCode> {
             run_id: Some(id.clone()),
             shared_memory: true,
             require_memory: None,
+            handoff_from_run: None,
             reviewer: "claude".into(),
             timeout: pin.timeout,
             whole_attempt: true,

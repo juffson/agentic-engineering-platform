@@ -579,6 +579,8 @@ fn launch(
         }
         if let Some(resume) = resume {
             command.args(["--resume-from", resume]);
+            let first = relay.latest(Round::First).context("缺少第一轮交接")?;
+            command.args(["--handoff-from-run", &first.id]);
         }
         if let Some(decision) = decision {
             command.args(["--require-memory", &decision.to_string()]);

@@ -7,6 +7,7 @@ mod project_cli;
 mod run;
 mod workflow_stage;
 mod zcode_desktop;
+mod zcode_desktop_send;
 mod zcode_stage;
 
 use anyhow::{Result, ensure};
@@ -114,6 +115,9 @@ struct Execution {
     /// Require this current memory version in each model client's context.
     #[arg(long, requires = "shared_memory")]
     require_memory: Option<i64>,
+    /// Include handoffs from the accepted run whose candidate this round resumes.
+    #[arg(long, requires = "shared_memory")]
+    handoff_from_run: Option<String>,
     #[arg(long, default_value="manual", value_parser=["manual","claude","zcode"])]
     reviewer: String,
     #[arg(long, default_value_t=600, value_parser=clap::value_parser!(u64).range(1..))]

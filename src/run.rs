@@ -214,6 +214,18 @@ pub fn execute(
     if args.shared_memory {
         request["shared_memory"] = json!(true);
     }
+    if let Some(prior) = &args.handoff_from_run {
+        let previous = status(repo, prior)?;
+        ensure!(
+            previous["status"] == "awaiting_human_review"
+                && previous["task"] == args.task
+                && previous["spec_sha"] == base
+                && args.candidate.is_some()
+                && previous["candidate_sha"].as_str() == args.candidate.as_deref(),
+            "previous handoff must match the successful run for this task, Spec and starting candidate"
+        );
+        request["handoff_from_run"] = json!(prior);
+    }
     if let Some(id) = args.require_memory {
         request["require_memory"] = json!(id);
     }
@@ -271,6 +283,7 @@ pub fn execute(
             zcode_model: zcode_model.map(str::to_owned),
             memory,
             require_memory: args.require_memory,
+            handoff_from_run: args.handoff_from_run.as_deref(),
             cancellation: &cancellation,
         };
         let initial = if let Some(rev) = &args.candidate {

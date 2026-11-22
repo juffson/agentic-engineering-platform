@@ -718,12 +718,7 @@ impl Studio {
                 );
             }
             if busy(&ev) {
-                if let Some(dispatch) = self.desktop_dispatch(
-                    &d,
-                    format!("workflow-zcode-desktop-{}", a.id),
-                    "阶段",
-                    cx,
-                ) {
+                if let Some(dispatch) = self.desktop_dispatch(&d, "阶段") {
                     bar = bar.child(dispatch);
                 }
                 let id = a.id.clone();

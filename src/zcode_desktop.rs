@@ -17,7 +17,7 @@ struct Reply {
     text: String,
 }
 
-fn find_message(
+pub(super) fn find_message(
     index: &Connection,
     db: &Connection,
     workspace: &str,
@@ -123,14 +123,20 @@ pub fn converse(
     let db = readonly(&home.join("cli/db/db.sqlite"))?;
     let workspace = workspace.canonicalize()?;
     let workspace = workspace.to_str().context("工作区路径必须为 UTF-8")?;
-    let marker = uuid::Uuid::new_v4().simple();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("desktop-dispatch.lock"))?;
+    lock.lock()?;
+    let marker = uuid::Uuid::new_v4().simple().to_string();
     let role = match mode {
         "edit" => "实现",
         "guarded" => "验收",
         _ => "审查",
     };
     let prompt_file = dir.join("desktop-prompt.txt");
-    fs::write(&prompt_file, prompt)?;
+
     let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("AEP");
     let run = if name.starts_with("zcode-") {
         dir.parent()
@@ -140,23 +146,40 @@ pub fn converse(
     } else {
         name
     };
-    let dispatch = format!(
-        "AEP {role} · {run} · {marker}\n请读取 {}，按其中任务返回最终答复和交接记录。",
-        prompt_file.display()
-    );
-    let since = chrono::Utc::now().timestamp_millis();
-    save_json(
-        dir,
-        "desktop-request.json",
-        &json!({"workspace":workspace,"dispatch":dispatch,"model":model,"mode":mode}),
-    )?;
-    eprintln!("在 ZCode 桌面打开 {workspace} 并新建任务，选择 {model} 后发送：\n{dispatch}");
-    let (task, message) = loop {
-        if let Some(pair) = find_message(&index, &db, workspace, since, &dispatch)? {
-            break pair;
-        }
-        std::thread::sleep(Duration::from_secs(1));
+    let instruction = if mode == "plan" {
+        "本轮只读取给定材料并返回审查意见，请勿修改项目文件。\n"
+    } else {
+        ""
     };
+    let dispatch = format!(
+        "AEP {role} · {run} · {marker}\n{instruction}\n{}",
+        prompt.trim_end()
+    );
+    let request = dir.join("desktop-request.json");
+    let job = if request.try_exists()? {
+        let saved = aep::workspace::read(&request)?;
+        ensure!(
+            saved["model"] == *model
+                && saved["mode"] == mode
+                && saved["workspace"] == workspace
+                && fs::read_to_string(&prompt_file)? == prompt,
+            "本轮已有不同的 ZCode 派发请求"
+        );
+        saved
+    } else {
+        fs::write(&prompt_file, prompt)?;
+        let job = json!({"requestId":marker,"workspace":workspace,"dispatch":dispatch,"model":model,"mode":mode,
+            "since":chrono::Utc::now().timestamp_millis()});
+        save_json(dir, "desktop-request.json", &job)?;
+        job
+    };
+    let (task, message) = crate::zcode_desktop_send::dispatch(
+        &index,
+        &db,
+        dir,
+        &job,
+        job["since"].as_i64().unwrap_or(0),
+    )?;
     save_json(
         dir,
         "desktop-task.json",
@@ -206,6 +229,9 @@ mod tests {
         assert!(find_message(&db, &db, "/checkout", 3, "unique dispatch")?.is_none());
         assert!(read_reply(&db, "/checkout", "s", "user", &model)?.is_none());
         db.execute("UPDATE turn_usage SET status='completed'", [])?;
+        let default = json!({"providerId":"plan","modelId":"glm"});
+        let actual = read_reply(&db, "/checkout", "s", "user", &default)?.unwrap();
+        assert_eq!(actual.evidence["reasoningLevel"], "max");
         let reply = read_reply(&db, "/checkout", "s", "user", &model)?.unwrap();
         assert_eq!(reply.text, "handoff");
         assert_eq!(reply.evidence["turn"], "t");

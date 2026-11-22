@@ -279,7 +279,10 @@ impl Studio {
             implementer: self.relay_implementer,
             reviewer: self.relay_reviewer,
             model: self.relay_model.read(cx).value().trim().to_owned(),
-            zcode_model: self.relay_zcode_model.read(cx).value().trim().to_owned(),
+            zcode_model: aep::zcode_catalog::effective_selection(
+                self.relay_zcode_model.read(cx).value().trim(),
+            )
+            .to_owned(),
         }
     }
 
@@ -296,8 +299,13 @@ impl Studio {
         self.relay_reviewer = agents.reviewer;
         self.relay_model
             .update(cx, |s, cx| s.set_value(&agents.model, w, cx));
-        self.relay_zcode_model
-            .update(cx, |s, cx| s.set_value(&agents.zcode_model, w, cx));
+        self.relay_zcode_model.update(cx, |s, cx| {
+            s.set_value(
+                aep::zcode_catalog::effective_selection(&agents.zcode_model),
+                w,
+                cx,
+            )
+        });
     }
 
     pub(super) fn relay_model_input(&self, cx: &Context<Self>) -> Div {
@@ -456,11 +464,11 @@ impl Studio {
                         && receipt["transport"] == "desktop"
                     {
                         let text = format!(
-                            "{} · {}/{} · {}",
+                            "{} · {}/{} · 实际档位 {}",
                             receipt["session"].as_str().unwrap_or(""),
                             receipt["providerId"].as_str().unwrap_or(""),
                             receipt["modelId"].as_str().unwrap_or(""),
-                            receipt["reasoningLevel"].as_str().unwrap_or("默认")
+                            receipt["reasoningLevel"].as_str().unwrap_or("未记录")
                         );
                         card = card.child(caption(format!("ZCode 桌面{role}回执"))).child(
                             detail_text(
@@ -470,12 +478,7 @@ impl Studio {
                         );
                     } else if run.text("status") == "running"
                         && run.text("phase") == phase
-                        && let Some(dispatch) = self.desktop_dispatch(
-                            &dir,
-                            format!("relay-{key}-desktop-{mode}"),
-                            role,
-                            cx,
-                        )
+                        && let Some(dispatch) = self.desktop_dispatch(&dir, role)
                     {
                         card = card.child(dispatch);
                     }

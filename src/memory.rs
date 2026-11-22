@@ -211,19 +211,42 @@ impl Memory {
         run: Option<&str>,
         required: Option<i64>,
     ) -> Result<Vec<Value>> {
+        self.context_with_handoff(k, run, required, None)
+    }
+
+    pub fn context_with_handoff(
+        &self,
+        k: &Key,
+        run: Option<&str>,
+        required: Option<i64>,
+        previous: Option<&str>,
+    ) -> Result<Vec<Value>> {
         let mut stmt = self.0.prepare(
             "SELECT n.* FROM notes n
              WHERE (scope='project' OR (task=?1 AND spec_sha=?2 AND
-                   (scope='task' OR (scope='candidate' AND candidate_sha=?3))))
+                   (scope='task' OR (scope='candidate' AND (candidate_sha=?3 OR (run_id=?6 AND kind IN ('review','handoff')))))))
                AND NOT EXISTS(SELECT 1 FROM notes successor WHERE successor.replaces=n.id)
-             ORDER BY CASE WHEN id=?5 THEN -1 WHEN run_id=?4 THEN 0 WHEN scope='candidate' THEN 1
+             ORDER BY CASE WHEN id=?5 THEN -3 WHEN run_id=?6 AND kind='review' THEN -2
+                           WHEN run_id=?4 THEN -1 WHEN run_id=?6 AND kind='handoff' THEN 0 WHEN scope='candidate' THEN 1
                            WHEN scope='task' THEN 2 ELSE 3 END, id DESC LIMIT 48",
         )?;
         let mut result = Vec::new();
         let mut bytes = 2;
-        for row in stmt.query_map(params![k.task, k.spec, k.candidate, run, required], note)? {
+        for row in stmt.query_map(
+            params![k.task, k.spec, k.candidate, run, required, previous],
+            note,
+        )? {
             let v = row?;
             let added = serde_json::to_vec(&v)?.len() + usize::from(!result.is_empty());
+            if bytes + added > 8192
+                && previous.is_some()
+                && v["run_id"].as_str() == previous
+                && v["kind"] == "review"
+            {
+                anyhow::bail!(
+                    "the previous review and required decision exceed the shared memory budget"
+                );
+            }
             if bytes + added <= 8192 {
                 bytes += added;
                 result.push(v);

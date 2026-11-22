@@ -147,3 +147,34 @@ fn manual_revision_of_an_agent_question_keeps_its_scope_and_provenance_chain() {
             .is_empty()
     );
 }
+
+#[test]
+fn relay_reads_the_preceding_review_on_the_new_candidate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = Memory::open(tmp.path()).unwrap();
+    let old = Key::new("task", "spec", "old");
+    let ids = db
+        .publish(
+            "reviewer",
+            "first",
+            &old,
+            &serde_json::json!({"note":"first handoff","question":""}),
+        )
+        .unwrap();
+    let next = Key::new("task", "spec", "next");
+    assert!(db.context(&next, Some("second")).unwrap().is_empty());
+    let notes = db
+        .context_with_handoff(&next, Some("second"), None, Some("first"))
+        .unwrap();
+    assert_eq!(notes[0]["id"], ids[0]);
+    assert!(
+        db.context_with_handoff(
+            &Key::new("task", "other", "next"),
+            Some("second"),
+            None,
+            Some("first")
+        )
+        .unwrap()
+        .is_empty()
+    );
+}

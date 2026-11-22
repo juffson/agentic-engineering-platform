@@ -20,9 +20,7 @@ impl Studio {
     pub(in crate::view) fn desktop_dispatch(
         &self,
         dir: &std::path::Path,
-        id: String,
         role: &str,
-        cx: &Context<Self>,
     ) -> Option<Div> {
         let job = aep::workspace::read(&dir.join("desktop-request.json")).ok()?;
         if let Ok(task) = aep::workspace::read(&dir.join("desktop-task.json")) {
@@ -31,15 +29,6 @@ impl Studio {
                 task["session"].as_str()?
             )));
         }
-        let path = job["workspace"].as_str()?;
-        let dispatch = job["dispatch"].as_str()?.to_owned();
-        let url = aep::zcode_catalog::workspace_url(path);
-        let action = button(id, format!("复制{role}任务并打开 ZCode"), true).on_click(cx.listener(
-            move |_, _, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(dispatch.clone()));
-                cx.open_url(&url);
-            },
-        ));
         let model = &job["model"];
         let level = model
             .pointer("/options/reasoningLevel")
@@ -47,15 +36,10 @@ impl Studio {
             .unwrap_or("默认");
         let provider = model["providerId"].as_str()?;
         let plan = aep::zcode_catalog::desktop_plan(provider).unwrap_or(provider);
-        Some(
-            v_flex()
-                .gap_1()
-                .child(caption(format!(
-                    "在 {path} 新建 ZCode 任务。选择 {plan} / {} / {level}，粘贴并发送。",
-                    model["modelId"].as_str()?
-                )))
-                .child(action),
-        )
+        Some(caption(format!(
+            "正在 ZCode 桌面创建{role}任务 · {plan} / {} / {level}",
+            model["modelId"].as_str()?
+        )))
     }
 
     pub(crate) fn relay_project_default(&self) -> String {
@@ -128,6 +112,7 @@ impl Studio {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let value = aep::zcode_catalog::effective_selection(&value).to_owned();
         match target {
             Target::Round => self
                 .relay_zcode_model
@@ -224,7 +209,9 @@ impl Studio {
                 ));
             }
             panel = panel.child(row);
-            if let Some((_, m)) = current.into_iter().find(|(_, m)| m.id.model_id == name)
+            if aep::zcode_catalog::desktop_plan(provider).is_some() {
+                panel = panel.child(caption("推理档位使用模型默认值，完成后显示实际档位。"));
+            } else if let Some((_, m)) = current.into_iter().find(|(_, m)| m.id.model_id == name)
                 && !m.reasoning.levels.is_empty()
             {
                 let mut row = h_flex().flex_wrap().gap_2().child(caption("推理档位"));
@@ -279,7 +266,7 @@ impl Studio {
     }
 
     pub(super) fn project_zcode_settings(&self, p: &Project, cx: &Context<Self>) -> Div {
-        let saved = p.zcode_default();
+        let saved = aep::zcode_catalog::effective_selection(p.zcode_default());
         let value = self
             .board
             .zcode_draft
