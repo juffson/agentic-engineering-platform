@@ -13,6 +13,7 @@ mod view;
 pub use relay::Runner;
 
 use aep::{
+    project::directory::DirectoryAction,
     studio::{Artifact, Snapshot, preview},
     workspace::Workspace,
 };
@@ -263,7 +264,7 @@ impl Studio {
             return;
         }
         let page = match self.page {
-            Page::Lifecycle | Page::HttpsPilot | Page::Local => self.page,
+            Page::Project | Page::Lifecycle | Page::HttpsPilot | Page::Local => self.page,
             _ => Page::Runs,
         };
         let dialog = cx.prompt_for_paths(PathPromptOptions {
@@ -283,7 +284,14 @@ impl Studio {
             .await;
             let _ = this.update_in(cx, |this, window, cx| match selection {
                 Ok(None) => (),
+                Ok(Some(ws)) if page == Page::Project => {
+                    this.open_project_repository(ws, DirectoryAction::Open, window, cx)
+                }
                 Ok(Some(ws)) => this.set_workspace(ws, page, window, cx),
+                Err(error) if page == Page::Project => {
+                    this.board.error = Some(format!("打开目录失败 {error:#}"));
+                    cx.notify();
+                }
                 Err(error) => {
                     this.repo_error = Some(format!("打开仓库失败：{error:#}"));
                     cx.notify();
@@ -560,12 +568,7 @@ pub fn open_studio(
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
-    match ws {
-        Some(ws) => {
-            open_window(Some(ws), Runner::default(), true, options, cx).map(|(window, _)| window)
-        }
-        None => open_project_window(None, options, cx),
-    }
+    open_project_window(ws.map(|ws| ws.root), options, cx)
 }
 
 /// Present the project library before Git resolves a working tree (which may be offline).
@@ -575,16 +578,17 @@ pub fn open_project_window(
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
     let (window, studio) = open_window(None, Runner::default(), true, options, cx)?;
-    let recent = recent::last_path();
     let explicit = path.is_some();
-    let Some(path) = path.or(recent.clone()) else {
+    let action = if explicit {
+        DirectoryAction::Open
+    } else {
+        DirectoryAction::Restore
+    };
+    let Some(path) = path.or_else(recent::last_path) else {
         return Ok(window);
     };
     window.update(cx, |_, w, cx| {
         studio.update(cx, |this, cx| {
-            if recent.as_ref() == Some(&path) {
-                this.adopt_first_repository(&path, cx);
-            }
             let generation = this.workspace_generation;
             let job = cx
                 .background_executor()
@@ -596,10 +600,7 @@ pub fn open_project_window(
                         return;
                     }
                     match result {
-                        Ok(ws) => {
-                            this.adopt_first_repository(&ws.root, cx);
-                            this.set_workspace(ws, Page::Project, w, cx);
-                        }
+                        Ok(ws) => this.open_project_repository(ws, action, w, cx),
                         Err(e) if explicit => {
                             this.board.error = Some(format!("打开仓库失败 {e:#}"));
                             cx.notify();

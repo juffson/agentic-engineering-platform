@@ -665,3 +665,127 @@ fn status_summarizes_https_records_confines_symlinks() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn directory_opens_the_cli_bound_catalog_and_item_without_duplicate_writes() -> Result<()> {
+    use aep::project::directory::{Binding, DirectoryAction, DirectoryProject};
+    use aep::workspace::Workspace;
+    let tmp = tempfile::tempdir()?;
+    let repo = tmp.path().join("sources");
+    let home = tmp.path().join("session-library");
+    let other = tmp.path().join("studio-library");
+    ensure!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()?
+            .success()
+    );
+    let api = |args: &[&str]| call(&home, &repo, args);
+    let project = api(&["create", "bound", "--repository", "."])?["project"].clone();
+    let work = api(&["add-work", "review"])?["work"].clone();
+    api(&["bind"])?;
+    api(&["add-work", "another"])?;
+    api(&["create", "last opened"])?;
+    let dir = repo.join("src");
+    fs::create_dir(&dir)?;
+    let ws = Workspace::open(&dir)?;
+    let restored = DirectoryProject::resolve(&ws, &other, None, DirectoryAction::Restore)?;
+    assert_eq!(restored.library.project().unwrap().name, "last opened");
+    assert!(!restored.bound_work);
+    let opened = DirectoryProject::resolve(&ws, &other, None, DirectoryAction::Open)?;
+    assert!(opened.bound_work);
+    assert_eq!(opened.home, home);
+    assert_eq!(opened.library.active.as_deref(), project.as_str());
+    assert_eq!(
+        opened.library.project().unwrap().selected.as_deref(),
+        work.as_str()
+    );
+    let revision = opened.library.revision;
+    assert_eq!(
+        DirectoryProject::resolve(&ws, &other, None, DirectoryAction::Open)?
+            .library
+            .revision,
+        revision
+    );
+    assert!(!other.exists());
+    let explicit = DirectoryProject::resolve(&ws, &other, Some(&other), DirectoryAction::Open)?;
+    assert!(!explicit.bound_work);
+    assert_eq!(explicit.home, other);
+    let file = Binding::file(&repo).unwrap();
+    let mut stale = Binding::read(&file)?.unwrap();
+    stale.work = "missing".into();
+    fs::write(&file, serde_json::to_vec(&stale)?)?;
+    assert!(DirectoryProject::resolve(&ws, &other, None, DirectoryAction::Open).is_err());
+    assert_eq!(aep::project::Library::open(&home)?.revision, revision);
+    Ok(())
+}
+
+#[test]
+fn directory_matches_linked_worktrees_without_guessing_between_projects() -> Result<()> {
+    use aep::project::directory::{DirectoryAction, DirectoryProject};
+    use aep::workspace::{Workspace, git};
+    let tmp = tempfile::tempdir()?;
+    let home = tmp.path().join("catalog");
+    let repo = tmp.path().join("repo");
+    let tree = tmp.path().join("tree");
+    fs::create_dir(&repo)?;
+    git(&repo, &["init", "-q"])?;
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+    )?;
+    git(
+        &repo,
+        &["worktree", "add", "-q", "--detach", tree.to_str().unwrap()],
+    )?;
+    let api = |args: &[&str]| call(&home, &repo, args);
+    api(&["create", "first", "--repository", "."])?;
+    api(&["create", "unrelated"])?;
+    let ws = Workspace::open(&tree)?;
+    assert_eq!(
+        DirectoryProject::resolve(&ws, &home, None, DirectoryAction::Open)?
+            .library
+            .project()
+            .unwrap()
+            .name,
+        "first"
+    );
+    api(&["create", "second", "--repository", "."])?;
+    assert_eq!(
+        DirectoryProject::resolve(&ws, &home, None, DirectoryAction::Open)?
+            .library
+            .project()
+            .unwrap()
+            .name,
+        "second"
+    );
+    api(&["--project", "unrelated", "open"])?;
+    assert!(DirectoryProject::resolve(&ws, &home, None, DirectoryAction::Open).is_err());
+    let unlinked = tmp.path().join("new");
+    fs::create_dir(&unlinked)?;
+    git(&unlinked, &["init", "-q"])?;
+    assert!(
+        DirectoryProject::resolve(
+            &Workspace::open(&unlinked)?,
+            &home,
+            None,
+            DirectoryAction::Open
+        )
+        .is_err()
+    );
+    assert_eq!(
+        aep::project::Library::open(&home)?.project().unwrap().name,
+        "unrelated"
+    );
+    Ok(())
+}

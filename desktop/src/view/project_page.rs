@@ -47,6 +47,7 @@ pub(crate) struct Board {
     editing_memory: Option<i64>,
     memory_note: Entity<TextareaState>,
     pub(crate) error: Option<String>,
+    sync_message: Option<String>,
     statuses: BTreeMap<PathBuf, String>,
     generation: u64,
 }
@@ -63,23 +64,13 @@ impl Board {
             ws.map(|w| w.data.join("studio-projects"))
         };
         let mut error = None;
-        let mut library = dir
+        let library = dir
             .as_ref()
             .map_or_else(|| Ok(Library::default()), |d| Library::open(d))
             .unwrap_or_else(|e| {
                 error = Some(format!("{e:#}"));
                 Library::default()
             });
-        if remember
-            && error.is_none()
-            && library.projects.is_empty()
-            && let (Some(ws), Some(dir)) = (ws, dir.as_ref())
-        {
-            let name = basename(&ws.root);
-            if let Err(e) = library.change(dir, |lib| lib.create(&name, vec![ws.root.clone()])) {
-                error = Some(format!("{e:#}"));
-            }
-        }
         let section = if library.project().is_some() {
             Section::Overview
         } else {
@@ -124,6 +115,7 @@ impl Board {
                 TextareaState::new(window, cx).placeholder("写下对项目内所有阶段有效的决定…")
             }),
             error,
+            sync_message: None,
             statuses: BTreeMap::new(),
             generation: 0,
         }
@@ -161,14 +153,86 @@ fn input_field(id: &'static str, field: &Entity<InputState>) -> Div {
 }
 
 impl Studio {
-    pub(crate) fn adopt_first_repository(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if self.board.library.projects.is_empty()
-            && self.board.error.is_none()
-            && self.board.new_project.read(cx).value().trim().is_empty()
-            && self.change_board(cx, |lib| lib.create(&basename(path), vec![path.to_owned()]))
-        {
-            self.board.section = Section::Overview;
+    pub(crate) fn open_project_repository(
+        &mut self,
+        ws: Workspace,
+        action: aep::project::directory::DirectoryAction,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let default_home = if self.remember_repository {
+            crate::recent::storage()
+        } else {
+            self.board.dir.clone()
+        };
+        let explicit_home = std::env::var_os("AEP_PROJECT_HOME").map(PathBuf::from);
+        let result = default_home.context("找不到项目库目录").and_then(|dir| {
+            aep::project::directory::DirectoryProject::resolve(
+                &ws,
+                &dir,
+                explicit_home.as_deref(),
+                action,
+            )
+        });
+        match result {
+            Ok(target) => {
+                self.board.dir = Some(target.home);
+                self.board.library = target.library;
+                self.board.note_key = None;
+                self.board.desk = None;
+                self.board.log_view = None;
+                self.set_workspace(ws, Page::Project, w, cx);
+                self.section(
+                    if target.bound_work {
+                        Section::Work
+                    } else {
+                        Section::Overview
+                    },
+                    w,
+                    cx,
+                );
+                self.sync_feedback();
+            }
+            Err(e) => {
+                self.board.sync_message = None;
+                self.board.error = Some(format!("{e:#}"));
+            }
         }
+        cx.notify();
+    }
+    fn sync_feedback(&mut self) {
+        self.board.sync_message = Some(match self.board.library.project() {
+            Some(p) => format!("已同步 · {} · {} 个开发事项", p.name, p.work.len()),
+            None => "已同步项目库".into(),
+        });
+    }
+    fn sync_project(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let result = self
+            .board
+            .dir
+            .as_deref()
+            .context("找不到项目库目录")
+            .and_then(Library::open);
+        self.board.error = None;
+        match result {
+            Ok(latest) => {
+                if latest.revision != self.board.library.revision {
+                    self.accept_catalog(latest, w, cx);
+                }
+                if self.board.section == Section::Work {
+                    self.refresh_work(cx);
+                } else if self.board.section == Section::Memory {
+                    self.refresh_project_memory(cx);
+                }
+                self.watch_agents(cx);
+                self.sync_feedback();
+            }
+            Err(e) => {
+                self.board.sync_message = None;
+                self.board.error = Some(format!("{e:#}"));
+            }
+        }
+        cx.notify();
     }
     fn change_board(
         &mut self,
@@ -194,6 +258,7 @@ impl Studio {
     fn section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.page = Page::Project;
         self.board.section = section;
+        self.board.sync_message = None;
         self.board.site_editor = None;
         self.board.infra_view = None;
         self.board.pick_record = false;
@@ -540,6 +605,17 @@ impl Studio {
                 IconName::BookOpen,
                 cx,
             ));
+        if self.page == Page::Project {
+            rail = rail
+                .child(
+                    button("project-open-directory", "打开项目目录…", false)
+                        .on_click(cx.listener(|this, _, w, cx| this.choose_repo(w, cx))),
+                )
+                .child(
+                    button("project-sync", "立即同步", false)
+                        .on_click(cx.listener(|this, _, w, cx| this.sync_project(w, cx))),
+                );
+        }
         if let Some(p) = project {
             rail = rail
                 .child(caption(p.name.clone()).truncate().mt_4().px_2())
@@ -609,6 +685,8 @@ impl Studio {
             .p_6();
         if let Some(error) = &self.board.error {
             page = page.child(detail_text("project-error", error).text_color(rgb(AMBER)));
+        } else if let Some(message) = &self.board.sync_message {
+            page = page.child(detail_text("project-sync-result", message));
         }
         if self.board.section == Section::Library || project.is_none() {
             page = page.child(self.library_view(cx));

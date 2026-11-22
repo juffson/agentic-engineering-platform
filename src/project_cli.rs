@@ -1,5 +1,6 @@
 //! The project workflow entry point used from shells and existing agent sessions.
 use crate::workflow_stage;
+use aep::project::directory::Binding;
 use aep::{
     cancel::Cancellation,
     handoff,
@@ -391,21 +392,6 @@ fn view(work: &Work, project: &Project, dir: &Path) -> Result<Value> {
         json!({"project":project.id,"work":work.id,"name":work.name,"template":work.template,"stage_name":work.stage_name(),"stage":(work.stage<work.notes.len()).then_some(work.stage+1),"repositories":work.repositories,"records":work.records,"https":https,"handoffs":work.handoffs,"stages":work.template.stages().iter().enumerate().map(|(i,s)|json!({"stage":i+1,"name":s.name,"profile":work.profile(i),"attempt":work.current_attempt.get(&i)})).collect::<Vec<_>>(),"attempts":attempts}),
     )
 }
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Binding {
-    home: PathBuf,
-    project: String,
-    work: String,
-}
-fn binding_file(cwd: &Path) -> Option<PathBuf> {
-    let git = aep::workspace::git(cwd, &["rev-parse", "--absolute-git-dir"]).ok()?;
-    Some(
-        Path::new(git.trim())
-            .join("aep")
-            .join("project-binding.json"),
-    )
-}
-
 struct Catalog {
     dir: PathBuf,
     library: Library,
@@ -538,12 +524,8 @@ impl Catalog {
     }
 }
 pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
-    let file = binding_file(cwd);
-    let binding: Option<Binding> = file
-        .as_ref()
-        .filter(|p| p.is_file())
-        .map(|p| serde_json::from_reader(fs::File::open(p)?).context("无法读取项目绑定"))
-        .transpose()?;
+    let file = Binding::file(cwd);
+    let binding = file.as_deref().map(Binding::read).transpose()?.flatten();
     let explicit_home = opt
         .home
         .or_else(|| std::env::var_os("AEP_PROJECT_HOME").map(PathBuf::from));

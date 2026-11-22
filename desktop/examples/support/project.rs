@@ -207,16 +207,25 @@ pub(super) fn run(args: &Args) -> Result<()> {
         ui.frame(|w, _| w.remove_window())?;
         ui = Driver::open_with_runner(&ws, args, runner.clone())?;
         ui.click("back-to-project")?;
-        ui.click("project-library")?;
+        let home = data.parent().unwrap();
         let id = catalog["active"].as_str().unwrap();
-        ui.click(&format!("project-open-{id}"))?;
+        project_cli(&binary, &client, home, &["--project", id, "open"])?;
+        ensure!(
+            !ui.absent("project-open-directory")?,
+            "missing folder picker"
+        );
+        ui.click("project-sync")?;
+        ensure!(
+            !ui.absent("project-sync-result")?,
+            "manual sync did not report completion"
+        );
+        ui.checkpoint("project-manual-sync")?;
         ui.click("project-work")?;
         click(&mut ui, "project-stage-1")?;
         ensure!(
             ui.by_label("阶段记录")?.value() == Some("Studio 保存进度，Worker 保留执行回执。"),
             "design record lost after restart"
         );
-        let home = data.parent().unwrap();
         let worker_ws = Workspace::open(&worker)?;
         let operator = root.path().join("operator");
         fs::write(&operator, "fixture-operator-file-only")?;

@@ -1,3 +1,4 @@
+pub mod directory;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{

@@ -201,6 +201,53 @@ impl Studio {
         );
         Ok(Some(fs::read_to_string(d.join("result.txt"))?))
     }
+    pub(super) fn accept_catalog(
+        &mut self,
+        latest: Library,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let draft = self
+            .board
+            .library
+            .project()
+            .and_then(Project::selected)
+            .is_some_and(|item| {
+                let s = self.board.viewing;
+                item.notes.get(s).is_some_and(|n| {
+                    n != self.board.note.read(cx).value().as_str()
+                        || item.profile(s) != self.chosen_profile(cx)
+                })
+            });
+        let selected = latest.project().and_then(Project::selected).map(|i| &i.id);
+        let switched = selected
+            != self
+                .board
+                .library
+                .project()
+                .and_then(Project::selected)
+                .map(|i| &i.id);
+        let follow = switched
+            || self
+                .board
+                .library
+                .project()
+                .and_then(Project::selected)
+                .is_none_or(|item| {
+                    self.board.viewing == item.stage.min(item.notes.len().saturating_sub(1))
+                });
+        self.board.library = latest;
+        if self.board.section == Section::Work && (!draft || switched) {
+            self.board.note_key = None;
+            if follow {
+                self.load_stage(w, cx);
+            } else {
+                self.show_stage(self.board.viewing, w, cx);
+            }
+        }
+        self.watch_agents(cx);
+        cx.notify();
+    }
     pub(in crate::view) fn watch_project_catalog(
         &mut self,
         window: &mut Window,
@@ -209,11 +256,8 @@ impl Studio {
         if self.board.catalog_polling {
             return;
         }
-        let Some(dir) = self.board.dir.clone() else {
-            return;
-        };
         self.board.catalog_polling = true;
-        let path = dir.join("projects.json");
+        let mut watched_dir = None;
         let stamp = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
         let mut last = None;
         let mut last_memory = None;
@@ -226,54 +270,21 @@ impl Studio {
                         this.board.catalog_polling = false;
                         return false;
                     }
-                    let current = stamp(&path);
+                    let Some(dir) = this.board.dir.as_ref() else {
+                        return true;
+                    };
+                    if watched_dir.as_ref() != Some(dir) {
+                        watched_dir = Some(dir.clone());
+                        last = None;
+                        last_memory = None;
+                    }
+                    let current = stamp(&dir.join("projects.json"));
                     if current != last {
                         last = current;
-                        if let Ok(latest) = Library::open(&dir)
+                        if let Ok(latest) = Library::open(dir)
                             && latest.revision != this.board.library.revision
                         {
-                            let draft = this
-                                .board
-                                .library
-                                .project()
-                                .and_then(Project::selected)
-                                .is_some_and(|item| {
-                                    let s = this.board.viewing;
-                                    item.notes.get(s).is_some_and(|n| {
-                                        n != this.board.note.read(cx).value().as_str()
-                                            || item.profile(s) != this.chosen_profile(cx)
-                                    })
-                                });
-                            let selected =
-                                latest.project().and_then(Project::selected).map(|i| &i.id);
-                            let switched = selected
-                                != this
-                                    .board
-                                    .library
-                                    .project()
-                                    .and_then(Project::selected)
-                                    .map(|i| &i.id);
-                            let follow = switched
-                                || this
-                                    .board
-                                    .library
-                                    .project()
-                                    .and_then(Project::selected)
-                                    .is_none_or(|item| {
-                                        this.board.viewing
-                                            == item.stage.min(item.notes.len().saturating_sub(1))
-                                    });
-                            this.board.library = latest;
-                            if this.board.section == Section::Work && (!draft || switched) {
-                                this.board.note_key = None;
-                                if follow {
-                                    this.load_stage(w, cx);
-                                } else {
-                                    this.show_stage(this.board.viewing, w, cx);
-                                }
-                            }
-                            this.watch_agents(cx);
-                            cx.notify();
+                            this.accept_catalog(latest, w, cx);
                         }
                     }
                     if this.board.section == Section::Memory
