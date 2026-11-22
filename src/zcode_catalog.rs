@@ -75,10 +75,7 @@ pub fn app_server(binary: &Path) -> Command {
             .is_ok_and(|p| p == Path::new(ZCODE_APP)))
         && std::env::var_os("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE").is_none()
     {
-        command.env(
-            "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
-            "/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json",
-        );
+        command.env("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE", BUILTIN);
     }
     command.arg("app-server");
     command
@@ -93,7 +90,7 @@ pub fn client_response(method: &str) -> Result<Value> {
     }
 }
 
-pub fn discover(path: &OsStr) -> Result<Vec<Model>> {
+fn resolved_models(path: &OsStr) -> Result<Vec<Model>> {
     let profile = Profile {
         client: Client::ZCode,
         executable: String::new(),
@@ -146,7 +143,6 @@ pub fn discover(path: &OsStr) -> Result<Vec<Model>> {
                         .filter(|r| r["disabledReason"].is_null())
                         .map(|r| serde_json::from_value(r.clone()))
                         .collect::<Result<_, _>>()?;
-                    ensure!(!models.is_empty(), "ZCode 未配置可用模型");
                     let _ = send(
                         json!({"id":2,"method":"session/close","params":{"sessionId":session,"expectedPersistence":"deferred"}}),
                     );
@@ -166,4 +162,166 @@ pub fn discover(path: &OsStr) -> Result<Vec<Model>> {
     );
     let _ = child.wait();
     result?
+}
+
+const BUILTIN: &str =
+    "/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json";
+
+pub fn desktop_plan(id: &str) -> Option<&'static str> {
+    match id {
+        "account:bigmodel-start-plan" => Some("BigModel Start Plan"),
+        "account:bigmodel-individual-coding-plan" => Some("BigModel 个人 Coding Plan"),
+        _ => None,
+    }
+}
+
+fn rows<'a>(doc: &'a Value, path: &str) -> impl Iterator<Item = &'a Value> {
+    doc.pointer(path)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn desktop_models(local: &Value, builtin: &Value) -> Vec<Model> {
+    let mut result = Vec::new();
+    let rules: Vec<_> = rows(builtin, "/config/modelConfigRules/modelRules")
+        .filter_map(|r| {
+            Some((
+                regex::RegexBuilder::new(r["modelMatch"].as_str()?)
+                    .case_insensitive(true)
+                    .build()
+                    .ok()?,
+                r.pointer("/config/optionSpecs/reasoningLevel/values")?
+                    .as_array()?,
+            ))
+        })
+        .collect();
+    for provider in rows(local, "/config/providerConfigRules/providerRules") {
+        if provider["config"]["enabled"] == false {
+            continue;
+        }
+        let Some(id) = provider["providerId"].as_str() else {
+            continue;
+        };
+        let Some(label) = desktop_plan(id) else {
+            continue;
+        };
+        let Some(base) = rows(builtin, "/config/providerConfigRules/providerRules")
+            .find(|p| p["providerId"] == id)
+        else {
+            continue;
+        };
+        let builtin_ids = rows(base, "/config/builtinModelIds").collect::<Vec<_>>();
+        let personal = rows(provider, "/config/personalModelIds").collect::<Vec<_>>();
+        let mut order = rows(provider, "/config/modelOrder").collect::<Vec<_>>();
+        if order.is_empty() {
+            order.extend(builtin_ids.iter().copied());
+        }
+        order.extend(personal.iter().copied());
+        let mut seen = std::collections::HashSet::new();
+        for model in order {
+            let Some(name) = model.as_str() else { continue };
+            if !seen.insert(name) || !(builtin_ids.contains(&model) || personal.contains(&model)) {
+                continue;
+            }
+            if rows(local, "/config/modelConfigRules/providerModelRules").any(|r| {
+                r["modelId"] == name && r["providerId"] == id && r["config"]["enabled"] == false
+            }) {
+                continue;
+            }
+            let levels = rules
+                .iter()
+                .rev()
+                .find(|(re, _)| re.is_match(name))
+                .into_iter()
+                .flat_map(|(_, levels)| levels.iter())
+                .filter_map(Value::as_str)
+                .map(|v| Level {
+                    value: v.to_owned(),
+                    label: v.to_owned(),
+                })
+                .collect();
+            result.push(Model {
+                id: ModelRef {
+                    provider_id: id.to_owned(),
+                    model_id: name.to_owned(),
+                },
+                label: name.to_owned(),
+                provider_label: Some(label.to_owned()),
+                reasoning: Reasoning {
+                    levels,
+                    default_level: None,
+                },
+            });
+        }
+    }
+    result
+}
+
+pub fn discover(path: &OsStr) -> Result<Vec<Model>> {
+    let cli = resolved_models(path);
+    let Some(config) = std::env::home_dir()
+        .map(|h| h.join(".zcode/v2/provider_config.json"))
+        .filter(|p| p.is_file() && Path::new(BUILTIN).is_file())
+    else {
+        let models = cli?;
+        ensure!(!models.is_empty(), "ZCode 未配置可用模型");
+        return Ok(models);
+    };
+    let desktop = desktop_models(
+        &crate::workspace::read(&config)?,
+        &crate::workspace::read(Path::new(BUILTIN))?,
+    );
+    let mut models = if desktop.is_empty() {
+        cli?
+    } else {
+        cli.unwrap_or_default()
+    };
+    for model in desktop {
+        if let Some(entry) = models.iter_mut().find(|m| {
+            m.id.provider_id == model.id.provider_id && m.id.model_id == model.id.model_id
+        }) {
+            entry.provider_label = model.provider_label;
+        } else {
+            models.push(model);
+        }
+    }
+    ensure!(!models.is_empty(), "ZCode 未配置可用模型");
+    Ok(models)
+}
+
+pub fn workspace_url(path: &str) -> String {
+    let mut url = url::Url::parse("zcode://workspace/open").expect("static workspace URL");
+    url.query_pairs_mut().append_pair("path", path);
+    url.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignores_stale_order_entries_and_keeps_model_ids_scoped_to_each_plan() {
+        let start = "account:bigmodel-start-plan";
+        let individual = "account:bigmodel-individual-coding-plan";
+        let local = json!({"config":{
+          "providerConfigRules":{"providerRules":[
+            {"providerId":start,"config":{"modelOrder":["stale","flash"]}},
+            {"providerId":individual,"config":{"personalModelIds":["extra","off"],"modelOrder":["flash"]}}
+          ]},
+          "modelConfigRules":{"providerModelRules":[{"providerId":individual,"modelId":"off","config":{"enabled":false}}]}
+        }});
+        let builtin = json!({"config":{
+          "providerConfigRules":{"providerRules":[
+            {"providerId":start,"config":{"builtinModelIds":["flash"]}},
+            {"providerId":individual,"config":{"builtinModelIds":["flash"]}}
+          ]},
+          "modelConfigRules":{"modelRules":[{"modelMatch":"^FLASH$","config":{"optionSpecs":{"reasoningLevel":{"values":["low","max"]}}}}]}
+        }});
+        let models = desktop_models(&local, &builtin);
+        assert_eq!(models.len(), 3);
+        assert!(models[0].accepts(&format!("{start}/flash@max")));
+        assert!(models[1].accepts(&format!("{individual}/flash@low")));
+        assert!(models[2].accepts(&format!("{individual}/extra")));
+    }
 }

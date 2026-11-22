@@ -176,7 +176,7 @@ aep run --task market-volume-dedup-rust --implementer codex --reviewer claude
 aep run --task market-volume-dedup-rust --implementer zcode --reviewer manual
 ```
 
-Codex 在独立 Worktree 生成候选提交。Claude 接收该版本的 Spec 和 Diff，禁用工具，审查文本保存在同一次运行的 `review.txt`。ZCode 实现端以编辑模式执行附件中的任务，审查端以计划模式只读核对 Spec 与 Diff。指定模型时 ZCode 改走本机 app-server 会话并锁定所选模型。人工在 GitHub 查看 Diff、CI 和审查意见并决定是否批准。选用现有候选提交时可单独加 `--reviewer claude` 或 `--reviewer zcode`。默认走人工审查，不会调用模型。协议测试用本地替身验证适配器调用，不消耗模型额度。
+Codex 在独立 Worktree 生成候选提交。Claude 接收该版本的 Spec 和 Diff，禁用工具，审查文本保存在同一次运行的 `review.txt`。ZCode 实现端以编辑模式执行附件中的任务，审查端以计划模式只读核对 Spec 与 Diff。指定普通 CLI 模型时 ZCode 通过本机 app-server 锁定模型。BigModel 桌面方案使用下文的桌面任务交接。人工在 GitHub 查看 Diff、CI 和审查意见并决定是否批准。选用现有候选提交时可单独加 `--reviewer claude` 或 `--reviewer zcode`。默认走人工审查，不会调用模型。协议测试用本地替身验证适配器调用，不消耗模型额度。
 
 ### 两个 Agent 如何共享记忆
 
@@ -189,7 +189,11 @@ aep run --task market-volume-dedup-rust --implementer codex --reviewer claude --
 aep status --run-id market-handoff-001
 ```
 
-Studio 的「两轮接力」可分别选择实现端（Codex 或 ZCode）和审查端（Claude 或 ZCode）。第二轮或重试前可以更换客户端。两端都选 ZCode 时共用一个模型配置，各自在独立会话中执行。在「项目设置 → ZCode 项目默认模型」选择本机 provider、模型和推理档位，点击「保存项目默认」。每轮从项目默认开始，可在该轮改选或点「使用客户端默认」；重试会保留该轮已用的配置。「刷新本机模型」从本机 ZCode 的 app-server 重新读取可选项。选定模型后会通过 app-server 锁定它。模型与档位需已在本机 ZCode 配置；需要交互授权时，请查看该轮执行日志。已保存的接力和本地队列会保留所选配置，旧记录沿用 Codex 实现、Claude 审查。
+Studio 的「两轮接力」可分别选择实现端（Codex 或 ZCode）和审查端（Claude 或 ZCode）。第二轮或重试前可以更换客户端。两端都选 ZCode 时共用一个模型配置，各自在独立会话中执行。在「项目设置 → ZCode 项目默认模型」选择本机 provider、模型和推理档位，点击「保存项目默认」。每轮从项目默认开始，可在该轮改选或点「使用客户端默认」；重试会保留该轮已用的配置。「刷新本机模型」会读取本机 CLI 模型目录以及 ZCode 桌面已配置的 BigModel Start Plan、个人 Coding Plan 模型和推理档位。模型与档位需已在本机 ZCode 配置；需要交互授权时，请查看该轮执行日志。已保存的接力和本地队列会保留所选配置，旧记录沿用 Codex 实现、Claude 审查。
+
+选择 BigModel 桌面方案后，在本轮卡片点击「复制审查任务并打开 ZCode」（实现端为「复制实现任务并打开 ZCode」）。在打开的目录新建桌面任务，核对方案、模型和档位后粘贴发送。实现任务使用本轮隔离工作区，审查任务在项目下读取已固定的 Spec、Diff 和共享记忆。CLI 用户可在本轮的 `zcode-edit/desktop-request.json` 或 `zcode-plan/desktop-request.json` 中找到相同的目录和派发文本。
+
+Studio 会自动收取桌面答复。回执按工作区、本次派发、桌面任务和对话轮次匹配，并逐条核对主对话实际记录的 provider、模型和推理档位。模型不符时本轮失败，诊断保存在运行目录。接力卡片显示桌面任务 ID、实际模型和交接摘要。桌面回执保存在对应角色目录的 `session.json` 中。该流程在 macOS 的 ZCode 3.19.1 上验证。
 
 CLI 可用 `aep project zcode-models` 列出本机选项，`aep project zcode-default` 查看项目默认，`aep project zcode-default --model provider/model@档位` 保存，`--clear` 清除。
 

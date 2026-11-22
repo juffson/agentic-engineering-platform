@@ -669,7 +669,16 @@ impl Studio {
                 .pointer("/native_session/session")
                 .and_then(Value::as_str)
             {
-                bar = bar.child(caption(format!("ZCode app-server · {session}")));
+                let source = if ev
+                    .pointer("/native_session/transport")
+                    .and_then(Value::as_str)
+                    == Some("desktop")
+                {
+                    "ZCode 桌面"
+                } else {
+                    "ZCode app-server"
+                };
+                bar = bar.child(caption(format!("{source} · {session}")));
             }
             let expanded = self
                 .board
@@ -709,6 +718,14 @@ impl Studio {
                 );
             }
             if busy(&ev) {
+                if let Some(dispatch) = self.desktop_dispatch(
+                    &d,
+                    format!("workflow-zcode-desktop-{}", a.id),
+                    "阶段",
+                    cx,
+                ) {
+                    bar = bar.child(dispatch);
+                }
                 let id = a.id.clone();
                 let attempt = d.clone();
                 bar = bar.child(

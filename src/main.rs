@@ -6,6 +6,7 @@ mod local;
 mod project_cli;
 mod run;
 mod workflow_stage;
+mod zcode_desktop;
 mod zcode_stage;
 
 use anyhow::{Result, ensure};
@@ -44,6 +45,8 @@ enum Action {
         prompt: PathBuf,
         #[arg(long)]
         dir: PathBuf,
+        #[arg(long)]
+        desktop_workspace: Option<PathBuf>,
     },
     /// Run a single configured model CLI in a project workflow.
     WorkflowStage {
@@ -171,13 +174,14 @@ fn app() -> Result<ExitCode> {
             model,
             prompt,
             dir,
+            desktop_workspace,
         } => {
             let selection = model.map(|path| aep::workspace::read(&path)).transpose()?;
             let text = std::fs::read_to_string(&prompt)?;
-            println!(
-                "{}",
-                zcode_stage::converse(&binary, &dir, &mode, selection.as_ref(), &text)?
-            );
+            let workspace = desktop_workspace.unwrap_or(std::env::current_dir()?);
+            let reply =
+                zcode_stage::converse(&binary, &dir, &mode, selection.as_ref(), &text, &workspace)?;
+            println!("{reply}");
             return Ok(ExitCode::SUCCESS);
         }
         Action::WorkflowStage { request } => {

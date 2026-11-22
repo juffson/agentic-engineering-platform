@@ -17,6 +17,47 @@ impl Target {
 }
 
 impl Studio {
+    pub(in crate::view) fn desktop_dispatch(
+        &self,
+        dir: &std::path::Path,
+        id: String,
+        role: &str,
+        cx: &Context<Self>,
+    ) -> Option<Div> {
+        let job = aep::workspace::read(&dir.join("desktop-request.json")).ok()?;
+        if let Ok(task) = aep::workspace::read(&dir.join("desktop-task.json")) {
+            return Some(caption(format!(
+                "ZCode 桌面任务 {} · 等待交接",
+                task["session"].as_str()?
+            )));
+        }
+        let path = job["workspace"].as_str()?;
+        let dispatch = job["dispatch"].as_str()?.to_owned();
+        let url = aep::zcode_catalog::workspace_url(path);
+        let action = button(id, format!("复制{role}任务并打开 ZCode"), true).on_click(cx.listener(
+            move |_, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(dispatch.clone()));
+                cx.open_url(&url);
+            },
+        ));
+        let model = &job["model"];
+        let level = model
+            .pointer("/options/reasoningLevel")
+            .and_then(Value::as_str)
+            .unwrap_or("默认");
+        let provider = model["providerId"].as_str()?;
+        let plan = aep::zcode_catalog::desktop_plan(provider).unwrap_or(provider);
+        Some(
+            v_flex()
+                .gap_1()
+                .child(caption(format!(
+                    "在 {path} 新建 ZCode 任务。选择 {plan} / {} / {level}，粘贴并发送。",
+                    model["modelId"].as_str()?
+                )))
+                .child(action),
+        )
+    }
+
     pub(crate) fn relay_project_default(&self) -> String {
         let Some(project) = self.board.library.project() else {
             return String::new();

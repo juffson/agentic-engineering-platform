@@ -161,6 +161,7 @@ fn usage(record: &mut Value, role: &str, result: &Value) {
 
 pub struct Agents<'a> {
     pub work: &'a Path,
+    pub repository: &'a Path,
     pub folder: &'a Path,
     pub timeout: u64,
     pub deadline: Option<Instant>,
@@ -220,6 +221,11 @@ impl Agents<'_> {
             fs::create_dir_all(&evidence)?;
             let selection = evidence.join("zcode-selection.json");
             fs::write(&selection, serde_json::to_vec(&profile.zcode_selection()?)?)?;
+            let workspace = if mode == "plan" {
+                self.repository
+            } else {
+                self.work
+            };
             return Ok(vec![
                 std::env::current_exe()?.display().to_string(),
                 "zcode-bridge".into(),
@@ -233,6 +239,8 @@ impl Agents<'_> {
                 prompt_path.display().to_string(),
                 "--dir".into(),
                 evidence.display().to_string(),
+                "--desktop-workspace".into(),
+                workspace.display().to_string(),
             ]);
         }
         let mut argv = Vec::new();

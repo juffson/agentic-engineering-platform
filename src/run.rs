@@ -258,6 +258,7 @@ pub fn execute(
             None
         };
         let mut agents = Agents {
+            repository: &repo.root,
             work: &work,
             folder: &folder,
             timeout: args.timeout,

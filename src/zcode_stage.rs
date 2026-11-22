@@ -9,15 +9,31 @@ use std::{
     process::Stdio,
 };
 
-/// Run one prompt through a ZCode app-server session and return the final assistant reply.
-/// Session and model evidence are saved into `dir`.
+/// Run a configured desktop plan in its native task, or an ordinary CLI model via app-server.
 pub fn converse(
     binary: &Path,
     dir: &Path,
     mode: &str,
     model: Option<&Value>,
     prompt: &str,
+    desktop_workspace: &Path,
 ) -> Result<String> {
+    if Path::new(aep::workflow::ZCODE_APP).is_file()
+        && let Some(model) = model
+        && model["providerId"]
+            .as_str()
+            .and_then(aep::zcode_catalog::desktop_plan)
+            .is_some()
+    {
+        return crate::zcode_desktop::converse(dir, desktop_workspace, mode, model, prompt)
+            .inspect_err(|e| {
+                let _ = aep::project::save_json(
+                    dir,
+                    "desktop-error.json",
+                    &json!({"error":format!("{e:#}")}),
+                );
+            });
+    }
     let mut child = aep::zcode_catalog::app_server(binary)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -160,9 +176,14 @@ pub fn run(binary: &Path, request: &Path) -> Result<()> {
         _ => "plan",
     };
     let prompt = fs::read_to_string(dir.join("prompt.txt"))?;
-    println!(
-        "{}",
-        converse(binary, dir, mode, selection.as_ref(), &prompt)?
-    );
+    let reply = converse(
+        binary,
+        dir,
+        mode,
+        selection.as_ref(),
+        &prompt,
+        &std::env::current_dir()?,
+    )?;
+    println!("{reply}");
     Ok(())
 }

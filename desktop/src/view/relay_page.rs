@@ -194,7 +194,7 @@ impl Studio {
                 .child(
                     panel()
                         .child(heading("第一轮"))
-                        .child(caption("运行使用本机 CLI 账号和任务的验收命令。"))
+                        .child(caption("选择本轮实现端和审查端。验收命令来自任务 Spec。"))
                         .child(self.relay_model_input(cx))
                         .when(!self.relay_launching && !pending, |card| {
                             card.child(button("start-relay", "发起第一轮", true).on_click(
@@ -440,6 +440,62 @@ impl Studio {
             }
         }
         if let Some(run) = run {
+            if let Some(ws) = &self.workspace {
+                let folder = ws.data.join("runs").join(&run.id);
+                for (mode, role, phase) in [
+                    ("edit", "实现", "implementing"),
+                    ("plan", "审查", "reviewing"),
+                ] {
+                    let dir = folder.join(format!("zcode-{mode}"));
+                    if let Ok(err) = aep::workspace::read(&dir.join("desktop-error.json"))
+                        && let Some(reason) = err["error"].as_str()
+                    {
+                        card = card.child(caption(reason.to_owned()).text_color(rgb(RED)));
+                    }
+                    if let Ok(receipt) = aep::workspace::read(&dir.join("session.json"))
+                        && receipt["transport"] == "desktop"
+                    {
+                        let text = format!(
+                            "{} · {}/{} · {}",
+                            receipt["session"].as_str().unwrap_or(""),
+                            receipt["providerId"].as_str().unwrap_or(""),
+                            receipt["modelId"].as_str().unwrap_or(""),
+                            receipt["reasoningLevel"].as_str().unwrap_or("默认")
+                        );
+                        card = card.child(caption(format!("ZCode 桌面{role}回执"))).child(
+                            detail_text(
+                                SharedString::from(format!("relay-{key}-{mode}-receipt")),
+                                &text,
+                            ),
+                        );
+                    } else if run.text("status") == "running"
+                        && run.text("phase") == phase
+                        && let Some(dispatch) = self.desktop_dispatch(
+                            &dir,
+                            format!("relay-{key}-desktop-{mode}"),
+                            role,
+                            cx,
+                        )
+                    {
+                        card = card.child(dispatch);
+                    }
+                }
+                for note in self.snapshot.notes.iter().filter(|n| {
+                    n["run_id"] == run.id
+                        && matches!(n["kind"].as_str(), Some("handoff" | "review"))
+                }) {
+                    if let Some(body) = note["body"].as_str() {
+                        card = card.child(field(
+                            if note["kind"] == "review" {
+                                "审查交接"
+                            } else {
+                                "实现交接"
+                            },
+                            body,
+                        ));
+                    }
+                }
+            }
             let detail = self
                 .workspace
                 .as_ref()
