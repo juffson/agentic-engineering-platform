@@ -32,6 +32,19 @@ enum Action {
         #[arg(long)]
         request: PathBuf,
     },
+    #[command(hide = true)]
+    ZcodeBridge {
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long)]
+        mode: String,
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(long)]
+        prompt: PathBuf,
+        #[arg(long)]
+        dir: PathBuf,
+    },
     /// Run a single configured model CLI in a project workflow.
     WorkflowStage {
         #[arg(long)]
@@ -59,13 +72,16 @@ enum Action {
         /// Use this pinned Spec commit for an already dispatched task.
         #[arg(long, conflicts_with = "remote")]
         base: Option<String>,
-        #[arg(long, value_parser=["codex"], conflicts_with="candidate", required_unless_present="candidate")]
+        #[arg(long, value_parser=["codex","zcode"], conflicts_with="candidate", required_unless_present="candidate")]
         implementer: Option<String>,
         /// Start Codex from an existing candidate descended from the Spec.
         #[arg(long, requires = "implementer")]
         resume_from: Option<String>,
         #[arg(long, requires = "implementer")]
         codex_model: Option<String>,
+        /// Pin the ZCode client with provider/model or provider/model@reasoning-level.
+        #[arg(long, conflicts_with = "codex_model")]
+        zcode_model: Option<String>,
     },
     Verify {
         #[command(flatten)]
@@ -95,7 +111,7 @@ struct Execution {
     /// Require this current memory version in each model client's context.
     #[arg(long, requires = "shared_memory")]
     require_memory: Option<i64>,
-    #[arg(long, default_value="manual", value_parser=["manual","claude"])]
+    #[arg(long, default_value="manual", value_parser=["manual","claude","zcode"])]
     reviewer: String,
     #[arg(long, default_value_t=600, value_parser=clap::value_parser!(u64).range(1..))]
     timeout: u64,
@@ -149,6 +165,21 @@ fn app() -> Result<ExitCode> {
             zcode_stage::run(&binary, &request)?;
             return Ok(ExitCode::SUCCESS);
         }
+        Action::ZcodeBridge {
+            binary,
+            mode,
+            model,
+            prompt,
+            dir,
+        } => {
+            let selection = model.map(|path| aep::workspace::read(&path)).transpose()?;
+            let text = std::fs::read_to_string(&prompt)?;
+            println!(
+                "{}",
+                zcode_stage::converse(&binary, &dir, &mode, selection.as_ref(), &text)?
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
         Action::WorkflowStage { request } => {
             workflow_stage::execute(&request)?;
             return Ok(ExitCode::SUCCESS);
@@ -164,6 +195,7 @@ fn app() -> Result<ExitCode> {
         Action::Project(_)
         | Action::Control(_)
         | Action::ZcodeStage { .. }
+        | Action::ZcodeBridge { .. }
         | Action::WorkflowStage { .. } => {
             unreachable!()
         }
@@ -176,6 +208,7 @@ fn app() -> Result<ExitCode> {
             implementer,
             resume_from,
             codex_model,
+            zcode_model,
         } => {
             if resume_from.is_some() {
                 args.candidate = resume_from;
@@ -187,11 +220,12 @@ fn app() -> Result<ExitCode> {
                     .map_or(run::Base::Remote(&remote), run::Base::Local),
                 implementer.as_deref(),
                 codex_model.as_deref(),
+                zcode_model.as_deref(),
             );
         }
         Action::Verify { args, base } => {
             ensure!(args.candidate.is_some(), "verify requires --candidate");
-            return run::execute(&repo, &args, run::Base::Local(&base), None, None);
+            return run::execute(&repo, &args, run::Base::Local(&base), None, None, None);
         }
         Action::Status { run_id } => println!(
             "{}",

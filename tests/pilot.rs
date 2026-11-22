@@ -34,6 +34,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(check: &[&str]) -> Self {
+        Self::manifest(json!({"title":"implement","allowed_paths":["result.txt"],"check":check}))
+    }
+    fn manifest(task: Value) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_owned();
         let repo = root.join("repo");
@@ -56,11 +59,7 @@ impl Fixture {
         );
         fs::create_dir_all(repo.join("specs/sample")).unwrap();
         fs::write(repo.join("specs/sample/spec.md"), "Write ok to result.txt.").unwrap();
-        fs::write(
-            repo.join("specs/sample/task.json"),
-            json!({"title":"implement","allowed_paths":["result.txt"],"check":check}).to_string(),
-        )
-        .unwrap();
+        fs::write(repo.join("specs/sample/task.json"), task.to_string()).unwrap();
         fs::write(repo.join("result.txt"), "old").unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-m", "base"]);
@@ -469,6 +468,228 @@ echo '{"structured_output":{"note":"seen revision","question":"","report":"revie
     assert!(ctx.contains("Which deadline?"));
     assert!(!ctx.contains("handoff-719"));
     assert!(!ctx.contains("log-only-canary"));
+}
+#[test]
+fn zcode_implementer_shares_memory_with_claude_reviewer() {
+    let f = Fixture::new(&["grep", "-qx", "ok", "result.txt"]);
+    ok(f.call(&[
+        "memory",
+        "add",
+        "--project",
+        "--kind",
+        "decision",
+        "--text",
+        "stable contract",
+    ]));
+    f.script(
+        "zcode",
+        r#"case "$*" in *"--mode edit"*) ;; *) echo 'missing edit mode' >&2; exit 3;; esac
+while [ "$1" != --attach ]; do shift; done
+prompt=$(cat "$2")
+case "$prompt" in *"stable contract"*) ;; *) echo 'decision missing' >&2; exit 1;; esac
+case "$prompt" in *AEP-RELAY*) ;; *) echo 'relay note missing' >&2; exit 2;; esac
+printf ok > result.txt
+printf 'implemented via headless zcode.\nAEP-RELAY: {"note":"zcode-handoff-42","question":"Which deadline?"}\n'"#,
+    );
+    f.script(
+        "claude",
+        r#"prompt=$(cat)
+case "$prompt" in *"zcode-handoff-42"*) ;; *) exit 1;; esac
+printf '%s' '{"structured_output":{"note":"review note","question":"","report":"detailed report"}}'"#,
+    );
+    let args = [
+        "run",
+        "--task",
+        "sample",
+        "--implementer",
+        "zcode",
+        "--reviewer",
+        "claude",
+        "--run-id",
+        "zcode-relay",
+        "--shared-memory",
+    ];
+    ok(f.call(&args));
+    let r = f.state("zcode-relay");
+    assert_eq!(r["implementation_source"], "zcode");
+    assert_eq!(r["request"]["source"], "zcode");
+    assert_eq!(r["review_status"], "findings_recorded");
+    let handoff = r["memory_outputs"]["implementer"][0].clone();
+    assert!(handoff.is_i64());
+    assert!(
+        r["memory_inputs"]["reviewer"]
+            .as_array()
+            .unwrap()
+            .contains(&handoff)
+    );
+    assert_eq!(
+        fs::read_to_string(f.repo.join(".git/aep/runs/zcode-relay/review.txt")).unwrap(),
+        "detailed report\n"
+    );
+    let published = aep::memory::Memory::open(&f.repo.join(".git/aep"))
+        .unwrap()
+        .get(handoff.as_i64().unwrap())
+        .unwrap();
+    assert_eq!(published["body"], "zcode-handoff-42");
+    ok(f.call(&args));
+    assert_eq!(r, f.state("zcode-relay"));
+}
+#[test]
+fn zcode_implementer_bridge_pins_model() {
+    let f = Fixture::new(&["grep", "-qx", "ok", "result.txt"]);
+    ok(f.call(&[
+        "memory",
+        "add",
+        "--project",
+        "--kind",
+        "decision",
+        "--text",
+        "bridge decision",
+    ]));
+    f.script(
+        "zcode",
+        r#"if [ "$1" = "app-server" ]; then
+    read -r create
+    case "$create" in *'"modelId":"qa-model"'*) ;; *) exit 7;; esac
+    case "$create" in *'"mode":"edit"'*) ;; *) exit 13;; esac
+    sid=$(printf '%s' "$create" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+    printf '%s\n' '{"id":1,"result":{"settings":{"model":{"current":{"providerId":"team","modelId":"qa-model"}}}}}'
+    read -r subscribe
+    printf '%s\n' '{"id":2,"result":{}}'
+    read -r prompt
+    case "$prompt" in *"bridge decision"*) ;; *) exit 8;; esac
+    printf ok > result.txt
+    printf '%s\n' '{"id":3,"result":{"accepted":true}}'
+    printf '{"method":"session/event","params":{"sessionId":"%s","type":"turn.completed"}}\n' "$sid"
+    read -r messages
+    printf '%s\n' '{"id":4,"result":{"messages":[{"info":{"role":"assistant"},"parts":[{"type":"text","text":"bridge done.\nAEP-RELAY: {\"note\":\"bridge-handoff-7\",\"question\":\"\"}"}]}]}}'
+    exit 0
+fi
+exit 9"#,
+    );
+    let args = [
+        "run",
+        "--task",
+        "sample",
+        "--implementer",
+        "zcode",
+        "--run-id",
+        "zcode-bridge",
+        "--shared-memory",
+        "--zcode-model",
+        "team/qa-model",
+    ];
+    ok(f.call(&args));
+    let r = f.state("zcode-bridge");
+    assert_eq!(r["request"]["zcode_model"], "team/qa-model");
+    assert_eq!(r["implementation_source"], "zcode");
+    let evidence = f.repo.join(".git/aep/runs/zcode-bridge");
+    assert!(evidence.join("session.json").is_file());
+    assert_eq!(
+        aep::workspace::read(&evidence.join("zcode-model.json")).unwrap()["modelId"],
+        "qa-model"
+    );
+    let handoff = r["memory_outputs"]["implementer"][0].as_i64().unwrap();
+    assert_eq!(
+        aep::memory::Memory::open(&f.repo.join(".git/aep"))
+            .unwrap()
+            .get(handoff)
+            .unwrap()["body"],
+        "bridge-handoff-7"
+    );
+    ok(f.call(&args));
+    assert_eq!(r, f.state("zcode-bridge"));
+}
+#[test]
+fn zcode_implementer_without_relay_line_fails() {
+    let f = Fixture::new(&["grep", "-qx", "ok", "result.txt"]);
+    f.script(
+        "zcode",
+        r#"while [ "$1" != --attach ]; do shift; done
+printf ok > result.txt
+echo 'finished without a relay line'"#,
+    );
+    let out = f.call(&[
+        "run",
+        "--task",
+        "sample",
+        "--implementer",
+        "zcode",
+        "--run-id",
+        "zcode-malformed",
+        "--shared-memory",
+    ]);
+    assert!(!out.status.success());
+    let r = f.state("zcode-malformed");
+    assert_eq!(r["status"], "failed");
+    assert!(r["error"].as_str().unwrap().contains("AEP-RELAY"));
+}
+#[test]
+fn zcode_reviewer_records_structured_findings() {
+    let f = Fixture::manifest(
+        json!({"title":"implement","allowed_paths":["result.txt"],"check":["true"],"criteria":["AC-1"]}),
+    );
+    f.script(
+        "zcode",
+        r#"case "$*" in *"--mode plan"*) ;; *) echo 'missing plan mode' >&2; exit 3;; esac
+while [ "$1" != --attach ]; do shift; done
+prompt=$(cat "$2")
+case "$prompt" in *AC-1*) ;; *) echo 'criteria missing' >&2; exit 1;; esac
+case "$prompt" in *AEP-RELAY*) ;; *) echo 'format note missing' >&2; exit 2;; esac
+printf 'review finished.\nAEP-RELAY: {"note":"review-note","question":"","report":"report body","blocking_findings":[]}\n'"#,
+    );
+    ok(f.call(&[
+        "run",
+        "--task",
+        "sample",
+        "--candidate",
+        "HEAD",
+        "--reviewer",
+        "zcode",
+        "--run-id",
+        "zcode-review",
+        "--shared-memory",
+    ]));
+    let r = f.state("zcode-review");
+    assert_eq!(r["request"]["reviewer"], "zcode");
+    assert_eq!(r["review_status"], "findings_recorded");
+    assert_eq!(
+        fs::read_to_string(f.repo.join(".git/aep/runs/zcode-review/review.txt")).unwrap(),
+        "report body\n"
+    );
+    assert!(r["memory_outputs"]["reviewer"][0].is_i64());
+}
+#[test]
+fn zcode_reviewer_requests_changes_with_blocking_findings() {
+    let f = Fixture::manifest(
+        json!({"title":"implement","allowed_paths":["result.txt"],"check":["true"],"criteria":["AC-1"]}),
+    );
+    f.script(
+        "zcode",
+        r#"while [ "$1" != --attach ]; do shift; done
+printf 'AEP-RELAY: {"note":"blocking review","question":"","report":"mismatch found","blocking_findings":[{"criterion":"AC-1","file":"result.txt","line":3,"reason":"content does not match the spec"}]}\n'"#,
+    );
+    let out = f.call(&[
+        "run",
+        "--task",
+        "sample",
+        "--candidate",
+        "HEAD",
+        "--reviewer",
+        "zcode",
+        "--run-id",
+        "zcode-block",
+        "--shared-memory",
+    ]);
+    assert!(!out.status.success());
+    let r = f.state("zcode-block");
+    assert_eq!(r["review_status"], "changes_requested");
+    assert_eq!(r["blocking_findings"][0]["criterion"], "AC-1");
+    assert_eq!(r["blocking_findings"][0]["file"], "result.txt");
+    assert_eq!(
+        fs::read_to_string(f.repo.join(".git/aep/runs/zcode-block/review.txt")).unwrap(),
+        "mismatch found\n"
+    );
 }
 #[test]
 fn failed_checks_and_invalid_handoffs_stay_out_of_shared_context() {
