@@ -68,14 +68,19 @@ fn valid_id(value: &str) -> bool {
 
 impl TaskManifest {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.allowed_paths.is_empty()
-                && self.allowed_paths.iter().all(|path| {
-                    path.split('/')
-                        .all(|part| !matches!(part, "" | "." | ".." | ".git"))
-                }),
-            "invalid allowed_paths"
-        );
+        ensure!(!self.allowed_paths.is_empty(), "invalid allowed_paths");
+        for (index, path) in self.allowed_paths.iter().enumerate() {
+            let entry = index + 1;
+            ensure!(
+                !path.contains('\0'),
+                "invalid allowed_paths entry #{entry}: contains NUL"
+            );
+            ensure!(
+                path.split('/')
+                    .all(|part| !matches!(part, "" | "." | ".." | ".git")),
+                "invalid allowed_paths entry #{entry}: invalid segment"
+            );
+        }
         ensure!(
             !self.check.is_empty() && self.check.iter().all(|part| !part.is_empty()),
             "check must contain a command"
@@ -129,6 +134,83 @@ impl TaskManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manifest_with_paths(allowed_paths: &[&str]) -> TaskManifest {
+        TaskManifest {
+            title: None,
+            allowed_paths: allowed_paths.iter().map(|path| path.to_string()).collect(),
+            check: vec!["true".into()],
+            criteria: vec![],
+            checks: vec![],
+        }
+    }
+
+    #[test]
+    fn rejects_nul_anywhere_in_allowed_paths() {
+        for (paths, entry) in [
+            (&["\0"][..], 1),
+            (&["\0src/task.rs"][..], 1),
+            (&["src/\0task.rs"][..], 1),
+            (&["src/task.rs\0"][..], 1),
+            (&["src/task.rs", "docs/\0plan.md"][..], 2),
+            (&["src/task.rs", "docs/plan.md", "a\0b.rs"][..], 3),
+        ] {
+            let error = manifest_with_paths(paths)
+                .validate()
+                .expect_err("NUL in allowed_paths must be rejected before file or Git operations");
+            let message = error.to_string();
+            assert!(
+                message.starts_with("invalid allowed_paths"),
+                "unexpected diagnostic: {error}"
+            );
+            assert!(
+                message.contains(&format!("entry #{entry}")),
+                "missing 1-based position: {error}"
+            );
+            assert!(
+                !message.contains('\0'),
+                "diagnostic must not echo the raw path: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_existing_allowed_paths_rules() {
+        assert!(
+            manifest_with_paths(&["src/my notes/task file.rs"])
+                .validate()
+                .is_ok()
+        );
+        let error = manifest_with_paths(&[])
+            .validate()
+            .expect_err("empty allowed_paths must stay invalid");
+        assert_eq!(error.to_string(), "invalid allowed_paths");
+        for (paths, entry) in [
+            (&["src//task.rs"][..], 1),
+            (&["src/./task.rs"][..], 1),
+            (&["src/../task.rs"][..], 1),
+            (&[".git/config"][..], 1),
+            (&["src/task.rs", "docs/plan.md", ".git/config"][..], 3),
+            (&["src/task.rs", "docs/plan.md", "other.rs", ""][..], 4),
+        ] {
+            let error = manifest_with_paths(paths)
+                .validate()
+                .expect_err("existing allowed_paths rules must keep rejecting these");
+            let message = error.to_string();
+            assert!(
+                message.starts_with("invalid allowed_paths"),
+                "unexpected diagnostic: {error}"
+            );
+            assert!(
+                message.contains(&format!("entry #{entry}")),
+                "missing 1-based position: {error}"
+            );
+            assert!(
+                !message.contains(".git") && !message.contains("src"),
+                "diagnostic must not echo the raw path: {error}"
+            );
+        }
+    }
 
     #[test]
     fn validates_primary_and_additional_command_arguments() {
