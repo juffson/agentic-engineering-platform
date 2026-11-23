@@ -7,6 +7,7 @@ pub(super) struct State {
     snapshot: Option<std::path::PathBuf>,
     data: Option<Result<Timeline, String>>,
     selected: Option<usize>,
+    pub(super) merge: Option<super::merge::State>,
 }
 fn stage_name(w: &Work, stage: Option<usize>) -> &str {
     stage
@@ -42,6 +43,7 @@ impl Studio {
             snapshot: None,
             data: None,
             selected: None,
+            merge: None,
         });
         let job = cx.background_executor().spawn(async move {
             aep::project::timeline::load(&home, &project, &work).map_err(|e| format!("{e:#}"))
@@ -61,6 +63,9 @@ impl Studio {
         cx.notify();
     }
     pub(super) fn work_timeline(&self, state: &State, w: &Work, cx: &Context<Self>) -> Div {
+        if let Some(merge) = &state.merge {
+            return self.work_merge(merge, cx);
+        }
         let mut body = v_flex().gap_3().child(
             h_flex()
                 .justify_between()
@@ -108,6 +113,68 @@ impl Studio {
                     "{} 次执行 · {}",
                     delivery.attempts, delivery.archived_at
                 )));
+            if let Some(r) = &delivery.merge {
+                archive = archive.child(field(
+                    "本地合并",
+                    &format!(
+                        "{} · {} · {}",
+                        if r.status == aep::project::merge::MergeStatus::Merged {
+                            "已合并到"
+                        } else {
+                            "合并未完成"
+                        },
+                        r.target_branch,
+                        r.merged_sha.as_deref().unwrap_or("合并未完成")
+                    ),
+                ));
+                archive = archive
+                    .child(field("合并前顶端", &r.before_sha))
+                    .child(field("已验收提交", &r.candidate_sha))
+                    .child(field("确认人", &r.operator))
+                    .child(field(
+                        "合并时间",
+                        r.merged_at.as_deref().unwrap_or("尚未完成"),
+                    ));
+                if r.recovered {
+                    archive = archive.child(caption("恢复补记"));
+                }
+                if let Some(sha) = &r.merged_sha {
+                    let sha = sha.clone();
+                    archive = archive.child(
+                        button(
+                            format!("merge-copy-{}", delivery.run),
+                            "复制完整合并 SHA",
+                            false,
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(sha.clone()))
+                        })),
+                    );
+                }
+            } else {
+                archive = archive.child(caption("未合并"));
+            }
+            for abandoned in &delivery.merge_history {
+                archive = archive.child(caption(format!(
+                    "已放弃合并意图 · {} · {}",
+                    abandoned.at, abandoned.reason
+                )));
+            }
+            if delivery
+                .merge
+                .as_ref()
+                .is_none_or(|r| r.status == aep::project::merge::MergeStatus::Pending)
+            {
+                let d = delivery.clone();
+                archive = archive.child(
+                    button(
+                        format!("delivery-merge-{}", delivery.run),
+                        "查看 Diff 并合入本地",
+                        true,
+                    )
+                    .on_click(cx.listener(move |s, _, _, cx| s.open_work_merge(d.clone(), cx))),
+                );
+            }
             if let Some(home) = &self.board.dir {
                 let dir = delivery.directory(home);
                 let receipt = delivery.clone();

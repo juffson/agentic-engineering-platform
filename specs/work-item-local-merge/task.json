@@ -1,0 +1,105 @@
+{
+  "title": "从事项归档接到本地合并",
+  "allowed_paths": [
+    "Cargo.toml",
+    "desktop/Cargo.lock",
+    "src/project.rs",
+    "src/project/archive.rs",
+    "src/project/merge.rs",
+    "src/project/timeline.rs",
+    "src/project_cli.rs",
+    "desktop/src/view/project_page.rs",
+    "desktop/src/view/project_page/delivery.rs",
+    "desktop/src/view/project_page/timeline.rs",
+    "desktop/src/view/project_page/merge.rs",
+    "desktop/examples/ui_debug.rs",
+    "desktop/examples/support/work_merge.rs",
+    "tests/work_item_merge.rs",
+    "tests/support/work_item_merge.rs",
+    "docs/studio-stage-relay.md",
+    "specs/work-item-local-merge/"
+  ],
+  "check": [
+    "cargo",
+    "test",
+    "--locked"
+  ],
+  "checks": [
+    {
+      "id": "merge",
+      "criteria": [
+        "归档链、分支状态、摘要、恢复和封存兼容性测试通过"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "project::"
+      ]
+    },
+    {
+      "id": "cli",
+      "criteria": [
+        "CLI 预览只读、并发确认和重开回执通过"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "work_item_merge"
+      ]
+    },
+    {
+      "id": "studio",
+      "criteria": [
+        "Studio 与全部示例编译通过"
+      ],
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--all-targets"
+      ]
+    },
+    {
+      "id": "studio-state",
+      "criteria": [
+        "刷新 Diff 保留目标分支，Pending 固定原目标并按顶端状态限制确认（不替代实际 GUI 验收）"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--lib",
+        "view::project_page::merge::tests"
+      ]
+    },
+    {
+      "id": "ui",
+      "criteria": [
+        "实际点击预览、确认、回执、重开；需可访问 macOS 桌面服务"
+      ],
+      "command": [
+        "cargo",
+        "run",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--example",
+        "ui_debug",
+        "--",
+        "--scenario",
+        "work-merge",
+        "--output-dir",
+        "target/work-item-local-merge-ui",
+        "--screenshots"
+      ]
+    }
+  ]
+}

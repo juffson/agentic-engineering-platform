@@ -2,6 +2,7 @@ use super::*;
 mod agents;
 mod collaboration;
 mod delivery;
+mod merge;
 mod timeline;
 mod zcode;
 mod zcode_history;

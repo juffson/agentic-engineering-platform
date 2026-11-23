@@ -138,3 +138,41 @@ jq -e -s '
 ```
 
 这里按顺序读取两份文件，比较 `accept/confirmed.json` 的 `.run` 和 `accept/destination.json` 的 `.read_stage_transfer.run`。输出 `true` 且退出码为 0，表示成功后的独立验收读取了已确认的那次测试执行；编号缺失、为空或不一致时检查不通过，应核对输出目录和本次重试的回执。
+
+### 从归档交付合入本地分支
+
+在事项的「会话与轮次」中，打开归档卡片上的「查看 Diff 并合入本地」。页面从封存的交接链确定已验收提交，校验接力保留引用和后续阶段工作区；选择本地分支后，可按文件展开最终 Diff，或导出完整二进制 patch。核对目标、顶端和统计后，再点「确认本地合并」。
+
+合并只更新本地分支，不会推送。未检出的分支使用带旧 SHA 校验的 `update-ref`；主工作区检出的分支要求工作区干净（包括未跟踪文件），执行 `merge --ff-only`；其他工作树检出的分支不可写入。已经包含候选的分支只记录当时的实际 SHA，不移动分支。AEP 内部分支默认折叠。
+
+CLI 使用相同的校验和回执（`delivery_run` 是交付归档执行 ID）：
+
+```sh
+aep project --work "$work_id" merge-targets --delivery "$delivery_run"
+aep project --work "$work_id" merge-preview --delivery "$delivery_run" --target main
+# 核对预览后，使用输出中的 diff_sha256 确认：
+aep project --work "$work_id" merge --delivery "$delivery_run" --target main --diff-sha256 "$diff_sha256"
+# 显式导出完整 patch；输出文件必须尚不存在：
+aep project --work "$work_id" merge-patch --delivery "$delivery_run" --target main --output /tmp/final-changes.patch
+```
+
+`merge-preview` 严格只读，JSON 包含候选、分支状态、顶端、统计、Diff、截断标记和摘要。预览不自动写 patch 文件；`merge-patch` 才会写入指定的新文件。摘要覆盖候选、目标名、顶端和完整 Diff，确认时重新校验。
+
+合并结果写在原交付条目的 `merge` 中，并在归档目录新增 `merge.json`。原有 `manifest.json`、`timeline.json` 和执行证据字节保持不变。`status` 的 `deliveries[].merge`、`timeline` 的 `merge_events[]` 以及 Studio 归档卡片均可回看实际 SHA、确认人和时间。
+
+中断后，`merge.status=pending` 保存原摘要和目标：目标仍在 `before_sha` 时，用原摘要重新确认；目标已经到 `candidate_sha` 时，重新确认会恢复补记；目标变为其他 SHA 时，拒绝自动处理。可以明确放弃意图后重新预览，放弃的时间、原因和原意图保存在 `merge_history`：
+
+```sh
+aep project --work "$work_id" merge-abandon --delivery "$delivery_run" --reason "目标分支已由其他操作更新"
+```
+
+同一交付只允许一份完成回执。重复确认同一目标返回原回执，换目标则拒绝。事项合并和 `aep local merge` 共用仓库的 `local-delivery.lock`。
+
+自测入口（全部使用临时仓库）：
+
+```sh
+cargo test --locked --lib project::
+cargo test --locked --test work_item_merge
+cargo check --locked --manifest-path desktop/Cargo.toml --all-targets
+cargo run --locked --manifest-path desktop/Cargo.toml --example ui_debug -- --scenario work-merge --output-dir target/work-item-local-merge-ui --screenshots
+```

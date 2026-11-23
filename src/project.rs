@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod directory;
+pub mod merge;
 pub mod timeline;
 pub mod transfer;
 use anyhow::{Context, Result, ensure};
@@ -550,7 +551,19 @@ pub struct Library {
 impl Library {
     pub fn open(dir: &Path) -> Result<Self> {
         match fs::read(dir.join("projects.json")) {
-            Ok(data) => Ok(serde_json::from_slice(&data).context("项目库文件无法读取")?),
+            Ok(data) => {
+                let mut library: Self =
+                    serde_json::from_slice(&data).context("项目库文件无法读取")?;
+                for project in &mut library.projects {
+                    for work in &mut project.work {
+                        for delivery in &mut work.deliveries {
+                            delivery.merge =
+                                merge::receipt(dir, delivery)?.or(delivery.merge.take());
+                        }
+                    }
+                }
+                Ok(library)
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }

@@ -139,6 +139,43 @@ enum Action {
         clear: bool,
     },
     Status,
+    /// List local branches for a sealed delivery.
+    MergeTargets {
+        #[arg(long)]
+        delivery: String,
+    },
+    /// Read the exact final Diff without changing refs or the catalog.
+    MergePreview {
+        #[arg(long)]
+        delivery: String,
+        #[arg(long)]
+        target: String,
+    },
+    /// Export the full binary patch to a new file.
+    MergePatch {
+        #[arg(long)]
+        delivery: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Confirm the reviewed Diff and merge locally.
+    Merge {
+        #[arg(long)]
+        delivery: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        diff_sha256: String,
+    },
+    /// Preserve and abandon an interrupted intent before previewing again.
+    MergeAbandon {
+        #[arg(long)]
+        delivery: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Configure a stage without starting a model. Stage numbers start at 1.
     Configure {
         #[arg(long)]
@@ -432,6 +469,13 @@ struct Catalog {
     work: Option<String>,
 }
 impl Catalog {
+    fn delivery(&self, run: &str) -> Result<&project::archive::Delivery> {
+        self.work()?
+            .deliveries
+            .iter()
+            .find(|d| d.run == run)
+            .context("归档交付不存在")
+    }
     fn project(&self) -> Result<&Project> {
         resolve(&self.library, self.project.as_deref())
     }
@@ -800,6 +844,45 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             print(&c.project()?.https_sites.get(&root))
         }
         Action::Status => print(&view(c.work()?, c.project()?, &c.dir)?),
+        Action::MergeTargets { delivery } => print(&project::merge::branches(
+            &project::merge::candidate(&c.dir, c.delivery(&delivery)?)?,
+        )?),
+        Action::MergePreview { delivery, target } => print(&project::merge::preview(
+            &c.dir,
+            c.delivery(&delivery)?,
+            &target,
+        )?),
+        Action::MergePatch {
+            delivery,
+            target,
+            output,
+        } => {
+            project::merge::export_patch(&c.dir, c.delivery(&delivery)?, &target, &output)?;
+            print(&json!({"patch_path":output}))
+        }
+        Action::Merge {
+            delivery,
+            target,
+            diff_sha256,
+        } => {
+            let project = c.project()?.id.clone();
+            let work = c.work()?.id.clone();
+            print(&project::merge::merge(
+                &c.dir,
+                &mut c.library,
+                &project,
+                &work,
+                &delivery,
+                &target,
+                &diff_sha256,
+            )?)
+        }
+        Action::MergeAbandon { delivery, reason } => {
+            let project = c.project()?.id.clone();
+            let work = c.work()?.id.clone();
+            project::merge::abandon(&c.dir, &mut c.library, &project, &work, &delivery, &reason)?;
+            print(&json!({"abandoned":delivery}))
+        }
         Action::Metrics => {
             let rows = c
                 .work()?

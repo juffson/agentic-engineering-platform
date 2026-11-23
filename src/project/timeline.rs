@@ -17,6 +17,8 @@ use std::{
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Timeline {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_events: Vec<super::merge::MergeReceipt>,
     #[serde(default)]
     pub deliveries: Vec<super::archive::Delivery>,
     pub work_id: String,
@@ -280,6 +282,16 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
             .collect(),
         ..Default::default()
     };
+    for delivery in &mut result.deliveries {
+        delivery.merge = super::merge::receipt(home, delivery)?.or(delivery.merge.take());
+        if let Some(r) = delivery
+            .merge
+            .as_ref()
+            .filter(|r| r.status == super::merge::MergeStatus::Merged)
+        {
+            result.merge_events.push(r.clone());
+        }
+    }
     for link in work.records.iter().filter(|r| r.kind != RecordKind::Https) {
         if let Err(e) = result.record(link) {
             result.errors.push(format!("{} · {e:#}", link.id));
