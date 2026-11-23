@@ -163,6 +163,12 @@ impl Studio {
     }
 
     pub(super) fn project_settings(&self, p: &Project, cx: &Context<Self>) -> Div {
+        if let Some(history) = &self.board.zcode_history
+            && history.project == p.id
+            && p.repositories.contains(&history.repo)
+        {
+            return self.zcode_history_panel(history, cx);
+        }
         let mut body = v_flex()
             .gap_3()
             .child(self.project_zcode_settings(p, cx))
@@ -265,6 +271,15 @@ impl Studio {
                     )),
                 );
             }
+            let path = repo.clone();
+            history = history.child(
+                button(
+                    format!("settings-zcode-history-{}", repo.display()),
+                    "ZCode 任务归组",
+                    false,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.show_zcode_history(&path, cx))),
+            );
             body = body.child(
                 card.child(remote)
                     .child(caption("仓库工具与历史"))

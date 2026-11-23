@@ -30,6 +30,14 @@ enum Action {
     Project(project_cli::Options),
     /// Regroup verified local ZCode sessions belonging to this repository.
     ZcodeGroup {
+        /// List current desktop membership, workspaces and cleanup results without making changes.
+        #[arg(long, conflicts_with = "verify")]
+        list: bool,
+        /// Include workflow stages from this Studio project catalog.
+        #[arg(long, requires = "project_id")]
+        project_home: Option<PathBuf>,
+        #[arg(long, requires = "project_home")]
+        project_id: Option<String>,
         /// Confirm membership against the running ZCode desktop project list.
         #[arg(long)]
         verify: bool,
@@ -191,11 +199,19 @@ fn app() -> Result<ExitCode> {
             zcode_stage::run(&binary, &request)?;
             return Ok(ExitCode::SUCCESS);
         }
-        Action::ZcodeGroup { verify } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&zcode_group::sync(&cli.repo, verify)?)?
-            );
+        Action::ZcodeGroup {
+            verify,
+            list,
+            project_home,
+            project_id,
+        } => {
+            let scope = project_home.as_deref().zip(project_id.as_deref());
+            let rows = if list {
+                zcode_group::history::list(&cli.repo, scope)?
+            } else {
+                zcode_group::sync(&cli.repo, verify, scope)?
+            };
+            println!("{}", serde_json::to_string_pretty(&rows)?);
             return Ok(ExitCode::SUCCESS);
         }
         Action::ZcodeOpen { dir } => {

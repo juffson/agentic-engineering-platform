@@ -104,7 +104,7 @@ impl Studio {
         )))
     }
 
-    fn open_zcode_task(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+    pub(super) fn open_zcode_task(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         let program = self.runner.binary();
         self.zcode_navigation = Some((dir.clone(), "正在打开…".into()));
         let folder = dir.clone();

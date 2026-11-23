@@ -13,15 +13,20 @@ use std::{
     time::Duration,
 };
 
+pub mod history;
 pub mod staging;
 
-fn index() -> Result<Connection> {
+fn index_with(flags: OpenFlags) -> Result<Connection> {
     let file = std::env::home_dir()
         .context("missing home")?
         .join(".zcode/v2/tasks-index.sqlite");
-    let db = Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let db = Connection::open_with_flags(file, flags)?;
     db.busy_timeout(Duration::from_secs(5))?;
     Ok(db)
+}
+
+fn index() -> Result<Connection> {
+    index_with(OpenFlags::SQLITE_OPEN_READ_WRITE)
 }
 
 fn schema_supported(tx: &Connection) -> Result<()> {
@@ -33,7 +38,13 @@ fn schema_supported(tx: &Connection) -> Result<()> {
 }
 
 fn assign(db: &mut Connection, dir: &Path, repository: &str) -> Result<Value> {
-    let task = read(&dir.join("desktop-task.json"))?;
+    let task = if dir.join("desktop-task.json").try_exists()? {
+        read(&dir.join("desktop-task.json"))?
+    } else {
+        let saved = read(&dir.join("session.json"))?;
+        ensure!(saved["transport"] == "desktop", "此记录不是桌面会话");
+        saved
+    };
     let session = task["session"]
         .as_str()
         .context("missing desktop session")?;
@@ -121,23 +132,28 @@ fn subdirs(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-pub fn sync(repo: &Path, verify: bool) -> Result<Vec<Value>> {
-    let ws = Workspace::open(repo)?;
+fn evidence_dirs(ws: &Workspace, scope: Option<(&Path, &str)>) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     for run in subdirs(&ws.data.join("runs"))? {
         for role in ["zcode-edit", "zcode-plan"] {
             dirs.push(run.join(role));
         }
     }
-    if let Some(binding) = Binding::file(&ws.root)
-        .map(|f| Binding::read(&f))
-        .transpose()?
-        .flatten()
-    {
-        aep::workspace::ident(&binding.project, 64)?;
-        for work in subdirs(&binding.home.join("workflows").join(binding.project))? {
+    let scope = match scope {
+        Some((home, id)) => Some((home.to_owned(), id.to_owned())),
+        None => Binding::file(&ws.root)
+            .map(|f| Binding::read(&f))
+            .transpose()?
+            .flatten()
+            .map(|b| (b.home, b.project)),
+    };
+    if let Some((home, id)) = scope {
+        aep::workspace::ident(&id, 64)?;
+        for work in subdirs(&home.join("workflows").join(id))? {
             for run in subdirs(&work.join("runs"))? {
-                if run.join("desktop-task.json").is_file() {
+                if run.join("desktop-request.json").is_file()
+                    || run.join("desktop-task.json").is_file()
+                {
                     let req = read(&run.join("request.json"))?;
                     if req["repository"]
                         .as_str()
@@ -150,21 +166,40 @@ pub fn sync(repo: &Path, verify: bool) -> Result<Vec<Value>> {
             }
         }
     }
-    let mut outcomes = Vec::new();
-    for dir in dirs {
-        if dir.join("desktop-task.json").try_exists()? {
-            outcomes
-                .push(group(&dir, &ws.root).with_context(|| format!("归组 {}", dir.display()))?);
-        } else if dir.join("desktop-declined.json").is_file() {
-            // A retry of this request may already be in flight.
-            let lock = fs::File::open(dir.join("desktop-dispatch.lock"))?;
-            match lock.try_lock() {
-                Ok(()) => staging::cleanup(&dir, &ws.root)?,
-                Err(std::fs::TryLockError::WouldBlock) => (),
-                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
-            }
+    Ok(dirs)
+}
+
+fn sync_one(dir: &Path, repo: &Path) -> Result<Option<Value>> {
+    let completed_desktop = dir.join("desktop-request.json").is_file()
+        && dir.join("session.json").is_file()
+        && read(&dir.join("session.json"))?["transport"] == "desktop";
+    if dir.join("desktop-task.json").try_exists()? || completed_desktop {
+        return Ok(Some(group(dir, repo)?));
+    }
+    if dir.join("desktop-declined.json").is_file() {
+        // A retry of this request may already be in flight.
+        let lock = fs::File::open(dir.join("desktop-dispatch.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => staging::cleanup(dir, repo)?,
+            Err(std::fs::TryLockError::WouldBlock) => (),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
     }
+    Ok(None)
+}
+
+pub fn sync(repo: &Path, verify: bool, scope: Option<(&Path, &str)>) -> Result<Vec<Value>> {
+    let ws = Workspace::open(repo)?;
+    let mut outcomes = Vec::new();
+    let mut errors = Vec::new();
+    for dir in evidence_dirs(&ws, scope)? {
+        match sync_one(&dir, &ws.root) {
+            Ok(Some(row)) => outcomes.push(row),
+            Ok(None) => (),
+            Err(e) => errors.push(format!("{} · {e:#}", dir.display())),
+        }
+    }
+    ensure!(errors.is_empty(), "部分记录无法同步：{}", errors.join("\n"));
     if verify && let Some(first) = outcomes.first() {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let project = first["project"].clone();

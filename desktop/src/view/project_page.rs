@@ -2,6 +2,7 @@ use super::*;
 mod agents;
 mod collaboration;
 mod zcode;
+mod zcode_history;
 use aep::project::{Kind, Library, Project, Work};
 use aep::workflow::{self, Client, Profile, Role as StageRole, Template};
 use anyhow::{Context as _, ensure};
@@ -24,6 +25,7 @@ pub(crate) struct Board {
     zcode_catalog: Option<Result<Vec<aep::zcode_catalog::Model>, String>>,
     zcode_loading: bool,
     zcode_draft: Option<(String, String)>,
+    zcode_history: Option<zcode_history::History>,
     site_editor: Option<SiteEditor>,
     infra_view: Option<InfraView>,
     desk: Option<WorkDesk>,
@@ -85,6 +87,7 @@ impl Board {
             zcode_catalog: None,
             zcode_loading: false,
             zcode_draft: None,
+            zcode_history: None,
             site_editor: None,
             infra_view: None,
             desk: None,
@@ -265,6 +268,7 @@ impl Studio {
     fn section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.page = Page::Project;
         self.board.section = section;
+        self.board.zcode_history = None;
         self.board.sync_message = None;
         self.board.site_editor = None;
         self.board.infra_view = None;

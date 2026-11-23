@@ -203,6 +203,8 @@ zcode=/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
 
 Studio 派发的 ZCode 实现和审查会话归到所选仓库对应的本机 ZCode 项目。实现仍在各自的 Git 工作区执行。建会话使用官方扩展；归组只更新 ZCode 本机项目索引中的任务归属，并固定隔离任务原有的附加目录。每次派发的归组结果在 `desktop-group.json`，原创建回执继续保留。归组后，AEP 会从 ZCode 侧栏移除本次派发创建的空 `aep-work-*` 项目。清理与任务数量检查在同一个事务内完成；有任务记录（含未命名、归档和预留记录）、定时任务或闲时任务的项目会保留。实现会话引用的隔离工作区会在验收后保留，便于重新打开原任务。
 
+在 Studio 打开「项目设置」，在对应仓库的「仓库工具与历史」中选择「ZCode 任务归组」。列表显示实际归属项目、执行目录和原项目的清理结果。「同步历史任务并清理空项目」复用归组回执和空项目检查；「打开原会话」回到 ZCode 桌面中的同一个任务。CLI 可用 `aep zcode-group --list` 查看同一份记录。
+
 已有关联记录可在仓库目录运行 `aep zcode-group --verify` 归回并核对。命令按 AEP 回执识别任务，重复运行会复用原会话。`--verify` 通过 aep-studio 扩展 1.2 或更高版本向 ZCode 查询该项目的会话列表。
 
 ZCode 等待工具审批时，Studio 的接力卡显示轮次、实现或审查角色、工作区和待批命令。点「打开对应 ZCode 任务」，在打开的桌面会话点「允许一次」，原任务会自动续跑。ZCode 扩展仅能在插件自有项目中代答审批。AEP 的仓库和隔离工作区使用桌面原生确认。CLI 可用 `aep zcode-open --dir <本次运行的 zcode-edit 或 zcode-plan 目录>` 打开同一任务。已安装旧版扩展的用户可运行 `"$zcode" plugins marketplace update aep-local` 和 `"$zcode" plugins update aep-studio@aep-local`，再重新打开 ZCode。

@@ -165,6 +165,10 @@ fn session_action(receipt: &Value, action: &str) -> Result<Value> {
         session["sessionId"].is_string() && receipt["operation"]["session"] == *session,
         "创建回执缺少对应的 ZCode 会话或操作"
     );
+    desktop_action(session, &receipt["operation"], action)
+}
+
+fn desktop_action(session: &Value, operation: &Value, action: &str) -> Result<Value> {
     let root = std::env::home_dir()
         .context("缺少用户目录")?
         .join(".aep/zcode");
@@ -176,7 +180,7 @@ fn session_action(receipt: &Value, action: &str) -> Result<Value> {
         .as_object_mut()
         .context("invalid desktop session")?
         .remove("project");
-    let mut operation = receipt["operation"].clone();
+    let mut operation = operation.clone();
     operation["session"] = session.clone();
     let reply = exchange(
         &root,
@@ -197,8 +201,31 @@ fn session_action(receipt: &Value, action: &str) -> Result<Value> {
 }
 
 pub fn open_task(dir: &Path) -> Result<Value> {
-    let receipt = aep::workspace::read(&dir.join("desktop-create.json"))?;
-    let mut reply = session_action(&receipt, "open")?;
+    // A saved session can be opened after both Studio and the extension host quit.
+    let app = Path::new("/Applications/ZCode.app");
+    if cfg!(target_os = "macos") && app.is_dir() {
+        let status = Command::new("/usr/bin/open")
+            .args(["-g", "-a"])
+            .arg(app)
+            .status()?;
+        ensure!(status.success(), "无法启动 ZCode 桌面扩展");
+    }
+    // Desktop sessions predating automatic dispatch have a completed session
+    // receipt but no creation command. Opening only needs their native identity.
+    let open = || -> Result<Value> {
+        let path = dir.join("desktop-create.json");
+        if path.try_exists()? {
+            return session_action(&aep::workspace::read(&path)?, "open");
+        }
+        let saved = aep::workspace::read(&dir.join("session.json"))?;
+        ensure!(saved["transport"] == "desktop", "此记录不是 ZCode 桌面会话");
+        let id = saved["session"].as_str().context("缺少会话 ID")?;
+        let workspace = saved["workspace"].as_str().context("缺少工作区")?;
+        let session =
+            json!({"kind":"app","sourceServerId":"local","sessionId":id,"workspacePath":workspace});
+        desktop_action(&session, &json!({"sessionId":id}), "open")
+    };
+    let mut reply = open()?;
     if reply["reason"] == "project.task-not-found" && dir.join("desktop-cleanup.json").is_file() {
         // Focusing the desktop refreshes its sidebar projection after a background move.
         let status = Command::new("/usr/bin/open")
@@ -207,7 +234,7 @@ pub fn open_task(dir: &Path) -> Result<Value> {
         if status.success() {
             for _ in 0..3 {
                 thread::sleep(Duration::from_millis(350));
-                reply = session_action(&receipt, "open")?;
+                reply = open()?;
                 if reply["reason"] != "project.task-not-found" {
                     break;
                 }

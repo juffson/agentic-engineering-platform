@@ -19,6 +19,8 @@ mod local;
 mod project;
 #[path = "support/workflows.rs"]
 mod workflows;
+#[path = "support/zcode_history.rs"]
+mod zcode_history;
 
 use aep::{
     memory::{Key, Kind, Memory},
@@ -65,7 +67,7 @@ enum Scenario {
 #[derive(Parser)]
 #[command(
     about = "Exercise AEP Studio in a temporary Git workspace, using an offscreen GPUI window",
-    group(ArgGroup::new("live").args(["live_project_workflow","live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
+    group(ArgGroup::new("live").args(["live_zcode_history","live_project_workflow","live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
 )]
 struct Args {
     /// Run just one scenario (default: all)
@@ -86,6 +88,9 @@ struct Args {
     /// Also save PNGs from the platform's offscreen renderer
     #[arg(long, requires = "output_dir")]
     screenshots: bool,
+    /// Open project settings in an existing repository, sync ZCode records and open an original task.
+    #[arg(long, requires="output_dir", conflicts_with_all=["scenario","script","repo"])]
+    live_zcode_history: Option<PathBuf>,
     /// Exercise all seven software stages with the installed Codex, Claude and ZCode clients.
     #[arg(long, requires="output_dir",conflicts_with_all=["scenario","script","repo"])]
     live_project_workflow: bool,
@@ -164,17 +169,17 @@ impl<'a> Driver<'a> {
         };
         cx.update(aep_studio::init);
         let window = cx.update(|cx| {
-            aep_studio::open_studio_with_runner(
-                Some(ws.clone()),
-                runner,
-                WindowOptions {
-                    show: false,
-                    focus: false,
-                    window_bounds: Some(WindowBounds::centered(size(px(1120.), px(730.)), cx)),
-                    ..Default::default()
-                },
-                cx,
-            )
+            let options = WindowOptions {
+                show: false,
+                focus: false,
+                window_bounds: Some(WindowBounds::centered(size(px(1120.), px(730.)), cx)),
+                ..Default::default()
+            };
+            if args.live_zcode_history.is_some() {
+                aep_studio::open_project_window(Some(ws.root.clone()), options, cx)
+            } else {
+                aep_studio::open_studio_with_runner(Some(ws.clone()), runner, options, cx)
+            }
         })?;
         let mut driver = Self { cx, window, args };
         driver.settle()?;
@@ -1405,6 +1410,10 @@ fn main() -> Result<()> {
     }
     if let Some(dir) = &args.output_dir {
         fs::create_dir_all(dir)?;
+    }
+    if let Some(path) = &args.live_zcode_history {
+        let ws = Workspace::open(path)?;
+        return inspect(&args, &ws, |ui| zcode_history::exercise(ui, &ws.root));
     }
     if args.live_project_workflow {
         return workflows::live(&mut args);
