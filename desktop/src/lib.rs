@@ -8,6 +8,7 @@ mod recent;
 mod relay;
 mod rolling;
 pub mod rolling_gate;
+pub mod stage_lifecycle;
 mod task_queue;
 mod view;
 pub use relay::Runner;
@@ -665,13 +666,31 @@ pub fn open_project_window(
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
-    let (window, studio) = open_window(None, Runner::default(), true, options, cx)?;
-    let explicit = path.is_some();
-    let action = if explicit {
+    let action = if path.is_some() {
         DirectoryAction::Open
     } else {
         DirectoryAction::Restore
     };
+    project_window(path, options, action, cx)
+}
+
+/// Reattach a workflow window to its catalog without selecting the directory's bound item.
+pub fn restore_work_window(
+    path: PathBuf,
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    project_window(Some(path), options, DirectoryAction::Restore, cx)
+}
+
+fn project_window(
+    path: Option<PathBuf>,
+    options: WindowOptions,
+    action: DirectoryAction,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    let (window, studio) = open_window(None, Runner::default(), true, options, cx)?;
+    let explicit = path.is_some();
     let Some(path) = path.or_else(recent::last_path) else {
         return Ok(window);
     };

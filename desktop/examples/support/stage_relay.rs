@@ -16,6 +16,8 @@ struct Plan {
     work: String,
     stage: usize,
     task: String,
+    #[serde(default)]
+    spec_sha: Option<String>,
     first: Models,
     second: Models,
     decision: String,
@@ -23,49 +25,7 @@ struct Plan {
     operator_gates: bool,
 }
 
-#[derive(Deserialize, serde::Serialize)]
-pub(super) struct Models {
-    implementer: String,
-    implementation_model: String,
-    reviewer: String,
-    review_model: String,
-}
-
-impl Models {
-    pub(super) fn verify_receipt(&self, ev: &serde_json::Value) -> Result<()> {
-        let model = if self.implementer == "codex" {
-            "codex_model"
-        } else {
-            "zcode_model"
-        };
-        ensure!(
-            ev["implementation_source"] == self.implementer
-                && ev["reviewer"] == self.reviewer
-                && ev["request"][model] == self.implementation_model
-                && ev["request"]["reviewer_model"] == self.review_model
-                && ev["check_exit_code"] == 0
-                && ev["review_status"] == "findings_recorded"
-                && ev["blocking_findings"]
-                    .as_array()
-                    .is_some_and(Vec::is_empty)
-                && ev["acceptance"].as_array().is_some_and(|a| !a.is_empty()
-                    && a.iter()
-                        .all(|c| c["status"] == "passed" && c["exit_code"] == 0)),
-            "接力的客户端、模型、验收或审查回执不符"
-        );
-        Ok(())
-    }
-    pub(super) fn validate(&self) -> Result<()> {
-        ensure!(
-            matches!(self.implementer.as_str(), "codex" | "zcode")
-                && matches!(self.reviewer.as_str(), "claude" | "zcode")
-                && !self.implementation_model.trim().is_empty()
-                && !self.review_model.trim().is_empty(),
-            "请指定两个接力角色支持的客户端与模型"
-        );
-        Ok(())
-    }
-}
+use aep_studio::stage_lifecycle::Models;
 fn press(ui: &mut Driver<'_>, container: &str, id: &str) -> Result<()> {
     if !ui.element(id)?.visible() {
         ui.reveal(container, id)?;
@@ -157,6 +117,12 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
                 id
             } else {
                 press(ui, "relay-list", &format!("relay-task-{}", plan.task))?;
+                if let Some(sha) = &plan.spec_sha {
+                    ensure!(
+                        ui.element("relay-selected-spec")?.label() == Some(sha.as_str()),
+                        "任务 Spec 已变化，请重新选择"
+                    );
+                }
                 models(ui, &plan.first)?;
                 press(ui, "relay-detail", "stage-agents-second")?;
                 models(ui, &plan.second)?;
@@ -172,7 +138,11 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
         ensure!(
             state["stage_plan"]["work"] == plan.work
                 && state["stage_plan"]["stage"] == plan.stage - 1
-                && state["task"]["name"] == plan.task,
+                && state["task"]["name"] == plan.task
+                && plan
+                    .spec_sha
+                    .as_ref()
+                    .is_none_or(|sha| state["task"]["sha"] == *sha),
             "saved relay belongs to a different task"
         );
         // Reopen from the durable project catalog, even on the first invocation.
@@ -267,6 +237,8 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
                 if plan.operator_gates {
                     ui.checkpoint("stage-question")?;
                     super::stage_lifecycle::wait_for_operator(
+                        out,
+                        "decision",
                         &format!(
                             "在事项 {} 的阶段接力记录 {} 中将问题 #{q} 修订为决策、点击用此决策发起第二轮",
                             plan.work, id

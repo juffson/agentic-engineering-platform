@@ -203,7 +203,8 @@ impl Studio {
             let task = task.clone();
             detail = detail
                 .child(heading(task.name.clone()).text_2xl())
-                .child(field("Spec SHA", &task.sha))
+                .child(caption("Spec SHA"))
+                .child(detail_text("relay-selected-spec", &task.sha))
                 .child(
                     panel()
                         .child(heading(if stage.is_some() {

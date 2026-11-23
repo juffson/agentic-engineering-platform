@@ -23,6 +23,8 @@ mod stage_lifecycle;
 mod stage_relay;
 #[path = "support/stage_transfer.rs"]
 mod stage_transfer;
+#[path = "support/work_delivery.rs"]
+mod work_delivery;
 #[path = "support/workflows.rs"]
 mod workflows;
 #[path = "support/zcode_history.rs"]
@@ -73,7 +75,7 @@ enum Scenario {
 #[derive(Parser)]
 #[command(
     about = "Exercise AEP Studio in a temporary Git workspace, using an offscreen GPUI window",
-    group(ArgGroup::new("live").args(["live_stage_lifecycle","live_stage_transfer","live_stage_relay","live_zcode_history","live_project_workflow","live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
+    group(ArgGroup::new("live").args(["live_work_delivery","live_stage_lifecycle","live_stage_transfer","live_stage_relay","live_zcode_history","live_project_workflow","live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
 )]
 struct Args {
     /// Run just one scenario (default: all)
@@ -94,6 +96,11 @@ struct Args {
     /// Also save PNGs from the platform's offscreen renderer
     #[arg(long, requires = "output_dir")]
     screenshots: bool,
+    #[arg(long, hide = true, requires = "output_dir")]
+    restore_work_window: bool,
+    /// Drive the operator window for a real Studio-launched item delivery.
+    #[arg(long,requires="output_dir",conflicts_with_all=["scenario","script","repo"])]
+    live_work_delivery: Option<PathBuf>,
     /// Run a work item from its implementation relay through verified delivery and screenshots.
     #[arg(long, requires="output_dir", conflicts_with_all=["scenario","script","repo"])]
     live_stage_lifecycle: Option<PathBuf>,
@@ -201,9 +208,11 @@ impl<'a> Driver<'a> {
                 window_bounds: Some(WindowBounds::centered(size(px(1120.), px(730.)), cx)),
                 ..Default::default()
             };
-            if args.live_stage_transfer.is_some()
-                || args.live_zcode_history.is_some()
+            if args.live_work_delivery.is_some() || args.restore_work_window {
+                aep_studio::restore_work_window(ws.root.clone(), options, cx)
+            } else if args.live_stage_transfer.is_some()
                 || args.live_stage_relay.is_some()
+                || args.live_zcode_history.is_some()
             {
                 aep_studio::open_project_window(Some(ws.root.clone()), options, cx)
             } else {
@@ -1467,6 +1476,9 @@ fn main() -> Result<()> {
     }
     if let Some(dir) = &args.output_dir {
         fs::create_dir_all(dir)?;
+    }
+    if let Some(path) = &args.live_work_delivery {
+        return work_delivery::run(&args, path);
     }
     if let Some(path) = &args.live_stage_lifecycle {
         return stage_lifecycle::run(&args, path);

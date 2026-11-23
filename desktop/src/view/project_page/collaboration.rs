@@ -363,15 +363,21 @@ impl Studio {
     }
     pub(super) fn work_tabs(&self, work: &Work, open: bool, cx: &Context<Self>) -> Div {
         let id = work.id.clone();
+        let delivery = self
+            .board
+            .delivery
+            .as_ref()
+            .is_some_and(|s| s.work == work.id);
         h_flex()
             .gap_2()
             .child(
                 button(
                     "work-flow-tab",
                     "阶段工作流",
-                    !open && self.board.timeline.is_none(),
+                    !open && self.board.timeline.is_none() && !delivery,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
+                    this.board.delivery = None;
                     this.board.timeline = None;
                     this.board.desk = None;
                     cx.notify();
@@ -380,6 +386,7 @@ impl Studio {
             .child(
                 button("work-collab-tab", "协作与交接", open).on_click(cx.listener(
                     move |this, _, w, cx| {
+                        this.board.delivery = None;
                         this.board.timeline = None;
                         if this.board.desk.as_ref().is_none_or(|d| d.work != id) {
                             this.board.desk = Some(WorkDesk {
@@ -407,6 +414,15 @@ impl Studio {
                         .is_some_and(|t| t.work == work.id),
                 )
                 .on_click(cx.listener(|s, _, _, cx| s.load_timeline(cx))),
+            )
+            .when(
+                crate::stage_lifecycle::implementation_stage(work.template).is_some(),
+                |tabs| {
+                    tabs.child(
+                        button("work-delivery-tab", "开发全流程", delivery)
+                            .on_click(cx.listener(|s, _, w, cx| s.open_delivery(w, cx))),
+                    )
+                },
             )
     }
 

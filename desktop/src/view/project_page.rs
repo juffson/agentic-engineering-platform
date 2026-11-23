@@ -1,6 +1,7 @@
 use super::*;
 mod agents;
 mod collaboration;
+mod delivery;
 mod timeline;
 mod zcode;
 mod zcode_history;
@@ -31,6 +32,7 @@ pub(crate) struct Board {
     site_editor: Option<SiteEditor>,
     infra_view: Option<InfraView>,
     desk: Option<WorkDesk>,
+    delivery: Option<delivery::State>,
     pick_record: bool,
     dir: Option<PathBuf>,
     section: Section,
@@ -97,6 +99,7 @@ impl Board {
             site_editor: None,
             infra_view: None,
             desk: None,
+            delivery: None,
             pick_record: false,
             dir,
             section,
@@ -275,6 +278,7 @@ impl Studio {
         self.page = Page::Project;
         self.stage_setup = None;
         self.board.section = section;
+        self.board.delivery = None;
         self.board.timeline = None;
         self.board.zcode_history = None;
         self.board.sync_message = None;
@@ -888,7 +892,11 @@ impl Studio {
                     } else if let Some(work) = p.selected() {
                         let collab = self.board.desk.as_ref().is_some_and(|d| d.work == work.id);
                         page = page.child(self.work_tabs(work, collab, cx));
-                        if let Some(history) = self
+                        if let Some(flow) =
+                            self.board.delivery.as_ref().filter(|s| s.work == work.id)
+                        {
+                            page = page.child(self.delivery_page(flow, work, cx));
+                        } else if let Some(history) = self
                             .board
                             .timeline
                             .as_ref()
@@ -901,7 +909,14 @@ impl Studio {
                             page = page.child(self.work_detail(p, work, cx));
                         }
                     }
-                    page = page.child(self.work_list(p, cx));
+                    if !self
+                        .board
+                        .delivery
+                        .as_ref()
+                        .is_some_and(|s| p.selected().is_some_and(|w| w.id == s.work))
+                    {
+                        page = page.child(self.work_list(p, cx));
+                    }
                 }
                 Section::Library => {}
             }

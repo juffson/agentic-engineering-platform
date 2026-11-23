@@ -34,6 +34,7 @@ impl Studio {
         let project = p.id.clone();
         let request = uuid::Uuid::new_v4();
         self.board.desk = None;
+        self.board.delivery = None;
         self.board.timeline = Some(State {
             work: work.id.clone(),
             project: project.clone(),

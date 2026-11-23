@@ -5,11 +5,10 @@ use aep::{
         directory::{DirectoryAction, DirectoryProject},
         save_json,
     },
-    workflow::{Client, Role},
     workspace::{Workspace, ident, read},
 };
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -17,28 +16,7 @@ use std::{
     process::Command,
 };
 
-#[derive(Deserialize, Serialize)]
-struct Profile {
-    client: Client,
-    model: String,
-    brief: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct Plan {
-    repository: PathBuf,
-    work: String,
-    stage: usize,
-    task: String,
-    first: super::stage_relay::Models,
-    second: super::stage_relay::Models,
-    #[serde(default)]
-    decision: String,
-    test: Profile,
-    accept: Profile,
-    deliver: Profile,
-}
-
+use aep_studio::stage_lifecycle::Plan;
 // Selecting the same item in another Studio window can advance the catalog revision.
 pub(super) fn open_item(ui: &mut Driver<'_>, work: &str) -> Result<()> {
     until(ui, "project", 30, |ui| {
@@ -63,13 +41,17 @@ pub(super) fn open_item(ui: &mut Driver<'_>, work: &str) -> Result<()> {
 }
 
 pub(super) fn wait_for_operator(
+    dir: &Path,
+    kind: &str,
     label: &str,
     mut confirmed: impl FnMut() -> Result<bool>,
 ) -> Result<()> {
+    save_json(dir, "waiting.json", &json!({"kind":kind,"label":label}))?;
     println!("等待 Studio 确认 · {label}");
     while !confirmed()? {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
+    fs::remove_file(dir.join("waiting.json"))?;
     Ok(())
 }
 
@@ -79,6 +61,7 @@ fn step(out: &Path, name: &str, flag: &str, plan: &Value) -> Result<PathBuf> {
     save_json(&dir, "input.json", plan)?;
     println!("Studio · {name} · {}", dir.display());
     let status = Command::new(std::env::current_exe()?)
+        .arg("--restore-work-window")
         .arg(flag)
         .arg(dir.join("input.json"))
         .arg("--output-dir")
@@ -138,14 +121,7 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
     let start = plan.stage.checked_sub(1).context("阶段从 1 开始")?;
     let stages = work.template.stages();
     ensure!(
-        stages
-            .get(start..)
-            .is_some_and(|s| s.iter().map(|s| s.role).eq([
-                Role::Build,
-                Role::Test,
-                Role::Accept,
-                Role::Deliver
-            ])),
+        aep_studio::stage_lifecycle::implementation_stage(work.template) == Some(start),
         "请选择测试、独立验收、交付之前的开发实现阶段"
     );
     ensure!(

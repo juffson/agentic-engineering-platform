@@ -86,6 +86,8 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
             }
             if plan.operator_gates {
                 super::stage_lifecycle::wait_for_operator(
+                    dir,
+                    "transfer",
                     &format!(
                         "在事项 {} 的第 {} 阶段确认执行 {} 交接到下一阶段",
                         plan.work, plan.stage, plan.source_run
@@ -227,6 +229,8 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
                 }
                 if plan.operator_gates {
                     super::stage_lifecycle::wait_for_operator(
+                        dir,
+                        "archive",
                         &format!(
                             "在事项 {} 的交付阶段核对执行 {} 并点击「确认交付并归档」",
                             plan.work, id

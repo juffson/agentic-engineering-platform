@@ -284,6 +284,9 @@ impl Studio {
                             this.refresh_project_memory(cx);
                         }
                     }
+                    if this.board.delivery.is_some() {
+                        cx.notify();
+                    }
                     true
                 });
                 if !active.unwrap_or(false) {
