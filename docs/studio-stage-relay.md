@@ -38,3 +38,18 @@ AEP_STUDIO_RUNNER="$PWD/target/debug/aep" cargo run --locked \
 ```
 
 `plan.json` 填写 `repository`（本地仓库目录）、`work`（开发事项 ID）、`stage`（从 1 开始的阶段号）、`task`（已提交的任务名）、`decision`（要保存的修订正文），以及 `first` 和 `second` 两组配置。每组包含 `implementer`、`implementation_model`、`reviewer` 和 `review_model`。为这项复验准备的 Spec 应要求第一轮留一个明确问题，第二轮落实修订。复用同一输出目录会按保存的接力 ID 打开原记录。
+
+## 交给同一事项的下一阶段
+
+1. 在来源阶段打开「查看验收与阶段交接」，选择已通过独立审查和验收的第二轮。展开「记忆与交接」核对决策和审查报告，点「确认交接到测试验证」。普通阶段 Agent 成功完成后，也可以用「确认验收并交接到下一阶段」交付结果。
+2. 在目标阶段核对「已接收上一阶段交接」，选择 CLI 和模型，填写本轮测试说明，启动阶段 Agent。接收同仓库的接力提交时，Studio 从已验收的 SHA 创建隔离工作区。目标阶段也可以选择「阶段两轮接力」，两轮的实现端和审查端都会收到交接，任务基线由所选 Spec 决定。
+3. 重开 Studio，回到事项的「会话与轮次」。来源执行显示「已确认交接」，接收执行显示「本次执行已读取阶段交接」。比较来源执行 ID、决策版本及验收结果，即可核对两边的记录。回到旧阶段重做时，原回执保留在时间线，新执行沿用重新确认的交接。
+
+在 CLI 中确认同一笔交接时，传入来源阶段号（从 1 开始）和来源执行 ID。对于接力，使用最近一次成功的第二轮执行 ID。确认后可重新打开 Studio 选择模型，也可用项目已有的阶段执行命令继续。
+
+```sh
+aep project --work "$work_id" confirm-handoff --stage 4 --run "$source_run_id"
+aep project --work "$work_id" timeline
+```
+
+开发者可以用离屏 Studio 复验这一段。在前面的 UI debug 命令中，将 `--live-stage-relay plan.json` 换成 `--live-stage-transfer transfer.json`，使用独立的输出目录。配置包含 `repository`、`work`、`stage`（来源阶段号）、`source_run`（已通过的来源执行 ID），以及目标阶段的 `client`（例如 `Codex`）、`model` 和 `brief`。复验会保存确认回执、目标执行证据，以及重开后两端时间线的截图。

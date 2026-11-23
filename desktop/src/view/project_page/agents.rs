@@ -182,25 +182,6 @@ impl Studio {
             .and_then(|d| workflow::evidence(&d).ok())
             .is_some_and(|v| busy(&v))
     }
-    pub(super) fn reviewed_result(&self, index: usize) -> Result<Option<String>> {
-        let work = self
-            .board
-            .library
-            .project()
-            .and_then(Project::selected)
-            .context("请选择开发事项")?;
-        let Some(id) = work.current_attempt.get(&index) else {
-            return Ok(None);
-        };
-        let d = self.attempt_path(id).context("找不到执行目录")?;
-        let ev = workflow::evidence(&d)?;
-        ensure!(
-            ev["status"] == "succeeded",
-            "本阶段执行{}，请先完成或重试",
-            phase(&ev)
-        );
-        Ok(Some(fs::read_to_string(d.join("result.txt"))?))
-    }
     pub(super) fn accept_catalog(
         &mut self,
         latest: Library,

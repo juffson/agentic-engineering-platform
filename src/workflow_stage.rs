@@ -13,7 +13,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn workspace(work: &Path, repository: Option<&Path>) -> Result<PathBuf> {
+fn workspace(
+    work: &Path,
+    repository: Option<&Path>,
+    delivery: Option<&aep::project::transfer::Transfer>,
+    attempt: &str,
+) -> Result<PathBuf> {
     let Some(repo) = repository else {
         let p = work.join("workspace");
         fs::create_dir_all(&p)?;
@@ -25,8 +30,24 @@ fn workspace(work: &Path, repository: Option<&Path>) -> Result<PathBuf> {
         .and_then(|s| s.to_str())
         .context("missing work ID")?;
     aep::workspace::ident(id, 64)?;
-    let path = repo.data.join("workflow-worktrees").join(id);
-    let branch = format!("aep-stage/{id}");
+    let delivery = delivery.filter(|t| t.repository.as_ref() == Some(&repo.root));
+    let pinned = delivery.and_then(|t| t.candidate.as_deref());
+    let existing = delivery.and_then(|t| t.checkout.as_deref());
+    let checkout = if let Some(saved) = existing {
+        aep::workspace::ident(saved, 160)?;
+        ensure!(
+            saved == id || saved.starts_with(&format!("{id}-")),
+            "前序工作区属于其他事项"
+        );
+        saved.to_owned()
+    } else if pinned.is_some() {
+        format!("{id}-{attempt}")
+    } else {
+        id.to_owned()
+    };
+    let path = repo.data.join("workflow-worktrees").join(&checkout);
+    ensure!(existing.is_none() || path.is_dir(), "前序阶段工作区已移除");
+    let branch = format!("aep-stage/{checkout}");
     if !path.exists() {
         fs::create_dir_all(path.parent().unwrap())?;
         git(
@@ -37,7 +58,7 @@ fn workspace(work: &Path, repository: Option<&Path>) -> Result<PathBuf> {
                 "-b",
                 &branch,
                 path.to_str().context("invalid workspace path")?,
-                "HEAD",
+                pinned.unwrap_or("HEAD"),
             ],
         )?;
     }
@@ -138,10 +159,18 @@ fn perform(
     record: &mut Value,
 ) -> Result<()> {
     req.profile.validate()?;
-    let cwd = workspace(work, req.repository.as_deref())?;
+    let cwd = workspace(
+        work,
+        req.repository.as_deref(),
+        req.stage_transfer.as_ref(),
+        id,
+    )?;
     let packet = context(req, dir, &cwd, None)?;
     let prompt = packet.text;
     fs::write(dir.join("prompt.txt"), &prompt)?;
+    if let Some(t) = &req.stage_transfer {
+        record["read_stage_transfer"] = json!(t);
+    }
     record["workspace"] = json!(cwd);
     record["prompt_bytes"] = json!(prompt.len());
     record["read_memory"] = json!(packet.project_ids);
@@ -266,6 +295,15 @@ fn perform(
     }
     if profile.client == Client::Codex {
         record["commands"] = json!(command_receipts(&stdout)?);
+        for line in BufReader::new(fs::File::open(&stdout)?).lines().take(20) {
+            if let Ok(event) = serde_json::from_str::<Value>(&line?)
+                && event["type"] == "thread.started"
+                && event["thread_id"].is_string()
+            {
+                record["session"] = event["thread_id"].clone();
+                break;
+            }
+        }
     }
 
     ensure!(
@@ -283,6 +321,7 @@ fn perform(
         Client::Codex => fs::read_to_string(&result_path).context("Codex 未生成最终答复")?,
         Client::Claude => {
             let v: Value = serde_json::from_reader(fs::File::open(stdout)?)?;
+            record["session"] = v["session_id"].clone();
             if let Some(usage) = v["modelUsage"].as_object() {
                 record["reported_models"] = json!(usage.keys().collect::<Vec<_>>());
             }

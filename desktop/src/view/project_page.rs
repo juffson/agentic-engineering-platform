@@ -359,28 +359,19 @@ impl Studio {
         let Some((id, stage)) = self.board.note_key.clone() else {
             return;
         };
-        let mut value = self.board.note.read(cx).value().to_string();
-        if advance {
-            match self.reviewed_result(stage) {
-                Ok(Some(result)) if value.trim().is_empty() => value = result,
-                Ok(_) => (),
-                Err(e) => {
-                    self.board.error = Some(format!("{e:#}"));
-                    cx.notify();
-                    return;
-                }
-            }
-        }
+        let value = self.board.note.read(cx).value().to_string();
+        let Some(home) = self.board.dir.clone() else {
+            return;
+        };
         if self.change_board(cx, |lib| {
-            let work = lib.project_mut()?.selected_mut()?;
-            ensure!(work.id == id, "事项已更新，请重新打开");
+            let p = lib.project_mut()?;
+            ensure!(p.selected.as_ref() == Some(&id), "事项已更新，请重新打开");
             if advance {
-                ensure!(work.stage == stage, "仅可完成当前阶段");
-                ensure!(!value.trim().is_empty(), "请先填写阶段结论");
-                work.stage += 1;
+                p.finish_stage(&home, &id, stage, value)
+            } else {
+                p.selected_mut()?.notes[stage] = value;
+                Ok(())
             }
-            work.notes[stage] = value;
-            Ok(())
         }) && advance
         {
             self.load_stage(w, cx);
@@ -525,6 +516,7 @@ impl Studio {
             ..Default::default()
         };
         let plan = crate::relay::StagePlan {
+            incoming: work.incoming(stage).cloned(),
             project: project.id.clone(),
             work: work.id.clone(),
             stage,
@@ -571,6 +563,10 @@ impl Studio {
                 ensure!(
                     p.id == plan.project && p.selected.as_ref() == Some(&plan.work),
                     "事项已切换"
+                );
+                ensure!(
+                    p.selected().and_then(|w| w.incoming(plan.stage)) == plan.incoming.as_ref(),
+                    "阶段交接已变化，请重新打开"
                 );
                 p.link_at_stage(
                     &plan.work,
@@ -1256,7 +1252,10 @@ impl Studio {
                         .h(px(82.)),
                 ),
             );
-        let mut actions = h_flex().gap_2().child(
+        if let Some(t) = work.incoming(viewing) {
+            detail = detail.child(field("已接收上一阶段交接", &t.context()));
+        }
+        let mut actions = h_flex().gap_2().flex_wrap().child(
             button("project-save-note", "保存记录", false)
                 .on_click(cx.listener(|this, _, w, cx| this.save_stage(false, w, cx))),
         );
@@ -1265,12 +1264,27 @@ impl Studio {
                 cx.listener(move |s, _, w, cx| s.open_stage_relay(&repo, viewing, w, cx)),
             ));
         }
+        let has_relay = work
+            .records
+            .iter()
+            .any(|r| r.kind == aep::project::RecordKind::Relay && r.stage == Some(viewing));
+        if viewing + 1 < stages.len() && (has_relay || work.current_attempt.contains_key(&viewing))
+        {
+            actions = actions.child(
+                button("stage-transfer-review", "查看验收与阶段交接", true)
+                    .on_click(cx.listener(|s, _, _, cx| s.load_timeline(cx))),
+            );
+        }
         if viewing == work.stage {
             actions = actions.child(
                 primary(
                     "project-next",
                     if viewing + 1 == stages.len() {
                         "确认完成交付"
+                    } else if work.current_attempt.contains_key(&viewing) {
+                        "确认验收并交接到下一阶段"
+                    } else if has_relay {
+                        "按人工记录推进阶段"
                     } else {
                         "完成并进入下一阶段"
                     },
@@ -1289,6 +1303,7 @@ impl Studio {
                         }
                         if this.change_board(cx, |lib| {
                             let item = lib.project_mut()?.selected_mut()?;
+                            item.reopen_transfers(viewing);
                             item.stage = viewing;
                             item.current_attempt.retain(|s, _| *s < viewing);
                             Ok(())

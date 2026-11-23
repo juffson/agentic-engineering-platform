@@ -197,6 +197,13 @@ enum Action {
         #[arg(long)]
         attempt: String,
     },
+    /// Confirm a completed execution and deliver its evidence to the next stage.
+    ConfirmHandoff {
+        #[arg(long)]
+        stage: usize,
+        #[arg(long)]
+        run: String,
+    },
     /// Confirm the expected stage after reviewing its result or manual note.
     Advance {
         #[arg(long)]
@@ -390,6 +397,11 @@ fn external_context(dir: &Path, since: Option<i64>) -> Result<Value> {
         }
         ev[key] = json!(all);
     }
+    if since.is_none()
+        && let Some(t) = &req.stage_transfer
+    {
+        ev["read_stage_transfer"] = json!(t);
+    }
     ev["prompt_bytes"] = json!(dir.join("prompt.txt").metadata()?.len());
     save_json(dir, "evidence.json", &ev)?;
     Ok(
@@ -410,7 +422,7 @@ fn view(work: &Work, project: &Project, dir: &Path) -> Result<Value> {
         attempts.push(json!({"id":a.id,"stage":a.stage+1,"status":e["status"],"session":e["session"],"client":a.profile.client,"model":a.profile.model,"error":e["error"]}));
     }
     Ok(
-        json!({"project":project.id,"work":work.id,"name":work.name,"template":work.template,"stage_name":work.stage_name(),"stage":(work.stage<work.notes.len()).then_some(work.stage+1),"repositories":work.repositories,"records":work.records,"https":https,"handoffs":work.handoffs,"stages":work.template.stages().iter().enumerate().map(|(i,s)|json!({"stage":i+1,"name":s.name,"profile":work.profile(i),"attempt":work.current_attempt.get(&i)})).collect::<Vec<_>>(),"attempts":attempts}),
+        json!({"project":project.id,"work":work.id,"name":work.name,"template":work.template,"stage_name":work.stage_name(),"stage":(work.stage<work.notes.len()).then_some(work.stage+1),"repositories":work.repositories,"records":work.records,"https":https,"handoffs":work.handoffs,"stage_transfers":work.stage_transfers,"stages":work.template.stages().iter().enumerate().map(|(i,s)|json!({"stage":i+1,"name":s.name,"profile":work.profile(i),"attempt":work.current_attempt.get(&i)})).collect::<Vec<_>>(),"attempts":attempts}),
     )
 }
 struct Catalog {
@@ -495,24 +507,10 @@ impl Catalog {
     fn advance(&mut self, stage: usize, note: Option<String>) -> Result<()> {
         let w = self.work()?;
         let i = index(stage, w)?;
-        ensure!(i == w.stage, "阶段已推进或尚未到达");
-        let mut text = note.unwrap_or_else(|| w.notes[i].clone());
-        if let Some(id) = w.current_attempt.get(&i) {
-            let dir = self.attempt(id)?;
-            ensure!(
-                workflow::evidence(&dir)?["status"] == "succeeded",
-                "执行尚未通过"
-            );
-            if text.trim().is_empty() {
-                text = fs::read_to_string(dir.join("result.txt"))?;
-            }
-        }
-        ensure!(!text.trim().is_empty(), "请提供人工阶段结论");
-        self.edit_work(|w| {
-            w.notes[i] = text;
-            w.stage += 1;
-            Ok(())
-        })?;
+        let wid = w.id.clone();
+        let text = note.unwrap_or_else(|| w.notes[i].clone());
+        let home = self.dir.clone();
+        self.edit_project(|p| p.finish_stage(&home, &wid, i, text))?;
         print(&json!({"confirmed_stage":stage}))
     }
     fn show(&self, id: &str, part: &str, artifact: Option<PathBuf>) -> Result<()> {
@@ -831,6 +829,13 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             })?;
             print(&json!({"saved_stage":stage}))
         }
+        Action::ConfirmHandoff { stage, run } => {
+            let i = index(stage, c.work()?)?;
+            let wid = c.work()?.id.clone();
+            let home = c.dir.clone();
+            let receipt = c.edit_project(|p| p.confirm_transfer(&home, &wid, i, &run))?;
+            print(&json!(receipt))
+        }
         Action::Advance { stage, note } => c.advance(stage, note),
         Action::Reopen { stage } => {
             let w = c.work()?;
@@ -843,6 +848,7 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
                 );
             }
             c.edit_work(|w| {
+                w.reopen_transfers(i);
                 w.stage = i;
                 w.current_attempt.retain(|j, _| *j < i);
                 Ok(())

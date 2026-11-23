@@ -143,7 +143,23 @@ fn independent_sessions_share_revisions_and_immutable_evidence() -> Result<()> {
     );
     assert_eq!(done, api(&submit)?);
     assert_eq!(api(&take)?["status"], "succeeded");
+    assert!(
+        !invoke(&home, &a, &["confirm-handoff", "--stage", "2", "--run", id])?
+            .status
+            .success()
+    );
     api(&["advance", "--stage", "1"])?;
+    let confirmed = api(&["confirm-handoff", "--stage", "1", "--run", id])?;
+    assert_eq!(confirmed["run"], id);
+    assert_eq!(confirmed["to"], 1);
+    assert_eq!(
+        confirmed["project_decisions"],
+        serde_json::json!([{"id":2,"body":"current acceptance"}])
+    );
+    assert_eq!(
+        api(&["timeline"])?["stage_transfers"],
+        serde_json::json!([confirmed])
+    );
     assert!(!invoke(&home, &a, &take)?.status.success());
     let next = call(
         &home,
@@ -165,7 +181,24 @@ fn independent_sessions_share_revisions_and_immutable_evidence() -> Result<()> {
         "Claude"
     );
     let second = next["attempt"].as_str().unwrap();
+    let receipt = api(&["show", "--attempt", second, "--part", "receipt"])?;
+    assert_eq!(receipt["read_stage_transfer"], confirmed);
+    assert!(
+        next["context"]
+            .as_str()
+            .unwrap()
+            .contains(confirmed["acceptance"].as_str().unwrap())
+    );
     api(&["cancel", "--attempt", second])?;
+    assert!(
+        !invoke(
+            &home,
+            &a,
+            &["confirm-handoff", "--stage", "2", "--run", second]
+        )?
+        .status
+        .success()
+    );
     fs::write(b.join("still-owned"), "own session is usable")?;
     assert!(
         !invoke(

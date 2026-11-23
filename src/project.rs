@@ -1,5 +1,6 @@
 pub mod directory;
 pub mod timeline;
+pub mod transfer;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -274,6 +275,10 @@ pub struct WorkHandoff {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Work {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stage_transfers: Vec<transfer::Transfer>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub active_transfers: BTreeMap<usize, usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub records: Vec<WorkRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handoffs: Vec<WorkHandoff>,
@@ -503,6 +508,8 @@ impl Project {
         let id = Uuid::new_v4().simple().to_string();
         self.selected = Some(id.clone());
         let mut work = Work {
+            stage_transfers: vec![],
+            active_transfers: BTreeMap::new(),
             records: vec![],
             handoffs: vec![],
             tickets: Default::default(),

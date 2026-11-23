@@ -127,6 +127,8 @@ impl Default for RelayAgents {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct StagePlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming: Option<aep::project::transfer::Transfer>,
     pub project: String,
     pub work: String,
     pub stage: usize,
@@ -672,6 +674,12 @@ fn launch(
             .stdin(Stdio::from(owner.try_clone()?))
             .stdout(log.try_clone()?)
             .stderr(log.try_clone()?);
+        if let Some(t) = relay.stage_plan.as_ref().and_then(|p| p.incoming.as_ref()) {
+            aep::project::save_json(&path, "stage-transfer.json", t)?;
+            command
+                .arg("--stage-transfer")
+                .arg(path.join("stage-transfer.json"));
+        }
         if relay.agents.implementer == Client::Codex && !relay.agents.model.is_empty() {
             command.args(["--codex-model", &relay.agents.model]);
         }
@@ -799,6 +807,7 @@ mod tests {
         let ws = Workspace::open(repo)?;
         let task = stage_tasks(&ws)?.pop().context("local Spec")?;
         let plan = StagePlan {
+            incoming: None,
             project: "p".into(),
             work: "w".into(),
             stage: 3,

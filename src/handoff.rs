@@ -83,7 +83,7 @@ pub fn packet(
 ) -> Result<Packet> {
     let stage = req.template.stages().get(req.stage).context("无效阶段")?;
     let total = project.len();
-    let (project, project_ids) = entries(project, 1600, 720, since);
+    let (project, mut project_ids) = entries(project, 1600, 720, since);
     if since.is_some() {
         return Ok(Packet {
             more: project_ids.len() < total,
@@ -92,7 +92,7 @@ pub fn packet(
             repo_ids: vec![],
         });
     }
-    let (repo, repo_ids) = entries(repo, 650, 420, None);
+    let (repo, mut repo_ids) = entries(repo, 650, 420, None);
     let mut text = format!(
         "AEP Studio 项目：{} / {}\n阶段：{}（{}）\n阶段职责：{}\n本次说明：{}",
         clip(&req.project, 160),
@@ -102,6 +102,20 @@ pub fn packet(
         stage.brief,
         clip(req.brief.trim(), 850)
     );
+    if let Some(transfer) = &req.stage_transfer {
+        text.push('\n');
+        text.push_str(&transfer.context());
+        for decision in &transfer.project_decisions {
+            if !project_ids.contains(&decision.id) {
+                project_ids.push(decision.id);
+            }
+        }
+        if let Some(id) = transfer.repository_decision(req.repository.as_deref())
+            && !repo_ids.contains(&id)
+        {
+            repo_ids.insert(0, id);
+        }
+    }
     let mut remaining = 850usize;
     for h in req.handoffs.iter().rev() {
         if remaining < 120 {
@@ -177,6 +191,7 @@ pub struct Assignment {
 impl Work {
     pub fn request(&self, project: &str, stage: usize, assignment: Assignment) -> Request {
         Request {
+            stage_transfer: self.incoming(stage).cloned(),
             handoffs: self.handoffs.clone(),
             project: project.to_owned(),
             work: self.name.clone(),

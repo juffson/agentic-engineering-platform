@@ -19,6 +19,8 @@ mod local;
 mod project;
 #[path = "support/stage_relay.rs"]
 mod stage_relay;
+#[path = "support/stage_transfer.rs"]
+mod stage_transfer;
 #[path = "support/workflows.rs"]
 mod workflows;
 #[path = "support/zcode_history.rs"]
@@ -69,7 +71,7 @@ enum Scenario {
 #[derive(Parser)]
 #[command(
     about = "Exercise AEP Studio in a temporary Git workspace, using an offscreen GPUI window",
-    group(ArgGroup::new("live").args(["live_stage_relay","live_zcode_history","live_project_workflow","live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
+    group(ArgGroup::new("live").args(["live_stage_transfer","live_stage_relay","live_zcode_history","live_project_workflow","live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
 )]
 struct Args {
     /// Run just one scenario (default: all)
@@ -90,6 +92,9 @@ struct Args {
     /// Also save PNGs from the platform's offscreen renderer
     #[arg(long, requires = "output_dir")]
     screenshots: bool,
+    /// Confirm an accepted stage and launch the next model session in a local project.
+    #[arg(long, requires="output_dir", conflicts_with_all=["scenario","script","repo"])]
+    live_stage_transfer: Option<PathBuf>,
     /// Exercise a project stage relay using a local JSON plan and installed clients.
     #[arg(long, requires="output_dir", conflicts_with_all=["scenario","script","repo"])]
     live_stage_relay: Option<PathBuf>,
@@ -188,7 +193,10 @@ impl<'a> Driver<'a> {
                 window_bounds: Some(WindowBounds::centered(size(px(1120.), px(730.)), cx)),
                 ..Default::default()
             };
-            if args.live_zcode_history.is_some() || args.live_stage_relay.is_some() {
+            if args.live_stage_transfer.is_some()
+                || args.live_zcode_history.is_some()
+                || args.live_stage_relay.is_some()
+            {
                 aep_studio::open_project_window(Some(ws.root.clone()), options, cx)
             } else {
                 aep_studio::open_studio_with_runner(Some(ws.clone()), runner, options, cx)
@@ -1423,6 +1431,9 @@ fn main() -> Result<()> {
     }
     if let Some(dir) = &args.output_dir {
         fs::create_dir_all(dir)?;
+    }
+    if let Some(path) = &args.live_stage_transfer {
+        return stage_transfer::run(&args, path);
     }
     if let Some(path) = &args.live_stage_relay {
         return stage_relay::run(&args, path);

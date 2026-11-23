@@ -137,6 +137,9 @@ struct Execution {
     run_id: Option<String>,
     #[arg(long)]
     shared_memory: bool,
+    /// Pass a confirmed project stage delivery to each agent in this run.
+    #[arg(long, requires = "shared_memory")]
+    stage_transfer: Option<PathBuf>,
     /// Require this current memory version in each model client's context.
     #[arg(long, requires = "shared_memory")]
     require_memory: Option<i64>,

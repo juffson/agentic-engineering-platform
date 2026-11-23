@@ -481,11 +481,16 @@ fn zcode_implementer_shares_memory_with_claude_reviewer() {
         "--text",
         "stable contract",
     ]));
+    let transfer = f.repo.join(".git/stage-transfer.json");
+    fs::write(&transfer,serde_json::to_vec(&serde_json::json!({
+        "project":"project","work":"work","from":1,"to":2,"run":"previous-run","decision":"keep-api", "acceptance":"acceptance-17 passed","confirmed_at":"2026-11-23T00:00:00Z"
+    })).unwrap()).unwrap();
     f.script(
         "zcode",
         r#"case "$*" in *"--mode edit"*) ;; *) echo 'missing edit mode' >&2; exit 3;; esac
 while [ "$1" != --attach ]; do shift; done
 prompt=$(cat "$2")
+case "$prompt" in *"acceptance-17 passed"*) ;; *) exit 4;; esac
 case "$prompt" in *"stable contract"*) ;; *) echo 'decision missing' >&2; exit 1;; esac
 case "$prompt" in *AEP-RELAY*) ;; *) echo 'relay note missing' >&2; exit 2;; esac
 printf ok > result.txt
@@ -494,6 +499,7 @@ printf 'implemented via headless zcode.\nAEP-RELAY: {"note":"zcode-handoff-42","
     f.script(
         "claude",
         r#"prompt=$(cat)
+case "$prompt" in *"keep-api"*) ;; *) exit 5;; esac
 case "$prompt" in *"zcode-handoff-42"*) ;; *) exit 1;; esac
 printf '%s' '{"structured_output":{"note":"review note","question":"","report":"detailed report"}}'"#,
     );
@@ -508,9 +514,15 @@ printf '%s' '{"structured_output":{"note":"review note","question":"","report":"
         "--run-id",
         "zcode-relay",
         "--shared-memory",
+        "--stage-transfer",
+        transfer.to_str().unwrap(),
     ];
     ok(f.call(&args));
     let r = f.state("zcode-relay");
+    assert_eq!(
+        r["stage_transfer_readers"],
+        serde_json::json!({"implementer":"previous-run","reviewer":"previous-run"})
+    );
     assert_eq!(r["implementation_source"], "zcode");
     assert_eq!(r["request"]["source"], "zcode");
     assert_eq!(r["review_status"], "findings_recorded");

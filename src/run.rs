@@ -311,6 +311,14 @@ pub fn execute(
         "task": args.task, "spec_sha": base, "source": source,
         "reviewer": args.reviewer, "timeout": args.timeout
     });
+    let transfer: Option<aep::project::transfer::Transfer> = args
+        .stage_transfer
+        .as_ref()
+        .map(|p| -> Result<_> { Ok(serde_json::from_reader(fs::File::open(p)?)?) })
+        .transpose()?;
+    if let Some(t) = &transfer {
+        request["stage_transfer"] = json!(t);
+    }
     if args.shared_memory {
         request["shared_memory"] = json!(true);
     }
@@ -414,6 +422,7 @@ pub fn execute(
             None
         };
         let mut agents = Agents {
+            stage_transfer: transfer.as_ref(),
             repository: &repo.root,
             work: &work,
             folder: &folder,

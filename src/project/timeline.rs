@@ -21,6 +21,7 @@ pub struct Timeline {
     pub work_name: String,
     pub stages: Vec<String>,
     pub rounds: Vec<Round>,
+    pub stage_transfers: Vec<super::transfer::Transfer>,
     pub errors: Vec<String>,
 }
 #[derive(Serialize)]
@@ -34,6 +35,7 @@ pub struct Round {
     pub attempt: usize,
     pub status: String,
     pub decision: Option<i64>,
+    pub read_stage_transfer: Option<super::transfer::Transfer>,
     pub agents: Vec<Agent>,
 }
 #[derive(Serialize)]
@@ -156,6 +158,7 @@ fn repository_run(
     let ev = crate::workspace::status(&ws.data, &round.run)?;
     ensure!(ev["run_id"] == round.run, "运行回执身份不符");
     round.status = text(&ev, "status").into();
+    round.read_stage_transfer = serde_json::from_value(ev["read_stage_transfer"].clone())?;
     for (role, name, client, folder) in [
         ("implementer", "实现", "implementation_source", "zcode-edit"),
         ("reviewer", "审查", "reviewer", "zcode-plan"),
@@ -246,6 +249,7 @@ impl Timeline {
                 round: number,
                 attempt: *count,
                 status: String::new(),
+                read_stage_transfer: None,
                 decision: a["decision"].as_i64(),
                 agents: vec![],
             };
@@ -263,6 +267,7 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
     ident(&work.id, 64)?;
     let mut result = Timeline {
         work_id: work.id.clone(),
+        stage_transfers: work.stage_transfers.clone(),
         work_name: work.name.clone(),
         stages: work
             .template
@@ -299,6 +304,22 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
                     &ev["read_repository_memory"],
                 )?);
             }
+            let received: Option<super::transfer::Transfer> =
+                serde_json::from_value(ev["read_stage_transfer"].clone())?;
+            // Early delivery receipts embedded the exact revision before separately indexing repository reads.
+            if let Some((t, id)) = received.as_ref().and_then(|t| {
+                t.repository_decision(a.repository.as_deref())
+                    .map(|id| (t, id))
+            }) && !reads.iter().any(|n| n.store == "仓库" && n.id == id)
+            {
+                reads.push(Note {
+                    store: "仓库",
+                    id,
+                    kind: "decision".into(),
+                    body: t.decision.clone(),
+                    replaces: None,
+                });
+            }
             let session = session(&dir)?;
             let stage = work.template.stages().get(a.stage).context("阶段不存在")?;
             let agent = Agent {
@@ -307,7 +328,7 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
                 model: (!a.profile.model.is_empty()).then(|| a.profile.model.clone()),
                 stage: Some(a.stage),
                 desktop_dir: session.as_ref().map(|_| dir.clone()),
-                session,
+                session: session.or_else(|| ev["session"].as_str().map(str::to_string)),
                 reads,
                 writes: notes(project_db.as_ref(), "项目", &ev["written_memory"])?,
                 handoff: crate::handoff::summary(&workflow::tail(&dir.join("result.txt"), 8192)),
@@ -320,6 +341,7 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
                 round: None,
                 attempt: *count,
                 status: text(&ev, "status").into(),
+                read_stage_transfer: received,
                 decision: None,
                 agents: vec![agent],
             })

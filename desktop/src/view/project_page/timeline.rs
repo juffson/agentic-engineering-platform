@@ -144,6 +144,70 @@ impl Studio {
                     ),
                 );
             }
+            for sent in history.stage_transfers.iter().filter(|t| t.run == r.run) {
+                card = card.child(
+                    v_flex()
+                        .child(detail_text(
+                            SharedString::from(format!("timeline-transfer-source-{i}")),
+                            "已确认交接",
+                        ))
+                        .child(caption(sent.context())),
+                );
+            }
+            if let Some(received) = &r.read_stage_transfer {
+                card = card.child(
+                    v_flex()
+                        .child(detail_text(
+                            SharedString::from(format!("timeline-transfer-destination-{i}")),
+                            "本次执行已读取阶段交接",
+                        ))
+                        .child(caption(received.context())),
+                );
+            }
+            if let Some(i_stage) = r.stage
+                && i_stage + 1 < w.template.stages().len()
+                && w.stage <= i_stage
+                && ((r.round == Some(2)
+                    && r.status == "awaiting_human_review"
+                    && !history
+                        .rounds
+                        .iter()
+                        .skip(i + 1)
+                        .any(|other| other.record == r.record))
+                    || (r.status == "succeeded" && w.current_attempt.get(&i_stage) == Some(&r.run)))
+            {
+                let run = r.run.clone();
+                let work = w.id.clone();
+
+                card = card.child(
+                    button(
+                        format!("confirm-stage-transfer-{run}"),
+                        if w.stage < i_stage {
+                            format!(
+                                "确认{}交接并将事项推进到{}",
+                                w.template.stages()[i_stage].name,
+                                w.template.stages()[i_stage + 1].name
+                            )
+                        } else {
+                            format!("确认交接到{}", w.template.stages()[i_stage + 1].name)
+                        },
+                        true,
+                    )
+                    .on_click(cx.listener(move |s, _, window, cx| {
+                        let Some(home) = s.board.dir.clone() else {
+                            return;
+                        };
+                        if s.change_board(cx, |lib| {
+                            let p = lib.project_mut()?;
+                            ensure!(p.selected.as_ref() == Some(&work), "事项已切换");
+                            p.confirm_transfer(&home, &work, i_stage, &run)?;
+                            Ok(())
+                        }) {
+                            s.section(Section::Work, window, cx);
+                        }
+                    })),
+                );
+            }
             if let Some(decision) = r.decision {
                 card = card.child(caption(format!("本轮决策 · 仓库 #{decision}")));
             }

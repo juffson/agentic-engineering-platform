@@ -724,6 +724,7 @@ fn start(repo: &Repo, id: &str, rerun: bool) -> Result<ExitCode> {
     let result = run::execute(
         repo,
         &Execution {
+            stage_transfer: None,
             task: pin.task.clone(),
             candidate,
             run_id: Some(id.clone()),
