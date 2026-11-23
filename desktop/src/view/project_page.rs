@@ -22,7 +22,7 @@ enum Section {
     Memory,
 }
 pub(crate) struct Board {
-    library: Library,
+    pub(super) library: Library,
     zcode_catalog: Option<Result<Vec<aep::zcode_catalog::Model>, String>>,
     zcode_loading: bool,
     zcode_draft: Option<(String, String)>,
@@ -60,6 +60,9 @@ pub(crate) struct Board {
     generation: u64,
 }
 impl Board {
+    pub(crate) fn library_project_id(&self) -> Option<&String> {
+        self.library.project().map(|p| &p.id)
+    }
     pub(crate) fn load(
         ws: Option<&Workspace>,
         remember: bool,
@@ -270,6 +273,7 @@ impl Studio {
     }
     fn section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.page = Page::Project;
+        self.stage_setup = None;
         self.board.section = section;
         self.board.timeline = None;
         self.board.zcode_history = None;
@@ -313,7 +317,21 @@ impl Studio {
         } else {
             Section::Library
         };
+        let stage = self
+            .stage_setup
+            .as_ref()
+            .filter(|s| {
+                self.context_work().is_some_and(|w| {
+                    w.id == s.plan.work && s.plan.stage < w.template.stages().len()
+                })
+            })
+            .map(|s| s.plan.stage);
         self.section(section, w, cx);
+        if let Some(stage) = stage
+            && section == Section::Work
+        {
+            self.show_stage(stage, w, cx);
+        }
     }
     fn load_stage(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if let Some(work) = self.board.library.project().and_then(Project::selected) {
@@ -479,6 +497,94 @@ impl Studio {
         })
         .detach();
     }
+    fn open_stage_relay(
+        &mut self,
+        repo: &Path,
+        stage: usize,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.board.library.project() else {
+            return;
+        };
+        let Some(work) = project.selected() else {
+            return;
+        };
+        let stage_model = |client| {
+            work.profiles
+                .get(&stage)
+                .filter(|profile| profile.client == client && !profile.model.is_empty())
+                .or_else(|| project.preset(client))
+                .map(|profile| profile.model.clone())
+                .unwrap_or_default()
+        };
+        let defaults = crate::relay::RelayAgents {
+            model: stage_model(Client::Codex),
+            reviewer_model: Some(stage_model(Client::Claude)),
+            zcode_model: stage_model(Client::ZCode),
+            ..Default::default()
+        };
+        let plan = crate::relay::StagePlan {
+            project: project.id.clone(),
+            work: work.id.clone(),
+            stage,
+            first: defaults.clone(),
+            second: defaults.clone(),
+        };
+        let title = format!(
+            "{} / {} / 两轮接力",
+            work.name,
+            work.template.stages()[stage].name
+        );
+        let result = Workspace::open(repo).and_then(|ws| crate::relay::stage_tasks(&ws));
+        match result {
+            Ok(tasks) => {
+                self.stage_setup = Some(crate::relay::StageSetup {
+                    plan,
+                    repo: repo.into(),
+                    title,
+                    tasks,
+                    editing_second: false,
+                });
+                self.project_tool(repo, Page::Relay, None, w, cx);
+                self.set_relay_agents(&defaults, w, cx);
+            }
+            Err(e) => self.board.error = Some(format!("读取本地任务失败 · {e:#}")),
+        }
+        cx.notify();
+    }
+    pub(crate) fn attach_stage_record(
+        &mut self,
+        plan: &crate::relay::StagePlan,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let repo = self
+            .workspace
+            .as_ref()
+            .context("没有选择仓库")?
+            .root
+            .clone();
+        ensure!(
+            self.change_board(cx, |lib| {
+                let p = lib.project_mut()?;
+                ensure!(
+                    p.id == plan.project && p.selected.as_ref() == Some(&plan.work),
+                    "事项已切换"
+                );
+                p.link_at_stage(
+                    &plan.work,
+                    &repo,
+                    aep::project::RecordKind::Relay,
+                    id,
+                    Some(plan.stage),
+                )
+            }),
+            "{}",
+            self.board.error.as_deref().unwrap_or("关联失败")
+        );
+        Ok(())
+    }
     fn project_tool(
         &mut self,
         path: &Path,
@@ -531,7 +637,7 @@ impl Studio {
         }
     }
 
-    pub(super) fn context_work(&self) -> Option<&Work> {
+    pub(crate) fn context_work(&self) -> Option<&Work> {
         if self.board.section != Section::Work {
             return None;
         }
@@ -1154,6 +1260,11 @@ impl Studio {
             button("project-save-note", "保存记录", false)
                 .on_click(cx.listener(|this, _, w, cx| this.save_stage(false, w, cx))),
         );
+        if let Some(repo) = work.target(viewing) {
+            actions = actions.child(button("stage-relay", "阶段两轮接力", true).on_click(
+                cx.listener(move |s, _, w, cx| s.open_stage_relay(&repo, viewing, w, cx)),
+            ));
+        }
         if viewing == work.stage {
             actions = actions.child(
                 primary(

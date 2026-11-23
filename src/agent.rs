@@ -230,6 +230,7 @@ pub struct Agents<'a> {
     pub implementer: Client,
     pub reviewer: Client,
     pub zcode_model: Option<String>,
+    pub review_model: Option<&'a str>,
     pub memory: Option<Memory>,
     pub require_memory: Option<i64>,
     pub handoff_from_run: Option<&'a str>,
@@ -244,12 +245,18 @@ impl Agents<'_> {
         ensure!(!remaining.is_zero(), "Run time budget exhausted");
         Ok(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0))
     }
+    fn zcode_model_for(&self, mode: &str) -> Option<&str> {
+        if mode == "plan" {
+            self.review_model
+        } else {
+            self.zcode_model.as_deref()
+        }
+    }
     fn model_timeout(&self, client: Client, mode: &str) -> Result<CommandTimeout> {
         let desktop = self.deadline.is_none()
             && client == Client::ZCode
             && self
-                .zcode_model
-                .as_deref()
+                .zcode_model_for(mode)
                 .and_then(|s| s.split_once('/'))
                 .and_then(|(provider, _)| aep::zcode_catalog::desktop_plan(provider))
                 .is_some();
@@ -293,11 +300,11 @@ impl Agents<'_> {
         let profile = Profile {
             client: Client::ZCode,
             executable: String::new(),
-            model: self.zcode_model.clone().unwrap_or_default(),
+            model: self.zcode_model_for(mode).unwrap_or_default().into(),
             check_command: String::new(),
         };
         let bin = profile.program(&std::env::var_os("PATH").unwrap_or_default())?;
-        if self.zcode_model.is_some() {
+        if self.zcode_model_for(mode).is_some() {
             let evidence = self.folder.join(format!("zcode-{mode}"));
             fs::create_dir_all(&evidence)?;
             let selection = evidence.join("zcode-selection.json");
@@ -429,6 +436,14 @@ impl Agents<'_> {
         );
         if let Ok(file) = File::open(&log) {
             for line in BufReader::new(file).lines().map_while(Result::ok) {
+                if self.implementer == Client::Codex
+                    && line.contains("thread.started")
+                    && let Ok(event) = serde_json::from_str::<Value>(&line)
+                    && event["type"] == "thread.started"
+                    && event["thread_id"].is_string()
+                {
+                    record["sessions"]["implementer"] = event["thread_id"].clone();
+                }
                 if line.contains("turn.completed")
                     && let Ok(event) = serde_json::from_str::<Value>(&line)
                     && event["type"] == "turn.completed"
@@ -569,6 +584,9 @@ impl Agents<'_> {
                     cmd.push("text".into());
                     (full.clone(), None)
                 };
+                if let Some(model) = self.review_model {
+                    cmd.extend(["--model".to_owned(), model.to_owned()]);
+                }
                 let prompt = self.prompt("reviewer", key, base, record, None)?;
                 let rc = logged(
                     &cmd,
@@ -588,6 +606,9 @@ impl Agents<'_> {
                 if structured {
                     let env = read(&output)?;
                     usage(record, "reviewer", &env);
+                    if env["session_id"].is_string() {
+                        record["sessions"]["reviewer"] = env["session_id"].clone();
+                    }
                     let payload = &env["structured_output"];
                     ensure!(env["is_error"] != true, "reviewer returned an error");
                     self.record_structured_review(key, payload, criteria, record)?;

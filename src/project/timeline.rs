@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -39,6 +40,7 @@ pub struct Round {
 pub struct Agent {
     pub role: String,
     pub client: String,
+    pub model: Option<String>,
     #[serde(rename = "stage_index")]
     pub stage: Option<usize>,
     pub session: Option<String>,
@@ -129,6 +131,20 @@ pub fn relay_for_run(ws: &Workspace, run: &str) -> Result<Option<String>> {
     .then(|| parent.to_owned()))
 }
 
+// Older Codex receipts only carry the CLI thread ID in the opening JSONL event.
+fn codex_thread(dir: &Path) -> Option<String> {
+    let file = fs::File::open(dir.join("implementation.log")).ok()?;
+    BufReader::new(file.take(32768))
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| {
+            let event: Value = serde_json::from_str(&line).ok()?;
+            (event["type"] == "thread.started")
+                .then(|| event["thread_id"].as_str().map(str::to_owned))
+                .flatten()
+        })
+}
+
 fn repository_run(
     ws: &Workspace,
     link: &WorkRecord,
@@ -145,7 +161,29 @@ fn repository_run(
         ("reviewer", "审查", "reviewer", "zcode-plan"),
     ] {
         let path = dir.join(folder);
-        let session = session(&path)?;
+        let desktop_session = session(&path)?;
+        let desktop_dir = desktop_session.as_ref().map(|_| path);
+        let client = text(&ev, client);
+        let request = &ev["request"];
+        let model = match (role, client) {
+            ("implementer", "codex") => &request["codex_model"],
+            ("reviewer", "zcode") if request["reviewer_model"].is_null() => &request["zcode_model"],
+            ("reviewer", _) => &request["reviewer_model"],
+            (_, "zcode") => &request["zcode_model"],
+            _ => &Value::Null,
+        }
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+        let session = desktop_session
+            .or_else(|| ev["sessions"][role].as_str().map(str::to_owned))
+            .or_else(|| {
+                if client == "codex" && role == "implementer" {
+                    codex_thread(&dir)
+                } else {
+                    None
+                }
+            });
         let handoff = if role == "implementer" {
             let h = optional(dir.join("handoff.json"))?;
             [text(&h, "note"), text(&h, "question")]
@@ -160,13 +198,14 @@ fn repository_run(
         };
         round.agents.push(Agent {
             role: name.into(),
-            client: text(&ev, client).into(),
+            client: client.into(),
+            model,
             stage: session
                 .as_ref()
                 .and_then(|id| link.session_stages.get(id))
                 .copied()
                 .or(link.stage),
-            desktop_dir: session.as_ref().map(|_| path),
+            desktop_dir,
             session,
             reads: notes(db, "仓库", &ev["memory_inputs"][role])?,
             writes: notes(db, "仓库", &ev["memory_outputs"][role])?,
@@ -265,6 +304,7 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
             let agent = Agent {
                 role: stage.name.into(),
                 client: a.profile.client.label().into(),
+                model: (!a.profile.model.is_empty()).then(|| a.profile.model.clone()),
                 stage: Some(a.stage),
                 desktop_dir: session.as_ref().map(|_| dir.clone()),
                 session,

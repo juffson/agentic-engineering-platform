@@ -352,6 +352,7 @@ mod tests {
     fn retry_and_decision_are_derived_from_the_latest_attempt() -> Result<()> {
         let evidence = tempfile::tempdir()?;
         let mut relay = Relay {
+            stage_plan: None,
             id: "relay-test".into(),
             task: Task {
                 name: "test".into(),

@@ -145,6 +145,9 @@ struct Execution {
     handoff_from_run: Option<String>,
     #[arg(long, default_value="manual", value_parser=["manual","claude","zcode"])]
     reviewer: String,
+    /// Select the independent reviewer model. An empty value uses the client default.
+    #[arg(long)]
+    reviewer_model: Option<String>,
     #[arg(long, default_value_t=600, value_parser=clap::value_parser!(u64).range(1..))]
     timeout: u64,
     #[arg(skip)]

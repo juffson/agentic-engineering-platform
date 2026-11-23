@@ -100,6 +100,8 @@ pub(crate) struct RelayAgents {
     // Keep the existing serialized Codex model field for older relay and queue records.
     pub model: String,
     pub zcode_model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
 }
 
 impl RelayAgents {
@@ -118,12 +120,31 @@ impl Default for RelayAgents {
             reviewer: Client::Claude,
             model: String::new(),
             zcode_model: String::new(),
+            reviewer_model: None,
         }
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct StagePlan {
+    pub project: String,
+    pub work: String,
+    pub stage: usize,
+    pub first: RelayAgents,
+    pub second: RelayAgents,
+}
+
+pub(crate) struct StageSetup {
+    pub plan: StagePlan,
+    pub repo: PathBuf,
+    pub title: String,
+    pub tasks: Vec<Task>,
+    pub editing_second: bool,
+}
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Relay {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_plan: Option<StagePlan>,
     pub id: String,
     pub task: Task,
     #[serde(flatten)]
@@ -169,7 +190,18 @@ impl Relay {
     }
 
     pub fn decisions<'a>(&self, snapshot: &'a Snapshot) -> Vec<&'a Value> {
-        let questions = self.questions(snapshot);
+        let mut roots = self.questions(snapshot);
+        let legacy_task_decision = roots.is_empty() && self.stage_plan.is_none();
+        if roots.is_empty()
+            && let Some(first) = self.latest(Round::First)
+        {
+            roots.extend(
+                snapshot
+                    .notes
+                    .iter()
+                    .filter(|n| n["author"] == "manual" && n["run_id"] == first.id),
+            );
+        }
         snapshot
             .notes
             .iter()
@@ -180,7 +212,9 @@ impl Relay {
                     && note["task"] == self.task.name
                     && note["spec_sha"] == self.task.sha
                     && note["successor"].is_null()
-                    && (questions.is_empty() || revises_question(note, &questions, &snapshot.notes))
+                    && (legacy_task_decision
+                        || roots.iter().any(|root| root["id"] == note["id"])
+                        || revises_question(note, &roots, &snapshot.notes))
             })
             .collect()
     }
@@ -261,6 +295,38 @@ pub(crate) fn tasks(ws: &Workspace) -> Result<Vec<Task>> {
         &["ls-remote", "--refs", "origin", "refs/heads/aep-task/*"],
     )?;
     Ok(tasks_from_heads(&output))
+}
+
+/// Stage relays run against immutable Spec commits already present in this checkout.
+pub(crate) fn stage_tasks(ws: &Workspace) -> Result<Vec<Task>> {
+    let head = commit(&ws.root, "HEAD")?;
+    let mut tasks = std::collections::BTreeMap::new();
+    for file in git_quiet(ws, &["ls-tree", "-r", "--name-only", &head, "specs/"])?.lines() {
+        if let Some(name) = file
+            .strip_prefix("specs/")
+            .and_then(|s| s.strip_suffix("/task.json"))
+            && ident(name, 63).is_ok()
+        {
+            tasks.insert(
+                name.to_owned(),
+                Task {
+                    name: name.to_owned(),
+                    sha: head.clone(),
+                },
+            );
+        }
+    }
+    for task in tasks_from_heads(&git_quiet(
+        ws,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)%09%(refname)",
+            "refs/heads/aep-task/",
+        ],
+    )?) {
+        tasks.insert(task.name.clone(), task);
+    }
+    Ok(tasks.into_values().collect())
 }
 
 pub(crate) fn tasks_from_heads(output: &str) -> Vec<Task> {
@@ -413,6 +479,7 @@ impl Lease {
     ) -> Result<()> {
         ensure!(self.read()?.is_none(), "此接力已存在");
         let mut relay = Relay {
+            stage_plan: None,
             id: self.id.clone(),
             task,
             agents,
@@ -428,6 +495,32 @@ impl Lease {
             None,
             None,
         )
+    }
+
+    /// Save the plan before linking it. A reopened item can start its first attempt.
+    pub fn prepare_stage(
+        &self,
+        task: Task,
+        plan: StagePlan,
+        link: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        ensure!(self.read()?.is_none(), "此接力已存在");
+        save(
+            &self.path,
+            &Relay {
+                agents: plan.first.clone(),
+                stage_plan: Some(plan),
+                id: self.id.clone(),
+                task,
+                attempts: Vec::new(),
+                busy: false,
+            },
+        )?;
+        if let Err(e) = link() {
+            fs::remove_file(self.path.join("relay.json")).context("清理未关联的空接力")?;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn advance(
@@ -462,6 +555,12 @@ impl Lease {
         } else {
             None
         };
+        if let Some(plan) = &mut relay.stage_plan {
+            match round {
+                Round::First => plan.first = agents.clone(),
+                Round::Second => plan.second = agents.clone(),
+            }
+        }
         relay.agents = agents;
         launch(
             ws,
@@ -533,10 +632,14 @@ fn launch(
             ident(&relay.task.name, 63)?;
             let spec = format!("refs/heads/aep-task/{}", relay.task.name);
             let pinned = format!("refs/aep/relays/{}/spec", relay.id);
-            git_quiet(
-                ws,
-                &["fetch", "--no-tags", "origin", &format!("{spec}:{pinned}")],
-            )?;
+            if relay.stage_plan.is_some() {
+                git_quiet(ws, &["update-ref", &pinned, &relay.task.sha])?;
+            } else {
+                git_quiet(
+                    ws,
+                    &["fetch", "--no-tags", "origin", &format!("{spec}:{pinned}")],
+                )?;
+            }
             ensure!(
                 commit(&ws.root, &pinned)? == relay.task.sha,
                 "任务的派发版本已变化，请刷新任务列表"
@@ -572,10 +675,14 @@ fn launch(
         if relay.agents.implementer == Client::Codex && !relay.agents.model.is_empty() {
             command.args(["--codex-model", &relay.agents.model]);
         }
-        if [relay.agents.implementer, relay.agents.reviewer].contains(&Client::ZCode)
+        if (relay.agents.implementer == Client::ZCode
+            || (relay.agents.reviewer == Client::ZCode && relay.agents.reviewer_model.is_none()))
             && !relay.agents.zcode_model.is_empty()
         {
             command.args(["--zcode-model", &relay.agents.zcode_model]);
+        }
+        if let Some(model) = &relay.agents.reviewer_model {
+            command.arg(format!("--reviewer-model={model}"));
         }
         if let Some(resume) = resume {
             command.args(["--resume-from", resume]);
@@ -664,6 +771,94 @@ mod tests {
         assert!(!restored.agents.matches_evidence(
             &serde_json::json!({"implementation_source":"codex","reviewer":"claude"})
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stage_plan_reopens_and_pins_a_local_spec_without_origin() -> Result<()> {
+        use aep::workspace::git;
+        let dir = tempfile::tempdir()?;
+        let repo = dir.path();
+        git(repo, &["init", "-q"])?;
+        let files = repo.join("specs/sample");
+        fs::create_dir_all(&files)?;
+        fs::write(files.join("task.json"), "{}")?;
+        git(repo, &["add", "specs"])?;
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "sample",
+            ],
+        )?;
+        let ws = Workspace::open(repo)?;
+        let task = stage_tasks(&ws)?.pop().context("local Spec")?;
+        let plan = StagePlan {
+            project: "p".into(),
+            work: "w".into(),
+            stage: 3,
+            first: RelayAgents::default(),
+            second: RelayAgents {
+                reviewer: Client::ZCode,
+                reviewer_model: Some("vendor/test".into()),
+                ..Default::default()
+            },
+        };
+        let lease = Lease::acquire(&ws, "relay-stage")?.unwrap();
+        assert!(
+            lease
+                .prepare_stage(task.clone(), plan.clone(), || anyhow::bail!(
+                    "stale catalog"
+                ))
+                .is_err()
+        );
+        assert!(load(&ws)?.is_empty());
+        lease.prepare_stage(task.clone(), plan.clone(), || Ok(()))?;
+        drop(lease);
+        let saved = load_one(&ws, "relay-stage")?;
+        assert!(saved.attempts.is_empty());
+        assert_eq!(saved.stage_plan.unwrap().second, plan.second);
+        let runner = Runner {
+            binary: Some("/usr/bin/true".into()),
+            ..Default::default()
+        };
+        let lease = Lease::acquire(&ws, "relay-stage")?.unwrap();
+        lease.advance(&ws, &runner, Round::First, None, plan.first)?;
+        assert_eq!(commit(repo, "refs/aep/relays/relay-stage/spec")?, task.sha);
+        assert!(lease.has_attempt("relay-stage-r1-1")?);
+        Ok(())
+    }
+
+    #[test]
+    fn stage_decision_without_question_stays_with_its_original_relay() -> Result<()> {
+        use serde_json::json;
+        let mut relay: Relay = serde_json::from_value(json!({
+            "id":"r", "task":{"name":"t","sha":"s"},
+            "stage_plan":{"project":"p","work":"w","stage":1,"first":{},"second":{}},
+            "attempts":[{"id":"first","round":"First","decision":null}]
+        }))?;
+        let decision = |id, run, replaces, successor| {
+            json!({
+                "id":id, "run_id":run, "replaces":replaces, "successor":successor, "author":"manual",
+                "task":"t", "spec_sha":"s", "scope":"task", "kind":"decision"
+            })
+        };
+        let snapshot = Snapshot {
+            notes: vec![
+                decision(1, "other", None, None),
+                decision(2, "first", None, Some(3)),
+                decision(3, "", Some(2), None),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(relay.decisions(&snapshot), vec![&snapshot.notes[2]]);
+        relay.stage_plan = None;
+        assert_eq!(relay.decisions(&snapshot).len(), 2);
         Ok(())
     }
 

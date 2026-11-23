@@ -616,7 +616,8 @@ impl Render for Studio {
             return editor.render(ws, cx);
         }
         if self.page == Page::Relay {
-            if self.relay_id.is_none()
+            if self.stage_setup.is_none()
+                && self.relay_id.is_none()
                 && self.relay_task.is_none()
                 && let Some(id) = self.current_queue_job().map(|job| job.relay.clone())
             {

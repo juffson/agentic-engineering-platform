@@ -610,7 +610,20 @@ impl Studio {
             d.note.update(cx, |s, cx| s.set_value("", w, cx));
         }
     }
-    pub(in crate::view) fn record_visible(&self, kind: RecordKind, id: &str) -> bool {
+    pub(crate) fn record_visible(&self, kind: RecordKind, id: &str) -> bool {
+        if let Some(scope) = &self.stage_setup
+            && kind == RecordKind::Relay
+        {
+            return self.context_work().is_some_and(|w| {
+                w.id == scope.plan.work
+                    && w.records.iter().any(|r| {
+                        r.kind == kind
+                            && r.id == id
+                            && r.repository == scope.repo
+                            && r.stage == Some(scope.plan.stage)
+                    })
+            });
+        }
         self.context_work()
             .zip(self.workspace.as_ref())
             .is_none_or(|(w, ws)| w.has_record(&ws.root, kind, id))

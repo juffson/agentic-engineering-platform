@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 #[derive(Clone, Copy)]
 enum Target {
     Project,
+    Review,
     Round,
 }
 
@@ -11,6 +12,7 @@ impl Target {
     fn prefix(self) -> &'static str {
         match self {
             Self::Project => "project-zcode",
+            Self::Review => "review-zcode",
             Self::Round => "round-zcode",
         }
     }
@@ -216,6 +218,9 @@ impl Studio {
     ) {
         let value = aep::zcode_catalog::effective_selection(&value).to_owned();
         match target {
+            Target::Review => self
+                .relay_reviewer_model
+                .update(cx, |s, cx| s.set_value(value, w, cx)),
             Target::Round => self
                 .relay_zcode_model
                 .update(cx, |s, cx| s.set_value(value, w, cx)),
@@ -337,6 +342,13 @@ impl Studio {
         panel
     }
 
+    pub(in crate::view) fn reviewer_zcode_picker(&self, cx: &Context<Self>) -> Div {
+        self.zcode_picker(
+            Target::Review,
+            &self.relay_reviewer_model.read(cx).value(),
+            cx,
+        )
+    }
     pub(in crate::view) fn relay_zcode_picker(&self, cx: &Context<Self>) -> Div {
         let value = self.relay_zcode_model.read(cx).value();
         self.zcode_picker(Target::Round, &value, cx)

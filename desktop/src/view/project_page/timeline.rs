@@ -130,6 +130,20 @@ impl Studio {
                         ),
                 )
                 .child(caption(format!("{} · {}", r.run, status(&r.status).0)));
+            if r.round.is_some()
+                && let Some(repo) = r.repository.clone()
+            {
+                let run = r.run.clone();
+                card = card.child(
+                    button(format!("timeline-evidence-{i}"), "查看本轮证据", false).on_click(
+                        cx.listener(move |s, _, window, cx| {
+                            s.project_tool(&repo, Page::Runs, None, window, cx);
+                            s.run = Some(run.clone());
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
             if let Some(decision) = r.decision {
                 card = card.child(caption(format!("本轮决策 · 仓库 #{decision}")));
             }
@@ -183,6 +197,12 @@ impl Studio {
                     ));
                 }
                 if expanded {
+                    if let Some(model) = &a.model {
+                        card = card.child(field("选择的模型", model));
+                    }
+                    if let Some(session) = &a.session {
+                        card = card.child(field("会话 ID", session));
+                    }
                     if !a.handoff.is_empty() {
                         card = card.child(field(
                             if a.role == "审查" {

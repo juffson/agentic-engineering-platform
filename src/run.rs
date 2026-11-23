@@ -246,7 +246,26 @@ pub fn execute(
             || reviewer_client == Some(Client::ZCode),
         "--zcode-model 需要 ZCode 实现端或审查端"
     );
-    if let Some(model) = zcode_model {
+    ensure!(
+        args.reviewer_model.is_none() || reviewer_client.is_some(),
+        "--reviewer-model 需要模型审查端"
+    );
+    let review_model = args
+        .reviewer_model
+        .as_deref()
+        .or_else(|| {
+            (reviewer_client == Some(Client::ZCode))
+                .then_some(zcode_model)
+                .flatten()
+        })
+        .filter(|m| !m.is_empty());
+    for model in [
+        zcode_model,
+        review_model.filter(|_| reviewer_client == Some(Client::ZCode)),
+    ]
+    .into_iter()
+    .flatten()
+    {
         Profile {
             client: Client::ZCode,
             executable: String::new(),
@@ -309,6 +328,9 @@ pub fn execute(
     }
     if let Some(id) = args.require_memory {
         request["require_memory"] = json!(id);
+    }
+    if let Some(model) = &args.reviewer_model {
+        request["reviewer_model"] = json!(model);
     }
     if let Some(m) = codex_model {
         request["codex_model"] = json!(m);
@@ -403,6 +425,7 @@ pub fn execute(
             implementer: implementer_client.unwrap_or(Client::Codex),
             reviewer: reviewer_client.unwrap_or(Client::Claude),
             zcode_model: zcode_model.map(str::to_owned),
+            review_model,
             memory,
             require_memory: args.require_memory,
             handoff_from_run: args.handoff_from_run.as_deref(),

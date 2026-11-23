@@ -168,6 +168,16 @@ impl Memory {
             .query_row("SELECT * FROM notes WHERE id=?", [id], note)?)
     }
     pub fn add(&mut self, k: &Key, kind: &str, body: &str, replaces: Option<i64>) -> Result<i64> {
+        self.add_manual(k, kind, body, replaces, None)
+    }
+    pub fn add_manual(
+        &mut self,
+        k: &Key,
+        kind: &str,
+        body: &str,
+        replaces: Option<i64>,
+        run: Option<&str>,
+    ) -> Result<i64> {
         let tx = self
             .0
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -184,9 +194,9 @@ impl Memory {
             ensure!(active, RevisionConflict);
         }
         tx.execute(
-            "INSERT INTO notes(scope,task,spec_sha,candidate_sha,origin_sha,kind,author,body,created_at,replaces)
-             VALUES(?1,?2,?3,?4,?4,?5,'manual',?6,?7,?8)",
-            params![k.scope(), k.task, k.spec, k.candidate, kind, text(body,false)?, Utc::now().to_rfc3339(), replaces],
+            "INSERT INTO notes(scope,task,spec_sha,candidate_sha,origin_sha,kind,author,body,created_at,replaces,run_id)
+             VALUES(?1,?2,?3,?4,?4,?5,'manual',?6,?7,?8,?9)",
+            params![k.scope(), k.task, k.spec, k.candidate, kind, text(body,false)?, Utc::now().to_rfc3339(), replaces, run],
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;

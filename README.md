@@ -205,6 +205,8 @@ Studio 派发的 ZCode 实现和审查会话归到所选仓库对应的本机 ZC
 
 在 Studio 打开「项目设置」，在对应仓库的「仓库工具与历史」中选择「ZCode 任务归组」。列表显示实际归属项目、执行目录和原项目的清理结果。「同步历史任务并清理空项目」复用归组回执和空项目检查；「打开原会话」回到 ZCode 桌面中的同一个任务。CLI 可用 `aep zcode-group --list` 查看同一份记录。
 
+在开发事项中选阶段，点「阶段两轮接力」，选择该阶段目标仓库的本地任务 Spec，分别配置两轮的实现端、审查端和模型。修订第一轮交接后，用选中的决策继续第二轮。Studio 保存两轮配置与事项归属，重开后可在原阶段选中接力继续。[阶段接力操作指南](docs/studio-stage-relay.md)
+
 在「开发事项 → 会话与轮次」查看每次接力的实现、审查、读写的记忆版本及交接正文，或打开原 ZCode 桌面会话。同轮重试按执行顺序分别保留。在「协作与交接」可以为整条接力指定阶段，也可以在「项目设置 → ZCode 任务归组 → 关联事项与阶段」为单个会话指定阶段。阶段工作流本身创建的会话自动沿用原事项和阶段。旧接力没有阶段回执时会显示「阶段待关联」。
 
 CLI 示例（阶段从 1 开始）：
@@ -227,7 +229,7 @@ ZCode 等待工具审批时，Studio 的接力卡显示轮次、实现或审查�
 
 CLI 可用 `aep project zcode-models` 列出本机选项，`aep project zcode-default` 查看项目默认，`aep project zcode-default --model provider/model@档位` 保存，`--clear` 清除。
 
-如果本机配置的模型不在当前 Codex 账号的可用列表中，可在上述 `run` 命令加上 `--codex-model <模型名>`。该选择只对这次 Run 生效，并记入执行证据。ZCode 的实现端或审查端可用 `--zcode-model provider/model` 或 `provider/model@推理档位` 指定模型，同样只对本次 Run 生效并记入证据。ZCode 的交接摘要和未决问题由最终答复末行的 `AEP-RELAY: {json}` 返回，验收通过后与 Codex 的结构化交接进入同一发布链路，审查端同样按 criterion、文件和行号校验阻断发现。
+如果本机配置的模型不在当前 Codex 账号的可用列表中，可在上述 `run` 命令加上 `--codex-model <模型名>`。该选择只对这次 Run 生效，并记入执行证据。ZCode 的实现端或审查端可用 `--zcode-model provider/model` 或 `provider/model@推理档位` 指定模型，同样只对本次 Run 生效并记入证据。用 `--reviewer-model <模型>` 可以单独指定 Claude 或 ZCode 的审查模型。ZCode 的交接摘要和未决问题由最终答复末行的 `AEP-RELAY: {json}` 返回，验收通过后与 Codex 的结构化交接进入同一发布链路，审查端同样按 criterion、文件和行号校验阻断发现。
 
 | 范围 | 适合记录的内容 | 何时会被选中 |
 | --- | --- | --- |

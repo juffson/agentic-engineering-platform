@@ -22,11 +22,13 @@ impl Scope {
 pub(super) enum Start {
     Blank,
     FromRun(String),
+    RelayDecision(String),
     Revise(i64),
     Resolve(i64),
 }
 
 pub(crate) struct Editor {
+    run: Option<String>,
     replaces: Option<i64>,
     scope: Scope,
     kind: Kind,
@@ -40,10 +42,14 @@ pub(crate) struct Editor {
 
 impl Studio {
     pub(super) fn compose(&mut self, start: Start, window: &mut Window, cx: &mut Context<Self>) {
+        let run = match &start {
+            Start::RelayDecision(id) => Some(id.clone()),
+            _ => None,
+        };
         let resolving = matches!(start, Start::Resolve(_));
         let (record, replaces, scope) = match start {
             Start::Blank => (&Value::Null, None, Scope::Project),
-            Start::FromRun(id) => {
+            Start::FromRun(id) | Start::RelayDecision(id) => {
                 let Some(run) = self.snapshot.runs.iter().find(|r| r.id == id) else {
                     return;
                 };
@@ -83,6 +89,7 @@ impl Studio {
         });
         body.focus_handle(cx).focus(window, cx);
         self.editor = Some(Editor {
+            run,
             replaces,
             scope,
             kind: if resolving {
@@ -145,6 +152,7 @@ impl Studio {
         }
         let kind = editor.kind;
         let replaces = editor.replaces;
+        let run = editor.run.clone();
         editor.saving = true;
         editor.error = None;
         cx.notify();
@@ -158,7 +166,7 @@ impl Studio {
                     scoped.then_some(spec.as_str()),
                     pinned.then_some(candidate.as_str()),
                 )?;
-                Memory::open(&ws.data)?.add(&key, kind.as_str(), &body, None)
+                Memory::open(&ws.data)?.add_manual(&key, kind.as_str(), &body, None, run.as_deref())
             }
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -205,7 +213,7 @@ impl Editor {
         let mut scopes = h_flex().gap_2();
         for scope in [Scope::Project, Scope::Task, Scope::Candidate] {
             let active = self.scope == scope;
-            if self.replaces.is_some() {
+            if self.replaces.is_some() || self.run.is_some() {
                 if active {
                     scopes = scopes.child(t(scope.label(), FG));
                 }
@@ -243,7 +251,7 @@ impl Editor {
                         .child(
                             Input::new(field)
                                 .aria_label(label)
-                                .readonly(self.replaces.is_some())
+                                .readonly(self.replaces.is_some() || self.run.is_some())
                                 .disabled(self.saving),
                         ),
                 );
@@ -252,6 +260,9 @@ impl Editor {
         }
         let mut kinds = h_flex().gap_2();
         for &k in Kind::value_variants() {
+            if self.run.is_some() && k != Kind::Decision {
+                continue;
+            }
             let label = kind(k.as_str());
             kinds = kinds.child(
                 button(label.to_owned(), label.to_owned(), k == self.kind).on_click(cx.listener(

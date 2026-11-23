@@ -28,8 +28,9 @@ impl Studio {
             Some(&relay.id) == self.relay_id.as_ref()
                 && self.record_visible(RecordKind::Relay, &relay.id)
         });
-        let task = self
-            .relay_tasks
+        let stage = self.stage_setup.as_ref();
+        let tasks = stage.map_or(&self.relay_tasks, |s| &s.tasks);
+        let task = tasks
             .iter()
             .find(|task| Some(&task.name) == self.relay_task.as_ref());
         let mut list = v_flex()
@@ -62,11 +63,16 @@ impl Studio {
                         .on_click(cx.listener(|this, _, _, cx| this.load_relay_tasks(cx))),
                     ),
             );
-        if self.relay_tasks.is_empty() && !self.tasks_loading {
-            list = list.child(caption("可从 origin 上已派发的任务发起接力。"));
+        if tasks.is_empty() && !self.tasks_loading {
+            list = list.child(caption(if stage.is_some() {
+                "当前仓库没有已提交的任务 Spec。"
+            } else {
+                "可从 origin 上已派发的任务发起接力。"
+            }));
         }
-        let completed_setup = self.lifecycle.is_some() && !self.relays.is_empty();
-        for task in self.relay_tasks.iter().filter(|_| !completed_setup) {
+        let completed_setup =
+            stage.is_none() && self.lifecycle.is_some() && !self.relays.is_empty();
+        for task in tasks.iter().filter(|_| !completed_setup) {
             let name = task.name.clone();
             list = list.child(
                 item(
@@ -80,7 +86,13 @@ impl Studio {
                     this.relay_id = None;
                     this.relay_error = None;
                     this.relay_form_round = None;
-                    this.reset_relay_agents(w, cx);
+                    if let Some(setup) = &mut this.stage_setup {
+                        setup.editing_second = false;
+                        let first = setup.plan.first.clone();
+                        this.set_relay_agents(&first, w, cx);
+                    } else {
+                        this.reset_relay_agents(w, cx);
+                    }
                     cx.notify();
                 })),
             );
@@ -89,13 +101,14 @@ impl Studio {
         if self.relays.is_empty() {
             list = list.child(caption("此仓库暂无接力记录。"));
         }
-        if self.context_work().is_some() {
+        if stage.is_none() && self.context_work().is_some() {
             list = list.child(self.record_picker(RecordKind::Relay, cx));
         }
         for relay in &self.relays {
             if !self.record_visible(RecordKind::Relay, &relay.id) {
-                if let Some(choice) =
-                    self.record_choice(RecordKind::Relay, &relay.id, &relay.task.name, cx)
+                if stage.is_none()
+                    && let Some(choice) =
+                        self.record_choice(RecordKind::Relay, &relay.id, &relay.task.name, cx)
                 {
                     list = list.child(choice);
                 }
@@ -156,7 +169,7 @@ impl Studio {
             .gap_3();
         let job = self
             .current_queue_job()
-            .filter(|j| self.record_visible(RecordKind::Relay, &j.relay));
+            .filter(|j| stage.is_none() && self.record_visible(RecordKind::Relay, &j.relay));
         let pending = job.is_some_and(|job| job.state.active());
         if let Some(job) = job {
             if pending {
@@ -193,7 +206,27 @@ impl Studio {
                 .child(field("Spec SHA", &task.sha))
                 .child(
                     panel()
-                        .child(heading("第一轮"))
+                        .child(heading(if stage.is_some() {
+                            "两轮模型配置"
+                        } else {
+                            "第一轮"
+                        }))
+                        .when_some(stage, |card, setup| {
+                            let mut row = h_flex().gap_2();
+                            for (second, id, label) in [
+                                (false, "stage-agents-first", "第一轮模型"),
+                                (true, "stage-agents-second", "第二轮模型"),
+                            ] {
+                                row = row.child(
+                                    button(id, label, setup.editing_second == second).on_click(
+                                        cx.listener(move |s, _, w, cx| {
+                                            s.switch_planned_round(second, w, cx)
+                                        }),
+                                    ),
+                                );
+                            }
+                            card.child(row)
+                        })
                         .child(caption("选择本轮实现端和审查端。验收命令来自任务 Spec。"))
                         .child(self.relay_model_input(cx))
                         .when(!self.relay_launching && !pending, |card| {
@@ -228,7 +261,10 @@ impl Studio {
                             .py_3()
                             .border_b_1()
                             .border_color(rgb(LINE))
-                            .child(heading("两轮接力").text_2xl())
+                            .child(
+                                heading(stage.map_or("两轮接力", |s| s.title.as_str()).to_owned())
+                                    .text_2xl(),
+                            )
                             .child(
                                 button("refresh-relays", "刷新进度", false)
                                     .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
@@ -245,6 +281,33 @@ impl Studio {
             )
     }
 
+    fn switch_planned_round(&mut self, second: bool, w: &mut Window, cx: &mut Context<Self>) {
+        let agents = self.relay_agents(cx);
+        let Some(setup) = &mut self.stage_setup else {
+            return;
+        };
+        if setup.editing_second {
+            setup.plan.second = agents;
+        } else {
+            setup.plan.first = agents;
+        }
+        setup.editing_second = second;
+        let show = if second {
+            &setup.plan.second
+        } else {
+            &setup.plan.first
+        }
+        .clone();
+        self.set_relay_agents(&show, w, cx);
+        cx.notify();
+    }
+    fn independent_review_model(&self) -> bool {
+        self.stage_setup.is_some()
+            || self
+                .relays
+                .iter()
+                .any(|r| self.relay_id.as_ref() == Some(&r.id) && r.stage_plan.is_some())
+    }
     pub(crate) fn reset_relay_agents(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let agents = RelayAgents {
             zcode_model: self.relay_project_default(),
@@ -269,13 +332,25 @@ impl Studio {
         }
         let mut agents = relay.agents.clone();
         if second && relay.latest(Round::Second).is_none() {
-            agents.zcode_model = self.relay_project_default();
+            if let Some(plan) = &relay.stage_plan {
+                agents = plan.second.clone();
+            } else {
+                agents.zcode_model = self.relay_project_default();
+            }
         }
         self.relay_form_round = Some(key);
         self.set_relay_agents(&agents, w, cx);
     }
     pub(crate) fn relay_agents(&self, cx: &App) -> RelayAgents {
         RelayAgents {
+            reviewer_model: self.independent_review_model().then(|| {
+                let value = self.relay_reviewer_model.read(cx).value();
+                if self.relay_reviewer == Client::ZCode {
+                    aep::zcode_catalog::effective_selection(value.trim()).to_owned()
+                } else {
+                    value.trim().to_owned()
+                }
+            }),
             implementer: self.relay_implementer,
             reviewer: self.relay_reviewer,
             model: self.relay_model.read(cx).value().trim().to_owned(),
@@ -297,6 +372,17 @@ impl Studio {
         }
         self.relay_implementer = agents.implementer;
         self.relay_reviewer = agents.reviewer;
+        let review =
+            agents
+                .reviewer_model
+                .as_deref()
+                .unwrap_or(if agents.reviewer == Client::ZCode {
+                    &agents.zcode_model
+                } else {
+                    ""
+                });
+        self.relay_reviewer_model
+            .update(cx, |s, cx| s.set_value(review.to_owned(), w, cx));
         self.relay_model
             .update(cx, |s, cx| s.set_value(&agents.model, w, cx));
         self.relay_zcode_model.update(cx, |s, cx| {
@@ -306,6 +392,57 @@ impl Studio {
                 cx,
             )
         });
+    }
+
+    fn known_models(&self, client: Client, cx: &Context<Self>) -> Div {
+        let mut names = std::collections::BTreeSet::<&str>::new();
+        if let Some(project) = self.board.library.project() {
+            for p in project.cli_defaults.iter().chain(
+                project
+                    .selected()
+                    .into_iter()
+                    .flat_map(|w| w.profiles.values()),
+            ) {
+                if p.client == client && !p.model.is_empty() {
+                    names.insert(&p.model);
+                }
+            }
+        }
+        let key = if client == Client::Codex {
+            "codex_model"
+        } else {
+            "reviewer_model"
+        };
+        for run in &self.snapshot.runs {
+            if relay::passed(Some(run))
+                && (client == Client::Codex || run.record["reviewer"] == client.binary())
+                && let Some(model) = run.record["request"][key]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+            {
+                names.insert(model);
+            }
+        }
+        let mut row = h_flex().gap_1().flex_wrap();
+        for (i, model) in names.into_iter().enumerate() {
+            let model = model.to_owned();
+            let input = if client == Client::Codex {
+                self.relay_model.clone()
+            } else {
+                self.relay_reviewer_model.clone()
+            };
+            row = row.child(
+                button(
+                    format!("stage-known-{}-{i}", client.binary()),
+                    model.clone(),
+                    input.read(cx).value().as_ref() == model.as_str(),
+                )
+                .on_click(cx.listener(move |_, _, w, cx| {
+                    input.update(cx, |s, cx| s.set_value(&model, w, cx));
+                })),
+            );
+        }
+        row
     }
 
     pub(super) fn relay_model_input(&self, cx: &Context<Self>) -> Div {
@@ -327,10 +464,19 @@ impl Studio {
                         client.label(),
                         selected == client,
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, w, cx| {
                         if role == "implementer" {
                             this.relay_implementer = client;
                         } else {
+                            if this.relay_reviewer != client {
+                                let default = if client == Client::ZCode {
+                                    this.relay_project_default()
+                                } else {
+                                    String::new()
+                                };
+                                this.relay_reviewer_model
+                                    .update(cx, |s, cx| s.set_value(default, w, cx));
+                            }
                             this.relay_reviewer = client;
                         }
                         if client == Client::ZCode {
@@ -349,8 +495,29 @@ impl Studio {
                     .aria_label("Codex 模型"),
             );
         }
-        if [self.relay_implementer, self.relay_reviewer].contains(&Client::ZCode) {
-            form = form.child(self.relay_zcode_picker(cx));
+        let independent = self.independent_review_model();
+        if self.relay_implementer == Client::ZCode
+            || (!independent && self.relay_reviewer == Client::ZCode)
+        {
+            form = form
+                .child(caption("ZCode 模型"))
+                .child(self.relay_zcode_picker(cx));
+        }
+        if independent {
+            if self.relay_implementer == Client::Codex {
+                form = form.child(self.known_models(Client::Codex, cx));
+            }
+            form = form.child(caption(format!("{} 审查模型", self.relay_reviewer.label())));
+            if self.relay_reviewer == Client::ZCode {
+                form = form.child(self.reviewer_zcode_picker(cx));
+            } else {
+                form = form.child(self.known_models(Client::Claude, cx));
+            }
+            form = form.child(
+                Input::new(&self.relay_reviewer_model)
+                    .id("relay-reviewer-model")
+                    .aria_label("审查模型"),
+            );
         }
         form
     }
@@ -373,6 +540,19 @@ impl Studio {
                 card = card.child(caption(format!(
                     "实现端 {implementation}  ·  审查端 {review}"
                 )));
+                if let Some(model) = request["reviewer_model"].as_str() {
+                    card = card.child(field(
+                        "审查模型",
+                        if model.is_empty() {
+                            "客户端默认"
+                        } else {
+                            model
+                        },
+                    ));
+                }
+                if let Some(model) = request["codex_model"].as_str() {
+                    card = card.child(field("实现模型", model));
+                }
                 if let Some(model) = request["zcode_model"].as_str() {
                     card = card.child(field("ZCode 模型", model));
                 }
@@ -597,10 +777,11 @@ impl Studio {
         let questions = relay.questions(&self.snapshot);
         let decisions = relay.decisions(&self.snapshot);
         let mut card = panel().child(heading("交接决策"));
-        if self
-            .lifecycle
-            .as_ref()
-            .is_some_and(|session| !session.real_task)
+        if relay.stage_plan.is_none()
+            && self
+                .lifecycle
+                .as_ref()
+                .is_some_and(|session| !session.real_task)
             && questions.is_empty()
         {
             return card.child(t(
@@ -608,18 +789,31 @@ impl Studio {
                 RED,
             ));
         }
-        if questions.is_empty() {
+        if questions.is_empty() && (relay.stage_plan.is_none() || decisions.is_empty()) {
+            let in_stage = relay.stage_plan.is_some();
             let run = relay
                 .latest(Round::First)
                 .map(|attempt| attempt.id.clone())
                 .unwrap_or_default();
             card = card
-                .child(caption(
-                    "第一轮没有留下问题。可新建任务决策，或使用该 Spec 下的现有决策。",
-                ))
+                .child(caption(if relay.stage_plan.is_some() {
+                    "第一轮没有留下问题，请为这次接力填写决策。"
+                } else {
+                    "第一轮没有留下问题。可新建任务决策，或使用该 Spec 下的现有决策。"
+                }))
                 .child(
                     button("relay-write-decision", "写任务决策", false).on_click(cx.listener(
-                        move |this, _, w, cx| this.compose(Start::FromRun(run.clone()), w, cx),
+                        move |this, _, w, cx| {
+                            this.compose(
+                                if in_stage {
+                                    Start::RelayDecision(run.clone())
+                                } else {
+                                    Start::FromRun(run.clone())
+                                },
+                                w,
+                                cx,
+                            )
+                        },
                     )),
                 );
         }

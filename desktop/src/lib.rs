@@ -17,7 +17,7 @@ use aep::{
     studio::{Artifact, Snapshot, preview},
     workspace::Workspace,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use gpui_kit::{
     component::{
         Theme, ThemeMode,
@@ -87,6 +87,8 @@ struct Studio {
     relay_implementer: aep::workflow::Client,
     relay_reviewer: aep::workflow::Client,
     relay_form_round: Option<(String, relay::Round)>,
+    stage_setup: Option<relay::StageSetup>,
+    relay_reviewer_model: Entity<InputState>,
     relay_zcode_model: Entity<InputState>,
     relay_model: Entity<InputState>,
     relay_error: Option<String>,
@@ -178,6 +180,9 @@ impl Studio {
             relay_implementer: aep::workflow::Client::Codex,
             relay_reviewer: aep::workflow::Client::Claude,
             relay_form_round: None,
+            stage_setup: None,
+            relay_reviewer_model: cx
+                .new(|cx| InputState::new(window, cx).placeholder("留空使用客户端默认模型")),
             relay_zcode_model: cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder("provider/model[@档位] · 留空使用 ZCode 默认模型")
@@ -321,6 +326,9 @@ impl Studio {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.stage_setup.as_ref().is_some_and(|s| s.repo != ws.root) {
+            self.stage_setup = None;
+        }
         let reopen_https = page == Page::HttpsPilot && self.https_remote_form.is_some();
         self.workspace_generation += 1;
         self.https_remote_form = None;
@@ -390,7 +398,7 @@ impl Studio {
             .update(cx, |input, cx| input.set_value("", window, cx));
         if page == Page::Relay {
             self.reload(cx);
-            if !self.tasks_loaded {
+            if self.stage_setup.is_none() && !self.tasks_loaded {
                 self.load_relay_tasks(cx);
             }
         }
@@ -410,6 +418,19 @@ impl Studio {
     }
 
     fn load_relay_tasks(&mut self, cx: &mut Context<Self>) {
+        if let Some(setup) = &mut self.stage_setup
+            && let Some(ws) = &self.workspace
+        {
+            match relay::stage_tasks(ws) {
+                Ok(tasks) => {
+                    setup.tasks = tasks;
+                    self.relay_error = None;
+                }
+                Err(e) => self.relay_error = Some(format!("{e:#}")),
+            }
+            cx.notify();
+            return;
+        }
         if self.tasks_loading {
             return;
         }
@@ -479,6 +500,53 @@ impl Studio {
         if self.relay_launching {
             return;
         }
+        if let Some(setup) = &self.stage_setup {
+            let mut plan = setup.plan.clone();
+            let valid = self.context_work().is_some_and(|w| w.id == plan.work)
+                && self.board.library_project_id() == Some(&plan.project)
+                && self
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|ws| ws.root == setup.repo)
+                && setup
+                    .tasks
+                    .iter()
+                    .any(|t| t.name == task.name && t.sha == task.sha);
+            if !valid {
+                self.relay_error = Some("事项或任务已变更，请重新进入阶段".into());
+                cx.notify();
+                return;
+            }
+            let edited = self.relay_agents(cx);
+            if setup.editing_second {
+                plan.second = edited;
+            } else {
+                plan.first = edited;
+            }
+            let id = relay::new_id();
+            let prepare = (|| -> Result<_> {
+                let ws = self.workspace.as_ref().context("没有选择仓库")?;
+                let lease = relay::Lease::acquire(ws, &id)?.context("接力正在执行")?;
+                lease.prepare_stage(task, plan.clone(), || {
+                    self.attach_stage_record(&plan, &id, cx)
+                })?;
+                Ok(lease)
+            })();
+            let lease = match prepare {
+                Ok(lease) => lease,
+                Err(e) => {
+                    self.relay_error = Some(format!("{e:#}"));
+                    cx.notify();
+                    return;
+                }
+            };
+            self.relay_id = Some(id);
+            self.relay_task = None;
+            self.submit_relay(cx, move |ws, runner, _| {
+                lease.advance(ws, runner, relay::Round::First, None, plan.first)
+            });
+            return;
+        }
         let queued = self
             .lifecycle
             .as_ref()
@@ -502,10 +570,17 @@ impl Studio {
     }
 
     fn advance_relay(&mut self, id: String, action: task_queue::Action, cx: &mut Context<Self>) {
-        if self
-            .lifecycle
-            .as_ref()
-            .is_some_and(|session| session.real_task)
+        if self.stage_setup.is_some() && !self.record_visible(aep::project::RecordKind::Relay, &id)
+        {
+            self.relay_error = Some("此接力未关联当前事项阶段".into());
+            cx.notify();
+            return;
+        }
+        if self.stage_setup.is_none()
+            && self
+                .lifecycle
+                .as_ref()
+                .is_some_and(|session| session.real_task)
         {
             self.enqueue_round(id, action, cx);
             return;
