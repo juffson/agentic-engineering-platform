@@ -204,6 +204,9 @@ fn perform(
             "\n请读取前序阶段的原始执行回执 {}，核对来源会话、结论和决策，再形成自己的结论。",
             file.display()
         ));
+        if stage.role == Role::Accept {
+            prompt.push_str("请在独立验收报告中引用你从该回执读到的完整 run_id，并列出决策编号和一项具体测试结果。");
+        }
         record["source_evidence"] = json!({"run":req.stage_transfer.as_ref().map(|t|&t.run),"file":"inputs/source-evidence.json"});
     }
     fs::write(dir.join("prompt.txt"), &prompt)?;

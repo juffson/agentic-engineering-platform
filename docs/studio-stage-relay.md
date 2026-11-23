@@ -20,6 +20,20 @@
 aep project --work "$work_id" timeline
 ```
 
+交付完成后，运行以下命令核对状态：
+
+```sh
+aep project --work "$work_id" status
+```
+
+确认输出中的 `stage_name` 为「已交付」，并在 `deliveries` 中找到对应的归档记录：`accepted_run` 是独立验收回执 ID，`run` 是交付回执 ID。
+
+安装 `jq` 后，可直接提取每条归档记录的两个执行 ID：
+
+```sh
+aep project --work "$work_id" status | jq '.deliveries[] | {"独立验收执行 ID": .accepted_run, "交付执行 ID": .run}'
+```
+
 ## 每轮验收
 
 两轮都运行 Spec 中的验收命令。第一轮可以留下需要人工决策的问题。第二轮可在「会话与轮次」展开「记忆与交接」，核对双方读取的决策编号和审查报告。
@@ -61,3 +75,21 @@ aep project --work "$work_id" timeline
 确认将这次验收交给「交付归档」后，选择模型并启动交付执行。执行成功后点「确认交付并归档」。重开同一事项，在「会话与轮次」点「查看归档时间线」，或者在 Finder 打开归档目录查看原始回执、报告、失败尝试和交接记录。CLI 的 `project --work "$work_id" timeline` 也会列出归档。
 
 复验最终交付时，在来源为独立验收阶段的 `transfer.json` 中加入 `"finalize_delivery": true`。UI debug 会点击归档确认、重开 Studio，核对归档时间线，并在输出目录保存 `archive.json` 和截图。
+
+## 一条命令从开发跑到归档
+
+在 AEP 源码目录复制计划示例，填好后运行。输出目录用于保存这次执行的回执和截图。
+
+```sh
+cp deploy/stage-lifecycle.example.json /tmp/aep-plan.json
+# 编辑 /tmp/aep-plan.json 后执行
+./deploy/stage-lifecycle.sh /tmp/aep-plan.json ./target/my-work-delivery
+```
+
+- 用 `aep project list` 查到事项 ID，填入 `work`。`repository` 是 Studio 已关联的本地仓库，`task` 是已提交的 Spec 名称。新事项应已到达开发实现阶段。软件开发模板填 `"stage": 4`。后续阶段沿用该仓库。
+- 在 `first`、`second` 分别选实现端、审查端和各自的模型。在 `test`、`accept`、`deliver` 分别填阶段客户端、模型及本轮说明。Spec 应写清两轮范围和第一轮要留下的问题。
+- 默认由操作者在 Studio 完成确认。按终端提示进入同一事项，打开阶段的接力记录，把第一轮问题修订成决策并启动第二轮。然后依次确认开发到测试、测试到独立验收、独立验收到交付的交接，最后点「确认交付并归档」。每次确认后命令自动继续。
+- 要做可重复的离屏演练，在计划的 `decision` 填入修订正文，运行同一命令时加 `--rehearse`。它会使用真实客户端，通过 Studio 的编辑和确认按钮完成演练。
+- 中断后用相同计划、确认方式和输出目录重跑，可继续原事项。已验证的输出目录只复核证据。要独立跑一次新任务，选处于开发阶段的事项，并指定新的输出目录。
+
+成功后打开 `verified.json` 查看决策版本、五次执行的对应关系、独立验收与交付回执，以及截图索引。`evidence/` 保存可单独复制的完整交付归档，`relay/`、`test/`、`accept/`、`deliver/` 保留各阶段的 Studio 截图和确认记录。

@@ -1,0 +1,34 @@
+{
+  "repository": ".",
+  "work": "替换为开发事项ID",
+  "stage": 4,
+  "task": "替换为任务名",
+  "first": {
+    "implementer": "codex",
+    "implementation_model": "gpt-6.1-sol",
+    "reviewer": "claude",
+    "review_model": "sonnet"
+  },
+  "second": {
+    "implementer": "codex",
+    "implementation_model": "gpt-6.1-sol",
+    "reviewer": "claude",
+    "review_model": "sonnet"
+  },
+  "decision": "请填入本次演练要采用的决策，人工模式可以删除本字段",
+  "test": {
+    "client": "Codex",
+    "model": "gpt-6.1-sol",
+    "brief": "在隔离工作区核对 Spec、运行验收命令并记录结果。通过时在末行写 AEP: PASS。"
+  },
+  "accept": {
+    "client": "Claude",
+    "model": "sonnet",
+    "brief": "独立读取原始测试回执和交付内容，核对决策，列出测试 run_id、命令和结果。通过时在末行写 AEP: PASS。"
+  },
+  "deliver": {
+    "client": "Codex",
+    "model": "gpt-6.1-sol",
+    "brief": "核对独立验收原始回执，记录交付版本、决策及验收结论。"
+  }
+}

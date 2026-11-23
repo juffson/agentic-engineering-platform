@@ -26,14 +26,12 @@ struct Plan {
     brief: String,
     #[serde(default)]
     finalize_delivery: bool,
+    #[serde(default)]
+    operator_gates: bool,
 }
 
 fn open_item(ui: &mut Driver<'_>, plan: &Plan) -> Result<()> {
-    until(ui, "project", 30, |ui| {
-        Ok((!ui.absent("project-overview")?).then_some(()))
-    })?;
-    ui.click("project-overview")?;
-    click(ui, &format!("project-item-{}", plan.work))
+    super::stage_lifecycle::open_item(ui, &plan.work)
 }
 pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
     let plan: Plan = serde_json::from_slice(&fs::read(path)?)?;
@@ -76,12 +74,34 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
             click(ui, &format!("project-stage-{from}"))?;
             click(ui, "stage-transfer-review")?;
             let button = format!("confirm-stage-transfer-{}", plan.source_run);
-            until(ui, "reviewed source run", 30, |ui| {
-                Ok((!ui.absent(&button)?).then_some(()))
+            let show_button = until(ui, "reviewed source run", 30, |ui| {
+                if !ui.absent(&button)? {
+                    return Ok(Some(true));
+                }
+                Ok((plan.operator_gates && item()?.incoming(from + 1).is_some()).then_some(false))
             })?;
-            ui.reveal("project-page", &button)?;
-            ui.checkpoint("source-acceptance")?;
-            click(ui, &button)?;
+            if show_button {
+                ui.reveal("project-page", &button)?;
+                ui.checkpoint("source-acceptance")?;
+            }
+            if plan.operator_gates {
+                super::stage_lifecycle::wait_for_operator(
+                    &format!(
+                        "在事项 {} 的第 {} 阶段确认执行 {} 交接到下一阶段",
+                        plan.work, plan.stage, plan.source_run
+                    ),
+                    || {
+                        let work = item()?;
+                        if let Some(t) = work.incoming(from + 1) {
+                            ensure!(t.run == plan.source_run, "已确认不同的来源执行");
+                            return Ok(true);
+                        }
+                        Ok(false)
+                    },
+                )?;
+            } else {
+                click(ui, &button)?;
+            }
         }
         let transfer = item()?
             .incoming(from + 1)
@@ -197,13 +217,35 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
                 *ui = Driver::open(&ws, ui.args)?;
                 open_item(ui, &plan)?;
                 click(ui, &format!("project-stage-{}", from + 1))?;
-                ensure!(
-                    ui.element("project-next")?.label() == Some("确认交付并归档"),
-                    "缺少归档确认"
-                );
-                ui.reveal("project-page", "project-next")?;
-                ui.checkpoint("delivery-confirmation")?;
-                click(ui, "project-next")?;
+                if !plan.operator_gates || !ui.absent("project-next")? {
+                    ensure!(
+                        ui.element("project-next")?.label() == Some("确认交付并归档"),
+                        "缺少归档确认"
+                    );
+                    ui.reveal("project-page", "project-next")?;
+                    ui.checkpoint("delivery-confirmation")?;
+                }
+                if plan.operator_gates {
+                    super::stage_lifecycle::wait_for_operator(
+                        &format!(
+                            "在事项 {} 的交付阶段核对执行 {} 并点击「确认交付并归档」",
+                            plan.work, id
+                        ),
+                        || {
+                            let work = item()?;
+                            ensure!(
+                                work.current_attempt.get(&(from + 1)) == Some(&id),
+                                "交付执行已切换"
+                            );
+                            Ok(work
+                                .deliveries
+                                .iter()
+                                .any(|r| r.run == id && r.accepted_run == plan.source_run))
+                        },
+                    )?;
+                } else {
+                    click(ui, "project-next")?;
+                }
             }
             let closed = item()?;
             ensure!(

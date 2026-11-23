@@ -19,16 +19,53 @@ struct Plan {
     first: Models,
     second: Models,
     decision: String,
+    #[serde(default)]
+    operator_gates: bool,
 }
 
-#[derive(Deserialize)]
-struct Models {
+#[derive(Deserialize, serde::Serialize)]
+pub(super) struct Models {
     implementer: String,
     implementation_model: String,
     reviewer: String,
     review_model: String,
 }
 
+impl Models {
+    pub(super) fn verify_receipt(&self, ev: &serde_json::Value) -> Result<()> {
+        let model = if self.implementer == "codex" {
+            "codex_model"
+        } else {
+            "zcode_model"
+        };
+        ensure!(
+            ev["implementation_source"] == self.implementer
+                && ev["reviewer"] == self.reviewer
+                && ev["request"][model] == self.implementation_model
+                && ev["request"]["reviewer_model"] == self.review_model
+                && ev["check_exit_code"] == 0
+                && ev["review_status"] == "findings_recorded"
+                && ev["blocking_findings"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+                && ev["acceptance"].as_array().is_some_and(|a| !a.is_empty()
+                    && a.iter()
+                        .all(|c| c["status"] == "passed" && c["exit_code"] == 0)),
+            "接力的客户端、模型、验收或审查回执不符"
+        );
+        Ok(())
+    }
+    pub(super) fn validate(&self) -> Result<()> {
+        ensure!(
+            matches!(self.implementer.as_str(), "codex" | "zcode")
+                && matches!(self.reviewer.as_str(), "claude" | "zcode")
+                && !self.implementation_model.trim().is_empty()
+                && !self.review_model.trim().is_empty(),
+            "请指定两个接力角色支持的客户端与模型"
+        );
+        Ok(())
+    }
+}
 fn press(ui: &mut Driver<'_>, container: &str, id: &str) -> Result<()> {
     if !ui.element(id)?.visible() {
         ui.reveal(container, id)?;
@@ -67,11 +104,7 @@ fn models(ui: &mut Driver<'_>, pick: &Models) -> Result<()> {
 }
 
 fn enter(ui: &mut Driver<'_>, plan: &Plan) -> Result<()> {
-    until(ui, "project", 30, |ui| {
-        Ok((!ui.absent("project-overview")?).then_some(()))
-    })?;
-    ui.click("project-overview")?;
-    click(ui, &format!("project-item-{}", plan.work))?;
+    super::stage_lifecycle::open_item(ui, &plan.work)?;
     click(
         ui,
         &format!(
@@ -93,31 +126,44 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
         let id = if handle.is_file() {
             fs::read_to_string(&handle)?
         } else {
-            press(ui, "relay-list", &format!("relay-task-{}", plan.task))?;
-            models(ui, &plan.first)?;
-            press(ui, "relay-detail", "stage-agents-second")?;
-            models(ui, &plan.second)?;
-            ui.checkpoint("stage-models")?;
             fs::create_dir_all(&folder)?;
-            let existing = fs::read_dir(&folder)?
-                .collect::<std::io::Result<Vec<_>>>()?
-                .into_iter()
-                .map(|e| e.path())
-                .collect::<Vec<_>>();
-            press(ui, "relay-detail", "start-relay")?;
-            let id = until(ui, "stage relay", 45, |_| {
+            let baseline = out.join("before-dispatch.json");
+            let existing: Vec<PathBuf> = if baseline.try_exists()? {
+                serde_json::from_slice(&fs::read(&baseline)?)?
+            } else {
+                let entries = fs::read_dir(&folder)?
+                    .map(|e| e.map(|e| e.path()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                aep::project::save_json(out, "before-dispatch.json", &entries)?;
+                entries
+            };
+            let dispatched = || -> Result<Option<String>> {
+                let mut ids = vec![];
                 for item in fs::read_dir(&folder)? {
                     let dir = item?.path();
                     if !existing.contains(&dir)
                         && let Ok(s) = read(&dir.join("relay.json"))
                         && s["stage_plan"]["work"] == plan.work
+                        && s["stage_plan"]["stage"] == plan.stage - 1
                         && s["task"]["name"] == plan.task
                     {
-                        return Ok(s["id"].as_str().map(str::to_owned));
+                        ids.push(s["id"].as_str().context("relay id")?.to_owned());
                     }
                 }
-                Ok(None)
-            })?;
+                ensure!(ids.len() <= 1, "同一事项出现多个新接力，请核对 relay-id");
+                Ok(ids.pop())
+            };
+            let id = if let Some(id) = dispatched()? {
+                id
+            } else {
+                press(ui, "relay-list", &format!("relay-task-{}", plan.task))?;
+                models(ui, &plan.first)?;
+                press(ui, "relay-detail", "stage-agents-second")?;
+                models(ui, &plan.second)?;
+                ui.checkpoint("stage-models")?;
+                press(ui, "relay-detail", "start-relay")?;
+                until(ui, "stage relay", 45, |_| dispatched())?
+            };
             fs::write(&handle, &id)?;
             id
         };
@@ -184,18 +230,9 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
                 }
             })?;
             let req = &evidence["request"];
-            let model = if selection.implementer == "codex" {
-                "codex_model"
-            } else {
-                "zcode_model"
-            };
-            ensure!(
-                req[model] == selection.implementation_model
-                    && req["reviewer_model"] == selection.review_model
-                    && evidence["check_exit_code"] == 0
-                    && evidence["review_status"] == "findings_recorded",
-                "{name}: model or acceptance mismatch"
-            );
+            selection
+                .verify_receipt(&evidence)
+                .with_context(|| format!("{name} 回执"))?;
             fs::write(
                 out.join(format!("{name}-run.json")),
                 serde_json::to_vec_pretty(&evidence)?,
@@ -227,6 +264,26 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
                     .find(|n| n["run_id"] == first["id"] && n["kind"] == "open_question")
                     .context("task did not leave the requested question")?;
                 let q = question["id"].as_i64().context("question id")?;
+                if plan.operator_gates {
+                    ui.checkpoint("stage-question")?;
+                    super::stage_lifecycle::wait_for_operator(
+                        &format!(
+                            "在事项 {} 的阶段接力记录 {} 中将问题 #{q} 修订为决策、点击用此决策发起第二轮",
+                            plan.work, id
+                        ),
+                        || {
+                            Ok(read(&saved)?["attempts"]
+                                .as_array()
+                                .context("attempts")?
+                                .iter()
+                                .any(|a| a["round"] == "Second"))
+                        },
+                    )?;
+                    *ui = Driver::open(&ws, ui.args)?;
+                    enter(ui, &plan)?;
+                    press(ui, "relay-list", &id)?;
+                    continue;
+                }
                 if question["successor"].is_null() {
                     let resolve = format!("relay-resolve-{q}");
                     until(ui, &resolve, 30, |ui| {
@@ -257,6 +314,31 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
                 let decision = req["require_memory"]
                     .as_i64()
                     .context("selected decision")?;
+                let snapshot = Snapshot::load(&ws);
+                let first = read(&out.join("first-run.json"))?;
+                let revision = snapshot
+                    .notes
+                    .iter()
+                    .find(|n| n["id"] == decision && n["kind"] == "decision")
+                    .context("决策版本")?;
+                let question = snapshot
+                    .notes
+                    .iter()
+                    .find(|n| {
+                        n["id"] == revision["replaces"]
+                            && n["kind"] == "open_question"
+                            && n["run_id"] == first["run_id"]
+                    })
+                    .context("决策未修订本轮的问题")?;
+                ensure!(
+                    plan.operator_gates || revision["body"] == plan.decision,
+                    "修订正文与演练计划不一致"
+                );
+                aep::project::save_json(
+                    out,
+                    "decision.json",
+                    &serde_json::json!({"question":question,"revision":revision}),
+                )?;
                 for role in ["implementer", "reviewer"] {
                     ensure!(
                         evidence["memory_inputs"][role]
@@ -338,10 +420,8 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
                 }
                 if let Some(decision) = round.decision {
                     ensure!(
-                        agent
-                            .reads
-                            .iter()
-                            .any(|n| n.id == decision && n.body == plan.decision),
+                        agent.reads.iter().any(|n| n.id == decision
+                            && (plan.operator_gates || n.body == plan.decision)),
                         "wrong revision in timeline"
                     );
                 }

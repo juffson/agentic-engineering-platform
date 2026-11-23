@@ -17,6 +17,8 @@ mod lifecycle;
 mod local;
 #[path = "support/project.rs"]
 mod project;
+#[path = "support/stage_lifecycle.rs"]
+mod stage_lifecycle;
 #[path = "support/stage_relay.rs"]
 mod stage_relay;
 #[path = "support/stage_transfer.rs"]
@@ -71,7 +73,7 @@ enum Scenario {
 #[derive(Parser)]
 #[command(
     about = "Exercise AEP Studio in a temporary Git workspace, using an offscreen GPUI window",
-    group(ArgGroup::new("live").args(["live_stage_transfer","live_stage_relay","live_zcode_history","live_project_workflow","live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
+    group(ArgGroup::new("live").args(["live_stage_lifecycle","live_stage_transfer","live_stage_relay","live_zcode_history","live_project_workflow","live_relay", "live_lifecycle", "live_https_pilot", "live_https_remote", "live_https_queue", "live_https_workers", "live_https_keys", "live_https_rolling_studio"]))
 )]
 struct Args {
     /// Run just one scenario (default: all)
@@ -92,6 +94,12 @@ struct Args {
     /// Also save PNGs from the platform's offscreen renderer
     #[arg(long, requires = "output_dir")]
     screenshots: bool,
+    /// Run a work item from its implementation relay through verified delivery and screenshots.
+    #[arg(long, requires="output_dir", conflicts_with_all=["scenario","script","repo"])]
+    live_stage_lifecycle: Option<PathBuf>,
+    /// Exercise the Studio decision and confirmation controls with the values in the plan.
+    #[arg(long, requires = "live_stage_lifecycle")]
+    rehearse: bool,
     /// Confirm an accepted stage and launch the next model session in a local project.
     #[arg(long, requires="output_dir", conflicts_with_all=["scenario","script","repo"])]
     live_stage_transfer: Option<PathBuf>,
@@ -1459,6 +1467,9 @@ fn main() -> Result<()> {
     }
     if let Some(dir) = &args.output_dir {
         fs::create_dir_all(dir)?;
+    }
+    if let Some(path) = &args.live_stage_lifecycle {
+        return stage_lifecycle::run(&args, path);
     }
     if let Some(path) = &args.live_stage_transfer {
         return stage_transfer::run(&args, path);
