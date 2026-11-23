@@ -185,6 +185,7 @@ pub fn converse(
         "desktop-task.json",
         &json!({"session":task,"userMessage":message,"workspace":workspace}),
     )?;
+    let _approval_monitor = crate::zcode_desktop_send::monitor(dir, &task);
     loop {
         if let Some(reply) = read_reply(&db, workspace, &task, &message, model)? {
             save_json(dir, "session.json", &reply.evidence)?;

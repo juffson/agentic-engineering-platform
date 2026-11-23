@@ -201,6 +201,8 @@ zcode=/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
 
 打开 ZCode，在插件详情页给 aep-studio 授予会话权限。若已打开的 ZCode 尚未载入插件，可重新打开。之后在 Studio 为每轮选择方案和模型，点击开始即可。官方扩展按 ZCode 的新任务默认权限在对应本地项目中创建任务并发送本轮 Spec、Diff 和共享记忆。实现任务使用隔离工作区。桌面方案使用模型默认推理档位，旧配置中的手选档位在新派发时也按默认处理。普通 CLI 模型仍可指定档位。
 
+ZCode 等待工具审批时，Studio 的接力卡显示轮次、实现或审查角色、工作区和待批命令。点「打开对应 ZCode 任务」，在打开的桌面会话点「允许一次」，原任务会自动续跑。ZCode 扩展仅能在插件自有项目中代答审批。AEP 的仓库和隔离工作区使用桌面原生确认。CLI 可用 `aep zcode-open --dir <本次运行的 zcode-edit 或 zcode-plan 目录>` 打开同一任务。已安装旧版扩展的用户可运行 `"$zcode" plugins marketplace update aep-local` 和 `"$zcode" plugins update aep-studio@aep-local`，再重新打开 ZCode。
+
 开始第二轮时，Studio 会把第一轮的运行 ID 与起始提交一起传给执行器。实现端和审查端都能读到该轮已发布的交接与审查记录，即使第二轮产生了新提交。记忆仍受任务、Spec 和大小上限约束，输入编号可在 `evidence.json` 的 `memory_inputs` 核对。
 
 每轮的 `zcode-edit` 或 `zcode-plan` 目录保留派发请求、扩展创建回执和最终回执。Studio 按目录、派发消息、会话和主对话用量核对方案与模型，再展示任务 ID、实际推理档位和交接摘要。

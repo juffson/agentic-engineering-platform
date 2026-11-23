@@ -10,6 +10,42 @@ const plans = new Set(["account:bigmodel-start-plan", "account:bigmodel-individu
 const active = new Map();
 let timer;
 
+function describe(row) {
+  const input = row.input ?? {};
+  const detail = [input.command, input.file_path, input.path, row.inputText]
+    .find(value => typeof value === "string" && value.trim()) ?? "";
+  return { tool: row.toolName, detail, id: row.toolCallId };
+}
+
+// Query only the operation admitted for this AEP attempt. A later user turn in
+// the same desktop session must never supply this card's commands.
+async function approvalState(ctx, job) {
+  const result = await ctx.sessions.waitSessions({
+    operations: [job.operation], mode: "any", timeoutMs: 0
+  });
+  const current = result.operations.find(op => op.operation.commandId === job.operation.commandId);
+  if (!current) throw new Error("ZCode 未返回该操作的状态");
+  if (current.attention?.kind !== "approval") return { waiting: false, tools: [] };
+
+  const pending = [];
+  let beforeRowId;
+  for (;;) {
+    const page = await ctx.sessions.readRows({
+      sessionId: job.session.sessionId, limit: 32, ...(beforeRowId === undefined ? {} : { beforeRowId })
+    });
+    for (const row of [...page.rows].reverse()) {
+      if (row.kind === "toolCall" && row.status === "pendingApproval") pending.push(row);
+      if (row.sourceCommandId === job.operation.commandId && row.kind === "turnHeader") {
+        return { waiting: true, tools: pending.filter(item => item.turnId === row.turnId).map(describe) };
+      }
+    }
+    const first = page.rows[0]?.rowId;
+    if (!page.hasMore || first === undefined || first === beforeRowId) break;
+    beforeRowId = first;
+  }
+  return { waiting: true, tools: [] };
+}
+
 async function serve(ctx, name, id) {
   const socket = createConnection(join(folder, name));
   active.set(name, socket);
@@ -17,7 +53,17 @@ async function serve(ctx, name, id) {
     const lines = createInterface({ input: socket, crlfDelay: Infinity });
     for await (const line of lines) {
       const job = JSON.parse(line);
-      if (job.requestId !== id || !plans.has(job.providerId) ||
+      if (job.requestId !== id) throw new Error("Invalid request ID");
+      if (job.action === "open" || job.action === "approvals") {
+        const session = job.session;
+        if (session?.sourceServerId !== "local" || !session.sessionId ||
+            session.sessionId !== job.operation?.sessionId) throw new Error("Invalid desktop session");
+        const reply = job.action === "open" ? await ctx.sessions.openSession({ session })
+          : await approvalState(ctx, job);
+        socket.end(JSON.stringify({ ...reply, sessionId: session.sessionId, requestId: id }) + "\n");
+        return;
+      }
+      if (!plans.has(job.providerId) ||
           typeof job.modelId !== "string" || !job.modelId || typeof job.prompt !== "string") {
         throw new Error("Invalid AEP dispatch");
       }

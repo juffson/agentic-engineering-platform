@@ -718,7 +718,7 @@ impl Studio {
                 );
             }
             if busy(&ev) {
-                if let Some(dispatch) = self.desktop_dispatch(&d, "阶段") {
+                if let Some(dispatch) = self.desktop_dispatch(&d, "阶段", cx) {
                     bar = bar.child(dispatch);
                 }
                 let id = a.id.clone();

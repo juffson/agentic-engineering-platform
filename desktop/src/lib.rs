@@ -90,6 +90,7 @@ struct Studio {
     relay_zcode_model: Entity<InputState>,
     relay_model: Entity<InputState>,
     relay_error: Option<String>,
+    zcode_navigation: Option<(PathBuf, String)>,
     tasks_loading: bool,
     tasks_loaded: bool,
     relay_launching: bool,
@@ -184,6 +185,7 @@ impl Studio {
             relay_model: cx
                 .new(|cx| InputState::new(window, cx).placeholder("由 Codex 本机配置决定")),
             relay_error: None,
+            zcode_navigation: None,
             tasks_loading: false,
             tasks_loaded: false,
             relay_launching: false,

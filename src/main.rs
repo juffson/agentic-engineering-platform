@@ -27,6 +27,11 @@ struct Cli {
 enum Action {
     /// Manage Studio projects, run a stage or exchange handoffs with independent sessions.
     Project(project_cli::Options),
+    /// Open the exact ZCode desktop task saved in a role or stage evidence directory.
+    ZcodeOpen {
+        #[arg(long)]
+        dir: PathBuf,
+    },
     #[command(hide = true)]
     ZcodeStage {
         #[arg(long)]
@@ -172,6 +177,10 @@ fn app() -> Result<ExitCode> {
             zcode_stage::run(&binary, &request)?;
             return Ok(ExitCode::SUCCESS);
         }
+        Action::ZcodeOpen { dir } => {
+            println!("{}", zcode_desktop_send::open_task(&dir)?);
+            return Ok(ExitCode::SUCCESS);
+        }
         Action::ZcodeBridge {
             binary,
             mode,
@@ -203,6 +212,7 @@ fn app() -> Result<ExitCode> {
         Action::Project(_)
         | Action::Control(_)
         | Action::ZcodeStage { .. }
+        | Action::ZcodeOpen { .. }
         | Action::ZcodeBridge { .. }
         | Action::WorkflowStage { .. } => {
             unreachable!()

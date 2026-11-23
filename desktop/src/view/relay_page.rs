@@ -478,7 +478,8 @@ impl Studio {
                         );
                     } else if run.text("status") == "running"
                         && run.text("phase") == phase
-                        && let Some(dispatch) = self.desktop_dispatch(&dir, role)
+                        && let Some(dispatch) =
+                            self.desktop_dispatch(&dir, &format!("{title} · {role}"), cx)
                     {
                         card = card.child(dispatch);
                     }

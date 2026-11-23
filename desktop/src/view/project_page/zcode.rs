@@ -21,13 +21,75 @@ impl Studio {
         &self,
         dir: &std::path::Path,
         role: &str,
+        cx: &Context<Self>,
     ) -> Option<Div> {
         let job = aep::workspace::read(&dir.join("desktop-request.json")).ok()?;
         if let Ok(task) = aep::workspace::read(&dir.join("desktop-task.json")) {
-            return Some(caption(format!(
-                "ZCode 桌面任务 {} · 等待交接",
-                task["session"].as_str()?
-            )));
+            let session = task["session"].as_str()?;
+            let workspace = task["workspace"].as_str()?;
+            let path = dir.join("desktop-approvals.json");
+            let observed = aep::workspace::read(&path)
+                .ok()
+                .filter(|v| v["session"] == session && v["workspace"] == workspace);
+            let fresh = path
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < Duration::from_secs(15));
+            let state = observed.as_ref().map(|v| &v["state"]);
+            let mut panel = v_flex().gap_1();
+            if fresh && state.is_some_and(|s| s["waiting"] == true) {
+                panel = panel
+                    .child(
+                        detail_text(
+                            SharedString::from(format!("zcode-wait-{session}")),
+                            &format!("{role} · 等待工具审批"),
+                        )
+                        .text_color(rgb(AMBER)),
+                    )
+                    .child(field("工作区", workspace));
+                for tool in state
+                    .and_then(|s| s["tools"].as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    let name = tool["tool"].as_str().unwrap_or("工具");
+                    let detail = tool["detail"].as_str().unwrap_or("");
+                    panel = panel.child(detail_text(
+                        SharedString::from(format!(
+                            "zcode-tool-{session}-{}",
+                            tool["id"].as_str().unwrap_or("")
+                        )),
+                        &format!("{name}  {detail}"),
+                    ));
+                }
+            } else if let Some(error) = state.and_then(|s| s["error"].as_str()) {
+                panel = panel.child(caption(format!("审批状态不可用 · {error}")));
+            } else if observed.is_some() && !fresh {
+                panel = panel.child(caption("正在重新连接 ZCode 审批状态"));
+            } else {
+                panel = panel.child(caption(format!("ZCode 桌面任务 {session} · 等待交接")));
+            }
+            if dir.join("desktop-create.json").is_file() {
+                let folder = dir.to_owned();
+                panel = panel.child(
+                    button(
+                        format!("zcode-open-{session}"),
+                        "打开对应 ZCode 任务",
+                        false,
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.open_zcode_task(folder.clone(), cx)),
+                    ),
+                );
+            }
+            if let Some((path, msg)) = &self.zcode_navigation
+                && path == dir
+            {
+                panel = panel.child(caption(msg.clone()));
+            }
+            return Some(panel);
         }
         let model = &job["model"];
         let level = model
@@ -40,6 +102,46 @@ impl Studio {
             "正在 ZCode 桌面创建{role}任务 · {plan} / {} / {level}",
             model["modelId"].as_str()?
         )))
+    }
+
+    fn open_zcode_task(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let program = self.runner.binary();
+        self.zcode_navigation = Some((dir.clone(), "正在打开…".into()));
+        let folder = dir.clone();
+        let job = cx.background_executor().spawn(async move {
+            let output = std::process::Command::new(program?)
+                .arg("zcode-open")
+                .arg("--dir")
+                .arg(folder)
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            anyhow::Ok(())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .zcode_navigation
+                    .as_ref()
+                    .is_some_and(|(path, _)| path == &dir)
+                {
+                    this.zcode_navigation = Some((
+                        dir,
+                        result.map_or_else(
+                            |e| format!("打开失败 · {e:#}"),
+                            |_| "已打开 ZCode 任务".into(),
+                        ),
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     pub(crate) fn relay_project_default(&self) -> String {

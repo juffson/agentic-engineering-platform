@@ -63,7 +63,7 @@ impl Drop for SocketPath {
     }
 }
 
-fn create_session(root: &Path, request: &Value) -> Result<Value> {
+fn exchange(root: &Path, request: &Value) -> Result<Value> {
     DirBuilder::new().recursive(true).mode(0o700).create(root)?;
     let meta = fs::symlink_metadata(root)?;
     ensure!(
@@ -106,14 +106,24 @@ fn create_session(root: &Path, request: &Value) -> Result<Value> {
     let mut line = String::new();
     BufReader::new(socket)
         .read_line(&mut line)
-        .context("等待 ZCode 扩展创建回执")?;
-    let reply: Value = serde_json::from_str(&line).context("ZCode 扩展未返回创建回执")?;
+        .context("等待 ZCode 扩展回执")?;
+    let reply: Value = serde_json::from_str(&line).context("ZCode 扩展未返回有效回执")?;
     if let Some(error) = reply["error"].as_str() {
-        bail!(
-            "ZCode 扩展派发失败（{}）：{error}。请检查插件详情页的会话权限。",
-            reply["code"]
-        );
+        let hint = match reply["code"].as_str() {
+            Some("not-granted") => "。请在 ZCode 插件详情页授权",
+            _ if request["action"].is_string() && error == "Invalid AEP dispatch" => {
+                "。请更新并重新载入 aep-studio 扩展"
+            }
+            _ => "",
+        };
+        bail!("ZCode 扩展请求失败（{}）：{error}{hint}", reply["code"]);
     }
+    Ok(reply)
+}
+
+fn create_session(root: &Path, request: &Value) -> Result<Value> {
+    let reply = exchange(root, request)?;
+    let id = &request["requestId"];
     ensure!(
         reply["creation"] != "rejected" && reply["firstInput"] != "rejected",
         "ZCode 拒绝创建任务或发送首条消息：{}",
@@ -121,7 +131,7 @@ fn create_session(root: &Path, request: &Value) -> Result<Value> {
     );
     let session = &reply["session"];
     ensure!(
-        reply["requestId"] == id
+        &reply["requestId"] == id
             && session["sourceServerId"] == "local"
             && session["project"]["projectId"] == request["projectId"]
             && session["sessionId"]
@@ -130,6 +140,76 @@ fn create_session(root: &Path, request: &Value) -> Result<Value> {
         "ZCode 返回的项目或派发回执不匹配"
     );
     Ok(reply)
+}
+
+fn session_action(receipt: &Value, action: &str) -> Result<Value> {
+    let session = &receipt["session"];
+    ensure!(
+        session["sessionId"].is_string() && receipt["operation"]["session"] == *session,
+        "创建回执缺少对应的 ZCode 会话或操作"
+    );
+    let root = std::env::home_dir()
+        .context("缺少用户目录")?
+        .join(".aep/zcode");
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let reply = exchange(
+        &root,
+        &json!({"action":action,"requestId":id,"session":session,
+        "operation":receipt["operation"]}),
+    )?;
+    ensure!(
+        reply["requestId"] == id && reply["sessionId"] == session["sessionId"],
+        "ZCode 操作回执不匹配"
+    );
+    if action == "approvals" {
+        ensure!(
+            reply["waiting"].is_boolean() && reply["tools"].is_array(),
+            "ZCode 扩展返回的审批状态无效"
+        );
+    }
+    Ok(reply)
+}
+
+pub fn open_task(dir: &Path) -> Result<Value> {
+    let receipt = aep::workspace::read(&dir.join("desktop-create.json"))?;
+    let reply = session_action(&receipt, "open")?;
+    ensure!(
+        reply["status"] == "opened",
+        "ZCode 无法打开该任务：{}",
+        reply["reason"]
+    );
+    Ok(reply)
+}
+
+/// Observe approval state independently of reply collection. An unavailable
+/// extension must not discard a completed model reply or resend the prompt.
+pub fn monitor(dir: &Path, task: &str) -> Option<std::sync::mpsc::Sender<()>> {
+    let receipt = aep::workspace::read(&dir.join("desktop-create.json")).ok()?;
+    if receipt["session"]["sessionId"] != task {
+        return None;
+    }
+    let dir = dir.to_owned();
+    let (stop, stopped) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            let state = match session_action(&receipt, "approvals") {
+                Ok(reply) => json!({"waiting":reply["waiting"],"tools":reply["tools"]}),
+                Err(e) => json!({"error":format!("{e:#}")}),
+            };
+            if stopped.try_recv() != Err(std::sync::mpsc::TryRecvError::Empty) {
+                break;
+            }
+            let state = json!({"session":receipt["session"]["sessionId"],"workspace":receipt["session"]["workspacePath"],
+                "observedAt":chrono::Utc::now().timestamp(), "state":state});
+            let _ = aep::project::save_json(&dir, "desktop-approvals.json", &state);
+            if stopped.recv_timeout(Duration::from_secs(2))
+                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                break;
+            }
+        }
+    });
+    Some(stop)
 }
 
 pub fn dispatch(
