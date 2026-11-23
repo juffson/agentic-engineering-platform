@@ -203,6 +203,8 @@ zcode=/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
 
 ZCode 等待工具审批时，Studio 的接力卡显示轮次、实现或审查角色、工作区和待批命令。点「打开对应 ZCode 任务」，在打开的桌面会话点「允许一次」，原任务会自动续跑。ZCode 扩展仅能在插件自有项目中代答审批。AEP 的仓库和隔离工作区使用桌面原生确认。CLI 可用 `aep zcode-open --dir <本次运行的 zcode-edit 或 zcode-plan 目录>` 打开同一任务。已安装旧版扩展的用户可运行 `"$zcode" plugins marketplace update aep-local` 和 `"$zcode" plugins update aep-studio@aep-local`，再重新打开 ZCode。
 
+本地接力只在 ZCode 持续报告同一会话正在等待审批时暂停该模型步骤的超时计时，批准或拒绝后继续计时。对于旧版已在实现阶段超时的运行，待原桌面任务完成后，用相同的 `aep run` 参数和 `--run-id` 加上 `--recover-desktop` 可收取原交接。AEP 保留原超时记录和工作区，在独立工作区执行该任务的验收和审查。
+
 开始第二轮时，Studio 会把第一轮的运行 ID 与起始提交一起传给执行器。实现端和审查端都能读到该轮已发布的交接与审查记录，即使第二轮产生了新提交。记忆仍受任务、Spec 和大小上限约束，输入编号可在 `evidence.json` 的 `memory_inputs` 核对。
 
 每轮的 `zcode-edit` 或 `zcode-plan` 目录保留派发请求、扩展创建回执和最终回执。Studio 按目录、派发消息、会话和主对话用量核对方案与模型，再展示任务 ID、实际推理档位和交接摘要。

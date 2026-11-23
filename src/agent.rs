@@ -29,11 +29,48 @@ pub fn watch_interrupts() -> Result<()> {
     ctrlc::set_handler(|| INTERRUPTED.store(true, Ordering::Relaxed))?;
     Ok(())
 }
+/// Local desktop relays charge active execution time. Explicit whole-attempt
+/// budgets (including worker leases) and all other commands keep their wall clock.
+pub struct CommandTimeout {
+    seconds: u64,
+    desktop_role: Option<PathBuf>,
+}
+impl From<u64> for CommandTimeout {
+    fn from(seconds: u64) -> Self {
+        Self {
+            seconds,
+            desktop_role: None,
+        }
+    }
+}
+impl CommandTimeout {
+    fn awaiting_approval(&self) -> bool {
+        let Some(dir) = &self.desktop_role else {
+            return false;
+        };
+        let Ok(snapshot) = read(&dir.join("desktop-approvals.json")) else {
+            return false;
+        };
+        let age = snapshot["observedAt"]
+            .as_i64()
+            .map(|at| chrono::Utc::now().timestamp().saturating_sub(at));
+        if snapshot["state"]["waiting"] != true || !age.is_some_and(|s| (0..15).contains(&s)) {
+            return false;
+        }
+        let Ok(task) = read(&dir.join("desktop-task.json")) else {
+            return false;
+        };
+        task["session"].is_string()
+            && task["session"] == snapshot["session"]
+            && task["workspace"].is_string()
+            && task["workspace"] == snapshot["workspace"]
+    }
+}
 pub fn logged(
     argv: &[String],
     work: &Path,
     log: &Path,
-    timeout: u64,
+    timeout: impl Into<CommandTimeout>,
     prompt: Option<&str>,
     err: Option<PathBuf>,
     cancellation: &Cancellation,
@@ -64,7 +101,12 @@ pub fn logged(
         .stderr(stderr)
         .spawn()
         .with_context(|| format!("start {}", argv[0]))?;
+    let timeout = timeout.into();
     let start = Instant::now();
+    let limit = Duration::from_secs(timeout.seconds);
+    let mut paused_time = Duration::ZERO;
+    let mut sampled = start;
+    let mut paused = false;
     loop {
         if let Err(error) = cancellation.check() {
             let group = Pid::from_raw(child.id() as i32);
@@ -85,7 +127,21 @@ pub fn logged(
                 .code()
                 .unwrap_or_else(|| -status.signal().unwrap_or(1)));
         }
-        if INTERRUPTED.load(Ordering::Relaxed) || start.elapsed() >= Duration::from_secs(timeout) {
+        let now = Instant::now();
+        if timeout.desktop_role.is_some()
+            && (now.duration_since(sampled) >= Duration::from_millis(250)
+                || now.duration_since(start).saturating_sub(paused_time) >= limit)
+        {
+            let waiting = timeout.awaiting_approval();
+            if paused || waiting {
+                paused_time += now.duration_since(sampled);
+            }
+            paused = waiting;
+            sampled = now;
+        }
+        if INTERRUPTED.load(Ordering::Relaxed)
+            || now.duration_since(start).saturating_sub(paused_time) >= limit
+        {
             let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
             child.wait()?;
             bail!(
@@ -106,7 +162,7 @@ struct Finding {
     line: u64,
     reason: String,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RelayHandoff {
     note: String,
@@ -131,6 +187,11 @@ fn relay_payload<T: DeserializeOwned>(message: &str) -> Result<T> {
         .and_then(|line| line.strip_prefix("AEP-RELAY:"))
         .context("ZCode 未按约定在最后一行输出 AEP-RELAY 交接");
     serde_json::from_str(line?).context("AEP-RELAY 行不是有效的 JSON 交接")
+}
+pub fn save_zcode_handoff(folder: &Path, text: &str) -> Result<()> {
+    let handoff: RelayHandoff = relay_payload(text)?;
+    fs::write(folder.join("handoff.json"), serde_json::to_vec(&handoff)?)?;
+    Ok(())
 }
 const SCHEMA_NOTE: &str = "Return a short handoff in 'note' and one unresolved spec-level 'question' or an empty string (max 1000 characters each). Exclude credentials, logs and raw conversation. For a review put detailed findings in 'report'.";
 const RELAY_NOTE: &str = "Inspect allowed files using the file reader and make any necessary edits using the file editor. Keep already-correct code when resuming. The runner executes acceptance checks after your turn. End the reply with one final line AEP-RELAY: {\"note\":\"short handoff\",\"question\":\"one unresolved spec-level question or an empty string\"} as plain JSON without code fences (max 1000 characters each). Exclude credentials, logs and raw conversation.";
@@ -182,6 +243,20 @@ impl Agents<'_> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(!remaining.is_zero(), "Run time budget exhausted");
         Ok(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0))
+    }
+    fn model_timeout(&self, client: Client, mode: &str) -> Result<CommandTimeout> {
+        let desktop = self.deadline.is_none()
+            && client == Client::ZCode
+            && self
+                .zcode_model
+                .as_deref()
+                .and_then(|s| s.split_once('/'))
+                .and_then(|(provider, _)| aep::zcode_catalog::desktop_plan(provider))
+                .is_some();
+        Ok(CommandTimeout {
+            seconds: self.remaining_timeout()?,
+            desktop_role: desktop.then(|| self.folder.join(format!("zcode-{mode}"))),
+        })
     }
     fn prompt(
         &self,
@@ -345,7 +420,7 @@ impl Agents<'_> {
             &cmd,
             self.work,
             &log,
-            self.remaining_timeout()?,
+            self.model_timeout(self.implementer, "edit")?,
             stdin_prompt.as_deref(),
             None,
             self.cancellation,
@@ -367,11 +442,7 @@ impl Agents<'_> {
         );
         if self.implementer == Client::ZCode && self.memory.is_some() {
             // Same evidence shape the Codex adapter writes through --output-last-message.
-            let handoff: RelayHandoff = relay_payload(&fs::read_to_string(&log)?)?;
-            fs::write(
-                self.folder.join("handoff.json"),
-                serde_json::to_vec(&json!({"note":handoff.note,"question":handoff.question}))?,
-            )?;
+            save_zcode_handoff(self.folder, &fs::read_to_string(&log)?)?;
         }
         Ok(())
     }
@@ -545,7 +616,7 @@ impl Agents<'_> {
                     &cmd,
                     self.work,
                     &output,
-                    self.remaining_timeout()?,
+                    self.model_timeout(self.reviewer, "plan")?,
                     None,
                     err,
                     self.cancellation,
@@ -572,6 +643,51 @@ impl Agents<'_> {
             bail!("independent review requested changes; see review.txt");
         }
         record["review_status"] = json!("findings_recorded");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod approval_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_live_approval_for_this_desktop_turn_pauses_the_clock() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path();
+        let limit = CommandTimeout {
+            seconds: 1,
+            desktop_role: Some(dir.to_owned()),
+        };
+        aep::project::save_json(
+            dir,
+            "desktop-task.json",
+            &json!({"session":"original","workspace":"/isolated"}),
+        )?;
+        let observed = |session, workspace, age: i64, waiting| {
+            aep::project::save_json(
+                dir,
+                "desktop-approvals.json",
+                &json!({"session":session,"workspace":workspace,"observedAt":chrono::Utc::now().timestamp()-age,"state":{"waiting":waiting}}),
+            )
+        };
+        for (session, workspace, age, waiting) in [
+            ("other", "/isolated", 0, true),
+            ("original", "/other", 0, true),
+            ("original", "/isolated", 16, true),
+            ("original", "/isolated", 0, false),
+        ] {
+            observed(session, workspace, age, waiting)?;
+            assert!(!limit.awaiting_approval());
+        }
+        observed("original", "/isolated", 0, true)?;
+        let cancel = Cancellation::new(dir, "approval-test")?;
+        let job = vec!["sh".into(), "-c".into(), "sleep 2".into()];
+        assert_eq!(
+            logged(&job, dir, &dir.join("wait.log"), limit, None, None, &cancel)?,
+            0
+        );
+        assert!(logged(&job, dir, &dir.join("hard.log"), 1, None, None, &cancel).is_err());
         Ok(())
     }
 }

@@ -83,6 +83,9 @@ enum Action {
         base: Option<String>,
         #[arg(long, value_parser=["codex","zcode"], conflicts_with="candidate", required_unless_present="candidate")]
         implementer: Option<String>,
+        /// Collect a completed desktop turn after this exact run timed out during implementation.
+        #[arg(long, requires = "run_id")]
+        recover_desktop: bool,
         /// Start the implementer from an existing candidate descended from the Spec.
         #[arg(long, requires = "implementer")]
         resume_from: Option<String>,
@@ -127,6 +130,8 @@ struct Execution {
     reviewer: String,
     #[arg(long, default_value_t=600, value_parser=clap::value_parser!(u64).range(1..))]
     timeout: u64,
+    #[arg(skip)]
+    recover_desktop: bool,
     #[arg(skip)]
     whole_attempt: bool,
     #[arg(skip)]
@@ -224,10 +229,12 @@ fn app() -> Result<ExitCode> {
             remote,
             base,
             implementer,
+            recover_desktop,
             resume_from,
             codex_model,
             zcode_model,
         } => {
+            args.recover_desktop = recover_desktop;
             if resume_from.is_some() {
                 args.candidate = resume_from;
             }

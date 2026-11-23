@@ -732,6 +732,7 @@ fn start(repo: &Repo, id: &str, rerun: bool) -> Result<ExitCode> {
             handoff_from_run: None,
             reviewer: "claude".into(),
             timeout: pin.timeout,
+            recover_desktop: false,
             whole_attempt: true,
             feedback_run: feedback,
             budget: Some(Budget {

@@ -135,6 +135,87 @@ fn replay(repo: &Repo, args: &Execution, record: &Value, request: &Value) -> Res
     );
     Ok(())
 }
+/// Snapshot the retained worktree into Git using a private index. Verification
+/// and cleanup then run in a fresh checkout, leaving the user's desktop session intact.
+fn recover_desktop(
+    repo: &Repo,
+    folder: &Path,
+    previous: &Value,
+    task: &Task,
+    model: &str,
+) -> Result<String> {
+    ensure!(
+        previous["status"] == "failed"
+            && previous["phase"] == "implementing"
+            && previous["implementation_source"] == "zcode"
+            && previous["candidate_sha"].is_null()
+            && previous["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("timed out after")),
+        "recovery requires an implementation timeout before candidate verification"
+    );
+    let original = Path::new(
+        previous["recovery_worktree"]
+            .as_str()
+            .context("missing retained worktree")?,
+    )
+    .canonicalize()?;
+    let workspace = aep::workspace::Workspace::open(&original)?;
+    let initial = previous["requested_candidate_sha"]
+        .as_str()
+        .or(previous["spec_sha"].as_str())
+        .context("missing pinned commit")?;
+    ensure!(
+        workspace.data == repo.data
+            && workspace.root.canonicalize()? == original
+            && original != repo.root.canonicalize()?
+            && git(&original, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim() == "HEAD"
+            && commit(&original, "HEAD")? == initial,
+        "original worktree or pinned HEAD changed"
+    );
+    let text = crate::zcode_desktop::completed(&folder.join("zcode-edit"), &original, model)?;
+    if previous["request"]["shared_memory"] == true {
+        agent::save_zcode_handoff(folder, &text)?;
+    }
+    fs::write(folder.join("implementation.log"), text)?;
+    let dir = tempfile::tempdir()?;
+    let index = dir.path().join("index");
+    let indexed = |args: &[&str]| -> Result<String> {
+        let out = std::process::Command::new("git")
+            .current_dir(&original)
+            .env("GIT_INDEX_FILE", &index)
+            .args(args)
+            .output()?;
+        ensure!(
+            out.status.success(),
+            "git {}: {}",
+            args[0],
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8(out.stdout)?.trim_end().to_owned())
+    };
+    indexed(&["read-tree", initial])?;
+    indexed(&["add", "-A"])?;
+    let tree = indexed(&["write-tree"])?;
+    if tree == git(&original, &["rev-parse", "HEAD^{tree}"])?.trim() {
+        return Ok(initial.to_owned());
+    }
+    let candidate = indexed(&[
+        "commit-tree",
+        &tree,
+        "-p",
+        initial,
+        "-m",
+        task.title.as_deref().context("missing task title")?,
+    ])?;
+    repo.changes(
+        previous["spec_sha"].as_str().context("missing spec")?,
+        &candidate,
+        &task.allowed_paths,
+    )?;
+    Ok(candidate)
+}
+
 pub fn execute(
     repo: &Repo,
     args: &Execution,
@@ -241,11 +322,44 @@ pub fn execute(
     if let Some(id) = &args.feedback_run {
         request["feedback_run"] = json!(id);
     }
-    if path.exists() {
-        replay(repo, args, &read(&path)?, &request)?;
+    let previous = path.try_exists()?.then(|| read(&path)).transpose()?;
+    if let Some(record) = &previous
+        && (!args.recover_desktop || record["status"] == "awaiting_human_review")
+    {
+        replay(repo, args, record, &request)?;
         return Ok(ExitCode::SUCCESS);
     }
     let (spec, task) = repo.task(&base, &args.task)?;
+    let recovered = if args.recover_desktop {
+        cancellation.check()?;
+        let record = previous.as_ref().context("missing run to recover")?;
+        ensure!(
+            record["request"] == request
+                && record["run_id"] == id
+                && record["task"] == args.task
+                && record["spec_sha"] == base
+                && record["requested_candidate_ref"] == json!(args.candidate)
+                && !args.whole_attempt,
+            "run ID or recovery request differs from saved execution"
+        );
+        if let Some(rev) = &args.candidate {
+            ensure!(
+                record["requested_candidate_sha"] == commit(&repo.root, rev)?,
+                "starting candidate changed"
+            );
+        }
+        let sha = recover_desktop(
+            repo,
+            &folder,
+            record,
+            &task,
+            zcode_model.context("missing desktop model")?,
+        )?;
+        aep::project::save_json(&folder, "desktop-timeout.json", record)?;
+        Some(sha)
+    } else {
+        None
+    };
     let feedback = retry_feedback(repo, args, &base)?;
     agent::watch_interrupts()?;
     let work = tempfile::Builder::new()
@@ -258,12 +372,20 @@ pub fn execute(
         "requested_candidate_ref": args.candidate, "reviewer": args.reviewer,
         "review_status": "pending", "approved": false, "worktree": work, "phase": "preparing"
     });
+    if let Some(previous) = &previous {
+        record["started_at"] = previous["started_at"].clone();
+        record["memory_inputs"] = previous["memory_inputs"].clone();
+        record["desktop_recovery"] = json!({"resumed_at":Utc::now().to_rfc3339(),"previous_evidence":"desktop-timeout.json",
+            "workspace":previous["recovery_worktree"],"candidate_sha":recovered});
+    }
     save(&folder, &record)?;
     let mut attached = false;
     let result = (|| -> Result<()> {
         cancellation.check()?;
         let memory = if args.shared_memory {
-            record["memory_inputs"] = json!({});
+            if previous.is_none() {
+                record["memory_inputs"] = json!({});
+            }
             record["memory_outputs"] = json!({});
             Some(Memory::open(&repo.data)?)
         } else {
@@ -302,13 +424,13 @@ pub fn execute(
                 "add",
                 "--detach",
                 work.to_str().context("invalid worktree path")?,
-                &initial,
+                recovered.as_deref().unwrap_or(&initial),
             ],
         )?;
         attached = true;
         cancellation.check()?;
         let key = Key::new(&args.task, &base, &initial);
-        if implementer.is_some() {
+        if implementer.is_some() && recovered.is_none() {
             record["phase"] = json!("implementing");
             save(&folder, &record)?;
             agents.implement(

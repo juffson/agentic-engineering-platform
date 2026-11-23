@@ -109,6 +109,61 @@ fn read_reply(
     }))
 }
 
+/// Collect an already completed, pinned desktop input without creating a session or sending a prompt.
+pub fn completed(dir: &Path, workspace: &Path, selected: &str) -> Result<String> {
+    let task = aep::workspace::read(&dir.join("desktop-task.json"))?;
+    let job = aep::workspace::read(&dir.join("desktop-request.json"))?;
+    let creation = aep::workspace::read(&dir.join("desktop-create.json"))?;
+    let workspace = workspace
+        .to_str()
+        .context("invalid desktop worktree path")?;
+    let session = task["session"]
+        .as_str()
+        .context("missing desktop session")?;
+    let input = task["userMessage"]
+        .as_str()
+        .context("missing desktop message")?;
+    let model = &job["model"];
+    let expected = aep::zcode_catalog::effective_selection(selected);
+    ensure!(
+        task["workspace"] == workspace
+            && job["workspace"] == workspace
+            && creation["session"]["workspacePath"] == workspace
+            && creation["session"]["sessionId"] == session
+            && creation["requestId"] == job["requestId"]
+            && job["mode"] == "edit"
+            && format!(
+                "{}/{}",
+                model["providerId"].as_str().unwrap_or(""),
+                model["modelId"].as_str().unwrap_or("")
+            ) == expected,
+        "saved desktop task does not match the original workspace and model"
+    );
+    let home = std::env::home_dir()
+        .context("missing home directory")?
+        .join(".zcode");
+    let index = readonly(&home.join("v2/tasks-index.sqlite"))?;
+    let db = readonly(&home.join("cli/db/db.sqlite"))?;
+    let dispatched = find_message(
+        &index,
+        &db,
+        workspace,
+        job["since"].as_i64().context("missing dispatch time")?,
+        job["dispatch"].as_str().context("missing dispatch text")?,
+    )?;
+    ensure!(
+        dispatched
+            .as_ref()
+            .is_some_and(|(s, m)| s == session && m == input),
+        "original desktop input does not match"
+    );
+    let reply = read_reply(&db, workspace, session, input, model)?
+        .context("original desktop turn has not completed")?;
+    save_json(dir, "session.json", &reply.evidence)?;
+    save_json(dir, "zcode-model.json", &reply.evidence)?;
+    Ok(reply.text)
+}
+
 pub fn converse(
     dir: &Path,
     workspace: &Path,
