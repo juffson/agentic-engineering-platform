@@ -1,6 +1,7 @@
 use super::*;
 mod agents;
 mod collaboration;
+mod console;
 mod delivery;
 mod timeline;
 mod zcode;
@@ -60,6 +61,16 @@ pub(crate) struct Board {
     sync_message: Option<String>,
     statuses: BTreeMap<PathBuf, String>,
     generation: u64,
+    chat: Entity<TextareaState>,
+    /// Manual open/closed state of the stage CLI settings, per (work, stage).
+    config_open: Option<(String, usize, bool)>,
+    new_work_repos: Vec<PathBuf>,
+    switcher: bool,
+    transcripts: console::Cache,
+    scrolls: console::Scrolls,
+    /// Folded conversation blocks the user opened.
+    expanded: std::collections::BTreeSet<String>,
+    waive: Entity<InputState>,
 }
 impl Board {
     pub(crate) fn library_project_id(&self) -> Option<&String> {
@@ -137,6 +148,19 @@ impl Board {
             sync_message: None,
             statuses: BTreeMap::new(),
             generation: 0,
+            chat: cx.new(|cx| {
+                TextareaState::new(window, cx).placeholder("继续追问、补充要求或纠正方向…")
+            }),
+            config_open: None,
+            new_work_repos: vec![],
+            switcher: false,
+            transcripts: Default::default(),
+            scrolls: Default::default(),
+            expanded: Default::default(),
+            waive: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("人工放行理由，如：沙箱禁止监听端口，已在本机手动跑通全量测试")
+            }),
         }
     }
 }
@@ -146,12 +170,16 @@ fn basename(path: &Path) -> String {
         .to_string_lossy()
         .into_owned()
 }
-fn primary(id: &'static str, title: &'static str) -> ObservedElement<Stateful<Div>> {
+fn primary(
+    id: impl Into<ElementId>,
+    title: impl Into<SharedString>,
+) -> ObservedElement<Stateful<Div>> {
+    let title = title.into();
     div()
         .id(id)
         .test_support()
         .role(Role::Button)
-        .aria_label(title)
+        .aria_label(title.clone())
         .tab_stop(true)
         .cursor_pointer()
         .rounded_md()
@@ -385,7 +413,21 @@ impl Studio {
         let name = self.board.new_work.read(cx).value().to_string();
         let kind = self.board.kind;
         let template = self.board.template;
-        if self.change_board(cx, |lib| lib.project_mut()?.add_work(&name, kind, template)) {
+        let repos = self.board.new_work_repos.clone();
+        if self.change_board(cx, |lib| {
+            let p = lib.project_mut()?;
+            let repos: Vec<_> = repos
+                .into_iter()
+                .filter(|r| p.repositories.contains(r))
+                .collect();
+            p.add_work(&name, kind, template)?;
+            let work = p.selected_mut()?;
+            for repo in &repos {
+                work.include(repo);
+            }
+            Ok(())
+        }) {
+            self.board.new_work_repos.clear();
             self.board
                 .new_work
                 .update(cx, |field, cx| field.set_value("", w, cx));
@@ -816,16 +858,11 @@ impl Studio {
         if self.board.section == Section::Library || project.is_none() {
             page = page.child(self.library_view(cx));
         } else if let Some(p) = project {
-            let mut head = v_flex().gap_1().child(caption(match self.board.section {
-                Section::Overview => "项目概览",
-                Section::Work => "项目 / 开发事项",
-                Section::Memory => "项目 / 共享记忆",
-                Section::Settings => "项目 / 设置",
-                _ => "项目 / 关联仓库",
-            }));
+            let mut head = v_flex().gap_1().child(self.breadcrumb(p, cx));
             let title = match self.board.section {
                 Section::Overview => p.name.clone(),
-                Section::Work => "开发事项".into(),
+                Section::Work if self.board.creating_work => "新建开发事项".into(),
+                Section::Work => p.selected().map_or("开发事项".into(), |w| w.name.clone()),
                 Section::Memory => "项目记忆".into(),
                 Section::Settings => "项目设置".into(),
                 _ => "关联仓库".into(),
@@ -846,6 +883,9 @@ impl Studio {
                 );
             }
             page = page.child(bar);
+            if self.board.switcher {
+                page = page.child(self.project_switcher(cx));
+            }
             match self.board.section {
                 Section::Overview => {
                     let finished = p
@@ -888,7 +928,7 @@ impl Studio {
                 Section::Repositories => page = page.child(self.repositories(p, cx)),
                 Section::Work => {
                     if self.board.creating_work {
-                        page = page.child(self.work_form(cx));
+                        page = page.child(self.work_form(p, cx));
                     } else if let Some(work) = p.selected() {
                         let collab = self.board.desk.as_ref().is_some_and(|d| d.work == work.id);
                         page = page.child(self.work_tabs(work, collab, cx));
@@ -909,19 +949,449 @@ impl Studio {
                             page = page.child(self.work_detail(p, work, cx));
                         }
                     }
-                    if !self
-                        .board
-                        .delivery
-                        .as_ref()
-                        .is_some_and(|s| p.selected().is_some_and(|w| w.id == s.work))
-                    {
+                    if p.work.is_empty() && !self.board.creating_work {
                         page = page.child(self.work_list(p, cx));
                     }
                 }
                 Section::Library => {}
             }
         }
-        h_flex().size_full().bg(rgb(CANVAS)).child(rail).child(page)
+        let column = project
+            .filter(|p| self.board.section == Section::Work && !p.work.is_empty())
+            .map(|p| self.work_column(p, cx));
+        h_flex()
+            .size_full()
+            .bg(rgb(CANVAS))
+            .child(rail)
+            .children(column)
+            .child(page)
+    }
+
+    /// Exits for a stage whose run did not pass: send it back, retry, or waive with a reason.
+    /// Every option stays available, so a failing gate can never strand the item.
+    fn rework_panel(&self, work: &Work, from: usize, cx: &Context<Self>) -> Div {
+        let stages = work.template.stages();
+        let to = (0..from)
+            .rev()
+            .find(|&i| stages[i].role == StageRole::Build)
+            .unwrap_or(from - 1);
+        let report = work
+            .current_attempt
+            .get(&from)
+            .and_then(|id| self.attempt_path(id))
+            .and_then(|d| std::fs::read_to_string(d.join("result.txt")).ok())
+            .unwrap_or_default();
+        let blocked = report
+            .trim()
+            .lines()
+            .last()
+            .is_some_and(|l| l.trim().contains("BLOCKED"));
+        let loops = work.reworks_between(from, to);
+        let mut panel = v_flex()
+            .gap_2()
+            .mt_2()
+            .pl(px(34.))
+            .pt_3()
+            .border_t_1()
+            .border_color(rgb(LINE))
+            .child(t("这一轮没有通过，选择下一步：", FG).font_semibold());
+        if blocked {
+            panel = panel.child(caption(
+                "Agent 报告为 BLOCKED：多半是执行环境受限（沙箱、端口、GUI）。退回开发通常解决不了，建议修正环境后在上方继续对话重跑，或核实后人工放行。",
+            ).text_color(rgb(AMBER)));
+        }
+        if loops >= 2 {
+            panel = panel.child(
+                caption(format!(
+                    "已从「{}」退回「{}」{loops} 次。再次退回前，请先确认失败原因确实能由开发修复。",
+                    stages[from].name, stages[to].name
+                ))
+                .text_color(rgb(AMBER)),
+            );
+        }
+        let from_name = stages[from].name;
+        let next_name = stages.get(from + 1).map_or("交付完成", |s| s.name);
+        // An option row: label, explanation and a bordered action; the recommended one is filled.
+        let option = |title: String, note: String, recommended: bool| {
+            v_flex()
+                .gap_1()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(if recommended { MINT } else { LINE }))
+                .bg(rgb(CANVAS))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(t(title, FG).font_semibold())
+                        .when(recommended, |r| r.child(t("推荐", MINT).text_xs())),
+                )
+                .child(caption(note))
+        };
+        let action = |id: &'static str, label: String, filled: bool| {
+            let el = div()
+                .id(id)
+                .test_support()
+                .role(Role::Button)
+                .aria_label(SharedString::from(label.clone()))
+                .tab_stop(true)
+                .cursor_pointer()
+                .flex_none()
+                .px_4()
+                .py_1p5()
+                .rounded_md()
+                .text_sm()
+                .font_semibold()
+                .border_1()
+                .border_color(rgb(MINT))
+                .child(label);
+            if filled {
+                el.bg(rgb(MINT))
+                    .text_color(rgb(0x102920))
+                    .hover(|s| s.bg(rgb(0xb3ebd8)))
+            } else {
+                el.text_color(rgb(MINT)).hover(|s| s.bg(rgb(SELECTED)))
+            }
+        };
+        let reason_given = !self.board.waive.read(cx).value().trim().is_empty();
+        let error = self.board.error.clone();
+        panel
+            .child(
+                option(
+                    format!("① 退回「{}」修复", stages[to].name),
+                    format!(
+                        "代码确实有问题时用。失败报告会带回「{}」的原会话，修好后重新推进会再跑一次「{from_name}」。",
+                        stages[to].name
+                    ),
+                    !blocked,
+                )
+                .child(
+                    h_flex().child(
+                        action(
+                            "stage-send-back",
+                            format!("退回「{}」修复", stages[to].name),
+                            !blocked,
+                        )
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            this.send_back(from, to, from_name, w, cx)
+                        })),
+                    ),
+                ),
+            )
+            .child(option(
+                "② 继续对话重跑".into(),
+                "环境已修好或要补证据时用：在上方「阶段会话」输入要求并发送，本阶段会再跑一轮。".into(),
+                false,
+            ))
+            .child(
+                option(
+                    "③ 人工放行".into(),
+                    format!(
+                        "你已在别处核实过时用。写明理由后直接进入「{next_name}」，记录会保留理由和 Agent 的原始报告。"
+                    ),
+                    blocked,
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(input_field("stage-waive-reason", &self.board.waive))
+                        .child(
+                            action(
+                                "stage-waive",
+                                format!("放行并进入「{next_name}」"),
+                                blocked && reason_given,
+                            )
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                let reason = this.board.waive.read(cx).value().to_string();
+                                let Some(home) = this.board.dir.clone() else {
+                                    return;
+                                };
+                                if this.change_board(cx, |lib| {
+                                    let p = lib.project_mut()?;
+                                    let wid = p.selected().context("请选择开发事项")?.id.clone();
+                                    p.waive_stage(&home, &wid, from, &reason)
+                                }) {
+                                    this.board.waive.update(cx, |s, cx| s.set_value("", w, cx));
+                                    this.load_stage(w, cx);
+                                }
+                            })),
+                        ),
+                ),
+            )
+            .when_some(error, |p, e| {
+                p.child(detail_text("stage-rework-error", &e).text_color(rgb(RED)))
+            })
+    }
+
+    fn send_back(
+        &mut self,
+        from: usize,
+        to: usize,
+        from_name: &str,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_running_agent() {
+            self.board.error = Some("请先等待当前 CLI 完成，或取消执行".into());
+            cx.notify();
+            return;
+        }
+        let Some(work) = self.board.library.project().and_then(Project::selected) else {
+            return;
+        };
+        let report = work
+            .current_attempt
+            .get(&from)
+            .and_then(|id| self.attempt_path(id));
+        let text = report
+            .as_ref()
+            .and_then(|d| std::fs::read_to_string(d.join("result.txt")).ok())
+            .unwrap_or_default();
+        let summary = aep::handoff::summary(&text);
+        let reason = if summary.trim().is_empty() {
+            format!("「{from_name}」未通过")
+        } else {
+            summary
+        };
+        let continuable = work.current_attempt.contains_key(&to);
+        if !self.change_board(cx, |lib| {
+            lib.project_mut()?.selected_mut()?.send_back(to, &reason)
+        }) {
+            return;
+        }
+        let mut message = format!("「{from_name}」未通过，请根据报告修复后再交回：\n{reason}");
+        if let Some(d) = report {
+            message.push_str(&format!("\n\n完整报告：{}", d.join("result.txt").display()));
+        }
+        self.load_stage(w, cx);
+        if continuable {
+            self.board
+                .chat
+                .update(cx, |s, cx| s.set_value(&message, w, cx));
+        } else {
+            self.board
+                .note
+                .update(cx, |s, cx| s.set_value(&message, w, cx));
+        }
+        cx.notify();
+    }
+
+    /// 项目库 › 项目 ▾ › 事项 › 阶段 — the current selection, each part clickable.
+    fn breadcrumb(&self, p: &Project, cx: &Context<Self>) -> Div {
+        let crumb = |id: &'static str, label: SharedString, on: bool| {
+            div()
+                .id(id)
+                .test_support()
+                .role(Role::Button)
+                .aria_label(label.clone())
+                .tab_stop(true)
+                .cursor_pointer()
+                .px_1p5()
+                .rounded_sm()
+                .text_xs()
+                .text_color(rgb(if on { FG } else { MUTED }))
+                .hover(|s| s.bg(rgb(SELECTED)))
+                .child(label)
+        };
+        let mut row = h_flex()
+            .gap_1()
+            .child(
+                crumb("crumb-library", "项目库".into(), false).on_click(cx.listener(
+                    |this, _, w, cx| {
+                        this.board.switcher = false;
+                        this.section(Section::Library, w, cx)
+                    },
+                )),
+            )
+            .child(caption("›"))
+            .child(
+                crumb(
+                    "crumb-project",
+                    format!("{} ▾", p.name).into(),
+                    self.board.switcher,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.board.switcher = !this.board.switcher;
+                    cx.notify();
+                })),
+            );
+        let section = match self.board.section {
+            Section::Overview => None,
+            Section::Work => Some("开发事项"),
+            Section::Memory => Some("项目记忆"),
+            Section::Settings => Some("项目设置"),
+            _ => Some("关联仓库"),
+        };
+        if let Some(name) = section {
+            row = row.child(caption("›")).child(caption(name));
+        }
+        if self.board.section == Section::Work
+            && !self.board.creating_work
+            && let Some(work) = p.selected()
+        {
+            let stages = work.template.stages();
+            let viewing = self.board.viewing.min(stages.len() - 1);
+            row = row
+                .child(caption("›"))
+                .child(
+                    crumb("crumb-work", work.name.clone().into(), true)
+                        .on_click(cx.listener(|this, _, w, cx| this.load_stage(w, cx))),
+                )
+                .child(caption("›"))
+                .child(caption(if work.stage >= stages.len() {
+                    "已交付".to_string()
+                } else if viewing == work.stage {
+                    format!("{}（当前）", stages[viewing].name)
+                } else {
+                    format!("{}（查看中）", stages[viewing].name)
+                }));
+        }
+        row
+    }
+
+    fn project_switcher(&self, cx: &Context<Self>) -> Div {
+        let mut list = panel().flex_none().gap_1().child(caption("切换项目"));
+        for p in &self.board.library.projects {
+            let id = p.id.clone();
+            let on = self.board.library.active.as_ref() == Some(&id);
+            list = list.child(
+                h_flex()
+                    .id(SharedString::from(format!("crumb-project-{id}")))
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(p.name.clone())
+                    .tab_stop(true)
+                    .cursor_pointer()
+                    .justify_between()
+                    .px_2()
+                    .py_1p5()
+                    .rounded_md()
+                    .when(on, |r| r.bg(rgb(SELECTED)))
+                    .hover(|s| s.bg(rgb(SELECTED)))
+                    .child(t(p.name.clone(), if on { MINT } else { FG }))
+                    .child(caption(format!(
+                        "{} 个事项 · {} 个仓库",
+                        p.work.len(),
+                        p.repositories.len()
+                    )))
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        this.board.switcher = false;
+                        if this.change_board(cx, |lib| {
+                            lib.active = Some(id.clone());
+                            Ok(())
+                        }) {
+                            let section = if this.board.section == Section::Library {
+                                Section::Overview
+                            } else {
+                                this.board.section
+                            };
+                            this.section(section, w, cx);
+                        }
+                    })),
+            );
+        }
+        list.child(
+            button("crumb-new-project", "＋ 新建项目…", false).on_click(cx.listener(
+                |this, _, w, cx| {
+                    this.board.switcher = false;
+                    this.section(Section::Library, w, cx)
+                },
+            )),
+        )
+    }
+
+    /// The work items of the project, always beside the open item.
+    fn work_column(&self, p: &Project, cx: &Context<Self>) -> Stateful<Div> {
+        let selected = p.selected().map(|w| w.id.clone());
+        let mut column = v_flex()
+            .id("work-column")
+            .w(px(248.))
+            .flex_none()
+            .h_full()
+            .overflow_y_scroll()
+            .gap_1()
+            .p_3()
+            .border_r_1()
+            .border_color(rgb(LINE))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .pb_2()
+                    .child(t("开发事项", FG).font_semibold())
+                    .child(
+                        button("work-column-new", "＋ 新建", true).on_click(cx.listener(
+                            |this, _, w, cx| {
+                                this.section(Section::Work, w, cx);
+                                this.board.creating_work = true;
+                                this.board.new_work.focus_handle(cx).focus(w, cx);
+                            },
+                        )),
+                    ),
+            );
+        for (title, finished) in [("进行中", false), ("已交付", true)] {
+            let items: Vec<_> = p
+                .work
+                .iter()
+                .rev()
+                .filter(|w| (w.stage >= w.template.stages().len()) == finished)
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            column = column.child(caption(format!("{title} · {}", items.len())).pt_2());
+            for work in items {
+                let id = work.id.clone();
+                let stages = work.template.stages();
+                let mut bar = h_flex().gap(px(2.)).pt_1();
+                for i in 0..stages.len() {
+                    bar = bar.child(div().flex_1().h(px(3.)).rounded_sm().bg(rgb(
+                        if i < work.stage {
+                            MINT
+                        } else if i == work.stage {
+                            BLUE
+                        } else {
+                            LINE
+                        },
+                    )));
+                }
+                column = column.child(
+                    item(
+                        format!("project-item-{id}"),
+                        selected.as_ref() == Some(&id) && !self.board.creating_work,
+                    )
+                    .gap_1()
+                    .py_2()
+                    .child(
+                        h_flex().gap_2().child(caption(work.kind.label())).child(
+                            t(work.name.clone(), FG)
+                                .font_semibold()
+                                .truncate()
+                                .min_w_0(),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(caption(work.stage_name().to_owned()))
+                            .child(caption(format!(
+                                "{}/{}",
+                                work.stage.min(stages.len()),
+                                stages.len()
+                            ))),
+                    )
+                    .child(bar)
+                    .on_click(cx.listener(move |this, _, w, cx| {
+                        if this.change_board(cx, |lib| {
+                            lib.project_mut()?.selected = Some(id.clone());
+                            Ok(())
+                        }) {
+                            this.section(Section::Work, w, cx);
+                        }
+                    })),
+                );
+            }
+        }
+        column
     }
 
     fn template_panel(&self, p: &Project, cx: &Context<Self>) -> Div {
@@ -1016,7 +1486,7 @@ impl Studio {
             )
             .child(rows)
     }
-    fn work_form(&self, cx: &Context<Self>) -> Div {
+    fn work_form(&self, p: &Project, cx: &Context<Self>) -> Div {
         let mut types = h_flex().gap_2();
         for kind in [Kind::Feature, Kind::Release] {
             types = types.child(
@@ -1033,33 +1503,119 @@ impl Studio {
         }
         let mut templates = h_flex().gap_2();
         for template in [Template::Software, Template::Game] {
+            let on = self.board.template == template;
             templates = templates.child(
-                button(
-                    format!("work-template-{template:?}"),
-                    template.label(),
-                    self.board.template == template,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.board.template = template;
-                    cx.notify();
-                })),
+                v_flex()
+                    .id(SharedString::from(format!("work-template-{template:?}")))
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(template.label())
+                    .tab_stop(true)
+                    .cursor_pointer()
+                    .flex_1()
+                    .gap_1()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if on { MINT } else { LINE }))
+                    .bg(rgb(if on { SELECTED } else { CANVAS }))
+                    .hover(|s| s.bg(rgb(SELECTED)))
+                    .child(t(template.label(), if on { MINT } else { FG }).font_semibold())
+                    .child(caption(
+                        template
+                            .stages()
+                            .iter()
+                            .map(|s| s.name)
+                            .collect::<Vec<_>>()
+                            .join(" › "),
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.board.template = template;
+                        cx.notify();
+                    })),
             );
         }
+        let mut repos = v_flex().gap_1();
+        if p.repositories.is_empty() {
+            repos = repos.child(
+                h_flex()
+                    .gap_2()
+                    .child(caption(
+                        "项目还没有关联仓库，Agent 会在项目文件目录中工作。",
+                    ))
+                    .child(button("new-work-link-repos", "关联仓库", false).on_click(
+                        cx.listener(|this, _, w, cx| this.section(Section::Repositories, w, cx)),
+                    )),
+            );
+        }
+        for (i, path) in p.repositories.iter().enumerate() {
+            let on = self.board.new_work_repos.contains(path);
+            let repo = path.clone();
+            repos = repos.child(
+                h_flex()
+                    .id(SharedString::from(format!("new-work-repo-{i}")))
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(basename(path))
+                    .tab_stop(true)
+                    .cursor_pointer()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if on { MINT } else { LINE }))
+                    .bg(rgb(if on { SELECTED } else { CANVAS }))
+                    .child(t(if on { "☑" } else { "☐" }, if on { MINT } else { MUTED }))
+                    .child(t(basename(path), FG))
+                    .child(
+                        caption(path.display().to_string())
+                            .truncate()
+                            .min_w_0()
+                            .flex_1(),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let list = &mut this.board.new_work_repos;
+                        if let Some(at) = list.iter().position(|r| r == &repo) {
+                            list.remove(at);
+                        } else {
+                            list.push(repo.clone());
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        let step = |n: &str, title: &str| {
+            h_flex()
+                .gap_2()
+                .child(t(n.to_owned(), MINT).font_semibold())
+                .child(t(title.to_owned(), FG).font_semibold())
+        };
         panel()
             .flex_none()
-            .child(heading("新建开发事项"))
-            .child(templates)
-            .child(caption(
-                self.board
-                    .template
-                    .stages()
-                    .iter()
-                    .map(|s| s.name)
-                    .collect::<Vec<_>>()
-                    .join("  ›  "),
-            ))
-            .child(types)
-            .child(input_field("project-work-name", &self.board.new_work))
+            .gap_4()
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(step("1", "选择开发模板"))
+                    .child(templates),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(step("2", "类型与名称"))
+                    .child(types)
+                    .child(input_field("project-work-name", &self.board.new_work)),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(step("3", "纳入仓库"))
+                    .child(caption(
+                        "每个仓库会为这个事项建立独立工作树，之后也可以在事项里调整。",
+                    ))
+                    .child(repos),
+            )
             .child(
                 h_flex()
                     .gap_2()
@@ -1114,22 +1670,25 @@ impl Studio {
         for work in hits {
             let id = work.id.clone();
             rows = rows.child(
-                item(format!("project-item-{id}"), false)
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child(caption(work.kind.label()))
-                            .child(t(work.name.clone(), FG).flex_1().min_w_0().truncate())
-                            .child(chip(work.stage_name(), MINT)),
-                    )
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        if this.change_board(cx, |lib| {
-                            lib.project_mut()?.selected = Some(id.clone());
-                            Ok(())
-                        }) {
-                            this.section(Section::Work, w, cx);
-                        }
-                    })),
+                item(
+                    format!("project-item-{id}"),
+                    p.selected.as_ref() == Some(&work.id),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .child(caption(work.kind.label()))
+                        .child(t(work.name.clone(), FG).flex_1().min_w_0().truncate())
+                        .child(chip(work.stage_name(), MINT)),
+                )
+                .on_click(cx.listener(move |this, _, w, cx| {
+                    if this.change_board(cx, |lib| {
+                        lib.project_mut()?.selected = Some(id.clone());
+                        Ok(())
+                    }) {
+                        this.section(Section::Work, w, cx);
+                    }
+                })),
             );
         }
         rows
@@ -1195,18 +1754,24 @@ impl Studio {
         list
     }
     fn work_detail(&self, p: &Project, work: &Work, cx: &Context<Self>) -> Div {
-        let mut steps = h_flex().gap_2().flex_wrap();
         let stages = work.template.stages();
         let viewing = self.board.viewing.min(stages.len() - 1);
+        let finished = work.stage >= stages.len();
+        let is_current = viewing == work.stage;
+        let running = self.has_running_agent();
+        let current_ev = work
+            .current_attempt
+            .get(&viewing)
+            .and_then(|id| workflow::evidence(&self.attempt_path(id)?).ok());
+        let status = current_ev
+            .as_ref()
+            .and_then(|ev| ev["status"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+
+        let mut steps = h_flex().gap_1();
         for (i, stage) in stages.iter().enumerate() {
             let profile = work.profile(i);
-            let state = if i < work.stage {
-                "✓ "
-            } else if i == work.stage {
-                "● "
-            } else {
-                ""
-            };
             let tint = if i < work.stage {
                 MINT
             } else if i == work.stage {
@@ -1219,6 +1784,23 @@ impl Studio {
             } else {
                 format!("{} · {}", profile.client.label(), profile.model)
             };
+            let dot = div()
+                .size(px(16.))
+                .flex_none()
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .border_1()
+                .border_color(rgb(tint))
+                .when(i < work.stage, |d| d.bg(rgb(MINT)).text_color(rgb(CANVAS)))
+                .when(i >= work.stage, |d| d.text_color(rgb(tint)))
+                .child(if i < work.stage {
+                    "✓".to_string()
+                } else {
+                    (i + 1).to_string()
+                });
             steps = steps.child(
                 v_flex()
                     .id(format!("project-stage-{i}"))
@@ -1227,55 +1809,316 @@ impl Studio {
                     .aria_label(format!("{} · {model}", stage.name))
                     .tab_stop(true)
                     .cursor_pointer()
-                    .min_w(px(92.))
+                    .min_w_0()
                     .flex_1()
                     .gap_1()
                     .py_2()
                     .px_2()
-                    .rounded_md()
+                    .rounded_b_md()
                     .bg(rgb(if i == viewing { SELECTED } else { CANVAS }))
                     .border_t_2()
-                    .border_color(rgb(if i == viewing {
-                        MINT
-                    } else if i <= work.stage {
-                        tint
-                    } else {
-                        LINE
-                    }))
-                    .child(t(format!("{state}{}", stage.name), tint).font_semibold())
-                    .child(caption(model).truncate())
+                    .border_color(rgb(if i <= work.stage { tint } else { LINE }))
+                    .child(
+                        h_flex().gap_1p5().min_w_0().child(dot).child(
+                            t(stage.name, if i == viewing { FG } else { tint })
+                                .font_semibold()
+                                .truncate()
+                                .min_w_0(),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .min_w_0()
+                            .when(i == work.stage, |r| {
+                                r.child(
+                                    div()
+                                        .flex_none()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(rgb(BLUE))
+                                        .text_color(rgb(BLUE))
+                                        .text_xs()
+                                        .child("当前"),
+                                )
+                            })
+                            .child(caption(model).truncate().min_w_0()),
+                    )
                     .hover(|s| s.bg(rgb(SELECTED)))
                     .on_click(cx.listener(move |this, _, w, cx| this.show_stage(i, w, cx))),
             );
         }
-        let mut detail = panel()
-            .flex_none()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(chip(work.template.label(), BLUE))
-                    .child(heading(work.name.clone()))
-                    .child(chip(work.stage_name(), MINT)),
+
+        // Where am I, and what should I do next?
+        let guide = if finished {
+            panel().flex_none().flex_row().items_center().child(t(
+                "✓ 此事项已交付归档。可点击各阶段查看当时的会话与结论。",
+                MINT,
+            ))
+        } else if !is_current {
+            let mut row = h_flex()
+                .flex_none()
+                .gap_3()
+                .px_4()
+                .py_2()
+                .rounded_lg()
+                .bg(rgb(0x2a2518))
+                .border_1()
+                .border_color(rgb(0x574a2c))
+                .child(
+                    t(
+                        if viewing < work.stage {
+                            format!(
+                                "正在查看已完成的「{}」，以下为当时的会话与结论。",
+                                stages[viewing].name
+                            )
+                        } else {
+                            format!(
+                                "「{}」尚未开始，可以先设置它使用的 CLI。",
+                                stages[viewing].name
+                            )
+                        },
+                        AMBER,
+                    )
+                    .flex_1(),
+                );
+            if viewing < work.stage {
+                row = row.child(
+                    button("project-reopen-stage", "重新打开此阶段", false).on_click(cx.listener(
+                        move |this, _, w, cx| {
+                            if this.has_running_agent() {
+                                this.board.error = Some("请先等待当前 CLI 完成，或取消执行".into());
+                                cx.notify();
+                                return;
+                            }
+                            if this.change_board(cx, |lib| {
+                                let item = lib.project_mut()?.selected_mut()?;
+                                item.reopen_transfers(viewing);
+                                item.stage = viewing;
+                                item.current_attempt.retain(|s, _| *s < viewing);
+                                Ok(())
+                            }) {
+                                this.load_stage(w, cx);
+                            }
+                        },
+                    )),
+                );
+            }
+            row.child(
+                primary(
+                    "project-back-current",
+                    format!("回到当前阶段「{}」", stages[work.stage].name),
+                )
+                .on_click(cx.listener(|this, _, w, cx| this.load_stage(w, cx))),
             )
-            .child(steps)
-            .child(heading(stages[viewing].name))
-            .child(caption(stages[viewing].brief))
+        } else {
+            let next = if running {
+                "Agent 正在执行，可随时查看输出或取消"
+            } else {
+                match status.as_str() {
+                    "" => "写好阶段说明并运行 Agent，或直接记录人工结论后推进",
+                    "succeeded" => "核对答复：可以继续对话，确认无误后推进到下一阶段",
+                    "claimed" => "等待独立会话交回结果",
+                    _ => "查看失败原因，调整配置后继续对话或重新执行",
+                }
+            };
+            panel()
+                .flex_none()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .py_2()
+                .child(caption("下一步"))
+                .child(t(next, MINT).font_semibold().flex_1())
+                .child(caption(stages[viewing].brief).truncate().max_w(px(360.)))
+        };
+
+        let returned = work
+            .reworks
+            .last()
+            .filter(|r| is_current && r.to == viewing)
+            .map(|r| {
+                let n = work.reworks_between(r.from, r.to);
+                h_flex()
+                    .flex_none()
+                    .items_start()
+                    .gap_3()
+                    .px_4()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(rgb(0x2a2518))
+                    .border_1()
+                    .border_color(rgb(0x574a2c))
+                    .child(
+                        t(
+                            format!("↩ 由「{}」退回 · 第 {n} 次", stages[r.from].name),
+                            AMBER,
+                        )
+                        .flex_none(),
+                    )
+                    .child(
+                        detail_text(
+                            "stage-rework-reason",
+                            &r.reason.chars().take(400).collect::<String>(),
+                        )
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .min_w_0()
+                        .flex_1(),
+                    )
+            });
+        let card = |n: &str, title: &str, summary: String, tone: u32| {
+            h_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .size(px(22.))
+                        .flex_none()
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .font_semibold()
+                        .bg(rgb(tone))
+                        .text_color(rgb(if tone == SELECTED { MUTED } else { CANVAS }))
+                        .child(n.to_owned()),
+                )
+                .child(heading(title.to_owned()).text_base())
+                .child(caption(summary).truncate().min_w_0().flex_1())
+        };
+
+        // 1 · CLI settings: collapsed to one line once the stage has a working session.
+        let open = match &self.board.config_open {
+            Some((id, s, open)) if id == &work.id && *s == viewing => *open,
+            _ => {
+                !finished
+                    && !matches!(
+                        status.as_str(),
+                        "succeeded" | "running" | "initializing" | "claimed"
+                    )
+            }
+        };
+        let toggle_work = work.id.clone();
+        let mut config = panel().flex_none().child(
+            card(
+                "1",
+                "执行配置",
+                if open {
+                    "选择这个阶段使用的 CLI、模型和仓库".into()
+                } else {
+                    self.config_summary(work, viewing, cx)
+                },
+                MINT,
+            )
             .child(
-                div().id("project-stage-note").test_support().child(
-                    Textarea::new(&self.board.note)
-                        .aria_label("阶段记录")
-                        .h(px(82.)),
+                button(
+                    "workflow-config-toggle",
+                    if open { "收起" } else { "修改" },
+                    false,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.board.config_open = Some((toggle_work.clone(), viewing, !open));
+                    cx.notify();
+                })),
+            ),
+        );
+        if open {
+            config = config.child(
+                div()
+                    .pl(px(34.))
+                    .child(self.agent_config(p, work, viewing, cx)),
+            );
+        }
+
+        // 2 · Brief, run and conversation.
+        let turns = work.attempts.iter().filter(|a| a.stage == viewing).count();
+        let mut session = panel().flex_none().child(card(
+            "2",
+            "阶段会话",
+            match (turns, running && is_current) {
+                (_, true) => "运行中…".into(),
+                (0, _) if is_current => "写给阶段 Agent 的说明".into(),
+                (0, _) => "暂无会话".into(),
+                (n, _) => format!("{n} 轮"),
+            },
+            if is_current && !finished {
+                BLUE
+            } else {
+                SELECTED
+            },
+        ));
+        let mut body = v_flex().gap_3().pl(px(34.));
+        if let Some(t) = work.incoming(viewing) {
+            body = body.child(
+                v_flex().gap_1().child(caption("已接收上一阶段交接")).child(
+                    detail_text("stage-incoming", &t.context())
+                        .text_color(rgb(MUTED))
+                        .pl_3()
+                        .border_l_2()
+                        .border_color(rgb(BLUE)),
                 ),
             );
-        if let Some(t) = work.incoming(viewing) {
-            detail = detail.child(field("已接收上一阶段交接", &t.context()));
         }
-        let mut actions = h_flex().gap_2().flex_wrap().child(
-            button("project-save-note", "保存记录", false)
+        body = body.child(
+            v_flex()
+                .gap_1()
+                .child(caption(
+                    "阶段说明 · 首次运行时发给 Agent，也作为本阶段记录交给下一阶段",
+                ))
+                .child(
+                    div().id("project-stage-note").test_support().child(
+                        Textarea::new(&self.board.note)
+                            .aria_label("阶段记录")
+                            .h(px(if turns == 0 { 82. } else { 56. })),
+                    ),
+                ),
+        );
+        let mut run_row = h_flex().gap_2().flex_wrap().child(
+            button("project-save-note", "保存说明", false)
                 .on_click(cx.listener(|this, _, w, cx| this.save_stage(false, w, cx))),
         );
+        if is_current && !finished && !running {
+            let run = |id, label| {
+                if turns == 0 {
+                    primary(id, label)
+                } else {
+                    button(id, label, false)
+                }
+            };
+            run_row = run_row
+                .child(
+                    run(
+                        "workflow-run",
+                        if turns == 0 {
+                            "运行阶段 Agent"
+                        } else {
+                            "新会话重新执行"
+                        },
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Err(e) = this.launch_agent(cx) {
+                            this.board.error = Some(format!("{e:#}"));
+                        }
+                        cx.notify();
+                    })),
+                )
+                .child(caption(format!(
+                    "使用 {}",
+                    self.config_summary(work, viewing, cx)
+                )));
+        }
+        body = body.child(run_row);
+        if turns > 0 {
+            body = body.child(self.stage_console(p, work, viewing, cx));
+        }
+        session = session.child(body);
+
+        // 3 · Confirm and advance.
+        let mut actions = h_flex().gap_2().flex_wrap();
         if let Some(repo) = work.target(viewing) {
-            actions = actions.child(button("stage-relay", "阶段两轮接力", true).on_click(
+            actions = actions.child(button("stage-relay", "阶段两轮接力", false).on_click(
                 cx.listener(move |s, _, w, cx| s.open_stage_relay(&repo, viewing, w, cx)),
             ));
         }
@@ -1286,61 +2129,88 @@ impl Studio {
         if viewing + 1 < stages.len() && (has_relay || work.current_attempt.contains_key(&viewing))
         {
             actions = actions.child(
-                button("stage-transfer-review", "查看验收与阶段交接", true)
+                button("stage-transfer-review", "查看验收与阶段交接", false)
                     .on_click(cx.listener(|s, _, _, cx| s.load_timeline(cx))),
             );
         }
-        if viewing == work.stage {
-            actions = actions.child(
-                primary(
-                    "project-next",
-                    if viewing + 1 == stages.len()
-                        && work.incoming(viewing).is_some_and(|t| {
-                            stages
-                                .get(t.from)
-                                .is_some_and(|s| s.role == StageRole::Accept)
-                        })
-                        && work.current_attempt.contains_key(&viewing)
-                    {
-                        "确认交付并归档"
-                    } else if viewing + 1 == stages.len() {
-                        "确认完成交付"
-                    } else if work.current_attempt.contains_key(&viewing) {
-                        "确认验收并交接到下一阶段"
-                    } else if has_relay {
-                        "按人工记录推进阶段"
+        let mut advance = panel().flex_none().child(card(
+            "3",
+            "核对并推进",
+            if finished || viewing < work.stage {
+                "已确认".into()
+            } else if !is_current {
+                "—".into()
+            } else if status == "succeeded" {
+                "Agent 已答复，请核对后推进".into()
+            } else if work.current_attempt.contains_key(&viewing) {
+                "当前一轮未成功，暂不能按 Agent 结论推进".into()
+            } else {
+                "未运行 Agent 时，以阶段说明作为人工结论推进".into()
+            },
+            if is_current && status == "succeeded" {
+                MINT
+            } else {
+                SELECTED
+            },
+        ));
+        if is_current && !finished {
+            let label = if viewing + 1 == stages.len() {
+                if work.incoming(viewing).is_some_and(|t| {
+                    stages
+                        .get(t.from)
+                        .is_some_and(|s| s.role == StageRole::Accept)
+                }) && work.current_attempt.contains_key(&viewing)
+                {
+                    "确认交付并归档".to_string()
+                } else {
+                    "确认完成交付".to_string()
+                }
+            } else {
+                format!("确认并进入「{}」", stages[viewing + 1].name)
+            };
+            let blocked = work.current_attempt.contains_key(&viewing) && status != "succeeded";
+            let next = if blocked {
+                button("project-next", label, false)
+            } else {
+                primary("project-next", label)
+            };
+            actions = actions
+                .child(next.on_click(cx.listener(|this, _, w, cx| this.save_stage(true, w, cx))));
+        }
+        advance = advance.child(div().pl(px(34.)).child(actions));
+        if is_current
+            && !finished
+            && !running
+            && viewing > 0
+            && matches!(status.as_str(), "failed" | "cancelled")
+        {
+            advance = advance.child(self.rework_panel(work, viewing, cx));
+        }
+
+        let detail = v_flex()
+            .flex_none()
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(chip(work.template.label(), BLUE))
+                    .child(chip(work.stage_name(), MINT))
+                    .child(caption(if work.repositories.is_empty() {
+                        "未纳入仓库".to_string()
                     } else {
-                        "完成并进入下一阶段"
-                    },
-                )
-                .on_click(cx.listener(|this, _, w, cx| this.save_stage(true, w, cx))),
-            );
-        }
-        if viewing < work.stage {
-            actions = actions.child(
-                button("project-reopen-stage", "返回此阶段跟进", false).on_click(cx.listener(
-                    move |this, _, w, cx| {
-                        if this.has_running_agent() {
-                            this.board.error = Some("请先等待当前 CLI 完成，或取消执行".into());
-                            cx.notify();
-                            return;
-                        }
-                        if this.change_board(cx, |lib| {
-                            let item = lib.project_mut()?.selected_mut()?;
-                            item.reopen_transfers(viewing);
-                            item.stage = viewing;
-                            item.current_attempt.retain(|s, _| *s < viewing);
-                            Ok(())
-                        }) {
-                            this.load_stage(w, cx);
-                        }
-                    },
-                )),
-            );
-        }
-        detail = detail
-            .child(actions)
-            .child(self.agent_panel(p, work, viewing, cx));
+                        work.repositories
+                            .iter()
+                            .map(|r| basename(r))
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    })),
+            )
+            .child(steps)
+            .children(returned)
+            .child(guide)
+            .child(config)
+            .child(session)
+            .child(advance);
         let mut repos = panel().flex_none().child(
             h_flex()
                 .justify_between()

@@ -285,6 +285,9 @@ pub struct Work {
     pub records: Vec<WorkRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handoffs: Vec<WorkHandoff>,
+    /// Each time a later stage sent the item back for rework.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reworks: Vec<transfer::Rework>,
     #[serde(default)]
     pub tickets: std::collections::BTreeMap<PathBuf, String>,
     pub id: String,
@@ -511,6 +514,7 @@ impl Project {
         let id = Uuid::new_v4().simple().to_string();
         self.selected = Some(id.clone());
         let mut work = Work {
+            reworks: vec![],
             deliveries: vec![],
             stage_transfers: vec![],
             active_transfers: BTreeMap::new(),

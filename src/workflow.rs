@@ -171,8 +171,17 @@ pub struct ExternalSession {
     pub session: String,
     pub workspace: PathBuf,
 }
+/// A message that continues an earlier attempt's native CLI conversation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FollowUp {
+    /// The attempt whose session and workspace this turn continues.
+    pub attempt: String,
+    pub message: String,
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<FollowUp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_transfer: Option<crate::project::transfer::Transfer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

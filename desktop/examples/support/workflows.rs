@@ -31,6 +31,12 @@ printf '%s\n' '{"result":"handoff from Claude: frost-83\nAEP: PASS","is_error":f
 case "$input" in *frost-83*) ;; *) echo 'missing handoff' >&2; exit 6;; esac
 while [ "$1" != "--output-last-message" ]; do shift; done
 case "$input" in *"阶段职责：在事项工作区完成"*) echo local-build > gameplay.txt;; esac
+printf '%s\n' '{"type":"thread.started","thread_id":"t-fake"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"先确认交接再跑检查"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"c1","type":"command_execution","command":"cargo test --locked","aggregated_output":"running 3 tests\ntest save ... ok\ntest load ... ok\ntest restore ... ok\n\ntest result: ok. 3 passed","exit_code":0,"status":"completed"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"c2","type":"command_execution","command":"rg -n frost-83 docs","aggregated_output":"rg: docs: No such file or directory","exit_code":2,"status":"completed"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"f1","type":"file_change","changes":[{"path":"gameplay.txt","kind":"add"}]}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"handoff from Codex: frost-83\nAEP: PASS"}}'
 printf 'handoff from Codex: frost-83\nAEP: PASS\n' > "$2""#,
     )?;
     client(
@@ -207,6 +213,10 @@ echo "已核对玩家验收记录，交付 frost-83。""#,
                             && !repo.join("gameplay.txt").exists(),
                         "implementation was not isolated"
                     );
+                }
+                if i == 3 {
+                    ui.reveal("project-page", "workflow-send")?;
+                    ui.checkpoint("game-codex-transcript")?;
                 }
                 if i == 5 {
                     ui.checkpoint("game-independent-acceptance")?;

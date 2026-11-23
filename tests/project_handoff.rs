@@ -822,3 +822,308 @@ fn directory_matches_linked_worktrees_without_guessing_between_projects() -> Res
     );
     Ok(())
 }
+
+#[test]
+fn a_follow_up_resumes_the_claude_session_with_only_the_new_message() -> Result<()> {
+    use aep::{
+        handoff::Assignment,
+        project::{Kind, Library},
+        workflow::{Client, Profile, Template, attempt_dir},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().join("catalog");
+    let claude = temp.path().join("claude");
+    // First turn: a fresh stream-json session. Follow-up: must resume s-1 and receive only the message.
+    fs::write(
+        &claude,
+        r#"#!/bin/sh
+set -eu
+input=$(cat)
+case " $* " in
+  *" --resume s-1 "*)
+    test "$input" = "请补充回滚方案"
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-1","model":"sonnet"}'
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"已补充回滚方案"}]}}'
+    printf '%s\n' '{"type":"result","subtype":"success","result":"已补充回滚方案","is_error":false,"session_id":"s-1"}'
+    ;;
+  *"--resume"*) exit 7 ;;
+  *)
+    case " $* " in *" stream-json --verbose "*) ;; *) exit 6 ;; esac
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-1","model":"sonnet"}'
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"u1","name":"Bash","input":{"command":"ls"}}]}}'
+    printf '%s\n' '{"type":"user","message":{"content":[{"tool_use_id":"u1","type":"tool_result","content":"a.txt","is_error":false}]}}'
+    printf '%s\n' '{"type":"result","subtype":"success","result":"初版方案","is_error":false,"session_id":"s-1"}'
+    ;;
+esac
+"#,
+    )?;
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o700))?;
+    let profile = Profile {
+        client: Client::Claude,
+        executable: claude.display().to_string(),
+        model: String::new(),
+        check_command: String::new(),
+    };
+    let mut lib = Library::open(&home)?;
+    let first = lib.change(&home, |lib| {
+        lib.create("follow", vec![])?;
+        let p = lib.project_mut()?;
+        p.add_work("方案", Kind::Feature, Template::Software)?;
+        let work = p.selected().unwrap().id.clone();
+        p.reserve(
+            &home,
+            &work,
+            0,
+            Assignment {
+                profile: profile.clone(),
+                brief: "写一版方案".into(),
+                repository: None,
+                external: None,
+            },
+        )
+    })?;
+    let stage = |dir: &Path| -> Result<Value> {
+        let out = Command::new(env!("CARGO_BIN_EXE_aep"))
+            .args(["workflow-stage", "--request"])
+            .arg(dir.join("request.json"))
+            .output()?;
+        ensure!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(serde_json::from_slice(&fs::read(
+            dir.join("evidence.json"),
+        )?)?)
+    };
+    let ev = stage(&first)?;
+    assert_eq!(ev["session"], "s-1");
+    assert_eq!(fs::read_to_string(first.join("result.txt"))?, "初版方案");
+    let (pid, wid) = {
+        let p = lib.project().unwrap();
+        (p.id.clone(), p.selected().unwrap().id.clone())
+    };
+    let next = lib.change(&home, |lib| {
+        lib.project_mut()?
+            .reserve_follow_up(&home, &wid, 0, "请补充回滚方案")
+    })?;
+    let ev = stage(&next)?;
+    assert_eq!(ev["status"], "succeeded", "{ev}");
+    assert_eq!(ev["follow_up"]["resumed_session"], "s-1");
+    let before: Value = serde_json::from_slice(&fs::read(first.join("evidence.json"))?)?;
+    assert_eq!(
+        ev["workspace"], before["workspace"],
+        "follow-up must reuse the workspace"
+    );
+    assert_eq!(
+        fs::read_to_string(next.join("result.txt"))?,
+        "已补充回滚方案"
+    );
+    let p = lib.project().unwrap();
+    let work = p.selected().unwrap();
+    assert_eq!(
+        work.notes[0], "写一版方案",
+        "follow-up must not replace the stage note"
+    );
+    let current = &work.current_attempt[&0];
+    assert_eq!(attempt_dir(&home, &pid, &wid, current), next);
+    let t = aep::transcript::parse(&fs::read_to_string(first.join("stdout.log"))?);
+    assert!(
+        matches!(&t.entries[0], aep::transcript::Entry::Command { command, exit: Some(0), .. } if command == "ls")
+    );
+    Ok(())
+}
+
+#[test]
+fn a_failed_gate_can_loop_back_to_build_and_never_strands_the_item() -> Result<()> {
+    use aep::{
+        handoff::Assignment,
+        project::{Kind, Library},
+        workflow::{Client, Profile, Template},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().join("catalog");
+    let claude = temp.path().join("claude");
+    fs::write(
+        &claude,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"result\",\"result\":\"端口被沙箱拒绝\\nAEP: BLOCKED\",\"is_error\":false,\"session_id\":\"s-9\"}'\n",
+    )?;
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o700))?;
+    let profile = Profile {
+        client: Client::Claude,
+        executable: claude.display().to_string(),
+        model: String::new(),
+        check_command: String::new(),
+    };
+    let mut lib = Library::open(&home)?;
+    let wid = lib.change(&home, |lib| {
+        lib.create("loop", vec![])?;
+        let p = lib.project_mut()?;
+        p.add_work("导出", Kind::Feature, Template::Software)?;
+        let wid = p.selected().unwrap().id.clone();
+        for stage in 0..4 {
+            p.finish_stage(&home, &wid, stage, format!("人工结论 {stage}"))?;
+        }
+        Ok(wid)
+    })?;
+    let run_gate = |lib: &mut Library| -> Result<()> {
+        let dir = lib.change(&home, |lib| {
+            lib.project_mut()?.reserve(
+                &home,
+                &wid,
+                4,
+                Assignment {
+                    profile: profile.clone(),
+                    brief: "跑全量测试".into(),
+                    repository: None,
+                    external: None,
+                },
+            )
+        })?;
+        Command::new(env!("CARGO_BIN_EXE_aep"))
+            .args(["workflow-stage", "--request"])
+            .arg(dir.join("request.json"))
+            .output()?;
+        let ev: Value = serde_json::from_slice(&fs::read(dir.join("evidence.json"))?)?;
+        ensure!(ev["status"] == "failed", "{ev}");
+        Ok(())
+    };
+    run_gate(&mut lib)?;
+    // A failed gate cannot be advanced as if it passed.
+    assert!(
+        lib.change(&home, |lib| lib.project_mut()?.finish_stage(
+            &home,
+            &wid,
+            4,
+            String::new()
+        ))
+        .is_err()
+    );
+    // Loop: back to build, then forward again into a fresh test round.
+    lib.change(&home, |lib| {
+        lib.project_mut()?
+            .work_by_id_mut(&wid)?
+            .send_back(3, "端口被沙箱拒绝")
+    })?;
+    {
+        let work = &lib.project().unwrap().work[0];
+        assert_eq!(work.stage, 3);
+        assert!(!work.current_attempt.contains_key(&4));
+        assert_eq!(work.reworks_between(4, 3), 1);
+    }
+    lib.change(&home, |lib| {
+        lib.project_mut()?
+            .finish_stage(&home, &wid, 3, "已修复".into())
+    })?;
+    run_gate(&mut lib)?;
+    // The way out when the failure is environmental: a recorded human decision.
+    assert!(
+        lib.change(&home, |lib| lib
+            .project_mut()?
+            .waive_stage(&home, &wid, 4, " "))
+            .is_err(),
+        "waiving needs a reason"
+    );
+    lib.change(&home, |lib| {
+        lib.project_mut()?
+            .waive_stage(&home, &wid, 4, "本机手动跑通")
+    })?;
+    let work = &lib.project().unwrap().work[0];
+    assert_eq!(work.stage, 5);
+    assert!(work.notes[4].starts_with("人工放行：本机手动跑通"));
+    assert!(work.notes[4].contains("AEP: BLOCKED"));
+    Ok(())
+}
+
+#[test]
+fn a_follow_up_falls_back_to_the_previous_answer_when_the_session_is_gone() -> Result<()> {
+    use aep::{
+        handoff::Assignment,
+        project::{Kind, Library},
+        workflow::{Client, Profile, Template},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().join("catalog");
+    let claude = temp.path().join("claude");
+    // Resuming always fails as if the session was pruned; a replayed prompt must carry
+    // the earlier answer and the new request.
+    fs::write(
+        &claude,
+        r#"#!/bin/sh
+input=$(cat)
+case " $* " in *" --resume "*) echo 'No conversation found with session ID: s-1' >&2; exit 1 ;; esac
+case "$input" in
+  *"继续的要求"*)
+    case "$input" in *"上一轮答复"*"初版方案"*"请直接修改"*|*"上一轮答复"*"已按要求修改"*"请直接修改"*) ;; *) exit 5 ;; esac
+    printf '%s\n' '{"type":"result","result":"已按要求修改","is_error":false,"session_id":"s-2"}'
+    ;;
+  *) printf '%s\n' '{"type":"result","result":"初版方案","is_error":false,"session_id":"s-1"}' ;;
+esac
+"#,
+    )?;
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o700))?;
+    let profile = Profile {
+        client: Client::Claude,
+        executable: claude.display().to_string(),
+        model: String::new(),
+        check_command: String::new(),
+    };
+    let stage = |dir: &Path| -> Result<Value> {
+        Command::new(env!("CARGO_BIN_EXE_aep"))
+            .args(["workflow-stage", "--request"])
+            .arg(dir.join("request.json"))
+            .output()?;
+        Ok(serde_json::from_slice(&fs::read(
+            dir.join("evidence.json"),
+        )?)?)
+    };
+    let mut lib = Library::open(&home)?;
+    let (wid, first) = lib.change(&home, |lib| {
+        lib.create("gone", vec![])?;
+        let p = lib.project_mut()?;
+        p.add_work("方案", Kind::Feature, Template::Software)?;
+        let wid = p.selected().unwrap().id.clone();
+        let dir = p.reserve(
+            &home,
+            &wid,
+            0,
+            Assignment {
+                profile: profile.clone(),
+                brief: "写一版方案".into(),
+                repository: None,
+                external: None,
+            },
+        )?;
+        Ok((wid, dir))
+    })?;
+    assert_eq!(stage(&first)?["resumable"], true);
+    let next = lib.change(&home, |lib| {
+        lib.project_mut()?
+            .reserve_follow_up(&home, &wid, 0, "请直接修改")
+    })?;
+    let ev = stage(&next)?;
+    assert_eq!(ev["status"], "succeeded", "{ev}");
+    assert!(ev["follow_up"]["resume_error"].is_string(), "{ev}");
+    assert_eq!(fs::read_to_string(next.join("result.txt"))?, "已按要求修改");
+
+    // A session recorded by an older build (no `resumable` marker) is never resumed.
+    for dir in [&first, &next] {
+        let mut old: Value = serde_json::from_slice(&fs::read(dir.join("evidence.json"))?)?;
+        old.as_object_mut().unwrap().remove("resumable");
+        fs::write(dir.join("evidence.json"), serde_json::to_vec(&old)?)?;
+    }
+    let third = lib.change(&home, |lib| {
+        lib.project_mut()?
+            .reserve_follow_up(&home, &wid, 0, "请直接修改")
+    })?;
+    let ev = stage(&third)?;
+    assert_eq!(ev["status"], "succeeded", "{ev}");
+    assert!(
+        ev["follow_up"]["resume_error"].is_null(),
+        "should not try to resume: {ev}"
+    );
+    Ok(())
+}

@@ -247,6 +247,45 @@ impl Work {
     pub fn reopen_transfers(&mut self, stage: usize) {
         self.active_transfers.retain(|to, _| *to <= stage);
     }
+    /// How many times work has gone back from `from` to `to`; the UI escalates repeated loops.
+    pub fn reworks_between(&self, from: usize, to: usize) -> usize {
+        self.reworks
+            .iter()
+            .filter(|r| r.from == from && r.to == to)
+            .count()
+    }
+    /// Return the item to an earlier stage after a later one did not pass.
+    ///
+    /// The target stage keeps its current attempt, so its CLI session can be continued
+    /// with the failure report instead of starting over.
+    pub fn send_back(&mut self, to: usize, reason: &str) -> Result<()> {
+        let from = self.stage;
+        ensure!(
+            to < from && from < self.template.stages().len(),
+            "只能退回到当前阶段之前的阶段"
+        );
+        let run = self.current_attempt.get(&from).cloned();
+        self.reopen_transfers(to);
+        self.current_attempt.retain(|s, _| *s <= to);
+        self.stage = to;
+        self.reworks.push(Rework {
+            from,
+            to,
+            run,
+            reason: reason.trim().chars().take(4000).collect(),
+            at: chrono::Utc::now().to_rfc3339(),
+        });
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Rework {
+    pub from: usize,
+    pub to: usize,
+    /// The attempt whose report caused the rework, if any.
+    pub run: Option<String>,
+    pub reason: String,
+    pub at: String,
 }
 impl Project {
     /// Advance the current stage with the same receipt rules in Studio and in the CLI.
@@ -294,6 +333,29 @@ impl Project {
         }
         self.work_by_id_mut(wid)?.notes[from] = note;
         Ok(())
+    }
+
+    /// Advance past a stage whose agent did not pass, on a person's explicit decision.
+    /// The failed report is kept in the stage note; no agent receipt is carried forward.
+    pub fn waive_stage(&mut self, home: &Path, wid: &str, from: usize, reason: &str) -> Result<()> {
+        ensure!(!reason.trim().is_empty(), "请写明人工放行的理由");
+        let pid = self.id.clone();
+        let work = self.work_by_id_mut(wid)?;
+        ensure!(work.stage == from, "阶段已变更");
+        let report = work
+            .current_attempt
+            .remove(&from)
+            .and_then(|run| {
+                fs::read_to_string(workflow::attempt_dir(home, &pid, wid, &run).join("result.txt"))
+                    .ok()
+            })
+            .unwrap_or_default();
+        let mut note = format!("人工放行：{}", reason.trim());
+        if !report.trim().is_empty() {
+            note.push_str("\n\nAgent 报告（未通过）：\n");
+            note.extend(report.trim().chars().take(4000));
+        }
+        self.finish_stage(home, wid, from, note)
     }
 
     pub fn confirm_transfer(

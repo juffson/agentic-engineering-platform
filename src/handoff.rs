@@ -191,6 +191,7 @@ pub struct Assignment {
 impl Work {
     pub fn request(&self, project: &str, stage: usize, assignment: Assignment) -> Request {
         Request {
+            follow_up: None,
             stage_transfer: self.incoming(stage).cloned(),
             handoffs: self.handoffs.clone(),
             project: project.to_owned(),
@@ -310,6 +311,62 @@ impl Project {
             repository,
         });
         item.current_attempt.insert(stage, id);
+        Ok(dir)
+    }
+    /// Reserve a turn that continues the stage's current attempt in the same CLI session and
+    /// workspace. The stage note stays as written; only the new message is sent.
+    pub fn reserve_follow_up(
+        &mut self,
+        catalog: &Path,
+        work_id: &str,
+        stage: usize,
+        message: &str,
+    ) -> Result<PathBuf> {
+        let message = message.trim();
+        ensure!(!message.is_empty(), "请输入要继续发送的消息");
+        let pid = self.id.clone();
+        let item = self.work_by_id_mut(work_id)?;
+        let previous = item
+            .current_attempt
+            .get(&stage)
+            .cloned()
+            .context("此阶段还没有可以继续的执行")?;
+        let attempt = item
+            .attempts
+            .iter()
+            .find(|a| a.id == previous)
+            .cloned()
+            .context("找不到上一轮执行")?;
+        let prior = workflow::evidence(&workflow::attempt_dir(catalog, &pid, work_id, &previous))?;
+        ensure!(
+            prior["mode"] != "external",
+            "独立会话领取的执行请在原会话中继续"
+        );
+        ensure!(
+            prior["workspace"].is_string(),
+            "上一轮执行没有生成工作区，请重新执行"
+        );
+        let note = item.notes.get(stage).cloned().unwrap_or_default();
+        let dir = self.reserve(
+            catalog,
+            work_id,
+            stage,
+            Assignment {
+                profile: attempt.profile,
+                brief: message.to_owned(),
+                repository: attempt.repository,
+                external: None,
+            },
+        )?;
+        let item = self.work_by_id_mut(work_id)?;
+        item.notes[stage] = note;
+        let mut request: Request =
+            serde_json::from_reader(fs::File::open(dir.join("request.json"))?)?;
+        request.follow_up = Some(workflow::FollowUp {
+            attempt: previous,
+            message: message.to_owned(),
+        });
+        save_json(&dir, "request.json", &request)?;
         Ok(dir)
     }
 }

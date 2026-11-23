@@ -2,11 +2,21 @@ use super::{Args, Driver, fixture, handoff_fixture, https_queue::until};
 use aep::workspace::Workspace;
 use aep::workspace::read;
 use anyhow::{Result, ensure};
+use gpui_kit::px;
 use serde_json::{Value, json};
 use std::{fs, path::Path, process::Command};
 
 pub(super) fn click(ui: &mut Driver<'_>, id: &str) -> Result<()> {
-    if !ui.element(id)?.visible() {
+    // `visible` is true for a control that only grazes the viewport edge; scroll until
+    // the point the pointer lands on is inside the page.
+    // Keep a margin: the window border at the edges takes pointer events for resizing.
+    let target = ui.element(id)?;
+    let inside = !ui.absent("project-page")? && {
+        let page = ui.element("project-page")?.bounds();
+        let y = target.bounds().center().y;
+        y > page.origin.y + px(24.) && y < page.origin.y + page.size.height - px(24.)
+    };
+    if !target.visible() || !inside {
         ui.reveal("project-page", id)?;
     }
     ui.click(id)

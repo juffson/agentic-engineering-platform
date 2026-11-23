@@ -5,6 +5,7 @@ pub mod deploy_keys;
 pub mod memory;
 pub mod studio;
 pub mod task;
+pub mod transcript;
 pub mod workspace;
 
 pub const CONTROL_OPERATOR_TOKEN: &str = "AEP_CONTROL_OPERATOR_TOKEN";

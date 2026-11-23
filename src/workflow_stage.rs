@@ -190,12 +190,85 @@ fn perform(
     record: &mut Value,
 ) -> Result<()> {
     req.profile.validate()?;
-    let cwd = workspace(
-        work,
-        req.repository.as_deref(),
-        req.stage_transfer.as_ref(),
-        id,
-    )?;
+    let gate = matches!(stage.role, Role::Test | Role::Accept);
+    let write = stage.role == Role::Build;
+    let prior = req
+        .follow_up
+        .as_ref()
+        .map(|f| prior_turn(dir, f))
+        .transpose()?;
+    let cwd = match &prior {
+        Some(p) => p.workspace.clone(),
+        None => workspace(
+            work,
+            req.repository.as_deref(),
+            req.stage_transfer.as_ref(),
+            id,
+        )?,
+    };
+    // A native session already holds the stage context; send only the new message.
+    let resume = prior
+        .as_ref()
+        .filter(|_| matches!(req.profile.client, Client::Codex | Client::Claude))
+        .and_then(|p| p.session.clone());
+    if let (Some(p), Some(f)) = (&prior, &req.follow_up) {
+        record["follow_up"] = json!({"attempt":f.attempt,"resumed_session":resume});
+        if resume.is_some() {
+            let mut prompt = f.message.clone();
+            if gate {
+                prompt.push_str(
+                    "\n\n（如果结论有变化，答复最后一行仍按约定：通过时单独输出 AEP: PASS。）",
+                );
+            }
+            match invoke(
+                req,
+                stage,
+                dir,
+                work,
+                id,
+                stop,
+                record,
+                &cwd,
+                prompt,
+                None,
+                resume,
+                gate,
+                write,
+                (vec![], vec![]),
+            ) {
+                Err(e) if !stop.requested()? && session_missing(dir) => {
+                    // Fall back to sending the context and the previous answer.
+                    record["follow_up"]["resume_error"] = json!(format!("{e:#}"));
+                    record["follow_up"]["resumed_session"] = Value::Null;
+                    record["session"] = Value::Null;
+                }
+                other => return other,
+            }
+        }
+        let packet = context(req, dir, &cwd, None)?;
+        let prompt = format!(
+            "{}\n\n## 上一轮答复\n{}\n\n## 继续的要求\n{}",
+            packet.text,
+            p.result.chars().take(8000).collect::<String>(),
+            f.message
+        );
+        return invoke(
+            req,
+            stage,
+            dir,
+            work,
+            id,
+            stop,
+            record,
+            &cwd,
+            prompt,
+            None,
+            None,
+            gate,
+            write,
+            (packet.project_ids, packet.repo_ids),
+        );
+    }
     let packet = context(req, dir, &cwd, None)?;
     let mut prompt = packet.text;
     let receipt = source_receipt(req, stage, dir)?;
@@ -209,16 +282,121 @@ fn perform(
         }
         record["source_evidence"] = json!({"run":req.stage_transfer.as_ref().map(|t|&t.run),"file":"inputs/source-evidence.json"});
     }
+    invoke(
+        req,
+        stage,
+        dir,
+        work,
+        id,
+        stop,
+        record,
+        &cwd,
+        prompt,
+        receipt,
+        None,
+        gate,
+        write,
+        (packet.project_ids, packet.repo_ids),
+    )
+}
+
+struct Prior {
+    workspace: PathBuf,
+    session: Option<String>,
+    result: String,
+}
+/// Load what a follow-up continues: the latest workspace, the newest session that was
+/// actually saved, and the newest non-empty answer. A failed round (for example a resume
+/// that could not find its session) defers to the round it continued.
+fn prior_turn(dir: &Path, follow: &aep::workflow::FollowUp) -> Result<Prior> {
+    let runs = dir.parent().context("missing runs directory")?;
+    let mut id = follow.attempt.clone();
+    let mut workspace = None;
+    let mut session = None;
+    let mut result = String::new();
+    for _ in 0..64 {
+        aep::workspace::ident(&id, 64)?;
+        let previous = runs.join(&id);
+        let ev = aep::workflow::evidence(&previous)?;
+        if workspace.is_none() {
+            workspace = ev["workspace"].as_str().map(PathBuf::from);
+        }
+        // Runs from before sessions were persisted (`--ephemeral`) cannot be resumed.
+        if session.is_none() && ev["resumable"] == true {
+            session = ev["session"].as_str().map(str::to_owned);
+        }
+        if result.trim().is_empty() {
+            result = fs::read_to_string(previous.join("result.txt")).unwrap_or_default();
+        }
+        if session.is_some() && !result.trim().is_empty() {
+            break;
+        }
+        match ev["follow_up"]["attempt"].as_str() {
+            Some(next) => id = next.to_owned(),
+            None => break,
+        }
+    }
+    let workspace = workspace.context("上一轮执行没有工作区")?;
+    ensure!(workspace.is_dir(), "上一轮执行的工作区已移除，请重新执行");
+    Ok(Prior {
+        workspace,
+        session,
+        result,
+    })
+}
+
+/// The CLI could not find the session it was asked to resume (pruned or never saved).
+fn session_missing(dir: &Path) -> bool {
+    ["stderr.log", "stdout.log"].iter().any(|name| {
+        let log = tail(&dir.join(name), 4000).to_lowercase();
+        log.contains("no rollout found")
+            || log.contains("no conversation found")
+            || log.contains("thread/resume failed")
+    })
+}
+
+/// Claude's stream-json output ends with one `result` event; older single-object
+/// output (and test doubles) carry the same fields without a `type`.
+fn claude_result(stdout: &Path) -> Result<Value> {
+    let mut last = None;
+    for line in BufReader::new(fs::File::open(stdout)?).lines() {
+        if let Ok(v) = serde_json::from_str::<Value>(&line?)
+            && (v["type"] == "result" || (v["type"].is_null() && !v["result"].is_null()))
+        {
+            last = Some(v);
+        }
+    }
+    last.context("Claude 未生成最终答复")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke(
+    req: &Request,
+    stage: &Stage,
+    dir: &Path,
+    work: &Path,
+    id: &str,
+    stop: &Cancellation,
+    record: &mut Value,
+    cwd: &Path,
+    prompt: String,
+    receipt: Option<PathBuf>,
+    resume: Option<String>,
+    gate: bool,
+    write: bool,
+    (project_ids, repo_ids): (Vec<i64>, Vec<i64>),
+) -> Result<()> {
+    let cwd = cwd.to_path_buf();
     fs::write(dir.join("prompt.txt"), &prompt)?;
-    if let Some(t) = &req.stage_transfer {
+    if req.follow_up.is_none()
+        && let Some(t) = &req.stage_transfer
+    {
         record["read_stage_transfer"] = json!(t);
     }
     record["workspace"] = json!(cwd);
     record["prompt_bytes"] = json!(prompt.len());
-    record["read_memory"] = json!(packet.project_ids);
-    record["read_repository_memory"] = json!(packet.repo_ids);
-    let gate = matches!(stage.role, Role::Test | Role::Accept);
-    let write = stage.role == Role::Build;
+    record["read_memory"] = json!(project_ids);
+    record["read_repository_memory"] = json!(repo_ids);
     save(dir, record)?;
     let profile = &req.profile;
     let bin = profile.program(&std::env::var_os("PATH").unwrap_or_default())?;
@@ -238,21 +416,24 @@ fn perform(
     let result_path = dir.join("result.txt");
     match profile.client {
         Client::Codex => {
+            let sandbox = if write || gate {
+                "workspace-write"
+            } else {
+                "read-only"
+            };
+            args.push("exec".into());
+            if resume.is_some() {
+                // `exec resume` has no --sandbox flag; the config key sets the same policy.
+                args.extend([
+                    "resume".into(),
+                    "-c".into(),
+                    format!("sandbox_mode=\"{sandbox}\""),
+                ]);
+            } else {
+                args.extend(["--sandbox".into(), sandbox.into()]);
+            }
             args.extend(
-                [
-                    "exec",
-                    "--ephemeral",
-                    "--skip-git-repo-check",
-                    "--sandbox",
-                    if write || gate {
-                        "workspace-write"
-                    } else {
-                        "read-only"
-                    },
-                    "--json",
-                    "--output-last-message",
-                ]
-                .map(String::from),
+                ["--skip-git-repo-check", "--json", "--output-last-message"].map(String::from),
             );
             args.push(result_path.display().to_string());
         }
@@ -263,9 +444,9 @@ fn perform(
             args.extend(
                 [
                     "-p",
-                    "--no-session-persistence",
                     "--output-format",
-                    "json",
+                    "stream-json",
+                    "--verbose",
                     "--permission-mode",
                     if write { "acceptEdits" } else { "default" },
                     "--tools",
@@ -316,6 +497,13 @@ fn perform(
     if profile.client != Client::ZCode && !profile.model.trim().is_empty() {
         args.extend(["--model".into(), profile.model.trim().into()]);
     }
+    if let Some(session) = &resume {
+        if profile.client == Client::Claude {
+            args.extend(["--resume".into(), session.clone()]);
+        } else {
+            args.push(session.clone());
+        }
+    }
     if profile.client == Client::Codex {
         args.push("-".into());
     }
@@ -328,12 +516,15 @@ fn perform(
         &args,
         &cwd,
         &stdout,
-        900,
+        // Stage sessions run until they finish or the user cancels them.
+        u64::MAX,
         (profile.client != Client::ZCode).then_some(prompt.as_str()),
         Some(stderr.clone()),
         stop,
     )?;
     record["exit_code"] = json!(code);
+    // Codex and Claude now keep their sessions on disk, so this run can be continued.
+    record["resumable"] = json!(matches!(profile.client, Client::Codex | Client::Claude));
     if dir.join("session.json").is_file() {
         let native = aep::workspace::read(&dir.join("session.json"))?;
         record["native_session"] = native;
@@ -350,6 +541,11 @@ fn perform(
             }
         }
     }
+    if record["session"].is_null()
+        && let Some(session) = &resume
+    {
+        record["session"] = json!(session);
+    }
 
     ensure!(
         code == 0,
@@ -365,7 +561,7 @@ fn perform(
     let result = match profile.client {
         Client::Codex => fs::read_to_string(&result_path).context("Codex 未生成最终答复")?,
         Client::Claude => {
-            let v: Value = serde_json::from_reader(fs::File::open(stdout)?)?;
+            let v = claude_result(&stdout)?;
             record["session"] = v["session_id"].clone();
             if let Some(usage) = v["modelUsage"].as_object() {
                 record["reported_models"] = json!(usage.keys().collect::<Vec<_>>());

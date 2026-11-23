@@ -6,7 +6,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-fn phase(v: &Value) -> &str {
+pub(super) fn phase(v: &Value) -> &str {
     match v["status"].as_str() {
         Some("succeeded") => "已完成",
         Some("initializing") => "启动中",
@@ -163,7 +163,7 @@ impl Studio {
         p.selected_mut()?.profiles.insert(index, profile.clone());
         Ok(())
     }
-    fn attempt_path(&self, id: &str) -> Option<PathBuf> {
+    pub(super) fn attempt_path(&self, id: &str) -> Option<PathBuf> {
         let p = self.board.library.project()?;
         Some(workflow::attempt_dir(
             self.board.dir.as_ref()?,
@@ -320,7 +320,7 @@ impl Studio {
         })
         .detach();
     }
-    fn launch_agent(&mut self, cx: &mut Context<Self>) -> Result<()> {
+    pub(super) fn launch_agent(&mut self, cx: &mut Context<Self>) -> Result<()> {
         let p = self.board.library.project().context("请选择项目")?;
         let work = p.selected().context("请选择开发事项")?;
         let i = self.board.viewing;
@@ -328,12 +328,12 @@ impl Studio {
         ensure!(!self.has_running_agent(), "此事项已有 CLI 正在运行");
         let profile = self.chosen_profile(cx);
         profile.validate()?;
+        self.runner.binary()?;
+        self.runner.path()?;
         let work_id = work.id.clone();
         let repository = work.target(i);
         let home = self.board.dir.clone().context("找不到项目库")?;
         let brief = self.board.note.read(cx).value().to_string();
-        let binary = self.runner.binary()?;
-        let path = self.runner.path()?;
         let mut folder = None;
         if !self.change_board(cx, |lib| {
             let p = lib.project_mut()?;
@@ -354,6 +354,12 @@ impl Studio {
             return Ok(());
         }
         let d = folder.context("未创建运行记录")?;
+        self.spawn_stage(&d, cx)
+    }
+    /// Start the detached supervisor for a reserved attempt directory.
+    pub(super) fn spawn_stage(&mut self, d: &Path, cx: &mut Context<Self>) -> Result<()> {
+        let binary = self.runner.binary()?;
+        let path = self.runner.path()?;
         let supervisor = fs::File::create(d.join("supervisor.log"))?;
         match Command::new(binary)
             .env("PATH", path)
@@ -375,7 +381,7 @@ impl Studio {
             }
             Err(e) => {
                 crate::lifecycle::save(
-                    &d,
+                    d,
                     "evidence.json",
                     &serde_json::json!({"status":"failed","error":e.to_string()}),
                 )?;
@@ -385,7 +391,7 @@ impl Studio {
         self.watch_agents(cx);
         Ok(())
     }
-    fn log_view(
+    pub(super) fn log_view(
         &self,
         dir: &Path,
         id: &str,
@@ -454,7 +460,8 @@ impl Studio {
             Err(e) => view.child(caption(e.to_string())),
         }
     }
-    pub(super) fn agent_panel(
+    /// Card 1 of a stage: which CLI, model and repository the stage runs with.
+    pub(super) fn agent_config(
         &self,
         p: &Project,
         work: &Work,
@@ -496,36 +503,26 @@ impl Studio {
                 })),
             );
         }
-        let mut content = v_flex()
-            .border_t_1()
-            .border_color(rgb(LINE))
-            .pt_3()
-            .gap_2()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .flex_wrap()
-                    .child(heading("阶段 Agent"))
-                    .child(clients),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(input_field("workflow-model", &self.board.model))
-                    .child(input_field("workflow-executable", &self.board.executable)),
-            );
         let profile = self.chosen_profile(cx);
         let program = self.runner.path().and_then(|path| profile.program(&path));
-        let mut settings = h_flex().gap_2().flex_wrap().child(caption(
-            program.map_or_else(|e| e.to_string(), |p| p.display().to_string()),
-        ));
+        let mut content = v_flex().gap_3().child(
+            v_flex()
+                .gap_1()
+                .child(caption("Agent"))
+                .child(clients)
+                .child(match &program {
+                    Ok(p) => t(format!("● {}", p.display()), MINT).text_xs(),
+                    Err(e) => t(format!("● {e}"), AMBER).text_xs(),
+                }),
+        );
         let models: &[&str] = match self.board.client {
             Client::Codex => &["gpt-6.2-astra", "gpt-6.2-sol"],
-            Client::Claude => &["sonnet"],
+            Client::Claude => &["sonnet", "opus"],
             _ => &[],
         };
+        let mut presets = h_flex().gap_1().flex_wrap();
         for &name in models {
-            settings = settings.child(
+            presets = presets.child(
                 button(format!("model-preset-{name}"), name, profile.model == name).on_click(
                     cx.listener(move |this, _, w, cx| {
                         this.board
@@ -536,48 +533,87 @@ impl Studio {
                 ),
             );
         }
-        content = content.child(settings);
+        content = content.child(
+            v_flex()
+                .gap_1()
+                .child(caption(match self.board.client {
+                    Client::ZCode => "模型 · 留空沿用 ZCode 默认；指定时用 provider/model 或 provider/model@推理档位",
+                    _ => "模型 · 留空使用客户端当前配置",
+                }))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(presets)
+                        .child(input_field("workflow-model", &self.board.model)),
+                ),
+        );
+        let target = work.target(i);
+        let mut repos = v_flex()
+            .gap_1()
+            .child(caption("工作仓库 · 每个仓库使用独立的事项工作树"));
+        if work.repositories.is_empty() {
+            repos = repos.child(caption(
+                "事项还没纳入仓库，Agent 在项目文件目录中运行。可在下方「事项仓库」中纳入。",
+            ));
+        }
+        for (j, repo) in work.repositories.iter().enumerate() {
+            let path = repo.clone();
+            let on = Some(repo) == target.as_ref();
+            repos = repos.child(
+                h_flex()
+                    .id(format!("workflow-repo-{j}"))
+                    .test_support()
+                    .role(Role::Button)
+                    .aria_label(basename(repo))
+                    .tab_stop(true)
+                    .cursor_pointer()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if on { MINT } else { LINE }))
+                    .bg(rgb(if on { SELECTED } else { CANVAS }))
+                    .hover(|s| s.bg(rgb(SELECTED)))
+                    .child(t(if on { "◉" } else { "○" }, if on { MINT } else { MUTED }))
+                    .child(t(basename(repo), FG))
+                    .child(
+                        caption(repo.display().to_string())
+                            .truncate()
+                            .min_w_0()
+                            .flex_1(),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.change_board(cx, |lib| {
+                            lib.project_mut()?
+                                .selected_mut()?
+                                .targets
+                                .insert(i, path.clone());
+                            Ok(())
+                        });
+                    })),
+            );
+        }
+        content = content.child(repos);
+        let mut advanced = v_flex()
+            .gap_2()
+            .child(caption("高级"))
+            .child(input_field("workflow-executable", &self.board.executable));
         match self.board.client {
             Client::Claude => {
-                content = content.child(input_field(
+                advanced = advanced.child(input_field(
                     "workflow-allow-command",
                     &self.board.check_command,
                 ));
             }
-            Client::ZCode => {
-                content = content.child(caption("留空沿用 ZCode 默认模型；指定模型使用 provider/model 或 provider/model@推理档位。"));
-            }
             Client::Custom => {
-                content=content.child(caption("程序在事项工作区启动，从标准输入读取任务，向标准输出写交付物。指定模型时传入 --model。"));
+                advanced = advanced.child(caption("程序在事项工作区启动，从标准输入读取任务，向标准输出写交付物。指定模型时传入 --model。"));
             }
             _ => {}
         }
-        let mut repos = h_flex().flex_wrap().gap_2().child(caption("工作区"));
-        let target = work.target(i);
-        if work.repositories.is_empty() {
-            repos = repos.child(t("项目文件", FG));
-        }
-        for (j, repo) in work.repositories.iter().enumerate() {
-            let path = repo.clone();
-            repos = repos.child(
-                button(
-                    format!("workflow-repo-{j}"),
-                    basename(repo),
-                    Some(repo) == target.as_ref(),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.change_board(cx, |lib| {
-                        lib.project_mut()?
-                            .selected_mut()?
-                            .targets
-                            .insert(i, path.clone());
-                        Ok(())
-                    });
-                })),
-            );
-        }
+        content = content.child(advanced);
         let mut actions = h_flex().gap_2().flex_wrap().child(
-            button("workflow-save-profile", "保存 CLI 配置", false).on_click(cx.listener(
+            button("workflow-save-profile", "设为此阶段默认", false).on_click(cx.listener(
                 move |this, _, _, cx| {
                     let profile = this.chosen_profile(cx);
                     this.change_board(cx, |lib| {
@@ -587,10 +623,12 @@ impl Studio {
                 },
             )),
         );
-        if i == work.stage && !self.has_running_agent() {
-            if let Some(home) = &self.board.dir {
+        if i == work.stage
+            && !self.has_running_agent()
+            && let Some(home) = &self.board.dir
+        {
+            {
                 let quote = |text: &str| format!("'{}'", text.replace('\'', "'\"'\"'"));
-                let profile = self.chosen_profile(cx);
                 let mut cmd = format!(
                     "aep project --home {} --project {} --work {} claim --stage {} --client {}",
                     quote(&home.display().to_string()),
@@ -611,170 +649,24 @@ impl Studio {
                     ),
                 );
             }
-            let label = if work.current_attempt.contains_key(&i) {
-                "重新执行"
+        }
+        content.child(actions)
+    }
+    /// One-line description of the stage's chosen CLI for collapsed headers.
+    pub(super) fn config_summary(&self, work: &Work, i: usize, cx: &Context<Self>) -> String {
+        let profile = self.chosen_profile(cx);
+        format!(
+            "{} · {} · {}",
+            profile.client.label(),
+            if profile.model.is_empty() {
+                "默认模型"
             } else {
-                "运行阶段 Agent"
-            };
-            actions = actions.child(primary("workflow-run", label).on_click(cx.listener(
-                |this, _, _, cx| {
-                    if let Err(e) = this.launch_agent(cx) {
-                        this.board.error = Some(format!("{e:#}"));
-                    }
-                    cx.notify();
-                },
-            )));
-        }
-        content = content.child(repos).child(actions);
-        let Some(base) = self.board.dir.as_ref() else {
-            return content;
-        };
-        for a in work.attempts.iter().rev().filter(|a| a.stage == i) {
-            let d = workflow::attempt_dir(base, &p.id, &work.id, &a.id);
-            let ev = workflow::evidence(&d)
-                .unwrap_or_else(|e| serde_json::json!({"error":e.to_string()}));
-            let mut bar = h_flex()
-                .gap_2()
-                .flex_wrap()
-                .child(chip(
-                    phase(&ev),
-                    if ev["status"] == "failed" { RED } else { MINT },
-                ))
-                .child(caption(format!(
-                    "{} · {} · {}",
-                    a.profile.client.label(),
-                    if a.profile.model.is_empty() {
-                        "默认模型"
-                    } else {
-                        &a.profile.model
-                    },
-                    a.repository
-                        .as_deref()
-                        .map(basename)
-                        .unwrap_or_else(|| "项目文件".into())
-                )));
-            if let Some(session) = ev["session"].as_str() {
-                bar = bar.child(caption(format!("独立会话 · {session}")));
-            }
-            if let Some(session) = ev
-                .pointer("/native_session/session")
-                .and_then(Value::as_str)
-            {
-                let source = if ev
-                    .pointer("/native_session/transport")
-                    .and_then(Value::as_str)
-                    == Some("desktop")
-                {
-                    "ZCode 桌面"
-                } else {
-                    "ZCode app-server"
-                };
-                bar = bar.child(caption(format!("{source} · {session}")));
-            }
-            let expanded = self
-                .board
-                .log_view
-                .as_ref()
-                .is_some_and(|(id, _, _)| id == &a.id);
-            let current = a.id.clone();
-            bar = bar.child(
-                button(
-                    format!("workflow-inspect-{current}"),
-                    if expanded {
-                        "收起控制台"
-                    } else {
-                        "查看控制台"
-                    },
-                    expanded,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.board.log_view = if expanded {
-                        None
-                    } else {
-                        Some((current.clone(), "result.txt", 0))
-                    };
-                    cx.notify();
-                })),
-            );
-            let archive = d.clone();
-            bar = bar.child(
-                button(format!("workflow-evidence-{}", a.id), "执行档案", false)
-                    .on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&archive))),
-            );
-            if let Some(ws) = ev["workspace"].as_str() {
-                let ws = PathBuf::from(ws);
-                bar = bar.child(
-                    button(format!("workflow-files-{}", a.id), "工作区文件", false)
-                        .on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&ws))),
-                );
-            }
-            if busy(&ev) {
-                if let Some(dispatch) = self.desktop_dispatch(&d, "阶段", cx) {
-                    bar = bar.child(dispatch);
-                }
-                let id = a.id.clone();
-                let attempt = d.clone();
-                bar = bar.child(
-                    button(
-                        format!("workflow-stop-{id}"),
-                        if ev["status"] == "claimed" {
-                            "取消领取"
-                        } else {
-                            "取消执行"
-                        },
-                        false,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Err(e) = aep::handoff::cancel(&attempt) {
-                            this.board.error = Some(e.to_string());
-                        }
-                        cx.notify();
-                    })),
-                );
-            }
-            content = content.child(bar);
-            if let Some((key, name, page)) = &self.board.log_view
-                && key == &a.id
-            {
-                content = content.child(self.log_view(&d, key, name, *page, cx));
-                continue;
-            }
-            if work.current_attempt.get(&i) == Some(&a.id) {
-                let memory = ev["read_memory"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|v| format!("#{v}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                content = content.child(caption(format!(
-                    "项目记忆读取 {}   写入 {}",
-                    if memory.is_empty() { "—" } else { &memory },
-                    ev["written_memory"]
-                        .as_i64()
-                        .map_or("—".into(), |id| format!("#{id}"))
-                )));
-                let mut output = ev["error"].as_str().unwrap_or_default().to_string();
-                for name in ["result.txt", "stderr.log", "stdout.log", "supervisor.log"] {
-                    let log = workflow::tail(&d.join(name), 1800);
-                    if !log.trim().is_empty() {
-                        if !output.contains(log.trim()) {
-                            output.push('\n');
-                            output.push_str(log.trim());
-                        }
-                        break;
-                    }
-                }
-                if !output.trim().is_empty() {
-                    content = content.child(
-                        detail_text("workflow-console", output.trim())
-                            .bg(rgb(CANVAS))
-                            .p_2()
-                            .rounded_md(),
-                    );
-                }
-            }
-        }
-        content
+                &profile.model
+            },
+            work.target(i)
+                .as_deref()
+                .map(basename)
+                .unwrap_or_else(|| "项目文件".into())
+        )
     }
 }
