@@ -53,3 +53,11 @@ aep project --work "$work_id" timeline
 ```
 
 开发者可以用离屏 Studio 复验这一段。在前面的 UI debug 命令中，将 `--live-stage-relay plan.json` 换成 `--live-stage-transfer transfer.json`，使用独立的输出目录。配置包含 `repository`、`work`、`stage`（来源阶段号）、`source_run`（已通过的来源执行 ID），以及目标阶段的 `client`（例如 `Codex`）、`model` 和 `brief`。复验会保存确认回执、目标执行证据，以及重开后两端时间线的截图。
+
+## 独立验收与交付归档
+
+在「测试验证」中核对通过的测试执行并确认交接，在「独立验收」选择 Claude 和模型。可在阶段说明里指定需要核对的决策、测试命令和回执。Claude 会收到决策正文和原始测试回执的副本。在「会话与轮次」展开验收执行，可核对它的会话、记忆读取和验收报告。通过报告的末行是 `AEP: PASS`。
+
+确认将这次验收交给「交付归档」后，选择模型并启动交付执行。执行成功后点「确认交付并归档」。重开同一事项，在「会话与轮次」点「查看归档时间线」，或者在 Finder 打开归档目录查看原始回执、报告、失败尝试和交接记录。CLI 的 `project --work "$work_id" timeline` 也会列出归档。
+
+复验最终交付时，在来源为独立验收阶段的 `transfer.json` 中加入 `"finalize_delivery": true`。UI debug 会点击归档确认、重开 Studio，核对归档时间线，并在输出目录保存 `archive.json` 和截图。

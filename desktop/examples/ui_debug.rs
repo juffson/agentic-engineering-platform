@@ -241,9 +241,37 @@ impl<'a> Driver<'a> {
         self.settle()
     }
     fn reveal(&mut self, container: &str, target: &str) -> Result<()> {
-        let top = self.element(container)?.bounds().origin.y;
+        use gpui_kit::{InputEvent, ScrollDelta, ScrollEvent, point};
+        let bounds = self.element(container)?.bounds();
         let target = self.element(target)?.bounds().origin.y;
-        self.scroll(container, f32::from(top + px(120.) - target))
+        // The center can be inside a nested textarea that consumes the wheel event.
+        let position = point(bounds.origin.x + px(3.), bounds.center().y);
+        let delta = ScrollDelta::Pixels(point(px(0.), bounds.origin.y + px(120.) - target));
+        self.frame(|w, cx| {
+            w.pointer_move(position, None, cx);
+            w.dispatch_event(
+                ScrollEvent {
+                    position,
+                    delta,
+                    modifiers: w.modifiers(),
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            )
+        })?;
+        self.settle()
+    }
+    fn fill_project_field(&mut self, id: &str, label: &str, value: &str) -> Result<()> {
+        self.reveal("project-page", id)?;
+        let input = self.by_label(label)?;
+        self.click_target(input)?;
+        self.replace_focused(value)?;
+        ensure!(
+            self.by_label(label)?.value() == Some(value),
+            "字段 {label} 未更新"
+        );
+        Ok(())
     }
     fn input(&mut self, text: &str) -> Result<()> {
         self.frame(|w, cx| w.input(text, cx))?;

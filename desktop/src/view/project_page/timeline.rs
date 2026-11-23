@@ -4,6 +4,7 @@ pub(super) struct State {
     pub(super) work: String,
     pub(super) project: String,
     request: uuid::Uuid,
+    snapshot: Option<std::path::PathBuf>,
     data: Option<Result<Timeline, String>>,
     selected: Option<usize>,
 }
@@ -37,6 +38,7 @@ impl Studio {
             work: work.id.clone(),
             project: project.clone(),
             request,
+            snapshot: None,
             data: None,
             selected: None,
         });
@@ -82,12 +84,68 @@ impl Studio {
                 })),
             );
         }
-        body = body.child(links);
+        if state.snapshot.is_none() {
+            body = body.child(links);
+        }
         let history = match &state.data {
             None => return body.child(caption("正在读取执行记录…")),
             Some(Err(e)) => return body.child(t(e.clone(), AMBER)),
             Some(Ok(t)) => t,
         };
+        if state.snapshot.is_some() {
+            body = body.child(detail_text("delivery-snapshot-open", "归档时间线"));
+        }
+        for delivery in &history.deliveries {
+            let mut archive = panel()
+                .child(detail_text(
+                    SharedString::from(format!("delivery-archive-{}", delivery.run)),
+                    "交付已归档",
+                ))
+                .child(field("独立验收执行", &delivery.accepted_run))
+                .child(field("交付执行", &delivery.run))
+                .child(caption(format!(
+                    "{} 次执行 · {}",
+                    delivery.attempts, delivery.archived_at
+                )));
+            if let Some(home) = &self.board.dir {
+                let dir = delivery.directory(home);
+                let receipt = delivery.clone();
+                let home = home.clone();
+                archive = archive.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            button(
+                                format!("delivery-snapshot-{}", delivery.run),
+                                "查看归档时间线",
+                                false,
+                            )
+                            .on_click(cx.listener(
+                                move |s, _, _, cx| {
+                                    if let Some(view) = s.board.timeline.as_mut() {
+                                        view.request = uuid::Uuid::new_v4();
+                                        view.data = Some(
+                                            receipt.snapshot(&home).map_err(|e| format!("{e:#}")),
+                                        );
+                                        view.snapshot = Some(receipt.directory(&home));
+                                        view.selected = None;
+                                        cx.notify();
+                                    }
+                                },
+                            )),
+                        )
+                        .child(
+                            button(
+                                format!("delivery-files-{}", delivery.run),
+                                "在 Finder 中查看证据",
+                                false,
+                            )
+                            .on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&dir))),
+                        ),
+                );
+            }
+            body = body.child(archive);
+        }
         for e in &history.errors {
             body = body.child(t(e.clone(), AMBER));
         }
@@ -130,7 +188,17 @@ impl Studio {
                         ),
                 )
                 .child(caption(format!("{} · {}", r.run, status(&r.status).0)));
-            if r.round.is_some()
+            if let Some(dir) = &state.snapshot {
+                let folder = dir.join(aep::project::archive::run_directory(i, &r.run));
+                card = card.child(
+                    button(
+                        format!("timeline-archived-evidence-{i}"),
+                        "查看本次归档证据",
+                        false,
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&folder))),
+                );
+            } else if r.round.is_some()
                 && let Some(repo) = r.repository.clone()
             {
                 let run = r.run.clone();
@@ -164,7 +232,8 @@ impl Studio {
                         .child(caption(received.context())),
                 );
             }
-            if let Some(i_stage) = r.stage
+            if state.snapshot.is_none()
+                && let Some(i_stage) = r.stage
                 && i_stage + 1 < w.template.stages().len()
                 && w.stage <= i_stage
                 && ((r.round == Some(2)

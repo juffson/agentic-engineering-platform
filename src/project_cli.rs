@@ -422,7 +422,7 @@ fn view(work: &Work, project: &Project, dir: &Path) -> Result<Value> {
         attempts.push(json!({"id":a.id,"stage":a.stage+1,"status":e["status"],"session":e["session"],"client":a.profile.client,"model":a.profile.model,"error":e["error"]}));
     }
     Ok(
-        json!({"project":project.id,"work":work.id,"name":work.name,"template":work.template,"stage_name":work.stage_name(),"stage":(work.stage<work.notes.len()).then_some(work.stage+1),"repositories":work.repositories,"records":work.records,"https":https,"handoffs":work.handoffs,"stage_transfers":work.stage_transfers,"stages":work.template.stages().iter().enumerate().map(|(i,s)|json!({"stage":i+1,"name":s.name,"profile":work.profile(i),"attempt":work.current_attempt.get(&i)})).collect::<Vec<_>>(),"attempts":attempts}),
+        json!({"project":project.id,"work":work.id,"name":work.name,"template":work.template,"stage_name":work.stage_name(),"stage":(work.stage<work.notes.len()).then_some(work.stage+1),"repositories":work.repositories,"records":work.records,"https":https,"handoffs":work.handoffs,"stage_transfers":work.stage_transfers,"deliveries":work.deliveries,"stages":work.template.stages().iter().enumerate().map(|(i,s)|json!({"stage":i+1,"name":s.name,"profile":work.profile(i),"attempt":work.current_attempt.get(&i)})).collect::<Vec<_>>(),"attempts":attempts}),
     )
 }
 struct Catalog {

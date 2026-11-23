@@ -106,18 +106,23 @@ echo "已核对玩家验收记录，交付 frost-83。""#,
         {
             click(&mut ui, &format!("workflow-client-{client}"))?;
             if i == 1 {
-                click(&mut ui, "workflow-model")?;
-                ui.input("gpt-test")?;
+                ui.fill_project_field("workflow-model", "模型 ID · 留空使用 CLI 默认", "gpt-test")?;
                 click(&mut ui, "workflow-save-profile")?;
             }
             if i == 6 {
-                click(&mut ui, "workflow-executable")?;
-                ui.input("delivery-cli")?;
+                ui.fill_project_field(
+                    "workflow-executable",
+                    "可执行文件路径 · 默认自动查找",
+                    "delivery-cli",
+                )?;
             }
             for retry in 0..=1 {
                 if i == 2 && retry == 1 {
-                    click(&mut ui, "workflow-model")?;
-                    ui.replace_focused("team/qa-model")?;
+                    ui.fill_project_field(
+                        "workflow-model",
+                        "模型 ID · 留空使用 CLI 默认",
+                        "team/qa-model",
+                    )?;
                 }
                 click(&mut ui, "workflow-run")?;
                 let state = read(&catalog.join("projects.json"))?;

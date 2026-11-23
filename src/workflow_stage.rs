@@ -149,6 +149,37 @@ pub(crate) fn preview(
     };
     aep::handoff::packet(req, &notes, &repo_notes, None)
 }
+/// Pin the exact upstream receipt alongside the prompt for a downstream gate or delivery.
+fn source_receipt(req: &Request, stage: &Stage, dir: &Path) -> Result<Option<PathBuf>> {
+    let Some(t) = &req.stage_transfer else {
+        return Ok(None);
+    };
+    if !matches!(stage.role, Role::Accept | Role::Deliver)
+        || !req
+            .prior_runs
+            .iter()
+            .any(|(i, id)| *i == t.from && id == &t.run)
+    {
+        return Ok(None);
+    }
+    aep::workspace::ident(&t.run, 64)?;
+    let runs = dir.parent().context("找不到事项执行目录")?;
+    let raw = fs::read(runs.join(&t.run).join("evidence.json"))?;
+    let ev: Value = serde_json::from_slice(&raw)?;
+    ensure!(
+        t.to == req.stage
+            && t.from.checked_add(1) == Some(req.stage)
+            && ev["run_id"] == t.run
+            && ev["status"] == "succeeded",
+        "前序回执与已确认的交接不符"
+    );
+    let inputs = dir.join("inputs");
+    fs::create_dir_all(&inputs)?;
+    let file = inputs.join("source-evidence.json");
+    fs::write(&file, raw)?;
+    Ok(Some(file))
+}
+
 fn perform(
     req: &Request,
     stage: &Stage,
@@ -166,7 +197,15 @@ fn perform(
         id,
     )?;
     let packet = context(req, dir, &cwd, None)?;
-    let prompt = packet.text;
+    let mut prompt = packet.text;
+    let receipt = source_receipt(req, stage, dir)?;
+    if let Some(file) = &receipt {
+        prompt.push_str(&format!(
+            "\n请读取前序阶段的原始执行回执 {}，核对来源会话、结论和决策，再形成自己的结论。",
+            file.display()
+        ));
+        record["source_evidence"] = json!({"run":req.stage_transfer.as_ref().map(|t|&t.run),"file":"inputs/source-evidence.json"});
+    }
     fs::write(dir.join("prompt.txt"), &prompt)?;
     if let Some(t) = &req.stage_transfer {
         record["read_stage_transfer"] = json!(t);
@@ -215,6 +254,9 @@ fn perform(
             args.push(result_path.display().to_string());
         }
         Client::Claude => {
+            if let Some(parent) = receipt.as_ref().and_then(|p| p.parent()) {
+                args.extend(["--add-dir".into(), parent.display().to_string()]);
+            }
             args.extend(
                 [
                     "-p",

@@ -273,6 +273,20 @@ impl Project {
             }
         }
         ensure!(!note.trim().is_empty(), "请先填写阶段结论");
+        if !has_next
+            && let Some(t) = work.incoming(from)
+            && work
+                .template
+                .stages()
+                .get(t.from)
+                .is_some_and(|s| s.role == workflow::Role::Accept)
+            && let Some(run) = attempt.as_deref()
+        {
+            let receipt = super::archive::seal(home, &pid, work, run, &note)?;
+            if !work.deliveries.iter().any(|d| d.run == run) {
+                work.deliveries.push(receipt);
+            }
+        }
         if let Some(run) = attempt.filter(|_| has_next) {
             self.confirm_transfer(home, wid, from, &run)?;
         } else {

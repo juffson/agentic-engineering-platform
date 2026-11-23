@@ -6,7 +6,7 @@ use crate::{
     workspace::{Workspace, ident, read},
 };
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -15,8 +15,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Default, Serialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Timeline {
+    #[serde(default)]
+    pub deliveries: Vec<super::archive::Delivery>,
     pub work_id: String,
     pub work_name: String,
     pub stages: Vec<String>,
@@ -24,7 +26,7 @@ pub struct Timeline {
     pub stage_transfers: Vec<super::transfer::Transfer>,
     pub errors: Vec<String>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Round {
     pub record: String,
     pub run: String,
@@ -38,7 +40,7 @@ pub struct Round {
     pub read_stage_transfer: Option<super::transfer::Transfer>,
     pub agents: Vec<Agent>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Agent {
     pub role: String,
     pub client: String,
@@ -51,9 +53,9 @@ pub struct Agent {
     pub writes: Vec<Note>,
     pub handoff: String,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Note {
-    pub store: &'static str,
+    pub store: String,
     pub id: i64,
     pub kind: String,
     pub body: String,
@@ -80,7 +82,7 @@ fn notes(db: Option<&Memory>, store: &'static str, ids: &Value) -> Result<Vec<No
             Err(e) => return Err(e),
         };
         result.push(Note {
-            store,
+            store: store.into(),
             id,
             kind: text(&note, "kind").into(),
             replaces: note["replaces"].as_i64(),
@@ -266,6 +268,7 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
     ident(project, 64)?;
     ident(&work.id, 64)?;
     let mut result = Timeline {
+        deliveries: work.deliveries.clone(),
         work_id: work.id.clone(),
         stage_transfers: work.stage_transfers.clone(),
         work_name: work.name.clone(),
@@ -313,7 +316,7 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
             }) && !reads.iter().any(|n| n.store == "仓库" && n.id == id)
             {
                 reads.push(Note {
-                    store: "仓库",
+                    store: "仓库".into(),
                     id,
                     kind: "decision".into(),
                     body: t.decision.clone(),

@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod directory;
 pub mod timeline;
 pub mod transfer;
@@ -275,6 +276,8 @@ pub struct WorkHandoff {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Work {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliveries: Vec<archive::Delivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stage_transfers: Vec<transfer::Transfer>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub active_transfers: BTreeMap<usize, usize>,
@@ -508,6 +511,7 @@ impl Project {
         let id = Uuid::new_v4().simple().to_string();
         self.selected = Some(id.clone());
         let mut work = Work {
+            deliveries: vec![],
             stage_transfers: vec![],
             active_transfers: BTreeMap::new(),
             records: vec![],

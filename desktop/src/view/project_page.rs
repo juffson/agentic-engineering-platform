@@ -1279,7 +1279,16 @@ impl Studio {
             actions = actions.child(
                 primary(
                     "project-next",
-                    if viewing + 1 == stages.len() {
+                    if viewing + 1 == stages.len()
+                        && work.incoming(viewing).is_some_and(|t| {
+                            stages
+                                .get(t.from)
+                                .is_some_and(|s| s.role == StageRole::Accept)
+                        })
+                        && work.current_attempt.contains_key(&viewing)
+                    {
+                        "确认交付并归档"
+                    } else if viewing + 1 == stages.len() {
                         "确认完成交付"
                     } else if work.current_attempt.contains_key(&viewing) {
                         "确认验收并交接到下一阶段"

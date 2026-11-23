@@ -24,6 +24,8 @@ struct Plan {
     client: Client,
     model: String,
     brief: String,
+    #[serde(default)]
+    finalize_delivery: bool,
 }
 
 fn open_item(ui: &mut Driver<'_>, plan: &Plan) -> Result<()> {
@@ -54,6 +56,17 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
     };
     let dir = args.output_dir.as_ref().context("output directory")?;
     let from = plan.stage.checked_sub(1).context("stage starts at one")?;
+    if plan.finalize_delivery {
+        let work = item()?;
+        let stages = work.template.stages();
+        ensure!(
+            plan.stage.checked_add(1) == Some(stages.len())
+                && stages
+                    .last()
+                    .is_some_and(|s| s.role == aep::workflow::Role::Deliver),
+            "只能归档最后一个交付阶段"
+        );
+    }
     super::inspect(args, &ws, |ui| {
         open_item(ui, &plan)?;
         if !item()?
@@ -95,6 +108,7 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
             let path = attempt_dir(home, &p.id, &plan.work, &a.id);
             let req = read(&path.join("request.json"))?;
             if req["stage_transfer"]["run"] == plan.source_run
+                && req["profile"]["client"] == serde_json::to_value(plan.client)?
                 && req["profile"]["model"] == plan.model
                 && req["brief"] == plan.brief
             {
@@ -105,11 +119,12 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
         let id = if let Some(id) = existing {
             id
         } else {
-            click(ui, &format!("workflow-client-{:?}", plan.client))?;
-            click(ui, "workflow-model")?;
-            ui.replace_focused(&plan.model)?;
+            ui.reveal("project-page", "project-stage-note")?;
             click(ui, "project-stage-note")?;
             ui.replace_focused(&plan.brief)?;
+            click(ui, &format!("workflow-client-{:?}", plan.client))?;
+            ui.fill_project_field("workflow-model", "模型 ID · 留空使用 CLI 默认", &plan.model)?;
+            ui.reveal("project-page", "workflow-run")?;
             click(ui, "workflow-run")?;
             item()?
                 .current_attempt
@@ -177,6 +192,61 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
             dir.join("timeline.json"),
             serde_json::to_vec_pretty(&history)?,
         )?;
+        if plan.finalize_delivery {
+            if item()?.stage == from + 1 {
+                *ui = Driver::open(&ws, ui.args)?;
+                open_item(ui, &plan)?;
+                click(ui, &format!("project-stage-{}", from + 1))?;
+                ensure!(
+                    ui.element("project-next")?.label() == Some("确认交付并归档"),
+                    "缺少归档确认"
+                );
+                ui.reveal("project-page", "project-next")?;
+                ui.checkpoint("delivery-confirmation")?;
+                click(ui, "project-next")?;
+            }
+            let closed = item()?;
+            ensure!(
+                closed.stage == closed.template.stages().len(),
+                "事项尚未交付"
+            );
+            let receipt = closed
+                .deliveries
+                .iter()
+                .find(|d| d.run == id && d.accepted_run == plan.source_run)
+                .context("交付归档未关联到验收")?;
+            *ui = Driver::open(&ws, ui.args)?;
+            open_item(ui, &plan)?;
+            click(ui, "work-timeline-tab")?;
+            let button = format!("delivery-snapshot-{}", id);
+            until(ui, "归档索引", 30, |ui| {
+                Ok((!ui.absent(&button)?).then_some(()))
+            })?;
+            click(ui, &button)?;
+            let marker = "delivery-snapshot-open";
+            ensure!(!ui.absent(marker)?, "无法打开已归档的时间线");
+            ui.reveal("project-page", marker)?;
+            ui.checkpoint("reopened-delivery-archive")?;
+            let snapshot = receipt.snapshot(home)?;
+            ensure!(
+                snapshot.rounds.len() == history.rounds.len()
+                    && snapshot.stage_transfers == history.stage_transfers,
+                "重开后的归档缺少历史记录"
+            );
+            for (i, row) in snapshot.rounds.iter().enumerate() {
+                ensure!(
+                    !ui.absent(&format!("timeline-title-{i}"))?,
+                    "归档未显示执行 {}",
+                    row.run
+                );
+            }
+            fs::write(
+                dir.join("archive.json"),
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"directory":receipt.directory(home),"receipt":receipt}),
+                )?,
+            )?;
+        }
         Ok(())
     })
 }
