@@ -116,19 +116,36 @@ pub(super) fn exchange(root: &Path, request: &Value) -> Result<Value> {
             }
             _ => "",
         };
-        bail!("ZCode 扩展请求失败（{}）：{error}{hint}", reply["code"]);
+        let message = format!("ZCode 扩展请求失败（{}）：{error}{hint}", reply["code"]);
+        if matches!(
+            reply["code"].as_str(),
+            Some("invalid-input" | "not-granted" | "forbidden")
+        ) {
+            return Err(anyhow::Error::new(DispatchRejected).context(message));
+        }
+        bail!(message);
     }
     Ok(reply)
 }
 
+#[derive(Debug)]
+struct DispatchRejected;
+impl std::fmt::Display for DispatchRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("派发已被 ZCode 拒绝")
+    }
+}
+impl std::error::Error for DispatchRejected {}
+
 fn create_session(root: &Path, request: &Value) -> Result<Value> {
     let reply = exchange(root, request)?;
     let id = &request["requestId"];
-    ensure!(
-        reply["creation"] != "rejected" && reply["firstInput"] != "rejected",
-        "ZCode 拒绝创建任务或发送首条消息：{}",
-        reply["reason"]
-    );
+    if reply["creation"] == "rejected" || reply["firstInput"] == "rejected" {
+        return Err(anyhow::Error::new(DispatchRejected).context(format!(
+            "ZCode 拒绝创建任务或发送首条消息：{}",
+            reply["reason"]
+        )));
+    }
     let session = &reply["session"];
     ensure!(
         &reply["requestId"] == id
@@ -181,7 +198,22 @@ fn session_action(receipt: &Value, action: &str) -> Result<Value> {
 
 pub fn open_task(dir: &Path) -> Result<Value> {
     let receipt = aep::workspace::read(&dir.join("desktop-create.json"))?;
-    let reply = session_action(&receipt, "open")?;
+    let mut reply = session_action(&receipt, "open")?;
+    if reply["reason"] == "project.task-not-found" && dir.join("desktop-cleanup.json").is_file() {
+        // Focusing the desktop refreshes its sidebar projection after a background move.
+        let status = Command::new("/usr/bin/open")
+            .args(["-a", "/Applications/ZCode.app"])
+            .status()?;
+        if status.success() {
+            for _ in 0..3 {
+                thread::sleep(Duration::from_millis(350));
+                reply = session_action(&receipt, "open")?;
+                if reply["reason"] != "project.task-not-found" {
+                    break;
+                }
+            }
+        }
+    }
     ensure!(
         reply["status"] == "opened",
         "ZCode 无法打开该任务：{}",
@@ -227,6 +259,7 @@ pub fn dispatch(
     dir: &Path,
     job: &Value,
     since: i64,
+    repository: Option<&Path>,
 ) -> Result<(String, String)> {
     let workspace = job["workspace"].as_str().context("缺少工作区")?;
     let prompt = job["dispatch"].as_str().context("缺少派发文本")?;
@@ -244,7 +277,21 @@ pub fn dispatch(
     let reply = if receipt.try_exists()? {
         aep::workspace::read(&receipt)?
     } else {
-        let project = local_project(index, workspace)?;
+        let source = repository
+            .map(|repo| crate::zcode_group::staging::prepare(dir, job, repo))
+            .transpose()?
+            .flatten();
+        let project = match source {
+            Some(id) => {
+                // Wake the extension host without opening a folder or reserving a draft.
+                let status = Command::new("/usr/bin/open")
+                    .args(["-g", "-a", "/Applications/ZCode.app"])
+                    .status()?;
+                ensure!(status.success(), "无法启动 ZCode 桌面扩展");
+                id
+            }
+            None => local_project(index, workspace)?,
+        };
         let model = &job["model"];
         let root = std::env::home_dir()
             .context("缺少用户目录")?
@@ -253,7 +300,23 @@ pub fn dispatch(
             &root,
             &json!({"requestId":job["requestId"],"projectId":project,
             "providerId":model["providerId"],"modelId":model["modelId"],"prompt":prompt}),
-        )?;
+        )
+        .inspect_err(|err| {
+            if err.is::<DispatchRejected>()
+                && let Some(repo) = repository
+                && dir.join("desktop-source-project.json").is_file()
+            {
+                let saved = aep::project::save_json(
+                    dir,
+                    "desktop-declined.json",
+                    &json!({"requestId":job["requestId"],"project":project}),
+                );
+                if let Err(e) = saved.and_then(|()| crate::zcode_group::staging::cleanup(dir, repo))
+                {
+                    eprintln!("ZCode 空项目清理失败：{e:#}");
+                }
+            }
+        })?;
         aep::project::save_json(dir, "desktop-create.json", &reply)?;
         reply
     };

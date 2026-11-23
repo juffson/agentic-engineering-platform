@@ -13,6 +13,8 @@ use std::{
     time::Duration,
 };
 
+pub mod staging;
+
 fn index() -> Result<Connection> {
     let file = std::env::home_dir()
         .context("missing home")?
@@ -20,6 +22,14 @@ fn index() -> Result<Connection> {
     let db = Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     db.busy_timeout(Duration::from_secs(5))?;
     Ok(db)
+}
+
+fn schema_supported(tx: &Connection) -> Result<()> {
+    let supported: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM schema_migration WHERE id='0010_task_worktree_root'
+            AND checksum='3aecdd4658f4672147d1e757b6a401bb986daf6590838a8072cb3409a4395d79') AND NOT EXISTS
+            (SELECT 1 FROM schema_migration WHERE id > '0010_task_worktree_root')", [], |r| r.get(0))?;
+    ensure!(supported, "当前 ZCode 项目索引版本尚未验证");
+    Ok(())
 }
 
 fn assign(db: &mut Connection, dir: &Path, repository: &str) -> Result<Value> {
@@ -59,10 +69,7 @@ fn assign(db: &mut Connection, dir: &Path, repository: &str) -> Result<Value> {
         );
         // AEP's automatic source project has only its isolated directory. Never
         // widen execution access by inheriting the destination project's roots.
-        let supported: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM schema_migration WHERE id='0010_task_worktree_root'
-            AND checksum='3aecdd4658f4672147d1e757b6a401bb986daf6590838a8072cb3409a4395d79') AND NOT EXISTS
-            (SELECT 1 FROM schema_migration WHERE id > '0010_task_worktree_root')", [], |r| r.get(0))?;
-        ensure!(supported, "当前 ZCode 项目索引版本尚未验证");
+        schema_supported(&tx)?;
         let count = tx.execute("UPDATE tasks SET project_id=?1, handoff_pending=handoff_pending | 8,
             execution_directories=coalesce(execution_directories,'[]')
             WHERE task_id=?2 AND project_id=?3 AND workspace_path=?4 AND root_path=?4 AND worktree_root IS NULL
@@ -96,6 +103,7 @@ pub fn group(dir: &Path, repository: &Path) -> Result<Value> {
     }) {
         aep::project::save_json(dir, "desktop-group.json", &result)?;
     }
+    staging::cleanup(dir, repository)?;
     Ok(result)
 }
 
@@ -147,6 +155,14 @@ pub fn sync(repo: &Path, verify: bool) -> Result<Vec<Value>> {
         if dir.join("desktop-task.json").try_exists()? {
             outcomes
                 .push(group(&dir, &ws.root).with_context(|| format!("归组 {}", dir.display()))?);
+        } else if dir.join("desktop-declined.json").is_file() {
+            // A retry of this request may already be in flight.
+            let lock = fs::File::open(dir.join("desktop-dispatch.lock"))?;
+            match lock.try_lock() {
+                Ok(()) => staging::cleanup(&dir, &ws.root)?,
+                Err(std::fs::TryLockError::WouldBlock) => (),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            }
         }
     }
     if verify && let Some(first) = outcomes.first() {

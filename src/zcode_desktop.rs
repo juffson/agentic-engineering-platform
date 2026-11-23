@@ -235,6 +235,7 @@ pub fn converse(
         dir,
         &job,
         job["since"].as_i64().unwrap_or(0),
+        repository,
     )?;
     save_json(
         dir,

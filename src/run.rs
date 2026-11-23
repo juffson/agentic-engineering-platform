@@ -508,12 +508,22 @@ pub fn execute(
             record["candidate_sha"].as_str().unwrap_or("?")
         );
     }
+    let desktop_workspace = result.is_ok()
+        && attached
+        && read(&folder.join("zcode-edit/session.json"))
+            .ok()
+            .filter(|r| r["transport"] == "desktop")
+            .and_then(|r| r["workspace"].as_str().map(PathBuf::from))
+            .is_some_and(|path| work.canonicalize().is_ok_and(|work| work == path));
+    if desktop_workspace {
+        record["retained_desktop_worktree"] = json!(work);
+    }
     record["finished_at"] = json!(Utc::now().to_rfc3339());
     save(&folder, &record)?;
     drop(terminal);
     let cleanup = if !attached {
         fs::remove_dir(&work).map_err(anyhow::Error::from)
-    } else if result.is_ok() {
+    } else if result.is_ok() && !desktop_workspace {
         git(
             &repo.root,
             &["worktree", "remove", "--force", work.to_str().unwrap()],
