@@ -217,7 +217,15 @@ mod tests {
         assert!(running(dir.path())?);
         assert!(launch_lock(dir.path())?.try_lock().is_err());
         drop(owner);
-        assert!(!running(dir.path())?);
+        // A test forking in parallel can briefly hold a copy of the descriptor until it execs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while running(dir.path())? {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launch lock stayed held"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         Ok(())
     }
     #[test]

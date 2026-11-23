@@ -836,7 +836,18 @@ mod tests {
             binary: Some("/usr/bin/true".into()),
             ..Default::default()
         };
-        let lease = Lease::acquire(&ws, "relay-stage")?.unwrap();
+        // A test forking in parallel can briefly hold a copy of the lease until it execs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let lease = loop {
+            if let Some(lease) = Lease::acquire(&ws, "relay-stage")? {
+                break lease;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "relay lease stayed held"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         lease.advance(&ws, &runner, Round::First, None, plan.first)?;
         assert_eq!(commit(repo, "refs/aep/relays/relay-stage/spec")?, task.sha);
         assert!(lease.has_attempt("relay-stage-r1-1")?);
