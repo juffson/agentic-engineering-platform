@@ -11,7 +11,7 @@ required-features = ["control"]
 
 [features]
 default = ["control"]
-control = ["dep:axum", "dep:reqwest", "dep:sha2", "dep:subtle", "dep:tokio"]
+control = ["dep:axum", "dep:reqwest", "dep:subtle", "dep:tokio"]
 
 [dependencies]
 anyhow = "1"
@@ -25,7 +25,7 @@ regex = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = { version = "0.10", optional = true }
+sha2 = "0.10"
 subtle = { version = "2", optional = true }
 tempfile = "3"
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net"] }

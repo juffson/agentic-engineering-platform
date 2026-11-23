@@ -21,6 +21,10 @@ pub struct Delivery {
     pub accepted_run: String,
     pub archived_at: String,
     pub attempts: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<super::merge::MergeReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_history: Vec<super::merge::AbandonedIntent>,
 }
 impl Delivery {
     pub fn snapshot(&self, home: &Path) -> Result<timeline::Timeline> {
@@ -31,13 +35,30 @@ impl Delivery {
         let manifest = read(&directory.join("manifest.json"))?;
         let snapshot: timeline::Timeline =
             serde_json::from_reader(fs::File::open(directory.join("timeline.json"))?)?;
+        let mut original = self.clone();
+        original.merge = None;
+        original.merge_history.clear();
         ensure!(
-            manifest["delivery"] == serde_json::to_value(self)?
+            manifest["delivery"] == serde_json::to_value(&original)?
                 && snapshot.work_id == self.work
                 && snapshot.rounds.len() == self.attempts
-                && snapshot.deliveries.contains(self),
+                && snapshot.deliveries.contains(&original),
             "归档索引和事项不匹配"
         );
+        let mut snapshot = snapshot;
+        for delivery in &mut snapshot.deliveries {
+            if delivery.run == self.run {
+                delivery.merge = super::merge::receipt(home, self)?.or(self.merge.clone());
+                delivery.merge_history = self.merge_history.clone();
+            }
+        }
+        snapshot.merge_events = snapshot
+            .deliveries
+            .iter()
+            .filter_map(|d| d.merge.as_ref())
+            .filter(|r| r.status == super::merge::MergeStatus::Merged)
+            .cloned()
+            .collect();
         Ok(snapshot)
     }
     pub fn directory(&self, home: &Path) -> PathBuf {
@@ -139,6 +160,8 @@ pub(super) fn seal(
         accepted_run: accepted.run.clone(),
         archived_at: chrono::Utc::now().to_rfc3339(),
         attempts: history.rounds.len(),
+        merge: None,
+        merge_history: vec![],
     };
     let target = receipt.directory(home);
     if target.try_exists()? {

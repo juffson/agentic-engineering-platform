@@ -227,6 +227,22 @@ impl Studio {
         let mut view = v_flex()
             .gap_3()
             .child(heading(format!("{} · 开发全流程", work.name)));
+        for delivery in &work.deliveries {
+            if let Some(r) = delivery
+                .merge
+                .as_ref()
+                .filter(|r| r.status == aep::project::merge::MergeStatus::Merged)
+            {
+                view = view.child(field(
+                    "本地合并",
+                    &format!(
+                        "已合并到 {} · {}",
+                        r.target_branch,
+                        r.merged_sha.as_deref().unwrap_or_default()
+                    ),
+                ));
+            }
+        }
         if s.jobs.len() > 1 {
             let mut history = h_flex().gap_2().flex_wrap();
             for (i, path) in s.jobs.iter().enumerate() {

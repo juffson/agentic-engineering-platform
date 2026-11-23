@@ -25,6 +25,8 @@ mod stage_relay;
 mod stage_transfer;
 #[path = "support/work_delivery.rs"]
 mod work_delivery;
+#[path = "support/work_merge.rs"]
+mod work_merge;
 #[path = "support/workflows.rs"]
 mod workflows;
 #[path = "support/zcode_history.rs"]
@@ -63,6 +65,7 @@ enum LiveKeyStep {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Scenario {
+    WorkMerge,
     Project,
     Workflows,
     History,
@@ -1558,10 +1561,12 @@ fn main() -> Result<()> {
                 Scenario::Local,
                 Scenario::Project,
                 Scenario::Workflows,
+                Scenario::WorkMerge,
             ],
         };
         for scenario in scenarios {
             match scenario {
+                Scenario::WorkMerge => work_merge::run(&args)?,
                 Scenario::History => with_fixture(&args, history)?,
                 Scenario::Conflict => with_fixture(&args, |ui, ws, _| conflict(ui, ws))?,
                 Scenario::Handoff => relay(&args, Clients::Fixture, None)?,
