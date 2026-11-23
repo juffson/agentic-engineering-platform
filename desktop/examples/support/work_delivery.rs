@@ -91,6 +91,26 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
             "启动计划不符"
         );
         let output = dir.join("output");
+        if let Some(expected) = &args.retry_failure {
+            let failure = read(&output.join("failure.json"))?;
+            ensure!(
+                failure["run"]
+                    .as_str()
+                    .or_else(|| failure["phase"].as_str())
+                    == Some(expected.as_str()),
+                "要重试的执行与失败回执不符"
+            );
+            let reason = failure["reason"].as_str().context("失败原因")?;
+            ensure!(
+                ui.element("delivery-failure-reason")?.label() == Some(reason),
+                "重开后未显示原失败原因"
+            );
+            ui.reveal("project-page", "delivery-failed-step")?;
+            ui.checkpoint("reopened-failed-step")?;
+            ui.reveal("project-page", "delivery-resume")?;
+            ui.checkpoint("retry-failed-step")?;
+            click(ui, "delivery-resume")?;
+        }
         for (phase, kind) in [
             ("relay", "decision"),
             ("test", "transfer"),

@@ -27,6 +27,8 @@ struct Plan {
     #[serde(default)]
     finalize_delivery: bool,
     #[serde(default)]
+    require_test_citation: bool,
+    #[serde(default)]
     operator_gates: bool,
 }
 
@@ -113,34 +115,40 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
             transfer.run == plan.source_run && transfer.work == plan.work && transfer.from == from,
             "wrong confirmation"
         );
-        fs::write(
-            dir.join("confirmed.json"),
-            serde_json::to_vec_pretty(&transfer)?,
-        )?;
-        *ui = Driver::open(&ws, ui.args)?;
-        open_item(ui, &plan)?;
-        click(ui, &format!("project-stage-{}", from + 1))?;
-        let mut existing = None;
-        for a in item()?
-            .attempts
-            .iter()
-            .rev()
-            .filter(|a| a.stage == from + 1)
-        {
-            let path = attempt_dir(home, &p.id, &plan.work, &a.id);
-            let req = read(&path.join("request.json"))?;
-            if req["stage_transfer"]["run"] == plan.source_run
-                && req["profile"]["client"] == serde_json::to_value(plan.client)?
-                && req["profile"]["model"] == plan.model
-                && req["brief"] == plan.brief
-            {
-                existing = Some(a.id.clone());
-                break;
-            }
-        }
-        let id = if let Some(id) = existing {
-            id
+        if dir.join("confirmed.json").try_exists()? {
+            ensure!(
+                read(&dir.join("confirmed.json"))? == serde_json::to_value(&transfer)?,
+                "原交接确认已改变，请核对来源执行"
+            );
         } else {
+            aep::project::save_json(dir, "confirmed.json", &transfer)?;
+        }
+        let mut dispatch = || -> Result<Option<String>> {
+            *ui = Driver::open(&ws, ui.args)?;
+            open_item(ui, &plan)?;
+            click(ui, &format!("project-stage-{}", from + 1))?;
+            let latest = item()?;
+            ensure!(
+                latest.incoming(from + 1) == Some(&transfer),
+                "目标阶段的交接已改变"
+            );
+            let mut existing = None;
+            for a in latest.attempts.iter().rev().filter(|a| a.stage == from + 1) {
+                let path = attempt_dir(home, &p.id, &plan.work, &a.id);
+                let req = read(&path.join("request.json"))?;
+                if req["stage_transfer"]["run"] == plan.source_run
+                    && req["profile"]["client"] == serde_json::to_value(plan.client)?
+                    && req["profile"]["model"] == plan.model
+                    && req["brief"] == plan.brief
+                {
+                    existing = Some(a.id.clone());
+                    break;
+                }
+            }
+            if let Some(id) = existing.filter(|id| Some(id) != args.retry_attempt.as_ref()) {
+                return Ok(Some(id));
+            }
+            ensure!(latest.stage == from + 1, "事项已切换阶段，不能重新派发");
             ui.reveal("project-page", "project-stage-note")?;
             click(ui, "project-stage-note")?;
             ui.replace_focused(&plan.brief)?;
@@ -148,18 +156,71 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
             ui.fill_project_field("workflow-model", "模型 ID · 留空使用 CLI 默认", &plan.model)?;
             ui.reveal("project-page", "workflow-run")?;
             click(ui, "workflow-run")?;
-            item()?
+            if !ui.absent("project-error")? {
+                let message = ui
+                    .element("project-error")?
+                    .label()
+                    .unwrap_or("阶段启动失败")
+                    .to_owned();
+                if message.contains("另一窗口更新") {
+                    return Ok(None);
+                }
+                anyhow::bail!("{message}");
+            }
+            let next = item()?
                 .current_attempt
                 .get(&(from + 1))
                 .cloned()
-                .context("new stage not started")?
+                .context("未启动新的阶段执行，请查看事项执行记录")?;
+            ensure!(
+                Some(&next) != args.retry_attempt.as_ref(),
+                "未启动重试，请查看事项执行记录"
+            );
+            Ok(Some(next))
         };
+        let mut started = None;
+        for _ in 0..3 {
+            started = dispatch()?;
+            if started.is_some() {
+                break;
+            }
+        }
+        let id = started.context("项目库持续被其他窗口修改，请重试此阶段")?;
         let path = attempt_dir(home, &p.id, &plan.work, &id);
         let ev = until(ui, "destination stage", 930, |_| {
-            let ev = read(&path.join("evidence.json")).unwrap_or_default();
-            Ok(ev["finished_at"].is_string().then_some(ev))
+            let ev = aep::workflow::evidence(&path)?;
+            Ok((ev["finished_at"].is_string()
+                || matches!(
+                    ev["status"].as_str(),
+                    Some("failed" | "blocked" | "cancelled" | "unstarted" | "needs_reconciliation")
+                ))
+            .then_some(ev))
         })?;
-        ensure!(ev["status"] == "succeeded", "stage {}: {}", id, ev["error"]);
+        let stage = if plan.finalize_delivery {
+            "deliver"
+        } else if plan.require_test_citation {
+            "accept"
+        } else {
+            "test"
+        };
+        if ev["status"] != "succeeded" {
+            let report = aep::workflow::tail(&path.join("result.txt"), 3000);
+            let error = ev["error"]
+                .as_str()
+                .or_else(|| ev["status"].as_str())
+                .unwrap_or("阶段执行未通过");
+            return super::stage_lifecycle::failed_attempt(
+                dir,
+                stage,
+                &id,
+                &format!("{error}\n{report}"),
+            );
+        }
+        if plan.require_test_citation
+            && let Err(e) = super::stage_lifecycle::acceptance_cites(&path, &plan.source_run)
+        {
+            return super::stage_lifecycle::failed_attempt(dir, stage, &id, &e.to_string());
+        }
         ensure!(
             ev["read_stage_transfer"] == serde_json::to_value(&transfer)?
                 && ev["profile"]["model"] == plan.model,

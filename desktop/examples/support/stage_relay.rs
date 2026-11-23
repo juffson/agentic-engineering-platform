@@ -152,13 +152,38 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
             Ok((!ui.absent(&id)?).then_some(()))
         })?;
         press(ui, "relay-list", &id)?;
-        if let Some(attempt) = state["attempts"].as_array().and_then(|a| a.last())
-            && attempt["round"] == "First"
-            && let Some(failed) = attempt["id"]
-                .as_str()
-                .and_then(|id| status(&ws.data, id).ok())
-            && failed["status"] == "failed"
-            && failed["request"]["codex_model"] != plan.first.implementation_model
+        if let Some(retry) = &args.retry_attempt
+            && let Some(last) = state["attempts"].as_array().and_then(|a| a.last())
+            && last["id"] == *retry
+        {
+            let control = if last["round"] == "First" {
+                "retry-relay-first".to_owned()
+            } else {
+                format!(
+                    "relay-continue-{}",
+                    last["decision"].as_i64().context("已确认的第二轮决策")?
+                )
+            };
+            until(ui, "原接力重试入口", 30, |ui| {
+                Ok((!ui.absent(&control)?).then_some(()))
+            })?;
+            press(ui, "relay-detail", &control)?;
+            until(ui, "新的接力尝试", 30, |_| {
+                Ok(read(&saved)?["attempts"]
+                    .as_array()
+                    .and_then(|a| a.last())
+                    .is_some_and(|a| a["id"] != *retry)
+                    .then_some(()))
+            })?;
+        }
+        // The standalone relay driver also permits correcting a bad first-round model.
+        if !args.restore_work_window
+            && args.retry_attempt.is_none()
+            && let Some(last) = state["attempts"].as_array().and_then(|a| a.last())
+            && last["round"] == "First"
+            && let Some(ev) = last["id"].as_str().and_then(|id| status(&ws.data, id).ok())
+            && ev["status"] == "failed"
+            && ev["request"]["codex_model"] != plan.first.implementation_model
         {
             models(ui, &plan.first)?;
             press(ui, "relay-detail", "retry-relay-first")?;
@@ -180,20 +205,28 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
                 else {
                     return Ok(None);
                 };
-                ensure!(
-                    attempt["diagnostics"].is_null(),
-                    "{name}: {}",
-                    attempt["diagnostics"]
-                );
-                let Some(run) = attempt["id"]
-                    .as_str()
-                    .and_then(|id| status(&ws.data, id).ok())
-                else {
-                    return Ok(None);
-                };
+                let run_id = attempt["id"].as_str().context("接力执行 ID")?;
+                let run = status(&ws.data, run_id).unwrap_or_default();
+                if (run["status"].is_null() || run["status"] == "unstarted")
+                    && let Ok(lock) = fs::File::open(folder.join(&id).join("owner.lock"))
+                    && lock.try_lock_shared().is_ok()
+                {
+                    let msg =
+                        aep::workflow::tail(&folder.join(&id).join(format!("{run_id}.log")), 2500);
+                    return super::stage_lifecycle::failed_attempt(
+                        out,
+                        name,
+                        run_id,
+                        &format!("执行未启动 {msg}"),
+                    );
+                }
                 match run["status"].as_str() {
-                    Some("failed" | "cancelled" | "blocked") => {
-                        anyhow::bail!("{name}: {}", run["error"])
+                    Some("failed" | "cancelled" | "blocked" | "needs_reconciliation") => {
+                        let reason = run["error"]
+                            .as_str()
+                            .or_else(|| run["status"].as_str())
+                            .unwrap_or("接力失败");
+                        super::stage_lifecycle::failed_attempt(out, name, run_id, reason)
                     }
                     Some("awaiting_human_review") => Ok(Some(run)),
                     _ => Ok(None),

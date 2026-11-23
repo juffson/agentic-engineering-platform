@@ -428,8 +428,23 @@ impl Studio {
             .iter()
             .find(|k| output.join(k).join("input.json").is_file())
             .copied();
+        let failure = read(&output.join("failure.json")).ok();
+        let failed_stage = failure.as_ref().and_then(|f| f["stage"].as_str());
+        let stage_title = match failed_stage {
+            Some("first") => "第一轮实现与审查",
+            Some("second") => "第二轮实现与审查",
+            Some("relay") => "开发接力",
+            Some("test") => "测试验证",
+            Some("accept") => "独立验收",
+            Some("deliver") => "交付归档",
+            _ => "归档核验",
+        };
+        let audit_failed = verified.as_ref().is_some_and(|v| v["verified"] == false);
+        let failed = !done && !live && (failure.is_some() || audit_failed);
         let status = if done {
             "核验通过"
+        } else if failed {
+            "执行失败"
         } else if !live {
             "已停止 · 可继续"
         } else if gate.is_some() {
@@ -492,6 +507,8 @@ impl Studio {
                 && (title != "第二轮" || output.join("relay/first-run.json").is_file());
             let (state, tone) = if complete {
                 ("已完成", MINT)
+            } else if current && failed {
+                ("失败", RED)
             } else if current && live {
                 ("进行中", BLUE)
             } else if current {
@@ -536,10 +553,31 @@ impl Studio {
                     )),
                 );
         }
+        if failed {
+            let reason = failure
+                .as_ref()
+                .and_then(|f| f["reason"].as_str())
+                .or_else(|| verified.as_ref().and_then(|v| v["error"].as_str()))
+                .unwrap_or("请查看执行日志");
+            summary = summary
+                .child(detail_text("delivery-failed-step", stage_title))
+                .child(detail_text("delivery-failure-reason", reason).text_color(rgb(RED)));
+            if let Some(run) = failure.as_ref().and_then(|f| f["run"].as_str()) {
+                summary = summary.child(field("失败执行", run));
+            }
+        }
         if !live && !done && s.jobs.first().is_some_and(|p| p == dir) {
             summary = summary.child(
-                button("delivery-resume", "继续原流程", true)
-                    .on_click(cx.listener(|s, _, _, cx| s.launch_delivery(true, cx))),
+                button(
+                    "delivery-resume",
+                    if failed {
+                        format!("从{stage_title}重试")
+                    } else {
+                        "继续原流程".into()
+                    },
+                    true,
+                )
+                .on_click(cx.listener(|s, _, _, cx| s.launch_delivery(true, cx))),
             );
         }
         if let Some(v) = &verified {
@@ -547,9 +585,10 @@ impl Studio {
                 summary = summary.child(detail_text(
                     "delivery-result",
                     &format!(
-                        "决策 #{} · {} 次执行 · {} 份证据 · {} 张截图",
+                        "决策 #{} · {} 个通过回执 · {} 次失败尝试 · {} 份证据 · {} 张截图",
                         v["decision"],
                         v["runs"].as_array().map_or(0, Vec::len),
+                        v["failed_attempts"].as_array().map_or(0, Vec::len),
                         v["checked_artifacts"],
                         v["screenshots"].as_array().map_or(0, Vec::len)
                     ),
@@ -570,6 +609,17 @@ impl Studio {
                 ("核验报告".to_owned(), "verified.json".to_owned()),
                 ("归档清单".into(), "evidence/manifest.json".into()),
             ];
+            for path in v["failed_attempts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                links.push((
+                    format!("失败原因 · {}", path.trim_end_matches(".json")),
+                    path.to_owned(),
+                ));
+            }
             if let Some(man) = manifest
                 && let Some(rows) = man["runs"].as_array()
             {

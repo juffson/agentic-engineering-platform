@@ -98,6 +98,12 @@ struct Args {
     screenshots: bool,
     #[arg(long, hide = true, requires = "output_dir")]
     restore_work_window: bool,
+    /// Only replace the recorded failed attempt when it is still the latest.
+    #[arg(long, hide = true, requires = "output_dir")]
+    retry_attempt: Option<String>,
+    /// Reopen the failed item, verify the failed run ID (or phase for a dispatch failure), then press its retry button.
+    #[arg(long, requires = "live_work_delivery")]
+    retry_failure: Option<String>,
     /// Drive the operator window for a real Studio-launched item delivery.
     #[arg(long,requires="output_dir",conflicts_with_all=["scenario","script","repo"])]
     live_work_delivery: Option<PathBuf>,

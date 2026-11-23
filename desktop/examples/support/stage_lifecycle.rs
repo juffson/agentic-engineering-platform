@@ -55,20 +55,94 @@ pub(super) fn wait_for_operator(
     Ok(())
 }
 
+/// Remember exactly which attempt can be replaced. A restarted driver attaches to a
+/// newer attempt if the previous process stopped just after dispatching it.
+pub(super) fn failed_attempt<T>(dir: &Path, stage: &str, run: &str, reason: &str) -> Result<T> {
+    let failure = json!({"stage":stage,"run":run,"reason":reason});
+    ident(run, 64)?;
+    save_json(dir, "attempt-error.json", &failure)?;
+    anyhow::bail!("{reason}")
+}
+
+fn retain_failure(dir: &Path, failure: &Value) -> Result<()> {
+    let Some(run) = failure["run"].as_str() else {
+        return Ok(());
+    };
+    ident(run, 64)?;
+    save_json(dir, &format!("failed-{run}.json"), failure)?;
+    for ext in ["json", "png"] {
+        let src = dir.join(format!("failure.{ext}"));
+        let dst = dir.join(format!("attempt-{run}.{ext}"));
+        if src.is_file() && !dst.try_exists()? {
+            fs::copy(src, dst)?;
+        }
+    }
+    Ok(())
+}
+
 fn step(out: &Path, name: &str, flag: &str, plan: &Value) -> Result<PathBuf> {
     let dir = out.join(name);
     fs::create_dir_all(&dir)?;
+    if dir.join("completed.json").try_exists()? {
+        ensure!(
+            read(&dir.join("completed.json"))? == *plan,
+            "已完成阶段与本次输入不符 {name}"
+        );
+        return Ok(dir);
+    }
     save_json(&dir, "input.json", plan)?;
     println!("Studio · {name} · {}", dir.display());
-    let status = Command::new(std::env::current_exe()?)
+    let mut child = Command::new(std::env::current_exe()?);
+    let prior = read(&out.join("failure.json")).ok();
+    if let Some(failure) = prior.as_ref().filter(|f| f["phase"] == name) {
+        retain_failure(&dir, failure)?;
+        if let Some(run) = failure["run"].as_str() {
+            child.arg("--retry-attempt").arg(run);
+        }
+    }
+    let diagnostic = dir.join("attempt-error.json");
+    if diagnostic.try_exists()? {
+        fs::remove_file(&diagnostic)?;
+    }
+    let stderr = dir.join("driver.stderr");
+    let status = child
         .arg("--restore-work-window")
         .arg(flag)
         .arg(dir.join("input.json"))
         .arg("--output-dir")
         .arg(&dir)
         .arg("--screenshots")
-        .status()?;
-    ensure!(status.success(), "{name} 中断，可在同一输出目录继续");
+        .stderr(fs::File::create(&stderr)?)
+        .status();
+    if !status.as_ref().is_ok_and(|s| s.success()) {
+        let mut failure = read(&diagnostic).unwrap_or_else(|_| {
+            let message = aep::workflow::tail(&stderr, 4000);
+            let reason = match status {
+                Err(e) => format!("无法启动阶段执行器：{e}"),
+                Ok(exit) if message.trim().is_empty() => format!("执行器退出 {exit}"),
+                Ok(_) => message,
+            };
+            let stage = if name == "relay" && !dir.join("first-run.json").is_file() {
+                "first"
+            } else if name == "relay" && !dir.join("second-run.json").is_file() {
+                "second"
+            } else {
+                name
+            };
+            json!({"stage":stage, "reason":reason})
+        });
+        failure["phase"] = json!(name);
+        save_json(out, "failure.json", &failure)?;
+        retain_failure(&dir, &failure)?;
+        anyhow::bail!(
+            "{name} · {}",
+            failure["reason"].as_str().unwrap_or("执行失败")
+        );
+    }
+    save_json(&dir, "completed.json", plan)?;
+    if prior.is_some_and(|f| f["phase"] == name) {
+        fs::remove_file(out.join("failure.json"))?;
+    }
     Ok(dir)
 }
 
@@ -181,27 +255,17 @@ pub(super) fn run(args: &Args, path: &Path) -> Result<()> {
     .enumerate()
     {
         let next = json!({"repository":ws.root,"work":plan.work,"stage":plan.stage+i,"source_run":source,
-            "client":p.client,"model":p.model,"brief":p.brief,"finalize_delivery":name=="deliver","operator_gates":!args.rehearse});
+            "client":p.client,"model":p.model,"brief":p.brief,"require_test_citation":name=="accept","finalize_delivery":name=="deliver","operator_gates":!args.rehearse});
         let dir = step(&out, name, "--live-stage-transfer", &next)?;
-        let previous = source.clone();
         source = read(&dir.join("destination.json"))?["run_id"]
             .as_str()
             .context("目标执行")?
             .to_owned();
-        if name == "accept" {
-            let path = aep::workflow::attempt_dir(
-                &catalog.home,
-                config["project"].as_str().context("项目 ID")?,
-                &plan.work,
-                &source,
-            );
-            acceptance_cites(&path, &previous)?;
-        }
     }
     audit(&out, &plan)
 }
 
-fn acceptance_cites(dir: &Path, test_run: &str) -> Result<()> {
+pub(super) fn acceptance_cites(dir: &Path, test_run: &str) -> Result<()> {
     ensure!(
         fs::read_to_string(dir.join("result.txt"))?.contains(test_run),
         "独立验收报告缺少原始测试执行 ID {test_run}"
@@ -395,11 +459,32 @@ fn verify_delivery(out: &Path, plan: &Plan) -> Result<()> {
     );
     let screenshots = screenshots(out)?;
     let count = export_bundle(root, out, &manifest)?;
+    let mut failures = Vec::new();
+    for phase in ["relay", "test", "accept", "deliver"] {
+        for entry in fs::read_dir(out.join(phase))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name
+                .to_str()
+                .filter(|n| n.starts_with("failed-") && n.ends_with(".json"))
+            else {
+                continue;
+            };
+            let f = read(&entry.path())?;
+            let run = f["run"].as_str().context("失败执行 ID")?;
+            ensure!(
+                name == format!("failed-{run}.json") && !ids.iter().any(|id| id == run),
+                "失败记录与通过记录冲突"
+            );
+            failures.push(format!("{phase}/{name}"));
+        }
+    }
+    failures.sort();
     save_json(
         out,
         "verified.json",
         &json!({"verified":true,"work":plan.work,"decision":decision,"revision":revision,
-        "runs":ids,"candidate":second["candidate_sha"],"stage_receipts":stages,"studio_archive":root,"evidence":"evidence","screenshots":screenshots,"checked_artifacts":count}),
+        "runs":ids,"candidate":second["candidate_sha"],"stage_receipts":stages,"failed_attempts":failures,"studio_archive":root,"evidence":"evidence","screenshots":screenshots,"checked_artifacts":count}),
     )?;
     println!("验证通过 · {}", out.join("verified.json").display());
     Ok(())
@@ -526,6 +611,43 @@ fn relay_revision<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retry_skips_only_a_completed_step_with_the_same_inputs() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join("test");
+        fs::create_dir(&dir)?;
+        let input = json!({"source_run":"r2","model":"test-model"});
+        save_json(&dir, "completed.json", &input)?;
+        assert_eq!(step(tmp.path(), "test", "--unreachable", &input)?, dir);
+        assert!(
+            step(
+                tmp.path(),
+                "test",
+                "--unreachable",
+                &json!({"source_run":"other"})
+            )
+            .is_err()
+        );
+        assert!(!dir.join("driver.stderr").exists());
+        Ok(())
+    }
+    #[test]
+    fn repeated_failures_preserve_each_attempt_reason() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        for id in ["accept-1", "accept-2"] {
+            assert!(failed_attempt::<()>(tmp.path(), "accept", id, id).is_err());
+            retain_failure(tmp.path(), &read(&tmp.path().join("attempt-error.json"))?)?;
+        }
+        assert_eq!(
+            read(&tmp.path().join("failed-accept-1.json"))?["reason"],
+            "accept-1"
+        );
+        assert_eq!(
+            read(&tmp.path().join("attempt-error.json"))?["run"],
+            "accept-2"
+        );
+        Ok(())
+    }
     #[test]
     fn an_incomplete_or_changed_export_does_not_verify() -> Result<()> {
         let tmp = tempfile::tempdir()?;

@@ -116,4 +116,25 @@ jq -r '.screenshots[]' "$output/verified.json"
 3. 点「启动开发全流程」。Studio 使用与 `deploy/stage-lifecycle.sh` 相同的本地执行器。页面显示当前阶段和执行日志。
 4. 等待决策时，点「修订决策并继续第二轮」。在原接力记录中将第一轮问题修订为决策，然后用该决策启动第二轮。回到事项的「开发全流程」，按提示打开验收记录，逐次确认交接，最后确认交付归档。
 5. 关闭 Studio 后，后台继续运行或停在原来的确认步骤。重开同一事项的「开发全流程」可查看进度。如果执行器中断，点「继续原流程」可读取同一份计划和输出目录。
-6. 显示「核验通过」后，点击验收报告、回执、交接文件或 Studio 截图即可预览。「在 Finder 中打开归档」可定位可复制的证据目录。
+6. 如果执行失败，页面会显示失败阶段、原因和执行编号。补齐缺少的证据或修复运行环境后，点「从独立验收重试」等对应阶段的按钮。Studio 复用原 Spec、模型、决策和已确认的交接，为失败执行生成新的回执。失败尝试仍可在归档里查看。
+7. 显示「核验通过」后，点击验收报告、回执、交接文件或 Studio 截图即可预览。「在 Finder 中打开归档」可定位可复制的证据目录。
+
+核对一次独立验收重试时，将 `output` 设置为本次开发全流程的输出目录，读取已确认交给独立验收的测试执行编号：
+
+```sh
+jq -r '.run' "$output/accept/confirmed.json"
+```
+
+这里的 `.run` 是交给独立验收的测试执行编号，用于确认本次验收接收了哪一次测试执行。
+
+独立验收重试成功后，继续使用同一个 `output`，将确认记录与成功后的验收回执交叉比对：
+
+```sh
+jq -e -s '
+  .[0].run as $test_run
+  | ($test_run | type == "string" and length > 0)
+    and (.[1].read_stage_transfer.run == $test_run)
+' "$output/accept/confirmed.json" "$output/accept/destination.json"
+```
+
+这里按顺序读取两份文件，比较 `accept/confirmed.json` 的 `.run` 和 `accept/destination.json` 的 `.read_stage_transfer.run`。输出 `true` 且退出码为 0，表示成功后的独立验收读取了已确认的那次测试执行；编号缺失、为空或不一致时检查不通过，应核对输出目录和本次重试的回执。
