@@ -237,6 +237,13 @@ impl Studio {
                     self.board.viewing == item.stage.min(item.notes.len().saturating_sub(1))
                 });
         self.board.library = latest;
+        if self.board.timeline.is_some() {
+            if switched {
+                self.board.timeline = None;
+            } else if self.board.section == Section::Work {
+                self.load_timeline(cx);
+            }
+        }
         if self.board.section == Section::Work && (!draft || switched) {
             self.board.note_key = None;
             if follow {

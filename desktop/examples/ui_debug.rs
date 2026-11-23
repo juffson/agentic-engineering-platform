@@ -91,6 +91,14 @@ struct Args {
     /// Open project settings in an existing repository, sync ZCode records and open an original task.
     #[arg(long, requires="output_dir", conflicts_with_all=["scenario","script","repo"])]
     live_zcode_history: Option<PathBuf>,
+    /// Inspect an existing item's rounds and open its original ZCode sessions.
+    #[arg(long, requires = "live_zcode_history")]
+    timeline_work: Option<String>,
+    /// Associate this original session with the specified work and stage before inspecting it.
+    #[arg(long,requires_all=["timeline_work","timeline_stage"])]
+    timeline_session: Option<String>,
+    #[arg(long, requires = "timeline_session")]
+    timeline_stage: Option<usize>,
     /// Exercise all seven software stages with the installed Codex, Claude and ZCode clients.
     #[arg(long, requires="output_dir",conflicts_with_all=["scenario","script","repo"])]
     live_project_workflow: bool,
@@ -1413,7 +1421,18 @@ fn main() -> Result<()> {
     }
     if let Some(path) = &args.live_zcode_history {
         let ws = Workspace::open(path)?;
-        return inspect(&args, &ws, |ui| zcode_history::exercise(ui, &ws.root));
+        return inspect(&args, &ws, |ui| {
+            if let Some(work) = &args.timeline_work {
+                zcode_history::timeline(
+                    ui,
+                    &ws.root,
+                    work,
+                    args.timeline_session.as_deref().zip(args.timeline_stage),
+                )
+            } else {
+                zcode_history::exercise(ui, &ws.root)
+            }
+        });
     }
     if args.live_project_workflow {
         return workflows::live(&mut args);

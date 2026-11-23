@@ -128,7 +128,18 @@ pub fn list(repo: &Path, scope: Option<(&Path, &str)>) -> Result<Vec<Value>> {
     let mut rows: Vec<_> = dirs
         .iter()
         .map(|dir| {
-            row(&tx, dir, &repo).unwrap_or_else(|e| json!({"dir":dir,"error":format!("{e:#}")}))
+            row(&tx, dir, &repo)
+                .and_then(|mut row| {
+                    if dir.starts_with(ws.data.join("runs")) {
+                        let run = row["run"].as_str().context("缺少运行 ID")?;
+                        let relay = aep::project::timeline::relay_for_run(&ws, run)?;
+                        row["record_kind"] = json!(if relay.is_some() { "relay" } else { "run" });
+                        row["record_id"] =
+                            json!(relay.unwrap_or_else(|| row["run"].as_str().unwrap().to_owned()));
+                    }
+                    Ok(row)
+                })
+                .unwrap_or_else(|e| json!({"dir":dir,"error":format!("{e:#}")}))
         })
         .collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r["since"].as_i64().unwrap_or_default()));

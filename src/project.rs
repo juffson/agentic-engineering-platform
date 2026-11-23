@@ -1,4 +1,5 @@
 pub mod directory;
+pub mod timeline;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -88,6 +89,7 @@ impl HttpsSite {
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum RecordKind {
+    Run,
     Relay,
     Https,
 }
@@ -195,6 +197,7 @@ impl RecordKind {
 
     pub fn key(self) -> &'static str {
         match self {
+            Self::Run => "run",
             Self::Relay => "relay",
             Self::Https => "https",
         }
@@ -208,6 +211,17 @@ impl RecordKind {
             "记录 ID 无效"
         );
         let (prefix, dir, file) = match self {
+            Self::Run => {
+                crate::workspace::ident(id, 64)?;
+                let record =
+                    crate::workspace::read(&ws.data.join("runs").join(id).join("evidence.json"))?;
+                ensure!(record["run_id"] == id, "运行回执与记录不匹配");
+                ensure!(
+                    timeline::relay_for_run(ws, id)?.is_none(),
+                    "请关联此运行所属的两轮接力"
+                );
+                return Ok(());
+            }
             Self::Relay => ("relay-", "relays", "relay.json"),
             Self::Https => ("studio-", "https-studio", "request.json"),
         };
@@ -221,6 +235,7 @@ impl RecordKind {
             "记录缺少任务名称"
         );
         match self {
+            Self::Run => unreachable!(),
             Self::Relay => ensure!(
                 record["id"] == id && record["attempts"].is_array(),
                 "接力记录身份或轮次无效"
@@ -239,6 +254,10 @@ impl RecordKind {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct WorkRecord {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_stages: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<usize>,
     pub repository: PathBuf,
     pub kind: RecordKind,
     pub id: String,
@@ -357,6 +376,17 @@ impl Project {
         kind: RecordKind,
         id: &str,
     ) -> Result<()> {
+        self.link_at_stage(work, repo, kind, id, None)
+    }
+
+    pub fn link_at_stage(
+        &mut self,
+        work: &str,
+        repo: &Path,
+        kind: RecordKind,
+        id: &str,
+        stage: Option<usize>,
+    ) -> Result<()> {
         ensure!(
             !self
                 .work
@@ -369,13 +399,49 @@ impl Project {
             item.repositories.iter().any(|r| r == repo),
             "仓库未纳入当前事项"
         );
-        if !item.has_record(repo, kind, id) {
+        ensure!(
+            stage.is_none_or(|i| i < item.template.stages().len()),
+            "无效阶段"
+        );
+        if let Some(record) = item
+            .records
+            .iter_mut()
+            .find(|r| r.repository == repo && r.kind == kind && r.id == id)
+        {
+            if stage.is_some() {
+                record.stage = stage;
+            }
+        } else {
             item.records.push(WorkRecord {
+                session_stages: BTreeMap::new(),
+                stage,
                 repository: repo.into(),
                 kind,
                 id: id.into(),
             });
         }
+        Ok(())
+    }
+
+    pub fn link_session(
+        &mut self,
+        work: &str,
+        repo: &Path,
+        kind: RecordKind,
+        record: &str,
+        session: &str,
+        stage: usize,
+    ) -> Result<()> {
+        let item = self.work_by_id_mut(work)?;
+        ensure!(stage < item.template.stages().len(), "无效阶段");
+        self.link_record(work, repo, kind, record)?;
+        let item = self.work_by_id_mut(work)?;
+        let link = item
+            .records
+            .iter_mut()
+            .find(|r| r.kind == kind && r.repository == repo && r.id == record)
+            .context("记录未关联")?;
+        link.session_stages.insert(session.to_owned(), stage);
         Ok(())
     }
 

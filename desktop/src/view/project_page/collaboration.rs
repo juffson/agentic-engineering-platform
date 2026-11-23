@@ -95,6 +95,7 @@ impl SiteFields {
 }
 
 pub(super) struct WorkDesk {
+    stage_record: Option<usize>,
     pub(super) work: String,
     recipient: Option<String>,
     note: Entity<TextareaState>,
@@ -365,18 +366,24 @@ impl Studio {
         h_flex()
             .gap_2()
             .child(
-                button("work-flow-tab", "阶段工作流", !open).on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.board.desk = None;
-                        cx.notify();
-                    },
-                )),
+                button(
+                    "work-flow-tab",
+                    "阶段工作流",
+                    !open && self.board.timeline.is_none(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.board.timeline = None;
+                    this.board.desk = None;
+                    cx.notify();
+                })),
             )
             .child(
                 button("work-collab-tab", "协作与交接", open).on_click(cx.listener(
                     move |this, _, w, cx| {
+                        this.board.timeline = None;
                         if this.board.desk.as_ref().is_none_or(|d| d.work != id) {
                             this.board.desk = Some(WorkDesk {
+                                stage_record: None,
                                 work: id.clone(),
                                 recipient: None,
                                 sent: None,
@@ -389,6 +396,17 @@ impl Studio {
                         cx.notify();
                     },
                 )),
+            )
+            .child(
+                button(
+                    "work-timeline-tab",
+                    "会话与轮次",
+                    self.board
+                        .timeline
+                        .as_ref()
+                        .is_some_and(|t| t.work == work.id),
+                )
+                .on_click(cx.listener(|s, _, _, cx| s.load_timeline(cx))),
             )
     }
 
@@ -431,7 +449,7 @@ impl Studio {
                     .child(
                         v_flex()
                             .child(t(basename(repo), FG))
-                            .child(caption(format!("已关联 {count} 条接力或远程记录"))),
+                            .child(caption(format!("已关联 {count} 条执行记录"))),
                     )
                     .child(links),
             );
@@ -446,6 +464,29 @@ impl Studio {
                         .gap_2()
                         .justify_between()
                         .child(t(format!("{} · {}", basename(&repo), id), FG).truncate())
+                        .when(kind != RecordKind::Https, |bar| {
+                            bar.child(
+                                button(
+                                    format!("record-stage-{index}"),
+                                    r.stage
+                                        .and_then(|i| work.template.stages().get(i))
+                                        .map_or("指定阶段", |s| s.name),
+                                    false,
+                                )
+                                .on_click(cx.listener(
+                                    move |s, _, _, cx| {
+                                        if let Some(d) = s.board.desk.as_mut() {
+                                            d.stage_record = if d.stage_record == Some(index) {
+                                                None
+                                            } else {
+                                                Some(index)
+                                            };
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        })
                         .child(
                             button(
                                 format!("unlink-{}-{}", kind.key(), index),
@@ -463,6 +504,36 @@ impl Studio {
                             )),
                         ),
                 );
+                if desk.stage_record == Some(index) && r.kind != RecordKind::Https {
+                    let mut stages = h_flex().flex_wrap().gap_2();
+                    for (i, stage) in work.template.stages().iter().enumerate() {
+                        let (wid, repo, id) = (work.id.clone(), r.repository.clone(), r.id.clone());
+                        stages = stages.child(
+                            button(
+                                format!("record-stage-{index}-{i}"),
+                                stage.name,
+                                r.stage == Some(i),
+                            )
+                            .on_click(cx.listener(
+                                move |s, _, _, cx| {
+                                    if s.change_board(cx, |l| {
+                                        l.project_mut()?.link_at_stage(
+                                            &wid,
+                                            &repo,
+                                            kind,
+                                            &id,
+                                            Some(i),
+                                        )
+                                    }) && let Some(d) = s.board.desk.as_mut()
+                                    {
+                                        d.stage_record = None;
+                                    }
+                                },
+                            )),
+                        );
+                    }
+                    saved = saved.child(stages);
+                }
             }
             workspaces = workspaces.child(saved);
         }
@@ -555,8 +626,10 @@ impl Studio {
         };
         let wid = work.id.clone();
         let repo = self.workspace.as_ref().unwrap().root.clone();
-        let success =
-            self.change_board(cx, |l| l.project_mut()?.link_record(&wid, &repo, kind, id));
+        let stage = (kind == RecordKind::Relay).then_some(self.board.viewing);
+        let success = self.change_board(cx, |l| {
+            l.project_mut()?.link_at_stage(&wid, &repo, kind, id, stage)
+        });
         ensure!(
             success,
             "{}",

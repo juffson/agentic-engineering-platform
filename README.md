@@ -205,6 +205,16 @@ Studio 派发的 ZCode 实现和审查会话归到所选仓库对应的本机 ZC
 
 在 Studio 打开「项目设置」，在对应仓库的「仓库工具与历史」中选择「ZCode 任务归组」。列表显示实际归属项目、执行目录和原项目的清理结果。「同步历史任务并清理空项目」复用归组回执和空项目检查；「打开原会话」回到 ZCode 桌面中的同一个任务。CLI 可用 `aep zcode-group --list` 查看同一份记录。
 
+在「开发事项 → 会话与轮次」查看每次接力的实现、审查、读写的记忆版本及交接正文，或打开原 ZCode 桌面会话。同轮重试按执行顺序分别保留。在「协作与交接」可以为整条接力指定阶段，也可以在「项目设置 → ZCode 任务归组 → 关联事项与阶段」为单个会话指定阶段。阶段工作流本身创建的会话自动沿用原事项和阶段。旧接力没有阶段回执时会显示「阶段待关联」。
+
+CLI 示例（阶段从 1 开始）：
+
+```sh
+aep project --work "$work_id" link-record --repository . --stage 4 relay "$relay_id"
+aep project --work "$work_id" link-session --repository . --stage 4 "$session_id"
+aep project --work "$work_id" timeline
+```
+
 已有关联记录可在仓库目录运行 `aep zcode-group --verify` 归回并核对。命令按 AEP 回执识别任务，重复运行会复用原会话。`--verify` 通过 aep-studio 扩展 1.2 或更高版本向 ZCode 查询该项目的会话列表。
 
 ZCode 等待工具审批时，Studio 的接力卡显示轮次、实现或审查角色、工作区和待批命令。点「打开对应 ZCode 任务」，在打开的桌面会话点「允许一次」，原任务会自动续跑。ZCode 扩展仅能在插件自有项目中代答审批。AEP 的仓库和隔离工作区使用桌面原生确认。CLI 可用 `aep zcode-open --dir <本次运行的 zcode-edit 或 zcode-plan 目录>` 打开同一任务。已安装旧版扩展的用户可运行 `"$zcode" plugins marketplace update aep-local` 和 `"$zcode" plugins update aep-studio@aep-local`，再重新打开 ZCode。

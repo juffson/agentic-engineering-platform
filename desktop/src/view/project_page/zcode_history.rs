@@ -4,6 +4,7 @@ pub(super) struct History {
     pub(super) project: String,
     pub(super) repo: PathBuf,
     rows: Vec<Value>,
+    editing: Option<(String, Option<String>)>,
     pending: Option<uuid::Uuid>,
     message: String,
 }
@@ -42,6 +43,7 @@ impl Studio {
             project: project.id.clone(),
             repo: repo.into(),
             rows: vec![],
+            editing: None,
             pending: None,
             message: String::new(),
         });
@@ -206,8 +208,152 @@ impl Studio {
             if let Some((_, msg)) = self.zcode_navigation.as_ref().filter(|(p, _)| p == &dir) {
                 card = card.child(detail_text("zcode-history-open-status", msg));
             }
+            if let Some(session) = r["session"].as_str() {
+                card = card.child(self.session_assignment(history, r, session, cx));
+            }
             body = body.child(card);
         }
         body
+    }
+}
+
+impl Studio {
+    fn session_assignment(
+        &self,
+        history: &History,
+        row: &Value,
+        session: &str,
+        cx: &Context<Self>,
+    ) -> Div {
+        let mut panel = v_flex().gap_2();
+        let Some(p) = self.board.library.project() else {
+            return panel;
+        };
+        let Ok(kind) =
+            serde_json::from_value::<aep::project::RecordKind>(row["record_kind"].clone())
+        else {
+            // A native workflow attempt is already scoped by its catalog directory.
+            if let Some(home) = self.board.dir.as_ref() {
+                for w in &p.work {
+                    if let Some(a) = w.attempts.iter().find(|a| {
+                        workflow::attempt_dir(home, &p.id, &w.id, &a.id)
+                            == Path::new(string(row, "dir"))
+                    }) {
+                        return panel.child(field("开发事项", &w.name)).child(field(
+                            "工作流阶段",
+                            w.template
+                                .stages()
+                                .get(a.stage)
+                                .map_or("未知阶段", |s| s.name),
+                        ));
+                    }
+                }
+            }
+            return panel;
+        };
+        let id = string(row, "record_id");
+        let owner = p.work.iter().find_map(|w| {
+            w.records
+                .iter()
+                .find(|r| r.kind == kind && r.id == id && r.repository == history.repo)
+                .map(|r| (w, r))
+        });
+        let mut bar = h_flex().gap_2().justify_between();
+        if let Some((work, record)) = owner {
+            let stage = record
+                .session_stages
+                .get(session)
+                .copied()
+                .or(record.stage)
+                .and_then(|i| work.template.stages().get(i))
+                .map_or("阶段待关联", |s| s.name);
+            bar = bar.child(t(format!("{} · {stage}", work.name), FG));
+        } else {
+            bar = bar.child(caption("待关联开发事项"));
+        }
+        let sid = session.to_owned();
+        let owner_id = owner.map(|(w, _)| w.id.clone());
+        let editing = history.editing.as_ref().filter(|(s, _)| s == session);
+        let editing_now = editing.is_some();
+        bar = bar.child(
+            button(
+                format!("assign-{session}"),
+                if editing_now {
+                    "收起"
+                } else {
+                    "关联事项与阶段"
+                },
+                false,
+            )
+            .on_click(cx.listener(move |s, _, _, cx| {
+                if let Some(h) = s.board.zcode_history.as_mut() {
+                    h.editing = (!editing_now).then(|| (sid.clone(), owner_id.clone()));
+                }
+                cx.notify();
+            })),
+        );
+        panel = panel.child(bar);
+        if let Some((_, selected)) = editing {
+            if let Some(w) = selected
+                .as_ref()
+                .and_then(|id| p.work.iter().find(|w| w.id == *id))
+            {
+                let mut choices = h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(caption(format!("{} · 选择阶段", w.name)));
+                for (i, stage) in w.template.stages().iter().enumerate() {
+                    let (wid, repo, record, sid, pid) = (
+                        w.id.clone(),
+                        history.repo.clone(),
+                        id.to_owned(),
+                        session.to_owned(),
+                        p.id.clone(),
+                    );
+                    choices = choices.child(
+                        button(
+                            format!("assign-stage-{session}-{wid}-{i}"),
+                            stage.name,
+                            false,
+                        )
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            if s.change_board(cx, |lib| {
+                                let p = lib.project_mut()?;
+                                ensure!(p.id == pid, "项目已切换");
+                                p.link_session(&wid, &repo, kind, &record, &sid, i)
+                            }) && let Some(h) = s.board.zcode_history.as_mut()
+                            {
+                                h.editing = None;
+                            }
+                        })),
+                    );
+                }
+                panel = panel.child(choices);
+            } else {
+                let mut choices = h_flex().flex_wrap().gap_2().child(caption("选择开发事项"));
+                for w in p
+                    .work
+                    .iter()
+                    .filter(|w| w.repositories.contains(&history.repo))
+                {
+                    let (sid, wid) = (session.to_owned(), w.id.clone());
+                    choices = choices.child(
+                        button(
+                            format!("assign-work-{session}-{wid}"),
+                            w.name.clone(),
+                            false,
+                        )
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            if let Some(h) = s.board.zcode_history.as_mut() {
+                                h.editing = Some((sid.clone(), Some(wid.clone())));
+                            }
+                            cx.notify();
+                        })),
+                    );
+                }
+                panel = panel.child(choices);
+            }
+        }
+        panel
     }
 }

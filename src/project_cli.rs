@@ -97,8 +97,20 @@ enum Action {
         #[arg(long)]
         note: String,
     },
-    /// Link an existing repository relay or remote HTTPS session to this work item.
+    /// Show rounds, sessions, shared memory and handoff receipts for this item.
+    Timeline,
+    /// Link a verified desktop session to a stage (1-based) of this work item.
+    LinkSession {
+        #[arg(long)]
+        repository: PathBuf,
+        #[arg(long)]
+        stage: usize,
+        session: String,
+    },
+    /// Associate a relay, standalone run or HTTPS record with an item and optional 1-based stage.
     LinkRecord {
+        #[arg(long)]
+        stage: Option<usize>,
         #[arg(long)]
         repository: PathBuf,
         #[arg(value_enum)]
@@ -719,7 +731,32 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             c.edit_project(|p| p.handoff(&source, &to, &note))?;
             print(&json!({"from": source, "to": to}))
         }
+        Action::LinkSession {
+            repository,
+            stage,
+            session,
+        } => {
+            let repo = root(&repository)?;
+            let project = c.project()?.id.clone();
+            let work = c.work()?.id.clone();
+            let i = index(stage, c.work()?)?;
+            let rows = crate::zcode_group::history::list(&repo, Some((&c.dir, &project)))?;
+            let mut hits = rows.iter().filter(|r| r["session"] == session);
+            let row = hits.next().context("此仓库没有对应的桌面会话")?;
+            ensure!(hits.next().is_none(), "会话回执不唯一");
+            let kind = serde_json::from_value(row["record_kind"].clone())
+                .context("工作流会话已由原始阶段管理")?;
+            let id = row["record_id"].as_str().context("缺少执行记录")?;
+            c.edit_project(|p| p.link_session(&work, &repo, kind, id, &session, i))?;
+            print(&json!({"work":work,"session":session,"stage":stage}))
+        }
+        Action::Timeline => print(&project::timeline::load(
+            &c.dir,
+            &c.project()?.id,
+            c.work()?,
+        )?),
         Action::LinkRecord {
+            stage,
             repository,
             kind,
             id,
@@ -727,7 +764,8 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             let ws = aep::workspace::Workspace::open(&repository)?;
             kind.verify(&ws, &id)?;
             let work = c.work()?.id.clone();
-            c.edit_project(|p| p.link_record(&work, &ws.root, kind, &id))?;
+            let stage = stage.map(|s| index(s, c.work()?)).transpose()?;
+            c.edit_project(|p| p.link_at_stage(&work, &ws.root, kind, &id, stage))?;
             print(&json!({"kind":kind, "id": id}))
         }
         Action::UnlinkRecord {

@@ -139,6 +139,15 @@ impl Memory {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn read_only(dir: &Path) -> Result<Option<Self>> {
+        let file = dir.join("memory.sqlite3");
+        if !file.try_exists()? {
+            return Ok(None);
+        }
+        let db = Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        Ok(Some(Self(db)))
+    }
     pub fn open(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir)?;
         let path = dir.join("memory.sqlite3");

@@ -48,3 +48,58 @@ pub(super) fn exercise(ui: &mut Driver<'_>, repo: &Path) -> Result<()> {
     ui.reveal("project-page", &id)?;
     ui.checkpoint("zcode-history-opened")
 }
+
+pub(super) fn timeline(
+    ui: &mut Driver<'_>,
+    repo: &Path,
+    work: &str,
+    assignment: Option<(&str, usize)>,
+) -> Result<()> {
+    until(ui, "project settings", 30, |ui| {
+        Ok((!ui.absent("project-settings")?).then_some(()))
+    })?;
+    if let Some((session, stage)) = assignment {
+        ui.click("project-settings")?;
+        click(ui, &format!("settings-zcode-history-{}", repo.display()))?;
+        let edit = format!("assign-{session}");
+        until(ui, &edit, 35, |ui| Ok((!ui.absent(&edit)?).then_some(())))?;
+        click(ui, &edit)?;
+        let item = format!("assign-work-{session}-{work}");
+        if !ui.absent(&item)? {
+            click(ui, &item)?;
+        }
+        let i = stage.checked_sub(1).context("stage starts at 1")?;
+        click(ui, &format!("assign-stage-{session}-{work}-{i}"))?;
+        ui.checkpoint("timeline-linked")?;
+    }
+    ui.click("project-overview")?;
+    click(ui, &format!("project-item-{work}"))?;
+    click(ui, "work-timeline-tab")?;
+    until(ui, "archived rounds", 30, |ui| {
+        Ok((!ui.absent("timeline-title-0")?).then_some(()))
+    })?;
+    ui.checkpoint("timeline-rounds")?;
+    for i in 0.. {
+        let detail = format!("timeline-detail-{i}");
+        if ui.absent(&detail)? {
+            break;
+        }
+        click(ui, &detail)?;
+        for j in 0..2 {
+            let open = format!("timeline-open-{i}-{j}");
+            if !ui.absent(&open)? {
+                click(ui, &open)?;
+                label(
+                    ui,
+                    &format!("timeline-open-status-{i}-{j}"),
+                    "已打开 ZCode 任务",
+                    40,
+                )?;
+            }
+        }
+        ui.reveal("project-page", &detail)?;
+        ui.checkpoint(&format!("timeline-attempt-{}", i + 1))?;
+        click(ui, &detail)?;
+    }
+    Ok(())
+}

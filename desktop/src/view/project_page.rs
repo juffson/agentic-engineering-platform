@@ -1,6 +1,7 @@
 use super::*;
 mod agents;
 mod collaboration;
+mod timeline;
 mod zcode;
 mod zcode_history;
 use aep::project::{Kind, Library, Project, Work};
@@ -26,6 +27,7 @@ pub(crate) struct Board {
     zcode_loading: bool,
     zcode_draft: Option<(String, String)>,
     zcode_history: Option<zcode_history::History>,
+    timeline: Option<timeline::State>,
     site_editor: Option<SiteEditor>,
     infra_view: Option<InfraView>,
     desk: Option<WorkDesk>,
@@ -88,6 +90,7 @@ impl Board {
             zcode_loading: false,
             zcode_draft: None,
             zcode_history: None,
+            timeline: None,
             site_editor: None,
             infra_view: None,
             desk: None,
@@ -268,6 +271,7 @@ impl Studio {
     fn section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         self.page = Page::Project;
         self.board.section = section;
+        self.board.timeline = None;
         self.board.zcode_history = None;
         self.board.sync_message = None;
         self.board.site_editor = None;
@@ -782,7 +786,14 @@ impl Studio {
                     } else if let Some(work) = p.selected() {
                         let collab = self.board.desk.as_ref().is_some_and(|d| d.work == work.id);
                         page = page.child(self.work_tabs(work, collab, cx));
-                        if collab {
+                        if let Some(history) = self
+                            .board
+                            .timeline
+                            .as_ref()
+                            .filter(|s| s.work == work.id && s.project == p.id)
+                        {
+                            page = page.child(self.work_timeline(history, work, cx));
+                        } else if collab {
                             page = page.child(self.work_collaboration(p, work, cx));
                         } else {
                             page = page.child(self.work_detail(p, work, cx));
