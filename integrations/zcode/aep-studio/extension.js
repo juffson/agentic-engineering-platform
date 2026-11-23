@@ -54,6 +54,25 @@ async function serve(ctx, name, id) {
     for await (const line of lines) {
       const job = JSON.parse(line);
       if (job.requestId !== id) throw new Error("Invalid request ID");
+      if (job.action === "projectSessions") {
+        const { projects } = await ctx.sessions.listProjects({});
+        const project = projects.find(row => row.project.sourceServerId === "local" &&
+          row.project.projectId === job.projectId)?.project;
+        if (!project || !Array.isArray(job.sessions)) throw new Error("Invalid project verification");
+        const wanted = new Set(job.sessions);
+        const found = [];
+        let cursor;
+        do {
+          const page = await ctx.sessions.listSessions({ project, archived: "include", limit: 50, ...(cursor ? { cursor } : {}) });
+          for (const row of page.sessions) {
+            if (wanted.delete(row.session.sessionId)) found.push(row.session);
+          }
+          if (page.nextCursor && page.nextCursor === cursor) throw new Error("Invalid project sessions cursor");
+          cursor = page.nextCursor;
+        } while (cursor && wanted.size);
+        socket.end(JSON.stringify({ requestId: id, projectId: project.projectId, sessions: found }) + "\n");
+        return;
+      }
       if (job.action === "open" || job.action === "approvals") {
         const session = job.session;
         if (session?.sourceServerId !== "local" || !session.sessionId ||

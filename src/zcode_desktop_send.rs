@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn project_id(index: &Connection, workspace: &str) -> Result<Option<String>> {
+pub(super) fn project_id(index: &Connection, workspace: &str) -> Result<Option<String>> {
     let mut q = index.prepare(
         "SELECT p.project_id FROM projects p JOIN hosts h USING(host_id)
         JOIN project_roots r USING(project_id) WHERE p.deleted=0 AND h.host_id='local'
@@ -30,7 +30,7 @@ fn project_id(index: &Connection, workspace: &str) -> Result<Option<String>> {
     Ok(first)
 }
 
-fn local_project(index: &Connection, workspace: &str) -> Result<String> {
+pub(super) fn local_project(index: &Connection, workspace: &str) -> Result<String> {
     if let Some(id) = project_id(index, workspace)? {
         return Ok(id);
     }
@@ -63,7 +63,7 @@ impl Drop for SocketPath {
     }
 }
 
-fn exchange(root: &Path, request: &Value) -> Result<Value> {
+pub(super) fn exchange(root: &Path, request: &Value) -> Result<Value> {
     DirBuilder::new().recursive(true).mode(0o700).create(root)?;
     let meta = fs::symlink_metadata(root)?;
     ensure!(
@@ -152,10 +152,19 @@ fn session_action(receipt: &Value, action: &str) -> Result<Value> {
         .context("缺少用户目录")?
         .join(".aep/zcode");
     let id = uuid::Uuid::new_v4().simple().to_string();
+    // The creation receipt is immutable. Resolve current project membership in the host
+    // when opening or observing a task that has since moved.
+    let mut session = session.clone();
+    session
+        .as_object_mut()
+        .context("invalid desktop session")?
+        .remove("project");
+    let mut operation = receipt["operation"].clone();
+    operation["session"] = session.clone();
     let reply = exchange(
         &root,
         &json!({"action":action,"requestId":id,"session":session,
-        "operation":receipt["operation"]}),
+        "operation":operation}),
     )?;
     ensure!(
         reply["requestId"] == id && reply["sessionId"] == session["sessionId"],

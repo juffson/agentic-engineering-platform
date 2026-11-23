@@ -17,6 +17,7 @@ pub fn converse(
     model: Option<&Value>,
     prompt: &str,
     desktop_workspace: &Path,
+    repository: Option<&Path>,
 ) -> Result<String> {
     if Path::new(aep::workflow::ZCODE_APP).is_file()
         && let Some(model) = model
@@ -26,14 +27,21 @@ pub fn converse(
             .is_some()
     {
         let selection = json!({"providerId":model["providerId"], "modelId":model["modelId"]});
-        return crate::zcode_desktop::converse(dir, desktop_workspace, mode, &selection, prompt)
-            .inspect_err(|e| {
-                let _ = aep::project::save_json(
-                    dir,
-                    "desktop-error.json",
-                    &json!({"error":format!("{e:#}")}),
-                );
-            });
+        return crate::zcode_desktop::converse(
+            dir,
+            desktop_workspace,
+            mode,
+            &selection,
+            prompt,
+            repository,
+        )
+        .inspect_err(|e| {
+            let _ = aep::project::save_json(
+                dir,
+                "desktop-error.json",
+                &json!({"error":format!("{e:#}")}),
+            );
+        });
     }
     let mut child = aep::zcode_catalog::app_server(binary)
         .stdin(Stdio::piped())
@@ -184,6 +192,7 @@ pub fn run(binary: &Path, request: &Path) -> Result<()> {
         selection.as_ref(),
         &prompt,
         &std::env::current_dir()?,
+        req.repository.as_deref(),
     )?;
     println!("{reply}");
     Ok(())

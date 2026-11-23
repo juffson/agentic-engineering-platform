@@ -201,6 +201,10 @@ zcode=/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
 
 打开 ZCode，在插件详情页给 aep-studio 授予会话权限。若已打开的 ZCode 尚未载入插件，可重新打开。之后在 Studio 为每轮选择方案和模型，点击开始即可。官方扩展按 ZCode 的新任务默认权限在对应本地项目中创建任务并发送本轮 Spec、Diff 和共享记忆。实现任务使用隔离工作区。桌面方案使用模型默认推理档位，旧配置中的手选档位在新派发时也按默认处理。普通 CLI 模型仍可指定档位。
 
+Studio 派发的 ZCode 实现和审查会话归到所选仓库对应的本机 ZCode 项目。实现仍在各自的 Git 工作区执行。建会话使用官方扩展；归组只更新 ZCode 本机项目索引中的任务归属，并固定隔离任务原有的附加目录。每次派发的归组结果在 `desktop-group.json`，原创建回执继续保留。首次为独立工作区创建的空项目可能仍显示在侧栏。
+
+已有关联记录可在仓库目录运行 `aep zcode-group --verify` 归回并核对。命令按 AEP 回执识别任务，重复运行会复用原会话。`--verify` 通过 aep-studio 扩展 1.2 或更高版本向 ZCode 查询该项目的会话列表。
+
 ZCode 等待工具审批时，Studio 的接力卡显示轮次、实现或审查角色、工作区和待批命令。点「打开对应 ZCode 任务」，在打开的桌面会话点「允许一次」，原任务会自动续跑。ZCode 扩展仅能在插件自有项目中代答审批。AEP 的仓库和隔离工作区使用桌面原生确认。CLI 可用 `aep zcode-open --dir <本次运行的 zcode-edit 或 zcode-plan 目录>` 打开同一任务。已安装旧版扩展的用户可运行 `"$zcode" plugins marketplace update aep-local` 和 `"$zcode" plugins update aep-studio@aep-local`，再重新打开 ZCode。
 
 本地接力只在 ZCode 持续报告同一会话正在等待审批时暂停该模型步骤的超时计时，批准或拒绝后继续计时。对于旧版已在实现阶段超时的运行，待原桌面任务完成后，用相同的 `aep run` 参数和 `--run-id` 加上 `--recover-desktop` 可收取原交接。AEP 保留原超时记录和工作区，在独立工作区执行该任务的验收和审查。

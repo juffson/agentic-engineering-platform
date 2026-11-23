@@ -23,6 +23,10 @@ test("AEP desktop extension protocol", async t => {
   const opened = [];
   const pending = { kind: "toolCall", turnId: "first", status: "pendingApproval" };
   ext.activate({ sessions: {
+    async listSessions({project, cursor}) {
+      assert.deepEqual(project,local);
+      return cursor ? { sessions: [{session}] } : { sessions: [{session:{sessionId:"unrelated"}}], nextCursor:"page2" };
+    },
     async openSession(input) {
       opened.push(input);
       return { status: "opened" };
@@ -79,6 +83,12 @@ test("AEP desktop extension protocol", async t => {
   }
 
   const request = { action: "approvals", session, operation };
+  await t.test("verifies only requested sessions against the desktop project across pages", async () => {
+    const response = await dispatch("aep", { action: "projectSessions", sessions: [session.sessionId] });
+    assert.deepEqual(response.reply.sessions, [session]);
+    assert.equal(response.reply.requestId, response.requestId);
+    assert.equal(response.reply.projectId, local.projectId);
+  });
   await t.test("dispatches the chosen model to the selected project and preserves its request ID", async () => {
     const accepted = await dispatch("aep");
     assert.equal(accepted.reply.firstInput, "accepted");

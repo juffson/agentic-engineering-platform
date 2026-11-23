@@ -322,6 +322,8 @@ impl Agents<'_> {
                 evidence.display().to_string(),
                 "--desktop-workspace".into(),
                 workspace.display().to_string(),
+                "--repository".into(),
+                self.repository.display().to_string(),
             ]);
         }
         let mut argv = Vec::new();

@@ -1,4 +1,4 @@
-//! Exchange one task with the user's ZCode desktop composer. Only ZCode writes its databases.
+//! Exchange one task with the user's ZCode desktop composer. Conversation history is read-only.
 use aep::project::save_json;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -170,6 +170,7 @@ pub fn converse(
     mode: &str,
     model: &Value,
     prompt: &str,
+    repository: Option<&Path>,
 ) -> Result<String> {
     let home = std::env::home_dir()
         .context("缺少 ZCode 用户目录")?
@@ -240,6 +241,16 @@ pub fn converse(
         "desktop-task.json",
         &json!({"session":task,"userMessage":message,"workspace":workspace}),
     )?;
+    if let Some(repo) = repository
+        && let Err(e) = crate::zcode_group::group(dir, repo)
+    {
+        eprintln!("ZCode 项目归组失败，可用 aep zcode-group 重试：{e:#}");
+        save_json(
+            dir,
+            "desktop-group.json",
+            &json!({"session":task,"error":format!("{e:#}")}),
+        )?;
+    }
     let _approval_monitor = crate::zcode_desktop_send::monitor(dir, &task);
     loop {
         if let Some(reply) = read_reply(&db, workspace, &task, &message, model)? {

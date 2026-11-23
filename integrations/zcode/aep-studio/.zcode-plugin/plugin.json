@@ -1,6 +1,6 @@
 {
   "name": "aep-studio",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Create local ZCode project tasks for AEP Studio and return the session receipt.",
   "extension": {
     "engines": { "zcode": "^1.3.0" },

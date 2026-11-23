@@ -8,6 +8,7 @@ mod run;
 mod workflow_stage;
 mod zcode_desktop;
 mod zcode_desktop_send;
+mod zcode_group;
 mod zcode_stage;
 
 use anyhow::{Result, ensure};
@@ -27,6 +28,12 @@ struct Cli {
 enum Action {
     /// Manage Studio projects, run a stage or exchange handoffs with independent sessions.
     Project(project_cli::Options),
+    /// Regroup verified local ZCode sessions belonging to this repository.
+    ZcodeGroup {
+        /// Confirm membership against the running ZCode desktop project list.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Open the exact ZCode desktop task saved in a role or stage evidence directory.
     ZcodeOpen {
         #[arg(long)]
@@ -53,6 +60,8 @@ enum Action {
         dir: PathBuf,
         #[arg(long)]
         desktop_workspace: Option<PathBuf>,
+        #[arg(long)]
+        repository: Option<PathBuf>,
     },
     /// Run a single configured model CLI in a project workflow.
     WorkflowStage {
@@ -182,6 +191,13 @@ fn app() -> Result<ExitCode> {
             zcode_stage::run(&binary, &request)?;
             return Ok(ExitCode::SUCCESS);
         }
+        Action::ZcodeGroup { verify } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&zcode_group::sync(&cli.repo, verify)?)?
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
         Action::ZcodeOpen { dir } => {
             println!("{}", zcode_desktop_send::open_task(&dir)?);
             return Ok(ExitCode::SUCCESS);
@@ -193,12 +209,20 @@ fn app() -> Result<ExitCode> {
             prompt,
             dir,
             desktop_workspace,
+            repository,
         } => {
             let selection = model.map(|path| aep::workspace::read(&path)).transpose()?;
             let text = std::fs::read_to_string(&prompt)?;
             let workspace = desktop_workspace.unwrap_or(std::env::current_dir()?);
-            let reply =
-                zcode_stage::converse(&binary, &dir, &mode, selection.as_ref(), &text, &workspace)?;
+            let reply = zcode_stage::converse(
+                &binary,
+                &dir,
+                &mode,
+                selection.as_ref(),
+                &text,
+                &workspace,
+                repository.as_deref(),
+            )?;
             println!("{reply}");
             return Ok(ExitCode::SUCCESS);
         }
@@ -217,6 +241,7 @@ fn app() -> Result<ExitCode> {
         Action::Project(_)
         | Action::Control(_)
         | Action::ZcodeStage { .. }
+        | Action::ZcodeGroup { .. }
         | Action::ZcodeOpen { .. }
         | Action::ZcodeBridge { .. }
         | Action::WorkflowStage { .. } => {
