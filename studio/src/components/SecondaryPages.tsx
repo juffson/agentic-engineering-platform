@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, FolderGit2, FolderOpen, Plus } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, FolderGit2, FolderOpen, Plus } from "lucide-react";
+import { ImportDialog } from "./Dialogs";
 import type { MemoryNote, ProjectSummary } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio } from "../state/store";
@@ -137,7 +138,7 @@ export function ReposPage({ project }: { project: ProjectSummary }) {
         {project.repositories.length === 0 && <p className="empty-text">还没有仓库。</p>}
         <ul className="repo-list">
           {project.repositories.map((r) => (
-            <RepoRow key={r} path={r} />
+            <RepoRow key={r} path={r} project={project.id} />
           ))}
         </ul>
       </div>
@@ -145,8 +146,9 @@ export function ReposPage({ project }: { project: ProjectSummary }) {
   );
 }
 
-function RepoRow({ path }: { path: string }) {
+function RepoRow({ path, project }: { path: string; project: string }) {
   const { act } = useStudio();
+  const [importing, setImporting] = useState(false);
   const [open, setOpen] = useState(false);
   const [notes, setNotes] = useState<MemoryNote[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -188,10 +190,14 @@ function RepoRow({ path }: { path: string }) {
           </span>
           <span className="repo-hint">{open ? "收起记忆" : "仓库记忆"}</span>
         </button>
+        <Button variant="secondary" size="sm" icon={<Download size={13} />} onClick={() => setImporting(true)}>
+          从 Claude / Codex / ZCode 导入
+        </Button>
         <button type="button" className="icon-btn" title="在访达中显示" aria-label="在访达中显示" onClick={() => act(() => api.reveal({ path }))}>
           <FolderOpen size={15} />
         </button>
       </div>
+      {importing && <ImportDialog project={project} path={path} onClose={() => setImporting(false)} />}
       {open && (
         <div className="repo-body">
           <p className="card-text">在这个仓库上运行的所有阶段，除了项目记忆，也会读取这些笔记。</p>

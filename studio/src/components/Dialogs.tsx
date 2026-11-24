@@ -1,9 +1,9 @@
-import { useState } from "react";
-import { FolderOpen, Plus } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Download, FolderOpen, Plus } from "lucide-react";
 import type { ImportFound, Template } from "../api/types";
-import { api } from "../api/client";
+import { api, errorMessage } from "../api/client";
 import { useStudio } from "../state/store";
-import { Button, Field, Modal, Segmented } from "./ui";
+import { Button, Field, Modal, Segmented, Spinner } from "./ui";
 
 export function NewWorkDialog({ onClose }: { onClose(): void }) {
   const { snapshot, project, act, selectWork } = useStudio();
@@ -100,6 +100,7 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
   const [found, setFound] = useState<Record<string, ImportFound>>({});
   const [memories, setMemories] = useState<Record<string, Set<string>>>({});
   const [branches, setBranches] = useState<Record<string, Set<string>>>({});
+  const [scanning, setScanning] = useState<string[]>([]);
   const list = repos
     .split("\n")
     .map((s) => s.trim())
@@ -107,7 +108,8 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
 
   /** Look at what the coding agents already have for a folder; all memory files start selected. */
   const scan = async (path: string) => {
-    if (!path || found[path]) return;
+    if (!path || found[path] || scanning.includes(path)) return;
+    setScanning((s) => [...s, path]);
     try {
       const f = await api.importScan({ path });
       setFound((m) => ({ ...m, [path]: f }));
@@ -115,6 +117,8 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
       setBranches((m) => ({ ...m, [path]: new Set() }));
     } catch {
       // Not a repository (yet): creating the project reports it.
+    } finally {
+      setScanning((s) => s.filter((p) => p !== path));
     }
   };
   const pick = async () => {
@@ -161,8 +165,8 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
           <Button variant="ghost" onClick={onClose}>
             取消
           </Button>
-          <Button variant="primary" icon={<Plus size={14} />} onClick={create} busy={busy} disabled={!name.trim()}>
-            创建项目
+          <Button variant="primary" icon={<Plus size={14} />} onClick={create} busy={busy} disabled={!name.trim() || scanning.length > 0}>
+            {scanning.length > 0 ? "正在查找可导入内容…" : "创建项目"}
           </Button>
         </>
       }
@@ -184,6 +188,11 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
           选择文件夹…
         </Button>
       </Field>
+      {scanning.length > 0 && (
+        <p className="field-hint scan-hint">
+          <Spinner size={12} /> 正在查找 Claude / Codex / ZCode 里可导入的记忆和分支…
+        </p>
+      )}
       {list
         .filter((p) => found[p])
         .map((p) => (
@@ -201,7 +210,7 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
 }
 
 /** What to bring over from Claude Code / Codex / ZCode for one repository. */
-function ImportSection({
+export function ImportSection({
   found,
   memories,
   branches,
@@ -279,5 +288,67 @@ function ImportSection({
         会话记录：Claude {found.claude_sessions} · Codex {found.codex_sessions} · ZCode {found.zcode_tasks}（只统计，不导入）。
       </p>
     </section>
+  );
+}
+
+/** Import into an existing project from one of its repositories. */
+export function ImportDialog({ project, path, onClose }: { project: string; path: string; onClose(): void }) {
+  const { act, notify } = useStudio();
+  const [found, setFound] = useState<ImportFound | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [memories, setMemories] = useState<Set<string>>(new Set());
+  const [branches, setBranches] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api
+      .importScan({ path })
+      .then((f) => {
+        setFound(f);
+        setMemories(new Set(f.memories.map((m) => m.file)));
+      })
+      .catch((e) => setError(errorMessage(e)));
+  }, [path]);
+  const apply = async () => {
+    if (!found) return;
+    setBusy(true);
+    const r = await act(() =>
+      api.importApply({
+        project,
+        path,
+        memories: [...memories],
+        branches: found.worktrees.filter((w) => w.branch && branches.has(w.path)).map((w) => ({ branch: w.branch!, path: w.path })),
+      }),
+    );
+    setBusy(false);
+    if (r) {
+      notify(`已导入 ${r.notes} 条记忆、${r.items.length} 个事项`, "info");
+      onClose();
+    }
+  };
+  return (
+    <Modal
+      title="导入现有信息"
+      onClose={onClose}
+      width={620}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            取消
+          </Button>
+          <Button variant="primary" icon={<Download size={14} />} onClick={apply} busy={busy} disabled={!found || (memories.size === 0 && branches.size === 0)}>
+            导入所选
+          </Button>
+        </>
+      }
+    >
+      {!found && !error && (
+        <p className="field-hint scan-hint">
+          <Spinner size={12} /> 正在查找 Claude / Codex / ZCode 里可导入的记忆和分支…
+        </p>
+      )}
+      {error && <p className="inline-error">{error}</p>}
+      {found && <ImportSection found={found} memories={memories} branches={branches} setMemories={setMemories} setBranches={setBranches} />}
+      {found && <p className="field-hint">已导入过的记忆不会重复添加。</p>}
+    </Modal>
   );
 }

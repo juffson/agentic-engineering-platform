@@ -590,6 +590,14 @@ class MockStore implements Api {
     }
   }
 
+  removeProject({ project }: { project: string }) {
+    if (!this.projects.some((p) => p.id === project)) throw new Error("项目不存在");
+    this.projects = this.projects.filter((p) => p.id !== project);
+    for (const [id, w] of [...this.works]) if (w.project === project) this.works.delete(id);
+    this.order = this.order.filter((id) => this.works.has(id));
+    if (this.active === project) this.active = this.projects[0]?.id ?? null;
+  }
+
   importScan({ path }: { path: string }): ImportFound {
     const repository = path.trim().replace(/\/$/, "");
     if (!repository.startsWith("/")) throw new Error("不是 Git 仓库");

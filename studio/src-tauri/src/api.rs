@@ -176,6 +176,39 @@ pub fn open_project(home: &Path, pid: &str) -> Result<()> {
     })
 }
 
+/// Take a project out of Studio. Repositories are untouched; Studio's own records for it
+/// move to `workflows/.removed/` so they can be restored by hand.
+pub fn remove_project(home: &Path, pid: &str) -> Result<()> {
+    let lib = Library::open(home)?;
+    let p = find(&lib, pid)?;
+    for w in &p.work {
+        ensure!(
+            running_attempt(home, pid, w).is_none()
+                && !autopilot::running(&autopilot::work_dir(home, pid, &w.id)),
+            "「{}」还有 Agent 在运行，先停止再移除项目",
+            w.name
+        );
+    }
+    change(home, |lib| {
+        find(lib, pid)?;
+        lib.projects.retain(|p| p.id != pid);
+        if lib.active.as_deref() == Some(pid) {
+            lib.active = lib.projects.first().map(|p| p.id.clone());
+        }
+        Ok(())
+    })?;
+    let dir = home.join("workflows").join(pid);
+    if dir.is_dir() {
+        let removed = home.join("workflows").join(".removed");
+        fs::create_dir_all(&removed)?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        fs::rename(&dir, removed.join(format!("{pid}-{stamp}")))?;
+    }
+    Ok(())
+}
+
 pub fn select_work(home: &Path, pid: &str, wid: &str) -> Result<()> {
     change(home, |lib| {
         let p = find_mut(lib, pid)?;

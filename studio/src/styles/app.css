@@ -2631,3 +2631,12 @@ select.input {
 .check.disabled {
   opacity: 0.5;
 }
+
+.scan-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.menu-item.danger {
+  color: var(--danger);
+}

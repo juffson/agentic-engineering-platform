@@ -195,6 +195,11 @@ fn importApply(
 }
 
 #[tauri::command(async)]
+fn removeProject(project: String) -> Result<impl Serialize, String> {
+    run(move |h| api::remove_project(&h, &project))
+}
+
+#[tauri::command(async)]
 fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
     run(move |h| api::cleanup(&h, &project, &work, force))
 }
@@ -299,6 +304,7 @@ pub fn start() {
             archive,
             unarchive,
             cleanup,
+            removeProject,
             importScan,
             importApply,
             pickFolder,

@@ -481,5 +481,17 @@ fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
     );
     assert!(Path::new(&wt_path).join("notes.txt").is_file());
     assert_eq!(git(&repo, &["rev-parse", "feat/export"])?.trim(), tip);
+
+    // The project can be taken out of Studio; its records are set aside, the repo stays.
+    api::remove_project(&home, &pid)?;
+    assert!(
+        api::snapshot(&home)?["projects"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!home.join("workflows").join(&pid).exists());
+    assert_eq!(fs::read_dir(home.join("workflows/.removed"))?.count(), 1);
+    assert!(repo.join("README.md").is_file());
     Ok(())
 }

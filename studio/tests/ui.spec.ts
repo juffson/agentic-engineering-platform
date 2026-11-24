@@ -239,3 +239,22 @@ test("a new project's repository can be picked from a folder", async ({ page }) 
   await expect(page.locator(".toast", { hasText: "已导入" })).toContainText("已导入 2 条记忆、1 个事项");
   await expect(page.getByRole("navigation", { name: "事项" }).getByText("fix/1448")).toBeVisible();
 });
+
+test("an existing project imports from its repository page, and can be removed", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  await page.getByRole("button", { name: /^仓库/ }).click();
+  await page.getByRole("button", { name: "从 Claude / Codex / ZCode 导入" }).first().click();
+  const dialog = page.getByRole("dialog", { name: "导入现有信息" });
+  await expect(dialog.getByTestId("import")).toContainText("Claude 记忆 3/3 条");
+  await dialog.getByText("chore/code-structure-review").click();
+  await shot(page, "21-import-existing");
+  await dialog.getByRole("button", { name: "导入所选" }).click();
+  await expect(page.locator(".toast", { hasText: "已导入" })).toContainText("已导入 3 条记忆、1 个事项");
+  await expect(page.getByRole("navigation", { name: "事项" }).getByText("chore/code-structure-review")).toBeVisible();
+
+  await page.locator(".project-btn").click();
+  page.once("dialog", (d) => d.accept());
+  await page.getByRole("menuitem", { name: /移除项目「行情终端」/ }).click();
+  await expect(page.locator(".project-name")).not.toHaveText("行情终端");
+});

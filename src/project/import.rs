@@ -169,7 +169,7 @@ fn worktrees(root: &Path) -> Result<Vec<FoundWorktree>> {
     let ws = Workspace::open(root)?;
     let ours = ws.data.join("workflow-worktrees");
     let list = git(root, &["worktree", "list", "--porcelain"])?;
-    let mut out = Vec::new();
+    let mut found = Vec::new();
     for block in list.split("\n\n") {
         let mut path = None;
         let mut branch = None;
@@ -184,31 +184,42 @@ fn worktrees(root: &Path) -> Result<Vec<FoundWorktree>> {
         if path == root || path.starts_with(&ours) || !path.is_dir() {
             continue;
         }
-        let ahead = branch
-            .as_deref()
-            .and_then(|b| git(root, &["rev-list", "--count", b, "^HEAD"]).ok())
-            .and_then(|n| n.trim().parse().ok())
-            .unwrap_or(0);
-        let dirty = git(&path, &["status", "--porcelain"])
-            .map(|s| s.lines().count())
-            .unwrap_or(0);
-        let p = path.to_string_lossy();
-        let source = if p.contains("/.zcode/worktrees/") {
-            "ZCode"
-        } else if p.contains("/.claude/worktrees/") {
-            "Claude"
-        } else {
-            "Git"
-        };
-        out.push(FoundWorktree {
-            path,
-            branch,
-            ahead,
-            dirty,
-            source: source.into(),
-        });
+        found.push((path, branch));
     }
-    Ok(out)
+    // `git status` takes most of a second in a large checkout: look at all of them at once.
+    Ok(std::thread::scope(|s| {
+        let jobs: Vec<_> = found
+            .into_iter()
+            .map(|(path, branch)| {
+                s.spawn(move || {
+                    let ahead = branch
+                        .as_deref()
+                        .and_then(|b| git(root, &["rev-list", "--count", b, "^HEAD"]).ok())
+                        .and_then(|n| n.trim().parse().ok())
+                        .unwrap_or(0);
+                    let dirty = git(&path, &["status", "--porcelain"])
+                        .map(|s| s.lines().count())
+                        .unwrap_or(0);
+                    let p = path.to_string_lossy();
+                    let source = if p.contains("/.zcode/worktrees/") {
+                        "ZCode"
+                    } else if p.contains("/.claude/worktrees/") {
+                        "Claude"
+                    } else {
+                        "Git"
+                    };
+                    FoundWorktree {
+                        source: source.into(),
+                        path,
+                        branch,
+                        ahead,
+                        dirty,
+                    }
+                })
+            })
+            .collect();
+        jobs.into_iter().filter_map(|j| j.join().ok()).collect()
+    }))
 }
 
 /// Everything importable for a repository folder.

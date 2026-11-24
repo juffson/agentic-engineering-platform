@@ -291,6 +291,8 @@ export interface Api {
   autopilotStop(a: { project: string; work: string }): void;
   archive(a: { project: string; work: string; memory: string; removeWorktree: boolean }): void;
   unarchive(a: { project: string; work: string }): void;
+  /** Take a project out of Studio (its repositories are untouched). */
+  removeProject(a: { project: string }): void;
   /** What Claude Code, Codex and ZCode already hold for a repository folder. */
   importScan(a: { path: string }): ImportFound;
   /** Import chosen Claude memory files (by file name) and existing branches (each becomes an

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { BookOpen, Check, ChevronDown, ChevronRight, FolderGit2, Plus } from "lucide-react";
+import { BookOpen, Check, ChevronDown, ChevronRight, FolderGit2, Plus, Trash2 } from "lucide-react";
+import { api } from "../api/client";
 import type { Group, WorkSummary } from "../api/types";
 import { useStudio } from "../state/store";
 import { isLive } from "../lib/work";
@@ -102,7 +103,7 @@ function WorkRow({ item, active, onSelect }: { item: WorkSummary; active: boolea
 }
 
 function ProjectSwitcher({ onNewProject }: { onNewProject(): void }) {
-  const { snapshot, project, openProject } = useStudio();
+  const { snapshot, project, openProject, act } = useStudio();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -158,6 +159,21 @@ function ProjectSwitcher({ onNewProject }: { onNewProject(): void }) {
             <Plus size={14} />
             <span className="menu-item-label">新建项目</span>
           </button>
+          {project && (
+            <button
+              type="button"
+              role="menuitem"
+              className="menu-item danger"
+              onClick={() => {
+                setOpen(false);
+                if (!window.confirm(`把项目「${project.name}」从 Studio 移除？\n仓库里的文件和分支不受影响；Studio 的记录会移到 workflows/.removed 下。`)) return;
+                void act(() => api.removeProject({ project: project.id }), "项目已移除");
+              }}
+            >
+              <Trash2 size={14} />
+              <span className="menu-item-label">移除项目「{project.name}」</span>
+            </button>
+          )}
         </div>
       )}
     </div>
