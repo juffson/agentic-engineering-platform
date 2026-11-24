@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { PlayCircle } from "lucide-react";
-import type { StageDetail, Tokens, UsageAnalysis, WorkDetail } from "../api/types";
+import type { AttemptSummary, StageDetail, Tokens, UsageAnalysis, WorkDetail } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio } from "../state/store";
-import { parseTokens, tokens, usd } from "../lib/format";
+import { carriesSummary, launchLabel, parseTokens, tokens, tokensK, usd } from "../lib/format";
 import { Button, Spinner } from "./ui";
 
 /** A token amount typed as "2M", "500k" or a plain number; empty clears it. */
@@ -13,18 +13,24 @@ export function BudgetField({
   label,
   onSave,
   disabled,
+  min,
+  minHint,
 }: {
   value: number | null;
   placeholder: string;
   label: string;
   onSave(tokens: number | null): void;
   disabled?: boolean;
+  /** Smallest accepted value; below it the field turns red and says `minHint`. */
+  min?: number;
+  minHint?: string;
 }) {
   const shown = value ? tokens(value) : "";
   const [text, setText] = useState(shown);
   useEffect(() => setText(shown), [shown]);
   const parsed = parseTokens(text);
-  const invalid = parsed !== null && Number.isNaN(parsed);
+  const tooSmall = parsed !== null && !Number.isNaN(parsed) && min !== undefined && parsed < min;
+  const invalid = (parsed !== null && Number.isNaN(parsed)) || tooSmall;
   const commit = () => {
     if (invalid || text === shown) return;
     if ((parsed ?? null) === (value ?? null)) return;
@@ -36,7 +42,8 @@ export function BudgetField({
       value={text}
       placeholder={placeholder}
       aria-label={label}
-      title="例如 2M、500k；留空表示不限"
+      title={tooSmall ? minHint : "例如 2M、500k；留空表示不限"}
+      aria-invalid={invalid || undefined}
       disabled={disabled}
       onChange={(e) => setText(e.target.value)}
       onBlur={commit}
@@ -66,19 +73,29 @@ export function BudgetMeter({ used, limit }: { used: number; limit: number | nul
 export function StageBudget({ detail, stage, compact }: { detail: WorkDetail; stage: StageDetail; compact?: boolean }) {
   const { act } = useStudio();
   const fallback = detail.budget.stage_default;
-  const save = (n: number | null) => act(() => api.setBudget({ project: detail.project, work: detail.id, stage: stage.index, tokens: n }));
+  const save = (n: number | null, done?: string) => act(() => api.setBudget({ project: detail.project, work: detail.id, stage: stage.index, tokens: n }), done);
+  // A suggestion from runs after the minimal launch (R9); only while no own budget is set.
+  const suggested = stage.budget.own ? null : stage.budget.suggested;
   return (
     <div className={`picker stage-budget${compact ? " compact" : ""}`}>
       {!compact && <span className="picker-label">Token 预算</span>}
       <div className="budget-row">
         <BudgetField
           value={stage.budget.own}
-          placeholder={fallback ? `默认 ${tokens(fallback)}` : "不限"}
+          placeholder={suggested ? `建议 ${tokensK(suggested.value)}` : fallback ? `默认 ${tokens(fallback)}` : "不限"}
           label={`「${stage.name}」Token 预算`}
-          onSave={save}
+          onSave={(n) => save(n)}
         />
         <BudgetMeter used={stage.budget.used} limit={stage.budget.limit} />
       </div>
+      {suggested && !compact && (
+        <span className="field-hint budget-suggest">
+          优化后 {suggested.runs} 次执行中位数 {tokensK(suggested.median)} × 1.5
+          <button type="button" className="link-btn inline" onClick={() => save(suggested.value, `已设为建议值 ${tokensK(suggested.value)}`)}>
+            采用
+          </button>
+        </span>
+      )}
     </div>
   );
 }
@@ -129,7 +146,19 @@ export function TokenLegend() {
 
 /** Where one run's tokens went: by kind of step, context size per call, and the steps that
  *  grew the context most. */
-export function UsageBreakdown({ project, work, attempt }: { project: string; work: string; attempt: string }) {
+export function UsageBreakdown({
+  project,
+  work,
+  attempt,
+  client,
+  session,
+}: {
+  project: string;
+  work: string;
+  attempt: string;
+  client?: string;
+  session?: AttemptSummary["session"];
+}) {
   const [data, setData] = useState<UsageAnalysis | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -146,6 +175,8 @@ export function UsageBreakdown({ project, work, attempt }: { project: string; wo
   const sum = total(s.tokens);
   if (!sum) return <p className="field-hint">这次执行没有可读取的用量记录。</p>;
   const peak = Math.max(1, ...data.calls.map((c) => c.context));
+  const launch = data.reused ? null : launchLabel(data.launch, client ?? (data.launch?.mcp_servers !== undefined ? "Claude" : ""));
+  const carried = carriesSummary(session);
   return (
     <div className="usage-breakdown" data-testid="usage-breakdown">
       <div className="ub-head">
@@ -155,6 +186,20 @@ export function UsageBreakdown({ project, work, attempt }: { project: string; wo
         </span>
         <TokenLegend />
       </div>
+      {data.reused ? (
+        <p className="ub-launch" data-testid="usage-launch">
+          <span className="tag tag-auto">复用会话</span>
+          <span>首轮已缓存 {data.launch?.first_context != null ? tokensK(data.launch.first_context) : "—"}</span>
+          <span className="muted">本轮只计本阶段窗口内的 {data.window_calls} 次调用</span>
+        </p>
+      ) : (
+        launch && (
+          <p className={`ub-launch ${launch.tone}`} data-testid="usage-launch" title={launch.title}>
+            <span className="picker-label">启动配置</span>
+            <span>{launch.text}</span>
+          </p>
+        )
+      )}
       <TokenBar t={s.tokens} />
       <p className="field-hint">
         缓存读取 {Math.round((s.tokens.cache_read / sum) * 100)}%：每次调用都会把整段上下文再读一遍，上下文越长、调用越多，消耗越大。
@@ -188,7 +233,7 @@ export function UsageBreakdown({ project, work, attempt }: { project: string; wo
           <span className="field-hint">每次调用的上下文（最高 {tokens(peak)}）</span>
           <div className="ub-spark">
             {data.calls.map((c, i) => (
-              <span key={i} className={`k-${c.kind}`} style={{ height: `${Math.max(4, (c.context / peak) * 100)}%` }} title={`#${i + 1} ${c.kind} ${c.detail}\n上下文 ${c.context.toLocaleString()} · 输出 ${c.output.toLocaleString()}`} />
+              <span key={i} className={`k-${c.kind}`} style={{ height: `${Math.max(4, (c.context / peak) * 100)}%` }} title={`#${i + 1} ${c.kind} ${c.detail}\n上下文 ${c.context.toLocaleString()} · 输出 ${c.output.toLocaleString()}${i === 0 && carried ? "\n新会话 + 交接摘要" : ""}`} />
             ))}
           </div>
         </div>
@@ -213,8 +258,10 @@ export function UsageBreakdown({ project, work, attempt }: { project: string; wo
   );
 }
 
-/** A run stopped by its budget: add budget and continue in the same session. */
-export function ExtendBudget({ detail, stage }: { detail: WorkDetail; stage: StageDetail }) {
+/** A run stopped by its budget: add budget and continue in the same session, or re-run the
+ *  stage when its CLI cannot continue the original task (ZCode desktop, R7). */
+export function ExtendBudget({ detail, stage, attempt }: { detail: WorkDetail; stage: StageDetail; attempt?: AttemptSummary }) {
+  const continuable = attempt?.continuable ?? true;
   const { act } = useStudio();
   const step = stage.budget.limit ?? detail.budget.total_limit ?? 1_000_000;
   const [extra, setExtra] = useState(tokens(Math.max(100_000, Math.round(step / 2))));
@@ -224,19 +271,26 @@ export function ExtendBudget({ detail, stage }: { detail: WorkDetail; stage: Sta
   const go = async () => {
     if (!n || Number.isNaN(n)) return;
     setBusy(true);
-    await act(() => api.extendBudget({ project: detail.project, work: detail.id, stage: stage.index, extra: n, message }), "已追加预算，继续执行");
+    await act(() => api.extendBudget({ project: detail.project, work: detail.id, stage: stage.index, extra: n, message: continuable ? message : "" }), continuable ? "已追加预算，继续执行" : "已追加预算，重新运行");
     setBusy(false);
   };
   return (
     <div className="extend-budget">
+      {!continuable && (
+        <p className="field-hint extend-note">
+          {attempt?.client === "ZCode" ? "ZCode 不支持在原任务上继续" : "这个 CLI 不支持在原会话上继续"}，会按原说明重新运行这一阶段
+        </p>
+      )}
       <label className="budget-row">
         <span className="picker-label">追加</span>
         <input className="input input-sm budget-input" value={extra} onChange={(e) => setExtra(e.target.value)} aria-label="追加 Token" />
         <BudgetMeter used={stage.budget.used} limit={stage.budget.limit} />
       </label>
-      <textarea className="input" rows={2} value={message} onChange={(e) => setMessage(e.target.value)} placeholder="继续时要说的话（可留空：从中断处继续）" aria-label="继续说明" />
+      {continuable && (
+        <textarea className="input" rows={2} value={message} onChange={(e) => setMessage(e.target.value)} placeholder="继续时要说的话（可留空：从中断处继续）" aria-label="继续说明" />
+      )}
       <Button variant="primary" size="lg" className="block" icon={<PlayCircle size={14} />} busy={busy} disabled={!n || Number.isNaN(n)} onClick={go}>
-        追加预算并继续
+        {continuable ? "追加预算并继续" : "追加预算并重跑"}
       </Button>
     </div>
   );
