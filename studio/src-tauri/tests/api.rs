@@ -408,8 +408,12 @@ fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
     let w = &found["worktrees"][0];
     assert_eq!(w["branch"], "feat/export", "{found}");
     assert_eq!(
-        (w["ahead"].as_u64(), w["dirty"].as_u64()),
-        (Some(1), Some(1))
+        (
+            w["ahead"].as_u64(),
+            w["dirty"].as_u64(),
+            w["untracked"].as_u64()
+        ),
+        (Some(1), Some(0), Some(1))
     );
     assert_eq!(w["source"], "Git");
 
@@ -532,6 +536,61 @@ fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
     );
     assert!(Path::new(&wt_path).join("notes.txt").is_file());
     assert_eq!(git(&repo, &["rev-parse", "feat/export"])?.trim(), tip);
+
+    // The branch page: every branch with its worktree, item branches named by their item.
+    let g = api::branch_graph(&home, &pid, &repo.display().to_string(), 200)?;
+    let branches = g["branches"].as_array().unwrap();
+    let feat = branches
+        .iter()
+        .find(|b| b["name"] == "feat/export")
+        .unwrap();
+    assert_eq!(feat["ahead"], 1, "{feat}");
+    assert_eq!(feat["worktree"]["source"], "Git");
+    assert_eq!(feat["worktree"]["untracked"], 1);
+    let ours = branches
+        .iter()
+        .find(|b| b["name"] == format!("aep-stage/{wid}").as_str())
+        .unwrap();
+    assert_eq!(ours["item"]["name"], "feat/export", "{ours}");
+    assert_eq!(ours["worktree"]["source"], "AEP");
+    assert!(
+        branches
+            .iter()
+            .any(|b| b["name"] == "main" && b["current"] == true)
+    );
+    let subjects: Vec<_> = g["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["subject"].as_str().unwrap())
+        .collect();
+    assert!(
+        subjects.contains(&"start export") && subjects.contains(&"init"),
+        "{subjects:?}"
+    );
+
+    // A git tool plugin from the config file opens the chosen folder.
+    fs::create_dir_all(home.join("plugins"))?;
+    fs::write(
+        home.join("plugins/git-tools.json"),
+        r#"[{"label":"标记","command":["/usr/bin/touch","{path}/opened"]}]"#,
+    )?;
+    let tools = api::git_tools(&home)?;
+    let tool = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["label"] == "标记")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    api::open_git_tool(&home, &tool, &wt_path)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(&wt_path).join("opened").exists() {
+        ensure!(Instant::now() < deadline, "tool did not run");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     // The project can be taken out of Studio; its records are set aside, the repo stays.
     api::remove_project(&home, &pid)?;

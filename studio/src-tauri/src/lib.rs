@@ -205,6 +205,21 @@ fn reviseMemory(project: String, id: i64, text: String) -> Result<impl Serialize
 }
 
 #[tauri::command(async)]
+fn branchGraph(project: String, path: String, limit: usize) -> Result<impl Serialize, String> {
+    run(move |h| api::branch_graph(&h, &project, &path, limit))
+}
+
+#[tauri::command(async)]
+fn gitTools() -> Result<impl Serialize, String> {
+    run(move |h| api::git_tools(&h))
+}
+
+#[tauri::command(async)]
+fn openGitTool(id: String, path: String) -> Result<impl Serialize, String> {
+    run(move |h| api::open_git_tool(&h, &id, &path))
+}
+
+#[tauri::command(async)]
 fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
     run(move |h| api::cleanup(&h, &project, &work, force))
 }
@@ -309,6 +324,9 @@ pub fn start() {
             archive,
             unarchive,
             cleanup,
+            branchGraph,
+            gitTools,
+            openGitTool,
             reviseMemory,
             removeProject,
             importScan,

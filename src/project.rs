@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod branches;
 pub mod directory;
 pub mod import;
 pub mod merge;

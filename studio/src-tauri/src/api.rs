@@ -956,6 +956,134 @@ pub fn revise_memory(home: &Path, pid: &str, id: i64, text: &str) -> Result<i64>
     Memory::open(&dir)?.revise(id, kind, text.trim())
 }
 
+/// A repository's branches and recent commit graph, with each `aep-stage/<id>` branch
+/// labelled by the project item it belongs to.
+pub fn branch_graph(home: &Path, pid: &str, path: &str, limit: usize) -> Result<Value> {
+    let lib = Library::open(home)?;
+    let p = find(&lib, pid)?;
+    let graph = aep::project::branches::graph(&repository(path)?, limit.clamp(50, 2000))?;
+    let mut v = serde_json::to_value(&graph)?;
+    for b in v["branches"].as_array_mut().into_iter().flatten() {
+        let name = b["name"].as_str().unwrap_or_default().to_owned();
+        let item = name.strip_prefix("aep-stage/").and_then(|rest| {
+            p.work
+                .iter()
+                .find(|w| rest == w.id || rest.starts_with(&format!("{}-", w.id)))
+        });
+        b["item"] = item.map_or(Value::Null, |w| json!({"id": w.id, "name": w.name}));
+    }
+    Ok(v)
+}
+
+/// External git tools Studio can open a repository or worktree in: known apps that are
+/// installed, plus any listed in `<catalog>/plugins/git-tools.json` as
+/// `[{"label": "...", "command": ["program", "arg", "{path}"]}]`.
+fn tool_list(home: &Path) -> Vec<(String, String, Vec<String>)> {
+    let mut tools = Vec::new();
+    for (app, label) in [
+        ("Fork", "Fork"),
+        ("GitHub Desktop", "GitHub Desktop"),
+        ("Sourcetree", "Sourcetree"),
+        ("Tower", "Tower"),
+        ("GitKraken", "GitKraken"),
+        ("Visual Studio Code", "VS Code（Git Graph 扩展）"),
+        ("Cursor", "Cursor"),
+    ] {
+        if Path::new(&format!("/Applications/{app}.app")).is_dir() {
+            tools.push((
+                format!("app:{app}"),
+                label.to_owned(),
+                vec![
+                    "/usr/bin/open".into(),
+                    "-a".into(),
+                    app.into(),
+                    "{path}".into(),
+                ],
+            ));
+        }
+    }
+    let on_path = |bin: &str| {
+        runner::path().ok().and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join(bin))
+                .find(|f| f.is_file())
+        })
+    };
+    for (bin, label) in [("lazygit", "lazygit"), ("tig", "tig")] {
+        if let Some(exe) = on_path(bin) {
+            // Terminal UIs open in a new Terminal window.
+            let script = format!(
+                "tell application \"Terminal\" to do script \"cd \" & quoted form of \"{{path}}\" & \" && {}\"",
+                exe.display()
+            );
+            tools.push((
+                format!("tui:{bin}"),
+                label.to_owned(),
+                vec![
+                    "/usr/bin/osascript".into(),
+                    "-e".into(),
+                    script,
+                    "-e".into(),
+                    "tell application \"Terminal\" to activate".into(),
+                ],
+            ));
+        }
+    }
+    if let Some(exe) = on_path("gitk") {
+        tools.push((
+            "bin:gitk".into(),
+            "gitk".into(),
+            vec![exe.display().to_string(), "--all".into()],
+        ));
+    }
+    let custom = home.join("plugins").join("git-tools.json");
+    if let Ok(list) = aep::workspace::read(&custom) {
+        for (i, t) in list.as_array().into_iter().flatten().enumerate() {
+            let label = t["label"].as_str().unwrap_or_default().to_owned();
+            let command: Vec<String> = t["command"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a.as_str().map(str::to_owned))
+                .collect();
+            if !label.is_empty() && !command.is_empty() {
+                tools.push((format!("custom:{i}"), label, command));
+            }
+        }
+    }
+    tools
+}
+
+pub fn git_tools(home: &Path) -> Result<Value> {
+    Ok(json!({
+        "tools": tool_list(home)
+            .into_iter()
+            .map(|(id, label, _)| json!({"id": id, "label": label}))
+            .collect::<Vec<_>>(),
+        "config": home.join("plugins").join("git-tools.json"),
+    }))
+}
+
+pub fn open_git_tool(home: &Path, id: &str, path: &str) -> Result<()> {
+    let dir = Path::new(path);
+    ensure!(dir.is_dir(), "目录不存在：{path}");
+    let (_, label, command) = tool_list(home)
+        .into_iter()
+        .find(|(i, ..)| i == id)
+        .context("找不到这个 git 工具")?;
+    let args: Vec<String> = command.iter().map(|a| a.replace("{path}", path)).collect();
+    std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .current_dir(dir)
+        .env("PATH", runner::path()?)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("无法启动 {label}"))?;
+    Ok(())
+}
+
 pub fn reveal(path: &str) -> Result<()> {
     let p = Path::new(path);
     if !p.exists() {

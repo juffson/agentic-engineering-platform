@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { BookOpen, Check, ChevronDown, ChevronRight, FolderGit2, Plus, Trash2 } from "lucide-react";
+import { BookOpen, Check, ChevronDown, ChevronRight, FolderGit2, GitBranch, Plus, Trash2 } from "lucide-react";
 import { api } from "../api/client";
 import type { Group, WorkSummary } from "../api/types";
 import { useStudio } from "../state/store";
@@ -65,6 +65,10 @@ export function Sidebar({ onNewWork, onNewProject }: { onNewWork(): void; onNewP
           <FolderGit2 size={14} />
           仓库
           {project && <span className="foot-count">{project.repositories.length}</span>}
+        </button>
+        <button type="button" className={`foot-link${page === "branches" ? " on" : ""}`} onClick={() => setPage("branches")} disabled={!project}>
+          <GitBranch size={14} />
+          分支
         </button>
       </div>
     </nav>

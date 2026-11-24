@@ -281,3 +281,20 @@ test("project memory keeps versions: edit, see what changed, restore", async ({ 
   await expect(page.getByTestId("memory-note").filter({ hasText: "zustand" })).toContainText("禁止新增全局单例");
   await expect(page.getByTestId("memory-note").filter({ hasText: "zustand" })).toContainText("第 4 版");
 });
+
+test("the branch page draws branches, their worktrees and items, and opens git tools", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  await page.getByRole("button", { name: /^分支/ }).click();
+  const list = page.getByRole("complementary", { name: "分支列表" });
+  await expect(list).toContainText("事项：自选股分组支持拖拽排序");
+  await expect(list).toContainText("Claude 工作区 · 0 改动 · 74 未跟踪");
+  await expect(page.locator(".graph-svg circle")).toHaveCount(10);
+  await list.getByText("feat/export-statement").click();
+  await expect(page.locator(".graph-row.on")).toContainText("导出对账单：补齐表头");
+  await shot(page, "23-branches");
+  await page.getByRole("button", { name: "Fork" }).click();
+  await expect(page.locator(".toast-error")).toHaveCount(0);
+  await list.getByText("fix/snapshot-paging").click();
+  await expect(page.getByText("这个分支没有检出到工作区")).toBeVisible();
+});

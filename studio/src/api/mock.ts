@@ -3,6 +3,7 @@
 // reveals one more transcript entry every `stepMs`, then finishes with its
 // scripted outcome. Mutations update this state so every flow is clickable.
 import type {
+  BranchGraph,
   ImportFound,
   Api,
   AttemptSummary,
@@ -590,6 +591,45 @@ class MockStore implements Api {
     }
   }
 
+  branchGraph({ project, path }: { project: string; path: string; limit: number }): BranchGraph {
+    if (!this.projects.some((p) => p.id === project)) throw new Error("项目不存在");
+    const now = Math.floor(Date.now() / 1000);
+    const c = (sha: string, parents: string[], subject: string, hoursAgo: number, author = "林舟") => ({ sha: sha.padEnd(40, "0"), parents: parents.map((p) => p.padEnd(40, "0")), subject, author, time: now - hoursAgo * 3600 });
+    const commits = [
+      c("a7", ["a6"], "导出对账单：补齐表头", 1, "Claude"),
+      c("f3", ["a5"], "分组拖拽：持久化排序", 2, "Codex"),
+      c("a6", ["a5"], "导出对账单：CSV 编码", 3, "Claude"),
+      c("m4", ["m3", "b2"], "Merge work item: 行情快照导出 CSV", 5),
+      c("b2", ["b1"], "快照导出：分页", 7, "ZCode"),
+      c("a5", ["m3"], "导出对账单：骨架", 8, "Claude"),
+      c("m3", ["m2"], "升级 quote-gateway 客户端", 20),
+      c("b1", ["m2"], "快照导出：接口", 26, "ZCode"),
+      c("m2", ["m1"], "首页布局调整", 40),
+      c("m1", [], "init", 80),
+    ];
+    const tip = (s: string) => s.padEnd(40, "0");
+    return {
+      repository: path,
+      head: "main",
+      branches: [
+        { name: "main", sha: tip("m4"), ahead: 0, behind: 0, current: true, worktree: null, item: null },
+        { name: "aep-stage/7f3a9c21", sha: tip("f3"), ahead: 2, behind: 1, current: false, worktree: { path: `${HOME}/worktrees/7f3a9c21`, source: "AEP", changed: 1, untracked: 0 }, item: { id: "w2", name: "自选股分组支持拖拽排序" } },
+        { name: "feat/export-statement", sha: tip("a7"), ahead: 3, behind: 1, current: false, worktree: { path: `${HOME}/.claude/worktrees/export`, source: "Claude", changed: 0, untracked: 74 }, item: null },
+        { name: "fix/snapshot-paging", sha: tip("b2"), ahead: 0, behind: 2, current: false, worktree: null, item: null },
+      ],
+      commits,
+      truncated: false,
+    };
+  }
+
+  gitTools() {
+    return { tools: [{ id: "app:Fork", label: "Fork" }, { id: "app:Visual Studio Code", label: "VS Code（Git Graph 扩展）" }, { id: "tui:lazygit", label: "lazygit" }], config: `${HOME}/plugins/git-tools.json` };
+  }
+
+  openGitTool({ id }: { id: string; path: string }) {
+    if (!id) throw new Error("找不到这个 git 工具");
+  }
+
   removeProject({ project }: { project: string }) {
     if (!this.projects.some((p) => p.id === project)) throw new Error("项目不存在");
     this.projects = this.projects.filter((p) => p.id !== project);
@@ -613,9 +653,9 @@ class MockStore implements Api {
       codex_sessions: 3,
       zcode_tasks: 38,
       worktrees: [
-        { path: `${HOME}/.zcode/worktrees/8ab3/app`, branch: "chore/code-structure-review", ahead: 4, dirty: 0, source: "ZCode" },
-        { path: `${repository}/.claude/worktrees/fix1448`, branch: "fix/1448", ahead: 2, dirty: 3, source: "Claude" },
-        { path: "/tmp/pr1932wt", branch: null, ahead: 0, dirty: 0, source: "Git" },
+        { path: `${HOME}/.zcode/worktrees/8ab3/app`, branch: "chore/code-structure-review", ahead: 4, dirty: 0, untracked: 0, source: "ZCode" },
+        { path: `${repository}/.claude/worktrees/fix1448`, branch: "fix/1448", ahead: 2, dirty: 3, untracked: 74, source: "Claude" },
+        { path: "/tmp/pr1932wt", branch: null, ahead: 0, dirty: 0, untracked: 0, source: "Git" },
       ],
     };
   }

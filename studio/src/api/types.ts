@@ -247,9 +247,26 @@ export interface ImportFound {
     path: string;
     branch: string | null;
     ahead: number;
-    dirty: number;
+    dirty: number; // changed tracked files
+    untracked: number;
     source: "Claude" | "ZCode" | "Git" | string;
   }[];
+}
+
+export interface BranchGraph {
+  repository: string;
+  head: string | null;
+  branches: {
+    name: string;
+    sha: string;
+    ahead: number; // vs the repository's checked-out branch
+    behind: number;
+    current: boolean;
+    worktree: { path: string; source: "Claude" | "ZCode" | "AEP" | "Git" | string; changed: number; untracked: number } | null;
+    item: { id: string; name: string } | null; // aep-stage/<id> branches
+  }[];
+  commits: { sha: string; parents: string[]; subject: string; author: string; time: number }[]; // topo order, newest first
+  truncated: boolean;
 }
 
 /** Commands. Each returns a Promise of the given type; errors reject with a message string. */
@@ -296,6 +313,11 @@ export interface Api {
   /** Save a new version of a project memory note (agents read only the newest); restoring an
    *  old version is revising the newest with its text. Returns the new note id. */
   reviseMemory(a: { project: string; id: number; text: string }): number;
+  /** Branches, worktrees and the recent commit graph of one of the project's repositories. */
+  branchGraph(a: { project: string; path: string; limit: number }): BranchGraph;
+  /** Installed git tools (Fork, VS Code, lazygit…) plus plugins from `config`. */
+  gitTools(): { tools: { id: string; label: string }[]; config: string };
+  openGitTool(a: { id: string; path: string }): void;
   /** Take a project out of Studio (its repositories are untouched). */
   removeProject(a: { project: string }): void;
   /** What Claude Code, Codex and ZCode already hold for a repository folder. */

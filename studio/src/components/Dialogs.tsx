@@ -274,7 +274,7 @@ export function ImportSection({
                     <span className="muted">
                       {" "}
                       · {w.source} · 领先 {w.ahead} 个提交
-                      {w.dirty > 0 && ` · ${w.dirty} 个未提交改动留在原工作区`}
+                      {w.dirty + w.untracked > 0 && ` · 原工作区有 ${w.dirty} 个改动、${w.untracked} 个未跟踪文件（不带过来）`}
                     </span>
                   </span>
                 </label>

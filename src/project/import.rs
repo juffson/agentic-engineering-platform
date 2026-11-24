@@ -41,8 +41,10 @@ pub struct FoundWorktree {
     pub branch: Option<String>,
     /// Commits on the branch that the repository's checked-out branch does not have.
     pub ahead: usize,
-    /// Uncommitted entries; these stay in the original worktree and are not imported.
+    /// Changed tracked files and untracked files; these stay in the original worktree and
+    /// are not imported.
     pub dirty: usize,
+    pub untracked: usize,
     /// "Claude", "ZCode" or "Git", from where the worktree lives.
     pub source: String,
 }
@@ -197,9 +199,7 @@ fn worktrees(root: &Path) -> Result<Vec<FoundWorktree>> {
                         .and_then(|b| git(root, &["rev-list", "--count", b, "^HEAD"]).ok())
                         .and_then(|n| n.trim().parse().ok())
                         .unwrap_or(0);
-                    let dirty = git(&path, &["status", "--porcelain"])
-                        .map(|s| s.lines().count())
-                        .unwrap_or(0);
+                    let (dirty, untracked) = super::branches::status(&path);
                     let p = path.to_string_lossy();
                     let source = if p.contains("/.zcode/worktrees/") {
                         "ZCode"
@@ -214,6 +214,7 @@ fn worktrees(root: &Path) -> Result<Vec<FoundWorktree>> {
                         branch,
                         ahead,
                         dirty,
+                        untracked,
                     }
                 })
             })
@@ -285,7 +286,9 @@ impl Project {
                 Some((_, body)) if body == &note => {}
                 // The file changed since it was imported: a new version of that note.
                 Some((id, _)) => ids.push(db.revise(*id, crate::memory::Kind::Decision, &note)?),
-                None => ids.push(db.add_manual(&Key::new("", "", ""), "decision", &note, None, None)?),
+                None => {
+                    ids.push(db.add_manual(&Key::new("", "", ""), "decision", &note, None, None)?)
+                }
             }
         }
         Ok(ids)
