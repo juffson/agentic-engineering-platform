@@ -268,6 +268,13 @@ fn perform(
             },
             None => session_reuse::decide(Mode::Continue, &current, None, threshold),
         };
+        // ZCode is outside `decide` (no adjacent reuse), but its app-server sessions can be
+        // continued by a follow-up (R7); desktop tasks keep re-running.
+        let plan = if req.profile.client == Client::ZCode {
+            zcode_continue(runs, req.stage, &p)
+        } else {
+            plan
+        };
         let plan = match plan {
             // The round being continued exists; what is missing is a session to resume.
             Plan::Fresh {
@@ -617,8 +624,12 @@ fn prior_turn(dir: &Path, follow: &aep::workflow::FollowUp) -> Result<Prior> {
             workspace = ev["workspace"].as_str().map(PathBuf::from);
         }
         // Runs from before sessions were persisted (`--ephemeral`) cannot be resumed.
-        if session.is_none() && ev["resumable"] == true {
-            session = ev["session"].as_str().map(str::to_owned);
+        if session.is_none() {
+            session = if ev["resumable"] == true {
+                ev["session"].as_str().map(str::to_owned)
+            } else {
+                zcode_app_session(&ev)
+            };
             if session.is_some() {
                 session_run = Some(id.clone());
             }
@@ -641,6 +652,36 @@ fn prior_turn(dir: &Path, follow: &aep::workflow::FollowUp) -> Result<Prior> {
         session_run,
         result,
     })
+}
+
+/// The ZCode app-server session a run saved (`native_session`); desktop tasks have none.
+fn zcode_app_session(ev: &Value) -> Option<String> {
+    let native = &ev["native_session"];
+    (native["client"] == "ZCode" && native["transport"] == "app-server")
+        .then(|| native["session"].as_str().map(str::to_owned))
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// A ZCode follow-up continues the newest app-server session of the rounds it follows.
+fn zcode_continue(runs: &Path, stage: usize, prior: &Prior) -> Plan {
+    let found = prior.session_run.as_ref().and_then(|run| {
+        let ev = aep::workflow::evidence(&runs.join(run)).ok()?;
+        Some((run.clone(), zcode_app_session(&ev)?))
+    });
+    match found {
+        Some((run, session)) => Plan::Resume {
+            session,
+            fork: false,
+            source_stage: stage,
+            source_run: run,
+            context: None,
+        },
+        None => Plan::Fresh {
+            reason: Reason::SessionUnavailable,
+            context: None,
+        },
+    }
 }
 
 fn first_event(stdout: &Path, kind: &str) -> Option<Value> {
@@ -713,6 +754,7 @@ fn session_missing(dir: &Path) -> bool {
         log.contains("no rollout found")
             || log.contains("no conversation found")
             || log.contains("thread/resume failed")
+            || log.contains(crate::zcode_stage::RESUME_FAILED)
     })
 }
 
@@ -899,6 +941,8 @@ fn invoke(
                 // A later stage gets its own session ID; the earlier one stays as it was.
                 args.push("--fork-session".into());
             }
+        } else if profile.client == Client::ZCode {
+            args.extend(["--resume".into(), session.clone()]);
         } else {
             args.push(session.clone());
         }
@@ -950,6 +994,12 @@ fn invoke(
                     && let Some(session) = &resume
                 {
                     record["session"] = json!(session);
+                }
+                // A ZCode app-server session saved before the stop can be continued (R7).
+                if profile.client == Client::ZCode
+                    && let Ok(native) = aep::workspace::read(&dir.join("session.json"))
+                {
+                    record["native_session"] = native;
                 }
             }
             return Err(e);
@@ -1256,6 +1306,107 @@ pub(crate) fn metrics(dir: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `<root>/runs/<id>/evidence.json`; returns the directory of a new round.
+    fn zcode_rounds(root: &Path, rounds: &[(&str, Value)]) -> PathBuf {
+        for (id, ev) in rounds {
+            let d = root.join("runs").join(id);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("evidence.json"), ev.to_string()).unwrap();
+            fs::write(d.join("result.txt"), format!("answer of {id}")).unwrap();
+        }
+        let next = root.join("runs").join("r3");
+        fs::create_dir_all(&next).unwrap();
+        next
+    }
+
+    #[test]
+    fn zcode_stage_follow_up_continues_the_saved_app_server_session() {
+        let t = tempfile::tempdir().unwrap();
+        let ws = t.path().join("ws");
+        fs::create_dir(&ws).unwrap();
+        let native = json!({"client":"ZCode","transport":"app-server","session":"sess_a"});
+        // r2 (budget-stopped or failed without a session) follows r1, which saved one.
+        let dir = zcode_rounds(
+            t.path(),
+            &[
+                (
+                    "r1",
+                    json!({"status":"succeeded","workspace":ws,"resumable":false,"native_session":native}),
+                ),
+                (
+                    "r2",
+                    json!({"status":"failed","workspace":ws,"resumable":false,"follow_up":{"attempt":"r1"}}),
+                ),
+            ],
+        );
+        let follow = aep::workflow::FollowUp {
+            attempt: "r2".into(),
+            message: "继续".into(),
+        };
+        let prior = prior_turn(&dir, &follow).unwrap();
+        assert_eq!(prior.session_run.as_deref(), Some("r1"));
+        match zcode_continue(&t.path().join("runs"), 3, &prior) {
+            Plan::Resume {
+                session,
+                fork,
+                source_run,
+                ..
+            } => {
+                assert_eq!(session, "sess_a");
+                assert!(!fork);
+                assert_eq!(source_run, "r1");
+            }
+            other => panic!("expected a resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zcode_stage_desktop_tasks_are_not_continued() {
+        let t = tempfile::tempdir().unwrap();
+        let ws = t.path().join("ws");
+        fs::create_dir(&ws).unwrap();
+        let native = json!({"client":"ZCode","transport":"desktop","session":"task_1"});
+        let dir = zcode_rounds(
+            t.path(),
+            &[(
+                "r1",
+                json!({"status":"succeeded","workspace":ws,"native_session":native}),
+            )],
+        );
+        let follow = aep::workflow::FollowUp {
+            attempt: "r1".into(),
+            message: "继续".into(),
+        };
+        let prior = prior_turn(&dir, &follow).unwrap();
+        assert_eq!(prior.session_run, None);
+        assert!(matches!(
+            zcode_continue(&t.path().join("runs"), 3, &prior),
+            Plan::Fresh {
+                reason: Reason::SessionUnavailable,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn zcode_stage_resume_failure_falls_back_to_full_context() {
+        let t = tempfile::tempdir().unwrap();
+        assert!(!session_missing(t.path()));
+        fs::write(
+            t.path().join("stderr.log"),
+            format!(
+                "{}: session not found\nError: ZCode\n",
+                crate::zcode_stage::RESUME_FAILED
+            ),
+        )
+        .unwrap();
+        assert!(session_missing(t.path()));
+        let mut record = json!({"session":"sess_a","reused_session":{"session":"sess_a"}});
+        resume_failed(&mut record, &anyhow::anyhow!("resume failed"));
+        assert_eq!(record["fresh_session_reason"], "session_unavailable");
+        assert!(record["session"].is_null());
+    }
 
     #[test]
     fn launch_stats_are_added_to_claude_evidence_only() {
