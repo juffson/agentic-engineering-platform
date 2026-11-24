@@ -75,24 +75,11 @@ fn entries(
     }
     (text, ids)
 }
-pub fn packet(
-    req: &Request,
-    project: &[Value],
-    repo: &[Value],
-    since: Option<i64>,
-) -> Result<Packet> {
+/// Reading convention appended to every stage prompt (R5): locate first, read ranges, cap output.
+pub const READING: &str = "读取约定：先用 rg 或 codegraph 定位，再按行范围读取（Read 的 offset/limit 或 sed -n 'a,bp'）；不要 cat 整个大文件；命令输出可能很长时用 head/tail 截断，或写到文件后按需读取。";
+/// Project / stage / duty / brief, plus the incoming stage transfer (it may carry human verdicts).
+pub fn header(req: &Request) -> Result<String> {
     let stage = req.template.stages().get(req.stage).context("无效阶段")?;
-    let total = project.len();
-    let (project, mut project_ids) = entries(project, 1600, 720, since);
-    if since.is_some() {
-        return Ok(Packet {
-            more: project_ids.len() < total,
-            text: project.trim_start().to_owned(),
-            project_ids,
-            repo_ids: vec![],
-        });
-    }
-    let (repo, mut repo_ids) = entries(repo, 650, 420, None);
     let mut text = format!(
         "AEP Studio 项目：{} / {}\n阶段：{}（{}）\n阶段职责：{}\n本次说明：{}",
         clip(&req.project, 160),
@@ -105,17 +92,13 @@ pub fn packet(
     if let Some(transfer) = &req.stage_transfer {
         text.push('\n');
         text.push_str(&transfer.context());
-        for decision in &transfer.project_decisions {
-            if !project_ids.contains(&decision.id) {
-                project_ids.push(decision.id);
-            }
-        }
-        if let Some(id) = transfer.repository_decision(req.repository.as_deref())
-            && !repo_ids.contains(&id)
-        {
-            repo_ids.insert(0, id);
-        }
     }
+    Ok(text)
+}
+/// Work hand-offs, approved stage notes, project and repository memory and the prior-run line.
+/// `header` is only read to skip approved notes it already quotes.
+pub fn memory_body(req: &Request, header: &str, project: &str, repo: &str) -> String {
+    let mut text = String::new();
     let mut remaining = 850usize;
     for h in req.handoffs.iter().rev() {
         if remaining < 120 {
@@ -144,7 +127,7 @@ pub fn packet(
             break;
         }
         let n = clip(note.trim(), left.min(340));
-        if text.contains(&n) || project.contains(&n) {
+        if header.contains(&n) || text.contains(&n) || project.contains(&n) {
             continue;
         }
         text.push_str(&format!("\n已确认 · {}：{n}", clip(label, 60)));
@@ -161,7 +144,13 @@ pub fn packet(
             "\n前序执行 {id}。需要完整交付物、命令或文件时使用 aep project show --attempt <ID>。"
         ));
     }
-    text.push_str("\n以当前决策和人工结论为准。完整说明存于 request.json。");
+    text
+}
+/// Stage rules: decision precedence, commit policy, AEP-HANDOFF, specs ownership, subtask scope,
+/// optional/send-back markers, gate verdict and the allowed check command.
+pub fn rules(req: &Request) -> Result<String> {
+    let stage = req.template.stages().get(req.stage).context("无效阶段")?;
+    let mut text = String::from("\n以当前决策和人工结论为准。完整说明存于 request.json。");
     if stage.role != Role::Build {
         text.push_str("保留已有实现。");
     }
@@ -200,9 +189,7 @@ pub fn packet(
             if task.check.is_empty() { "相关测试".into() } else { task.check.join(" ") },
         ));
     }
-    let optional: Vec<_> = req
-        .template
-        .stages()
+    let optional: Vec<_> = stages
         .iter()
         .enumerate()
         .filter(|(i, _)| *i > req.stage && workflow::skippable(req.template, *i))
@@ -214,7 +201,7 @@ pub fn packet(
             optional.join("、")
         ));
     }
-    let earlier: Vec<_> = req.template.stages()[..req.stage.min(req.template.stages().len())]
+    let earlier: Vec<_> = stages[..req.stage.min(stages.len())]
         .iter()
         .map(|s| s.name)
         .collect();
@@ -233,12 +220,75 @@ pub fn packet(
             req.profile.check_command
         ));
     }
+    Ok(text)
+}
+/// Fresh-session prompt: `header + memory_body + rules + READING`.
+pub fn packet(
+    req: &Request,
+    project: &[Value],
+    repo: &[Value],
+    since: Option<i64>,
+) -> Result<Packet> {
+    let total = project.len();
+    let (project, mut project_ids) = entries(project, 1600, 720, since);
+    if since.is_some() {
+        return Ok(Packet {
+            more: project_ids.len() < total,
+            text: project.trim_start().to_owned(),
+            project_ids,
+            repo_ids: vec![],
+        });
+    }
+    let (repo, mut repo_ids) = entries(repo, 650, 420, None);
+    let mut text = header(req)?;
+    if let Some(transfer) = &req.stage_transfer {
+        for decision in &transfer.project_decisions {
+            if !project_ids.contains(&decision.id) {
+                project_ids.push(decision.id);
+            }
+        }
+        if let Some(id) = transfer.repository_decision(req.repository.as_deref())
+            && !repo_ids.contains(&id)
+        {
+            repo_ids.insert(0, id);
+        }
+    }
+    let body = memory_body(req, &text, &project, &repo);
+    text.push_str(&body);
+    text.push_str(&rules(req)?);
+    text.push('\n');
+    text.push_str(READING);
     Ok(Packet {
         more: false,
         text,
         project_ids,
         repo_ids,
     })
+}
+/// Prompt for a stage that reuses the previous stage's session (R3): the session already holds
+/// memory and earlier outputs, so only `header + rules + READING` and this run's archive are sent.
+pub fn adjacent(req: &Request, dir: &Path) -> Result<String> {
+    Ok(format!(
+        "{}{}\n{READING}\n本次档案 {}。前序执行的 result.txt 和 evidence.json 位于同级执行目录。",
+        header(req)?,
+        rules(req)?,
+        dir.display()
+    ))
+}
+/// New-session prompt used instead of resuming (R2, E4, E5): the full fresh `base` prompt plus
+/// the previous answer (first 8000 chars) and a hand-off digest (its AEP-HANDOFF line and the
+/// source evidence file). `follow` is the operator's message when continuing the conversation.
+pub fn with_previous(base: &str, previous: &str, evidence: &Path, follow: Option<&str>) -> String {
+    let mut text = format!(
+        "{base}\n\n## 上一轮答复\n{}\n\n## 交接摘要\n{}\n回执：{}",
+        previous.chars().take(8000).collect::<String>(),
+        summary(previous),
+        evidence.display()
+    );
+    if let Some(message) = follow {
+        text.push_str(&format!("\n\n## 继续的要求\n{message}"));
+    }
+    text
 }
 pub struct Assignment {
     pub profile: Profile,
@@ -487,4 +537,103 @@ pub fn cancel(dir: &Path) -> Result<()> {
         save_json(dir, "evidence.json", &e)?;
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(stage: usize) -> Request {
+        serde_json::from_value(json!({
+            "project": "P",
+            "work": "W",
+            "template": "Software",
+            "stage": stage,
+            "profile": {"client": "Claude", "executable": "claude", "model": ""},
+            "repository": null,
+            "brief": "做点事",
+            "approved": [["产品需求", "已确认的需求结论 XYZ"]],
+            "prior_runs": [[0, "run-prev"]],
+            "handoffs": [{"from": "w0", "name": "事项甲", "stage": "产品需求", "note": "交接备注 HHH"}],
+        }))
+        .unwrap()
+    }
+    fn memory() -> Vec<Value> {
+        vec![json!({"id": 7, "kind": "decision", "body": "项目记忆正文 MMM"})]
+    }
+
+    #[test]
+    fn handoff_fresh_prompt_keeps_sections_and_reading() {
+        let r = req(1);
+        let p = packet(&r, &memory(), &[], None).unwrap();
+        let h = header(&r).unwrap();
+        assert!(p.text.starts_with(&h));
+        assert!(p.text.contains("阶段："));
+        for part in [
+            "项目记忆",
+            "MMM",
+            "已确认的需求结论 XYZ",
+            "交接备注 HHH",
+            "前序执行 run-prev",
+        ] {
+            assert!(p.text.contains(part), "missing {part}");
+        }
+        assert!(p.text.contains(&rules(&r).unwrap()));
+        assert!(
+            p.text.ends_with(READING),
+            "AC-10: reading convention in fresh prompt"
+        );
+        assert_eq!(p.project_ids, vec![7]);
+    }
+
+    #[test]
+    fn handoff_adjacent_prompt_has_no_memory_or_prior_output() {
+        let r = req(1);
+        let text = adjacent(&r, Path::new("/tmp/runs/abc")).unwrap();
+        assert!(text.lines().nth(1).unwrap().starts_with("阶段："));
+        assert!(
+            text.contains(READING),
+            "AC-10: reading convention in reused prompt"
+        );
+        assert!(text.contains("本次档案 /tmp/runs/abc"));
+        assert!(text.contains("AEP-HANDOFF"));
+        for part in ["项目记忆", "MMM", "XYZ", "HHH", "前序执行 run-prev"] {
+            assert!(!text.contains(part), "reused prompt leaks {part}");
+        }
+    }
+
+    #[test]
+    fn handoff_new_session_carries_previous_answer_and_digest() {
+        let r = req(3);
+        let base = packet(&r, &memory(), &[], None).unwrap().text;
+        let previous = "做完了一部分\nAEP-HANDOFF: 结论 OK；证据 target/x；下一步 T3";
+        let text = with_previous(&base, previous, Path::new("/runs/src/evidence.json"), None);
+        assert!(
+            text.contains(READING),
+            "AC-10: reading convention in fallback prompt"
+        );
+        assert!(text.contains("## 上一轮答复\n做完了一部分"));
+        assert!(text.contains("## 交接摘要\n结论 OK；证据 target/x；下一步 T3"));
+        assert!(text.contains("/runs/src/evidence.json"));
+        assert!(
+            text.contains("用 AEP-HANDOFF: 单行"),
+            "AC-5: format rule kept"
+        );
+        assert!(!text.contains("## 继续的要求"));
+        let long = "字".repeat(9000);
+        let cont = with_previous(&base, &long, Path::new("e.json"), Some("继续改"));
+        assert!(cont.ends_with("## 继续的要求\n继续改"));
+        assert!(!cont.contains(&"字".repeat(8001)));
+    }
+
+    #[test]
+    fn handoff_gate_rules_keep_verdict_line() {
+        let r = req(4);
+        let rules = rules(&r).unwrap();
+        assert!(rules.contains("AEP: PASS 或 AEP: BLOCKED"), "AC-5");
+        assert!(
+            adjacent(&r, Path::new("d"))
+                .unwrap()
+                .contains("AEP: PASS 或 AEP: BLOCKED")
+        );
+    }
 }
