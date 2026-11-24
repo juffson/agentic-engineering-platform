@@ -73,12 +73,28 @@ export function StageBudget({ detail, stage, compact }: { detail: WorkDetail; st
       <div className="budget-row">
         <BudgetField
           value={stage.budget.own}
-          placeholder={fallback ? `默认 ${tokens(fallback)}` : "不限"}
+          placeholder={fallback ? `默认 ${tokens(fallback)}` : "不限，如 5M"}
           label={`「${stage.name}」Token 预算`}
           onSave={save}
         />
+        {!compact &&
+          [2_000_000, 5_000_000, 10_000_000].map((n) => (
+            <button key={n} type="button" className={`chip budget-chip${stage.budget.own === n ? " on" : ""}`} onClick={() => save(n)}>
+              {tokens(n)}
+            </button>
+          ))}
+        {!compact && stage.budget.own !== null && (
+          <button type="button" className="link-btn inline" onClick={() => save(null)}>
+            不限
+          </button>
+        )}
         <BudgetMeter used={stage.budget.used} limit={stage.budget.limit} />
       </div>
+      {!compact && (
+        <p className="field-hint">
+          填这个阶段最多能用多少 Token，如 <code>5M</code>、<code>500k</code>；留空不限{fallback ? `（用项目默认 ${tokens(fallback)}）` : ""}。阶段的所有执行（含继续对话、子任务）合计，到 80% 提醒，用完就停下，等你追加后在原会话继续。参考：一次阶段执行通常用 2–6M，大部分是缓存读取。
+        </p>
+      )}
     </div>
   );
 }
