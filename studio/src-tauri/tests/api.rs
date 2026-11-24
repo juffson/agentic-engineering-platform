@@ -896,12 +896,30 @@ done
         None,
     )?;
     api::set_budget(&home, &pid, &wid, Some(0), Some(15_000))?;
+    // A worktree made before stage worktrees moved out of `.git` is moved on the next run.
+    let old = repo.join(".git/aep/workflow-worktrees").join(&wid);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &format!("aep-stage/{wid}"),
+            old.to_str().unwrap(),
+        ],
+    )?;
+    fs::write(old.join("draft.md"), "unsaved\n")?;
 
     let first = api::run_stage(&home, &pid, &wid, 0, None)?;
     let d = wait_idle(&home, &pid, &wid)?;
     let a = &d["stages"][0]["attempts"][0];
     assert_eq!(a["status"], "budget_exhausted", "{d}");
     assert!(a["error"].as_str().unwrap().contains("Token 预算已用完"));
+    let tree = std::path::PathBuf::from(d["worktrees"][0].as_str().unwrap());
+    assert!(tree.starts_with(home.canonicalize()?.join("worktrees")), "{tree:?}");
+    assert!(!old.exists());
+    assert_eq!(fs::read_to_string(tree.join("draft.md"))?, "unsaved\n");
     let used = d["stages"][0]["budget"]["used"].as_u64().unwrap();
     assert!(
         (18_000..40_000).contains(&used),

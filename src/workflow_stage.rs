@@ -64,9 +64,29 @@ fn workspace(
     } else {
         id.to_owned()
     };
-    let path = repo.data.join("workflow-worktrees").join(&checkout);
-    ensure!(existing.is_none() || path.is_dir(), "前序阶段工作区已移除");
+    // Stage worktrees live under the Studio catalog, outside `.git`: Claude Code refuses to
+    // write anywhere inside `.git`. The catalog is three levels above the item folder.
+    let catalog = work.ancestors().nth(3).context("missing Studio catalog")?;
+    let path = aep::project::branches::worktree_home(catalog, &repo.root).join(&checkout);
     let branch = format!("aep-stage/{checkout}");
+    if !path.exists()
+        && let Some((_, old)) = aep::project::branches::stage_worktrees(&repo.root)
+            .into_iter()
+            .find(|(name, p)| *name == checkout && p.is_dir())
+    {
+        // Created before worktrees moved out of `.git`: move it, uncommitted work and all.
+        fs::create_dir_all(path.parent().unwrap())?;
+        git(
+            &repo.root,
+            &[
+                "worktree",
+                "move",
+                old.to_str().context("invalid workspace path")?,
+                path.to_str().context("invalid workspace path")?,
+            ],
+        )?;
+    }
+    ensure!(existing.is_none() || path.is_dir(), "前序阶段工作区已移除");
     if !path.exists() {
         fs::create_dir_all(path.parent().unwrap())?;
         let target = path.to_str().context("invalid workspace path")?;
@@ -227,7 +247,7 @@ fn perform(
     let prior = req
         .follow_up
         .as_ref()
-        .map(|f| prior_turn(dir, f))
+        .map(|f| prior_turn(dir, f, req.repository.as_deref()))
         .transpose()?;
     let cwd = match &prior {
         Some(p) => p.workspace.clone(),
@@ -485,7 +505,11 @@ struct Prior {
 /// Load what a follow-up continues: the latest workspace, the newest session that was
 /// actually saved, and the newest non-empty answer. A failed round (for example a resume
 /// that could not find its session) defers to the round it continued.
-fn prior_turn(dir: &Path, follow: &aep::workflow::FollowUp) -> Result<Prior> {
+fn prior_turn(
+    dir: &Path,
+    follow: &aep::workflow::FollowUp,
+    repository: Option<&Path>,
+) -> Result<Prior> {
     let runs = dir.parent().context("missing runs directory")?;
     let mut id = follow.attempt.clone();
     let mut workspace = None;
@@ -513,7 +537,22 @@ fn prior_turn(dir: &Path, follow: &aep::workflow::FollowUp) -> Result<Prior> {
             None => break,
         }
     }
-    let workspace = workspace.context("上一轮执行没有工作区")?;
+    let mut workspace = workspace.context("上一轮执行没有工作区")?;
+    // A stage worktree moved out of `.git` since that turn is found again by its branch.
+    if !workspace.is_dir()
+        && let (Some(repo), Some(name)) = (
+            repository.and_then(|r| Workspace::open(r).ok()),
+            workspace
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned),
+        )
+        && let Some((_, moved)) = aep::project::branches::stage_worktrees(&repo.root)
+            .into_iter()
+            .find(|(checkout, p)| *checkout == name && p.is_dir())
+    {
+        workspace = moved;
+    }
     ensure!(workspace.is_dir(), "上一轮执行的工作区已移除，请重新执行");
     Ok(Prior {
         workspace,
@@ -677,6 +716,8 @@ fn invoke(
             if let Some(parent) = receipt.as_ref().and_then(|p| p.parent()) {
                 args.extend(["--add-dir".into(), parent.display().to_string()]);
             }
+            // The prompt points at request.json and earlier runs in the attempt folder.
+            args.extend(["--add-dir".into(), dir.display().to_string()]);
             args.extend(
                 [
                     "-p",
@@ -848,6 +889,27 @@ fn invoke(
             }
             let s = v["result"].as_str().context("Claude 未生成最终答复")?;
             ensure!(v["is_error"] != true, "Claude: {s}");
+            // A stage whose file writes were refused did not do its job, whatever it says.
+            if write {
+                let refused: Vec<String> = v["permission_denials"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|d| {
+                        matches!(
+                            d["tool_name"].as_str(),
+                            Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+                        )
+                    })
+                    .filter_map(|d| d["tool_input"]["file_path"].as_str().map(str::to_owned))
+                    .collect();
+                ensure!(
+                    refused.is_empty(),
+                    "Claude 的文件写入被拒绝 {} 次，本阶段没有完成：{}",
+                    refused.len(),
+                    refused.join("，")
+                );
+            }
             s.into()
         }
         _ => fs::read_to_string(stdout)?,
@@ -925,8 +987,11 @@ fn pin_worktree(
         return Ok(());
     }
     let repo = Workspace::open(repo)?;
-    let trees = repo.data.join("workflow-worktrees");
-    if cwd.canonicalize()?.parent() != Some(trees.canonicalize()?.as_path()) {
+    let cwd_real = cwd.canonicalize()?;
+    if !aep::project::branches::stage_worktrees(&repo.root)
+        .iter()
+        .any(|(_, p)| p.canonicalize().is_ok_and(|p| p == cwd_real))
+    {
         return Ok(());
     }
     let status = |cwd: &Path| git(cwd, &["status", "--porcelain", "--untracked-files=all"]);

@@ -268,7 +268,10 @@ fn worktrees(root: &Path) -> Result<Vec<FoundWorktree>> {
             }
         }
         let Some(path) = path else { continue };
-        if path == root || path.starts_with(&ours) || !path.is_dir() {
+        let stage = branch
+            .as_deref()
+            .is_some_and(|b| b.starts_with(super::branches::STAGE_PREFIX));
+        if path == root || path.starts_with(&ours) || stage || !path.is_dir() {
             continue;
         }
         found.push((path, branch));
