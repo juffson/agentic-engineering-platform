@@ -1,3 +1,4 @@
+/// <reference lib="dom" />
 import { expect, test, type Page } from "@playwright/test";
 
 /** Every element whose content is taller than it, and that is not clipped on purpose, must scroll. */
