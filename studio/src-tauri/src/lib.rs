@@ -295,6 +295,11 @@ fn setProjectBudget(project: String, tokens: Option<u64>) -> Result<impl Seriali
 }
 
 #[tauri::command(async)]
+fn setResumeLimit(project: String, tokens: String) -> Result<impl Serialize, String> {
+    run(move |h| api::set_resume_limit(&h, &project, &tokens))
+}
+
+#[tauri::command(async)]
 fn extendBudget(
     project: String,
     work: String,
@@ -401,6 +406,7 @@ pub fn start() {
             snapshot,
             setBudget,
             setProjectBudget,
+            setResumeLimit,
             extendBudget,
             usageAnalysis,
             projectUsage,

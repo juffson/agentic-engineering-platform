@@ -43,6 +43,90 @@ export interface UsageAnalysis {
   calls: { kind: string; detail: string; context: number; output: number }[];
   /** Steps that grew the context most; `carried` = growth × calls that read it again. */
   heaviest: { call: number; kind: string; detail: string; bytes: number; tokens: number; carried: number }[];
+  launch: Launch | null;
+  /** The run continued an adjacent stage's session; its count covers only its own window. */
+  reused: boolean;
+  window_calls: number;
+}
+
+/** Why a run started a new session instead of continuing one (evidence `fresh_session_reason`). */
+export type SessionReason =
+  | "no_prior"
+  | "context_over_threshold"
+  | "client_differs"
+  | "model_differs"
+  | "permission_differs"
+  | "workdir_differs"
+  | "session_unavailable"
+  | "prior_budget_stopped"
+  | "session_busy"
+  | "chain_broken"
+  | "prior_not_passed";
+
+/**
+ * How a run's session was chosen. `reused`: continued an adjacent stage's session
+ * (`stage`/`stage_name`/`run` = that run); `continued`: a follow-up resumed this stage's
+ * session; `fresh`: new session for `reason` (`context`/`threshold` when the resume limit
+ * decided, `prior` = the compared value: CLI, model ("" = default) or permission
+ * "read" | "write" | "gate" / sandbox). Null for old records and ZCode / custom CLIs.
+ */
+export interface SessionLabel {
+  kind: "reused" | "continued" | "fresh";
+  stage?: number;
+  stage_name?: string;
+  run?: string;
+  reason?: SessionReason;
+  context?: number | null;
+  threshold?: number | null;
+  prior?: string | null;
+}
+
+/** What the next run of the current stage will do with its session (a prediction). */
+export interface SessionPreview {
+  kind: "reused" | "fresh";
+  stage?: number;
+  run?: string;
+  stage_name?: string | null;
+  reason?: SessionReason;
+  context?: number | null;
+  threshold?: number | null;
+  prior?: string | null;
+}
+
+/**
+ * Launch configuration of a Codex / Claude run (evidence `launch`). `diet` marks runs
+ * after the minimal launch; Claude adds what its init event reported. Null = before.
+ */
+export interface Launch {
+  diet: number;
+  minimal?: boolean;
+  not_minimized?: string[];
+  model_source?: string | null;
+  version?: string;
+  probe_error?: string;
+  mcp_servers?: number;
+  mcp_tools?: number;
+  tools?: number;
+  skills?: number;
+  plugins?: number;
+  builtin_plugins?: string[];
+  first_context?: number | null;
+}
+
+/** One side of a before/after row; averages leave out runs without a first call (E12). */
+export interface CompareSide {
+  runs: number;
+  first_context_median: number | null;
+  avg_calls: number | null;
+  avg_total: number | null;
+}
+
+export interface CompareRow {
+  key: string; // stage name, or "Claude · opus"
+  before: CompareSide;
+  after: CompareSide;
+  /** after.avg_total / before.avg_total − 1; null while a side has no sample. */
+  change: number | null;
 }
 
 export interface UsageRow {
@@ -56,6 +140,12 @@ export interface UsageRow {
 export interface ProjectUsage {
   total: { tokens: Tokens; total: number; cost_usd: number; runs: number };
   stage_budget: number | null;
+  /** Project resume limit; null = default 150K. */
+  resume_limit: number | null;
+  /** Before / after the minimal launch, Codex and Claude runs only; most expensive first. */
+  compare: { by_stage: CompareRow[]; by_model: CompareRow[] };
+  /** Codex runs whose count may be too high (no rollout to recount, E11). */
+  maybe_high_runs: number;
   items: (UsageRow & { name: string; shelved: boolean; budget: number | null })[];
   stages: UsageRow[];
   models: UsageRow[];
@@ -74,6 +164,10 @@ export interface ProjectUsage {
     total: number;
     cost_usd: number | null;
     calls: number;
+    diet: boolean;
+    reused_from: string | null; // stage name whose session this run reused
+    count_maybe_high: boolean;
+    launch: Launch | null;
   }[];
   quota: { client: Client; at: string; windows: Record<string, number> }[];
 }
@@ -132,6 +226,11 @@ export interface AttemptSummary {
   committed: boolean; // platform committed worktree changes after this run
   head_sha: string | null;
   tokens: number; // total tokens this attempt used
+  session: SessionLabel | null;
+  launch: Launch | null;
+  /** "Add budget and continue" resumes the original session (false: re-runs the stage). */
+  continuable: boolean;
+  count_maybe_high: boolean;
 }
 
 export type StageState = "done" | "current" | "upcoming" | "skipped";
@@ -150,7 +249,15 @@ export interface StageDetail {
   attempts: AttemptSummary[]; // oldest first
   current_attempt: string | null;
   /** Tokens used by every attempt of this stage; `limit` = own budget or the project default. */
-  budget: { limit: number | null; own: number | null; used: number };
+  budget: {
+    limit: number | null;
+    own: number | null;
+    used: number;
+    /** Median of passed runs after the diet × 1.5, rounded up to 10K; null without samples. */
+    suggested: { value: number; runs: number; median: number } | null;
+  };
+  /** Only for the current stage while nothing runs; null when not applicable. */
+  session_preview: SessionPreview | null;
 }
 
 export interface Rework {
@@ -224,6 +331,10 @@ export interface AttemptView {
   zcode: { waiting: boolean; tools: { name: string; detail: string }[]; session: string | null; openable: boolean } | null;
   dir: string; // attempt directory, for "reveal"
   workspace: string | null;
+  /** False for Codex without a rollout: usage arrives only when the run ends (R8). */
+  live_usage: boolean;
+  launch: Launch | null;
+  usage_window: { calls: number } | null;
 }
 
 export interface MemoryNote {
@@ -487,6 +598,8 @@ export interface Api {
   setBudget(a: { project: string; work: string; stage?: number; tokens: number | null }): void;
   /** The project's default budget for stages without their own. */
   setProjectBudget(a: { project: string; tokens: number | null }): void;
+  /** The project's resume limit, e.g. "150k"; "" restores the default; below 20K is refused. */
+  setResumeLimit(a: { project: string; tokens: string }): void;
   /** Raise the budget that stopped the stage by `extra` and continue its session. */
   extendBudget(a: { project: string; work: string; stage: number; extra: number; message: string }): string;
   usageAnalysis(a: { project: string; work: string; attempt: string }): UsageAnalysis;

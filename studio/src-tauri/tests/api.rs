@@ -927,3 +927,278 @@ done
     assert_eq!(usage["stages"][0]["key"], "产品需求");
     Ok(())
 }
+
+/// Writes one recorded run (request, evidence, cached usage) and files it under the item.
+#[allow(clippy::too_many_arguments)]
+fn record_run(
+    home: &Path,
+    pid: &str,
+    wid: &str,
+    id: &str,
+    stage: usize,
+    profile: serde_json::Value,
+    evidence: serde_json::Value,
+    usage: serde_json::Value,
+) -> Result<()> {
+    let profile: aep::workflow::Profile = serde_json::from_value(profile)?;
+    let mut lib = aep::project::Library::open(home)?;
+    lib.change(home, |lib| {
+        let p = lib.projects.iter_mut().find(|p| p.id == pid).unwrap();
+        let name = p.name.clone();
+        let w = p.work_by_id_mut(wid)?;
+        let req = w.request(
+            &name,
+            stage,
+            aep::handoff::Assignment {
+                profile: profile.clone(),
+                brief: String::new(),
+                repository: None,
+                external: None,
+            },
+        );
+        let dir = aep::workflow::attempt_dir(home, pid, wid, id);
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("request.json"), serde_json::to_vec(&req)?)?;
+        let mut ev = evidence;
+        ev["profile"] = serde_json::to_value(&profile)?;
+        ev["run_id"] = id.into();
+        fs::write(dir.join("evidence.json"), serde_json::to_vec(&ev)?)?;
+        if !usage.is_null() {
+            fs::write(dir.join("usage.json"), serde_json::to_vec(&usage)?)?;
+        }
+        w.attempts.push(aep::project::Attempt {
+            id: id.into(),
+            stage,
+            profile,
+            repository: None,
+        });
+        w.current_attempt.insert(stage, id.into());
+        Ok(())
+    })
+}
+
+fn usage_json(total: u64, calls: u64, first: Option<u64>, last: Option<u64>, high: bool) -> Value {
+    serde_json::json!({
+        "tokens": {"input": total, "cache_read": 0, "cache_write": 0, "output": 0, "reasoning": 0},
+        "cost_usd": null, "models": [], "calls": calls, "rev": aep::usage::REV,
+        "first_context": first, "last_context": last, "count_maybe_high": high,
+    })
+}
+
+#[test]
+fn token_diet_fields_preview_comparison_and_resume_limit() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let home = t.path().join("catalog");
+    let ws = t.path().join("ws");
+    fs::create_dir_all(&ws)?;
+    api::create_project(&home, "diet", &[])?;
+    let pid = api::snapshot(&home)?["active"].as_str().unwrap().to_owned();
+    let wid = api::create_work(&home, &pid, "精简", "Software", false, &[])?;
+    let claude = |model: &str| serde_json::json!({"client":"Claude","executable":"claude","model":model,"check_command":""});
+    let launch = serde_json::json!({"diet":1,"minimal":true,"not_minimized":[],"mcp_servers":0,"skills":0,"plugins":5,"first_context":10000});
+    let ws_s = ws.display().to_string();
+
+    // Before the diet: one full run and one interrupted run without a first call (E12).
+    record_run(
+        &home,
+        &pid,
+        &wid,
+        "old1",
+        0,
+        claude("opus"),
+        serde_json::json!({"status":"succeeded","workspace":ws_s,"session":"s0","resumable":true,"fresh_session_reason":"no_prior"}),
+        usage_json(1_000_000, 40, Some(250_000), Some(260_000), false),
+    )?;
+    record_run(
+        &home,
+        &pid,
+        &wid,
+        "old2",
+        0,
+        claude("opus"),
+        serde_json::json!({"status":"failed","workspace":ws_s}),
+        usage_json(500, 1, None, None, false),
+    )?;
+    // After: the next stage reused stage 0's session.
+    record_run(
+        &home,
+        &pid,
+        &wid,
+        "new1",
+        1,
+        claude("opus"),
+        serde_json::json!({"status":"succeeded","workspace":ws_s,"session":"s1","resumable":true,"launch":launch,
+            "reused_session":{"stage":0,"name":"产品需求","run":"old1","session":"s0","forked":true},
+            "usage_window":{"calls":20},"last_context":90_000}),
+        usage_json(200_000, 20, Some(10_000), Some(90_000), false),
+    )?;
+    api::update_stage(
+        &home,
+        &pid,
+        &wid,
+        2,
+        None,
+        Some(serde_json::from_value(claude("opus"))?),
+        None,
+    )?;
+    let mut lib = aep::project::Library::open(&home)?;
+    lib.change(&home, |lib| {
+        lib.projects[0].work_by_id_mut(&wid)?.stage = 2;
+        Ok(())
+    })?;
+
+    // Attempt labels and launch.
+    let d = api::work_detail(&home, &pid, &wid)?;
+    let a0 = &d["stages"][0]["attempts"][0];
+    assert_eq!(a0["session"]["kind"], "fresh");
+    assert_eq!(a0["session"]["reason"], "no_prior");
+    assert!(a0["launch"].is_null());
+    assert_eq!(a0["continuable"], true);
+    let a1 = &d["stages"][1]["attempts"][0];
+    assert_eq!(a1["session"]["kind"], "reused", "{a1}");
+    assert_eq!(a1["session"]["stage_name"], "产品需求");
+    assert_eq!(a1["session"]["run"], "old1");
+    assert_eq!(a1["launch"]["diet"], 1);
+    assert_eq!(a1["count_maybe_high"], false);
+    // R9: one passed run after the diet at 200K → 300K.
+    assert_eq!(d["stages"][1]["budget"]["suggested"]["value"], 300_000);
+    assert_eq!(d["stages"][1]["budget"]["suggested"]["runs"], 1);
+    assert!(d["stages"][0]["budget"]["suggested"].is_null());
+
+    // Preview (AC-4/AC-7): same CLI, model, permission → reuse 交互设计's session.
+    let preview = &d["stages"][2]["session_preview"];
+    assert_eq!(preview["kind"], "reused", "{preview}");
+    assert_eq!(preview["stage_name"], "交互设计");
+    assert_eq!(preview["context"], 90_000);
+    assert!(d["stages"][1]["session_preview"].is_null());
+
+    // Resume limit: validated, stored, and applied to the preview.
+    assert!(api::set_resume_limit(&home, &pid, "10k").is_err());
+    assert!(api::set_resume_limit(&home, &pid, "lots").is_err());
+    api::set_resume_limit(&home, &pid, "50k")?;
+    assert_eq!(api::project_usage(&home, &pid)?["resume_limit"], 50_000);
+    let preview = api::work_detail(&home, &pid, &wid)?["stages"][2]["session_preview"].clone();
+    assert_eq!(preview["kind"], "fresh");
+    assert_eq!(preview["reason"], "context_over_threshold");
+    assert_eq!(preview["context"], 90_000);
+    assert_eq!(preview["threshold"], 50_000);
+    api::set_resume_limit(&home, &pid, "")?;
+    assert!(api::project_usage(&home, &pid)?["resume_limit"].is_null());
+    api::update_stage(
+        &home,
+        &pid,
+        &wid,
+        2,
+        None,
+        Some(serde_json::from_value(claude("sonnet"))?),
+        None,
+    )?;
+    let preview = api::work_detail(&home, &pid, &wid)?["stages"][2]["session_preview"].clone();
+    assert_eq!(preview["reason"], "model_differs");
+    assert_eq!(preview["prior"], "opus");
+
+    // Analysis of the reused run counts only its window (AC-8).
+    let analysis = api::usage_analysis(&home, &pid, &wid, "new1")?;
+    assert_eq!(analysis["reused"], true);
+    assert_eq!(analysis["window_calls"], 20);
+    assert_eq!(analysis["launch"]["minimal"], true);
+    let view = api::attempt_view(&home, &pid, &wid, "new1")?;
+    assert_eq!(view["live_usage"], true);
+    assert_eq!(view["usage_window"]["calls"], 20);
+
+    // Other CLIs: a Codex run without its rollout counts only at the end (R8) and may be
+    // counted high (E11); ZCode continues only through an app-server session (R7).
+    let other = api::create_work(&home, &pid, "其他", "Software", false, &[])?;
+    let zcode =
+        serde_json::json!({"client":"ZCode","executable":"zcode","model":"glm","check_command":""});
+    record_run(
+        &home,
+        &pid,
+        &other,
+        "zapp",
+        0,
+        zcode.clone(),
+        serde_json::json!({"status":"budget_exhausted","native_session":{"client":"ZCode","transport":"app-server","session":"sess_1"}}),
+        Value::Null,
+    )?;
+    record_run(
+        &home,
+        &pid,
+        &other,
+        "zdesk",
+        0,
+        zcode,
+        serde_json::json!({"status":"budget_exhausted","native_session":{"client":"ZCode","transport":"desktop","session":"task_1"}}),
+        Value::Null,
+    )?;
+    record_run(
+        &home,
+        &pid,
+        &other,
+        "cx",
+        1,
+        serde_json::json!({"client":"Codex","executable":"codex","model":"gpt-5","check_command":""}),
+        serde_json::json!({"status":"running","workspace":ws_s}),
+        usage_json(7_000_000, 1, None, None, true),
+    )?;
+    let d = api::work_detail(&home, &pid, &other)?;
+    let zs = &d["stages"][0]["attempts"];
+    assert_eq!(zs[0]["continuable"], true);
+    assert_eq!(zs[1]["continuable"], false);
+    assert!(zs[0]["session"].is_null());
+    assert_eq!(d["stages"][1]["attempts"][0]["count_maybe_high"], true);
+    assert_eq!(
+        api::attempt_view(&home, &pid, &other, "cx")?["live_usage"],
+        false
+    );
+
+    // Comparison (AC-11): diet marker splits runs; E12 runs count but are not averaged.
+    let u = api::project_usage(&home, &pid)?;
+    assert_eq!(u["maybe_high_runs"], 1);
+    let rows = u["compare"]["by_stage"].as_array().unwrap();
+    let row = |k: &str| rows.iter().find(|r| r["key"] == k).cloned().unwrap();
+    let r0 = row("产品需求");
+    assert_eq!(r0["before"]["runs"], 2);
+    assert_eq!(r0["before"]["first_context_median"], 250_000);
+    assert_eq!(r0["before"]["avg_total"], 1_000_000.0);
+    assert_eq!(r0["before"]["avg_calls"], 40.0);
+    assert_eq!(r0["after"]["runs"], 0);
+    assert!(r0["after"]["avg_total"].is_null());
+    assert!(r0["change"].is_null());
+    let r1 = row("交互设计");
+    assert_eq!(r1["after"]["first_context_median"], 10_000);
+    // The Codex run has no first-call context: counted, not averaged.
+    assert_eq!(r1["before"]["runs"], 1);
+    assert!(r1["before"]["avg_total"].is_null());
+    assert!(rows.iter().all(|r| r["key"] != "?"));
+    let models = u["compare"]["by_model"].as_array().unwrap();
+    let opus = models.iter().find(|r| r["key"] == "Claude · opus").unwrap();
+    assert_eq!(opus["before"]["avg_total"], 1_000_000.0);
+    assert_eq!(opus["after"]["avg_total"], 200_000.0);
+    assert!((opus["change"].as_f64().unwrap() + 0.8).abs() < 1e-9);
+    // ZCode runs stay out of the comparison.
+    assert!(
+        models
+            .iter()
+            .all(|r| !r["key"].as_str().unwrap().starts_with("ZCode"))
+    );
+    let run = u["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["attempt"] == "new1")
+        .unwrap()
+        .clone();
+    assert_eq!(run["diet"], true);
+    assert_eq!(run["reused_from"], "产品需求");
+    let cx = u["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["attempt"] == "cx")
+        .unwrap()
+        .clone();
+    assert_eq!(cx["count_maybe_high"], true);
+    assert_eq!(cx["diet"], false);
+    Ok(())
+}

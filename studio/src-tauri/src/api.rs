@@ -6,6 +6,7 @@ use aep::{
     handoff::{self, Assignment, busy},
     memory::{Key, Memory, TEXT_LIMIT},
     project::{Kind, Library, Project, Work, import, merge, shelf},
+    session_reuse,
     transcript::{self, Entry},
     usage,
     workflow::{self, Client, Profile, Request, Role, Sandbox, Template},
@@ -339,9 +340,8 @@ pub fn create_work(
 fn attempt_summary(home: &Path, pid: &str, wid: &str, id: &str) -> Value {
     let dir = workflow::attempt_dir(home, pid, wid, id);
     let ev = read_evidence(&dir);
-    let req: Option<Request> = fs::read(dir.join("request.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok());
+    let req = read_request(&dir);
+    let summary = usage::summary(&dir);
     let (prompt, follow_up, subtask, client, model) = match &req {
         Some(r) => (
             r.follow_up
@@ -370,7 +370,11 @@ fn attempt_summary(home: &Path, pid: &str, wid: &str, id: &str) -> Value {
         "route_back": if ev["route_back"].is_object() { ev["route_back"].clone() } else { Value::Null },
         "committed": ev["committed"] == true,
         "head_sha": ev["head_sha"],
-        "tokens": usage::summary(&dir).tokens.total(),
+        "tokens": summary.tokens.total(),
+        "session": session_label(&dir, &ev, req.as_ref()),
+        "launch": object_or_null(&ev["launch"]),
+        "continuable": continuable(req.as_ref().map(|r| r.profile.client), &ev),
+        "count_maybe_high": summary.count_maybe_high,
     })
 }
 
@@ -383,6 +387,7 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
     let dir = autopilot_dir(home, pid, wid);
     let autopilot_running = autopilot::running(&dir);
     let running = running_attempt(home, pid, w);
+    let diet_totals = diet_totals(home, p);
     let mut budget_used: std::collections::BTreeMap<usize, u64> = Default::default();
     for a in &w.attempts {
         *budget_used.entry(a.stage).or_default() +=
@@ -424,6 +429,12 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
                     "limit": w.budgets.get(&i).copied().or(p.stage_budget),
                     "own": w.budgets.get(&i),
                     "used": budget_used.get(&i).copied().unwrap_or(0),
+                    "suggested": diet_totals.get(s.name).map_or(Value::Null, |t| suggested_budget(t)),
+                },
+                "session_preview": if state == "current" && running.is_none() && !w.delivered() {
+                    session_preview(home, p, w, i)
+                } else {
+                    Value::Null
                 },
             })
         })
@@ -511,10 +522,10 @@ pub fn attempt_view(home: &Path, pid: &str, wid: &str, attempt: &str) -> Result<
     let raw = fs::read_to_string(dir.join("stdout.log")).unwrap_or_default();
     let t = transcript::parse(&raw);
     let used = usage::measure(&dir).unwrap_or_default();
-    let limit = fs::read(dir.join("request.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Request>(&b).ok())
-        .and_then(|r| r.token_limit);
+    let limit = read_request(&dir).and_then(|r| r.token_limit);
+    // Codex counts live only from its rollout (found and remembered by `measure`); without
+    // it the CLI reports usage once the turn ends, so a budget cannot stop it midway (R8).
+    let live_usage = ev["profile"]["client"] != "Codex" || dir.join("rollout.path").is_file();
     Ok(json!({
         "usage": used.summary,
         "token_limit": limit,
@@ -529,6 +540,9 @@ pub fn attempt_view(home: &Path, pid: &str, wid: &str, attempt: &str) -> Result<
         "zcode": zcode_task(&dir),
         "dir": dir,
         "workspace": ev["workspace"],
+        "live_usage": live_usage,
+        "launch": object_or_null(&ev["launch"]),
+        "usage_window": object_or_null(&ev["usage_window"]),
     }))
 }
 
@@ -1499,8 +1513,16 @@ pub fn usage_analysis(home: &Path, pid: &str, wid: &str, attempt: &str) -> Resul
     let dir = workflow::attempt_dir(home, pid, wid, attempt);
     ensure!(dir.is_dir(), "执行记录不存在");
     let report = usage::measure(&dir)?;
+    let ev = read_evidence(&dir);
     let mut v = usage::analysis(&report);
     v["summary"] = json!(report.summary);
+    v["launch"] = object_or_null(&ev["launch"]);
+    v["reused"] = json!(ev["reused_session"].is_object());
+    v["window_calls"] = json!(
+        ev["usage_window"]["calls"]
+            .as_u64()
+            .unwrap_or(report.summary.calls as u64)
+    );
     Ok(v)
 }
 
@@ -1530,6 +1552,8 @@ pub fn project_usage(home: &Path, pid: &str) -> Result<Value> {
     let (mut items, mut stages, mut models, mut days) = (vec![], vec![], vec![], vec![]);
     let mut runs: Vec<Value> = vec![];
     let mut quota: std::collections::BTreeMap<String, (String, Value)> = Default::default();
+    let (mut by_stage, mut by_model) = (Compare::default(), Compare::default());
+    let mut maybe_high_runs = 0;
     for w in &p.work {
         let mut item_sum = Sum::default();
         for a in &w.attempts {
@@ -1554,6 +1578,16 @@ pub fn project_usage(home: &Path, pid: &str) -> Result<Value> {
                 .collect::<String>();
             add(&mut stages, stage, &s);
             add(&mut models, &format!("{client} · {model}"), &s);
+            let after = diet(&ev);
+            if matches!(a.profile.client, Client::Codex | Client::Claude)
+                && ev["mode"] != "external"
+            {
+                by_stage.add(stage, after, &s);
+                by_model.add(&format!("{client} · {model}"), after, &s);
+            }
+            if s.count_maybe_high {
+                maybe_high_runs += 1;
+            }
             add(&mut days, &day, &s);
             item_sum.tokens.add(&s.tokens);
             item_sum.cost += s.cost_usd.unwrap_or(0.0);
@@ -1572,6 +1606,8 @@ pub fn project_usage(home: &Path, pid: &str) -> Result<Value> {
                 "stage_index": a.stage, "client": client, "model": model,
                 "status": ev["status"], "started_at": ev["started_at"],
                 "tokens": s.tokens, "total": s.tokens.total(), "cost_usd": s.cost_usd, "calls": s.calls,
+                "diet": after, "reused_from": ev["reused_session"]["name"].as_str(),
+                "count_maybe_high": s.count_maybe_high, "launch": object_or_null(&ev["launch"]),
             }));
         }
         if item_sum.runs > 0 {
@@ -1592,6 +1628,9 @@ pub fn project_usage(home: &Path, pid: &str) -> Result<Value> {
     Ok(json!({
         "total": {"tokens": total.tokens, "total": total.tokens.total(), "cost_usd": total.cost, "runs": total.runs},
         "stage_budget": p.stage_budget,
+        "resume_limit": p.resume_limit,
+        "compare": {"by_stage": by_stage.rows(), "by_model": by_model.rows()},
+        "maybe_high_runs": maybe_high_runs,
         "items": items,
         "stages": stages.iter().map(row).collect::<Vec<_>>(),
         "models": models.iter().map(row).collect::<Vec<_>>(),
@@ -1599,4 +1638,351 @@ pub fn project_usage(home: &Path, pid: &str) -> Result<Value> {
         "runs": runs,
         "quota": quota.into_iter().map(|(client, (at, q))| json!({"client": client, "at": at, "windows": q})).collect::<Vec<_>>(),
     }))
+}
+
+// ---- Token diet: session labels, launch config, before/after comparison (T7) ----
+
+fn read_request(dir: &Path) -> Option<Request> {
+    fs::read(dir.join("request.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+fn object_or_null(v: &Value) -> Value {
+    if v.is_object() {
+        v.clone()
+    } else {
+        Value::Null
+    }
+}
+
+/// The compared value behind a "new session" reason, for "（前序 X）": the source run's CLI,
+/// model (empty = default) or permission (sandbox when only that differs).
+fn prior_value(
+    reason: session_reuse::Reason,
+    current: &session_reuse::Side,
+    source: &session_reuse::Side,
+) -> Value {
+    use session_reuse::Reason as R;
+    match reason {
+        R::ClientDiffers => json!(format!("{:?}", source.client)),
+        R::ModelDiffers => json!(source.model),
+        R::PermissionDiffers if source.permission != current.permission => json!(source.permission),
+        R::PermissionDiffers => json!(format!("{:?}", source.sandbox)),
+        _ => Value::Null,
+    }
+}
+
+/// How an attempt's session was chosen (interaction §2.1): reused from an adjacent stage,
+/// continued from this stage, or new with a reason. Old records and ZCode / custom CLIs: null.
+fn session_label(dir: &Path, ev: &Value, req: Option<&Request>) -> Value {
+    let reused = &ev["reused_session"];
+    if reused.is_object() {
+        return json!({"kind": "reused", "stage": reused["stage"], "stage_name": reused["name"], "run": reused["run"]});
+    }
+    if ev["follow_up"]["resumed_session"].is_string() {
+        return json!({"kind": "continued", "run": ev["follow_up"]["attempt"]});
+    }
+    let Some(reason) = ev["fresh_session_reason"]
+        .as_str()
+        .and_then(|r| serde_json::from_value::<session_reuse::Reason>(json!(r)).ok())
+    else {
+        return Value::Null;
+    };
+    if reason == session_reuse::Reason::ClientNotReusable {
+        return Value::Null;
+    }
+    // The run compared with: the previous stage's run (adjacent reuse only).
+    let prior = req
+        .filter(|r| r.follow_up.is_none())
+        .and_then(|r| {
+            let (_, run) = r.prior_runs.last()?;
+            aep::workspace::ident(run, 64).ok()?;
+            let src = read_request(&dir.parent()?.join(run))?;
+            Some(prior_value(
+                reason,
+                &session_reuse::Side::of(r, None),
+                &session_reuse::Side::of(&src, None),
+            ))
+        })
+        .unwrap_or(Value::Null);
+    json!({
+        "kind": "fresh", "reason": reason.as_str(),
+        "context": ev["resume_context"], "threshold": ev["resume_threshold"], "prior": prior,
+    })
+}
+
+/// Whether "add budget and continue" continues the original session: Claude and Codex
+/// always can; ZCode only through an app-server session (R7).
+fn continuable(client: Option<Client>, ev: &Value) -> bool {
+    match client {
+        Some(Client::Claude | Client::Codex) => true,
+        Some(Client::ZCode) => {
+            let n = &ev["native_session"];
+            n["transport"] == "app-server"
+                && n["session"].as_str().is_some_and(|s| !s.trim().is_empty())
+        }
+        _ => false,
+    }
+}
+
+/// The profile a stage would run with now: an unset Codex / Claude model means the project's
+/// preset, as `Project::reserve` fills it in.
+fn effective_profile(p: &Project, w: &Work, stage: usize) -> Profile {
+    let mut profile = w.profile(stage);
+    if profile.model.trim().is_empty()
+        && matches!(profile.client, Client::Codex | Client::Claude)
+        && let Some(preset) = p
+            .preset(profile.client)
+            .filter(|x| !x.model.trim().is_empty())
+    {
+        profile.model = preset.model.clone();
+    }
+    profile
+}
+
+/// What the next run of the current stage would do with its session (interaction §4.1),
+/// computed by the runner's own `session_reuse::decide`. Null for the first stage, ZCode and
+/// custom CLIs. The workspace is assumed unchanged: a later change shows on the run's label.
+fn session_preview(home: &Path, p: &Project, w: &Work, stage: usize) -> Value {
+    use session_reuse::{Mode, Plan, Reason, Side};
+    let Some(st) = w.template.stages().get(stage) else {
+        return Value::Null;
+    };
+    let profile = effective_profile(p, w, stage);
+    let mut current = Side {
+        stage,
+        client: profile.client,
+        model: profile.model.trim().to_owned(),
+        sandbox: w.sandbox(stage),
+        permission: session_reuse::permission(st.role),
+        workspace: None,
+    };
+    let threshold = session_reuse::limit(p.resume_limit);
+    let source = w
+        .current_attempt
+        .range(..stage)
+        .next_back()
+        .map(|(s, run)| {
+            let name = w.template.stages().get(*s).map_or("", |x| x.name);
+            let runs = workflow::attempt_dir(home, &p.id, &w.id, run);
+            session_reuse::source(runs.parent().unwrap_or(&runs), *s, name, run)
+        });
+    let plan = match &source {
+        Some(Err(_)) if matches!(current.client, Client::Codex | Client::Claude) => Plan::Fresh {
+            reason: Reason::SessionUnavailable,
+            context: None,
+        },
+        Some(Ok(src)) => {
+            current.workspace = src.side.workspace.clone();
+            session_reuse::decide(Mode::Adjacent, &current, Some(src), threshold)
+        }
+        _ => session_reuse::decide(Mode::Adjacent, &current, None, threshold),
+    };
+    let src = source.as_ref().and_then(|s| s.as_ref().ok());
+    match plan {
+        Plan::Resume {
+            source_stage,
+            source_run,
+            context,
+            ..
+        } => json!({
+            "kind": "reused", "stage": source_stage, "run": source_run,
+            "stage_name": src.map(|s| s.stage_name.clone()), "context": context, "threshold": threshold,
+        }),
+        Plan::Fresh {
+            reason: Reason::ClientNotReusable | Reason::NoPrior,
+            ..
+        } => Value::Null,
+        Plan::Fresh { reason, context } => json!({
+            "kind": "fresh", "reason": reason.as_str(),
+            "stage_name": src.map(|s| s.stage_name.clone()),
+            "context": context, "threshold": context.map(|_| threshold),
+            "prior": src.map_or(Value::Null, |s| prior_value(reason, &current, &s.side)),
+        }),
+    }
+}
+
+/// A Codex / Claude run started with the minimal launch (`launch.diet` in evidence).
+fn diet(ev: &Value) -> bool {
+    !ev["launch"]["diet"].is_null()
+}
+
+/// Rounded-up suggestion for a stage budget from runs after the diet (R9): median × 1.5, in
+/// steps of 10K.
+fn suggested_budget(totals: &[u64]) -> Value {
+    let Some(median) = median(totals) else {
+        return Value::Null;
+    };
+    let value = (median.saturating_mul(3) / 2).div_ceil(10_000) * 10_000;
+    json!({"value": value, "runs": totals.len(), "median": median})
+}
+
+fn median(values: &[u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut v = values.to_vec();
+    v.sort_unstable();
+    let m = v.len() / 2;
+    Some(if v.len() % 2 == 1 {
+        v[m]
+    } else {
+        (v[m - 1] + v[m]).div_ceil(2)
+    })
+}
+
+/// Totals of passed runs after the diet, by stage name, across the project.
+fn diet_totals(home: &Path, p: &Project) -> std::collections::BTreeMap<String, Vec<u64>> {
+    let mut out: std::collections::BTreeMap<String, Vec<u64>> = Default::default();
+    for w in &p.work {
+        for a in &w.attempts {
+            let dir = workflow::attempt_dir(home, &p.id, &w.id, &a.id);
+            let ev = read_evidence(&dir);
+            if !diet(&ev) || ev["status"] != "succeeded" || ev["mode"] == "external" {
+                continue;
+            }
+            let total = usage::summary(&dir).tokens.total();
+            if total == 0 {
+                continue;
+            }
+            let name = w.template.stages().get(a.stage).map_or("?", |s| s.name);
+            out.entry(name.to_owned()).or_default().push(total);
+        }
+    }
+    out
+}
+
+/// One side (before or after the diet) of a comparison row. Runs without a first-call
+/// context (interrupted, E12) are counted but left out of the median and averages.
+#[derive(Default)]
+struct CompareSide {
+    runs: usize,
+    first: Vec<u64>,
+    calls: Vec<u64>,
+    totals: Vec<u64>,
+}
+impl CompareSide {
+    fn add(&mut self, s: &usage::Summary) {
+        self.runs += 1;
+        if let Some(f) = s.first_context {
+            self.first.push(f);
+            self.calls.push(s.calls as u64);
+            self.totals.push(s.tokens.total());
+        }
+    }
+    fn avg(v: &[u64]) -> Option<f64> {
+        (!v.is_empty()).then(|| v.iter().sum::<u64>() as f64 / v.len() as f64)
+    }
+    fn json(&self) -> Value {
+        json!({
+            "runs": self.runs,
+            "first_context_median": median(&self.first),
+            "avg_calls": Self::avg(&self.calls),
+            "avg_total": Self::avg(&self.totals),
+        })
+    }
+}
+
+#[derive(Default)]
+struct Compare(Vec<(String, CompareSide, CompareSide)>);
+impl Compare {
+    fn add(&mut self, key: &str, after: bool, s: &usage::Summary) {
+        let i = self
+            .0
+            .iter()
+            .position(|(k, ..)| k == key)
+            .unwrap_or_else(|| {
+                self.0
+                    .push((key.to_owned(), Default::default(), Default::default()));
+                self.0.len() - 1
+            });
+        let row = &mut self.0[i];
+        if after { row.2.add(s) } else { row.1.add(s) }
+    }
+    /// Rows by average total before the diet, the most expensive first; `change` compares the
+    /// average totals and is null while a side has no sample.
+    fn rows(mut self) -> Vec<Value> {
+        let before =
+            |r: &(String, CompareSide, CompareSide)| CompareSide::avg(&r.1.totals).unwrap_or(0.0);
+        self.0.sort_by(|a, b| before(b).total_cmp(&before(a)));
+        self.0
+            .iter()
+            .map(|(key, b, a)| {
+                let change = match (CompareSide::avg(&b.totals), CompareSide::avg(&a.totals)) {
+                    (Some(b), Some(a)) if b > 0.0 => Some(a / b - 1.0),
+                    _ => None,
+                };
+                json!({"key": key, "before": b.json(), "after": a.json(), "change": change})
+            })
+            .collect()
+    }
+}
+
+/// "150k", "1.5M", "150000"; empty = None.
+fn parse_amount(text: &str) -> Result<Option<u64>> {
+    let t: String = text
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, ',' | '_' | ' '))
+        .collect::<String>()
+        .to_lowercase();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let (num, mul) = match t.strip_suffix('k') {
+        Some(n) => (n, 1e3),
+        None => match t.strip_suffix('m') {
+            Some(n) => (n, 1e6),
+            None => (t.as_str(), 1.0),
+        },
+    };
+    let n: f64 = num
+        .parse()
+        .ok()
+        .filter(|n: &f64| n.is_finite() && *n >= 0.0)
+        .with_context(|| format!("无法识别的 Token 数：{}", text.trim()))?;
+    Ok(Some((n * mul).round() as u64))
+}
+
+/// The project's resume limit (R2): empty restores the default, below the minimum is refused.
+pub fn set_resume_limit(home: &Path, pid: &str, tokens: &str) -> Result<()> {
+    let limit = parse_amount(tokens)?;
+    if let Some(n) = limit {
+        ensure!(
+            n >= session_reuse::MIN_LIMIT,
+            "续接上限至少 {}K",
+            session_reuse::MIN_LIMIT / 1000
+        );
+    }
+    change(home, |lib| {
+        find_mut(lib, pid)?.resume_limit = limit;
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod diet_tests {
+    use super::*;
+
+    #[test]
+    fn amounts_parse_with_units() {
+        assert_eq!(parse_amount("150k").unwrap(), Some(150_000));
+        assert_eq!(parse_amount(" 1.5M ").unwrap(), Some(1_500_000));
+        assert_eq!(parse_amount("120,000").unwrap(), Some(120_000));
+        assert_eq!(parse_amount("").unwrap(), None);
+        assert!(parse_amount("abc").is_err());
+        assert!(parse_amount("-5k").is_err());
+    }
+
+    #[test]
+    fn suggestion_is_median_times_one_and_a_half_rounded_up() {
+        let v = suggested_budget(&[1_000_000, 1_200_000, 5_000_000]);
+        assert_eq!(v["median"], 1_200_000);
+        assert_eq!(v["value"], 1_800_000);
+        assert_eq!(v["runs"], 3);
+        assert_eq!(suggested_budget(&[101_000])["value"], 160_000);
+        assert!(suggested_budget(&[]).is_null());
+        assert_eq!(median(&[1, 4]), Some(3));
+    }
 }
