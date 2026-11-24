@@ -131,6 +131,8 @@ fn independent_sessions_share_revisions_and_immutable_evidence() -> Result<()> {
         .success()
     );
     let done = api(&submit)?;
+    let legacy = api(&["show", "--attempt", id])?;
+    assert_eq!(legacy.get("actual_model"), Some(&Value::Null));
     fs::write(a.join("design.md"), "changed later")?;
     assert_eq!(
         invoke(
@@ -276,7 +278,6 @@ fn native_zcode_bridge_uses_the_existing_default_and_keeps_its_session_id() -> R
 set -eu
 test "$1" = app-server
 IFS= read -r create
-case "$create" in *'"model":'*) exit 8;; esac
 sid=$(printf '%s' "$create" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
 printf '%s\n' '{"id":1,"result":{"settings":{"model":{"current":{"providerId":"native","modelId":"local-default"}}}}}'
 IFS= read -r subscribe
@@ -290,28 +291,88 @@ printf '%s\n' '{"id":4,"result":{"messages":[{"info":{"role":"assistant"},"parts
 "#,
     )?;
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
-    fs::write(
-        path.join("request.json"),
-        serde_json::to_vec(
-            &serde_json::json!({"project":"p","work":"w","template":"Software","stage":0,"profile":{"client":"ZCode","model":"","executable":""},"repository":null,"brief":"test","approved":[]}),
-        )?,
-    )?;
-    fs::write(path.join("prompt.txt"), "native default")?;
+    let home = path.join("library");
+    call(&home, path, &["create", "ZCode project"])?;
+    call(&home, path, &["add-work", "ZCode work"])?;
+    let mut library = aep::project::Library::open(&home)?;
+    library.change(&home, |library| {
+        library
+            .project_mut()?
+            .set_zcode_default("other/project-default".into());
+        Ok(())
+    })?;
     let out = Command::new(env!("CARGO_BIN_EXE_aep"))
         .current_dir(path)
-        .args(["zcode-stage", "--binary"])
-        .arg(binary)
-        .args(["--request", "request.json"])
+        .env("HOME", path)
+        .env_remove("AEP_PROJECT")
+        .env_remove("AEP_WORK")
+        .args(["project", "--home"])
+        .arg(&home)
+        .args(["run", "--client", "zcode", "--executable"])
+        .arg(&binary)
         .output()?;
     ensure!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(out.stdout, b"native bridge ready\n");
-    let session: Value = serde_json::from_slice(&fs::read(path.join("session.json"))?)?;
+    let evidence: Value = serde_json::from_slice(&out.stdout)?;
+    let view = call(&home, path, &["status"])?;
+    let attempt = &view["attempts"][0];
+    let id = attempt["id"].as_str().unwrap();
+    let dir = aep::workflow::attempt_dir(
+        &home,
+        view["project"].as_str().unwrap(),
+        view["work"].as_str().unwrap(),
+        attempt["id"].as_str().unwrap(),
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("result.txt"))?,
+        "native bridge ready\n"
+    );
+    let session = aep::workspace::read(&dir.join("session.json"))?;
     assert_eq!(session["transport"], "app-server");
     assert!(session["session"].as_str().unwrap().starts_with("sess_"));
+    assert_eq!(session["providerId"], "native");
+    assert_eq!(session["modelId"], "local-default");
+    assert_eq!(session["selected"], "");
+    assert_eq!(session["reasoningLevel"], Value::Null);
+    assert_eq!(session["source"], "settings");
+    assert_eq!(
+        session,
+        aep::workspace::read(&dir.join("zcode-model.json"))?
+    );
+    assert_eq!(attempt["model"], "");
+    assert_eq!(attempt["actual_model"], evidence["actual_model"]);
+    assert_eq!(
+        call(&home, path, &["show", "--attempt", id])?["actual_model"],
+        evidence["actual_model"]
+    );
+    assert_eq!(attempt["actual_model"]["modelId"], "local-default");
+    let note = evidence["written_memory"].as_i64().unwrap().to_string();
+    assert_eq!(
+        call(&home, path, &["memory", "get", &note])?["author"],
+        "ZCode / native / local-default@默认 · 客户端默认"
+    );
+    let mismatch = invoke(
+        &home,
+        path,
+        &[
+            "run",
+            "--client",
+            "zcode",
+            "--executable",
+            binary.to_str().unwrap(),
+            "--model",
+            "native/other",
+        ],
+    )?;
+    assert!(!mismatch.status.success());
+    let failed: Value = serde_json::from_slice(&mismatch.stdout)?;
+    let error = failed["error"].as_str().unwrap();
+    assert!(error.contains("所选 native/other") && error.contains("实际 native / local-default"));
+    assert!(failed["written_memory"].is_null());
+    assert!(failed["actual_model"].is_null());
     Ok(())
 }
 

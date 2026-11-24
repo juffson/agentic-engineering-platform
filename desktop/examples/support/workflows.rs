@@ -1,7 +1,12 @@
 //! Exercise the Studio-to-CLI boundary with deterministic local clients.
 use super::{Args, Driver, fixture, handoff_fixture, https_queue::until, project::click};
-use aep::{workflow::attempt_dir, workspace::read};
+use aep::{
+    project::{Attempt, Kind, Library, save_json},
+    workflow::{Client, Profile, Template, attempt_dir},
+    workspace::read,
+};
 use anyhow::{Context, Result, ensure};
+use serde_json::json;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 fn client(bin: &Path, name: &str, body: &str) -> Result<()> {
@@ -42,9 +47,12 @@ printf 'handoff from Codex: frost-83\nAEP: PASS\n' > "$2""#,
     client(
         &bin,
         "zcode",
-        r#"if [ "$1" = "app-server" ]; then
+        r#"test "$1" = app-server
     read -r create
-    case "$create" in *'"modelId":"qa-model"'*) ;; *) exit 7;; esac
+    case "$create" in
+        *'"modelId":"qa-model"'*) ;;
+        *) echo 'simulated missing engine' >&2; exit 12;;
+    esac
     sid=$(printf '%s' "$create" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
     printf '%s\n' '{"id":1,"result":{"settings":{"model":{"current":{"providerId":"team","modelId":"qa-model"}}}}}'
     read -r subscribe
@@ -55,12 +63,7 @@ printf 'handoff from Codex: frost-83\nAEP: PASS\n' > "$2""#,
     printf '{"method":"session/event","params":{"sessionId":"%s","type":"turn.completed"}}\n' "$sid"
     read -r messages
     printf '%s\n' '{"id":4,"result":{"messages":[{"info":{"role":"assistant"},"parts":[{"type":"text","text":"game checks passed, frost-83\nAEP: PASS"}]}]}}'
-    exit 0
-fi
-while [ "$1" != "--attach" ]; do shift; done
-grep -q frost-83 "$2"
-if [ ! -e already-tested ]; then touch already-tested; echo 'simulated missing engine' >&2; exit 12; fi
-printf 'game checks passed, frost-83\nAEP: PASS\n'"#,
+    "#,
     )?;
     client(
         &bin,
@@ -187,7 +190,10 @@ echo "已核对玩家验收记录，交付 frost-83。""#,
                 );
                 if i == 2 && retry == 0 {
                     ensure!(
-                        ev["exit_code"] == 12 && ev["status"] == "failed",
+                        ev["status"] == "failed"
+                            && ev["error"]
+                                .as_str()
+                                .is_some_and(|text| text.contains("simulated missing engine")),
                         "expected preflight failure: {ev}"
                     );
                     click(&mut ui, "project-next")?;
@@ -305,12 +311,101 @@ echo "已核对玩家验收记录，交付 frost-83。""#,
             cli(&["status"])?["stage"] == 2,
             "Studio and CLI disagree about the approved stage"
         );
+        let item = actual_model_fixture(&catalog, &repo)?;
+        ui = Driver::open_with_runner(&ws, args, runner.clone())?;
+        if !ui.absent("back-to-project")? {
+            ui.click("back-to-project")?;
+        }
+        super::stage_lifecycle::open_item(&mut ui, &item)?;
+        for (id, text) in [
+            ("start-plan", "BigModel Start Plan / glm / high"),
+            (
+                "client-default",
+                "BigModel 个人 Coding Plan / glm / 默认 · 客户端默认",
+            ),
+            ("legacy", "legacy/glm · 未记录实际模型"),
+            ("mismatch", "wrong/glm · 未记录实际模型"),
+        ] {
+            ensure!(
+                ui.element(&format!("turn-model-{id}"))?.label() == Some(text),
+                "unexpected model for {id}"
+            );
+        }
+        ensure!(
+            ui.element("turn-receipt-start-plan")?.label()
+                == Some("会话 start-session · turn start-turn"),
+            "desktop receipt missing after completion"
+        );
+        ui.reveal("project-page", "zcode-open-start-session")?;
+        ensure!(
+            ui.element("zcode-open-start-session")?.visible(),
+            "completed desktop task cannot be opened"
+        );
+        ui.checkpoint("zcode-stage-actual-model")?;
+        let error = ui.element("turn-mismatch-error")?;
+        ensure!(
+            error
+                .label()
+                .is_some_and(|label| label.contains("所选 wrong/glm")
+                    && label.contains("实际 BigModel Start Plan")),
+            "mismatch omitted the selected or actual model"
+        );
+        ui.reveal("project-page", "turn-mismatch-error")?;
+        ui.checkpoint("zcode-stage-model-mismatch")?;
         Ok(())
     })();
     if result.is_err() {
         let _ = ui.checkpoint("workflow-failure");
     }
     result
+}
+
+fn actual_model_fixture(home: &Path, repo: &Path) -> Result<String> {
+    let mut library = Library::open(home)?;
+    library.change(home, |library| {
+        let project = library.project_mut()?;
+        project.add_work("实际模型回执", Kind::Feature, Template::Software)?;
+        let project_id = project.id.clone();
+        let work = project.selected_mut()?;
+        for (id, selected, status, receipt) in [
+            ("start-plan", "account:bigmodel-start-plan/glm", "succeeded", json!({
+                "transport":"desktop","providerId":"account:bigmodel-start-plan","modelId":"glm",
+                "reasoningLevel":"high","selected":"account:bigmodel-start-plan/glm",
+                "session":"start-session","turn":"start-turn","workspace":repo
+            })),
+            ("client-default", "", "succeeded", json!({
+                "transport":"app-server","providerId":"account:bigmodel-individual-coding-plan",
+                "modelId":"glm","selected":"","session":"default-session"
+            })),
+            ("legacy", "legacy/glm", "succeeded", json!({"transport":"app-server","session":"old-session"})),
+            ("mismatch", "wrong/glm", "failed", serde_json::Value::Null),
+        ] {
+            let dir = attempt_dir(home, &project_id, &work.id, id);
+            fs::create_dir_all(&dir)?;
+            let evidence = if status == "failed" {
+                json!({"status":status,"error":aep::zcode_receipt::mismatch(
+                    selected, "account:bigmodel-start-plan", "glm", Some("high"))})
+            } else {
+                json!({"status":status})
+            };
+            save_json(&dir, "evidence.json", &evidence)?;
+            if !receipt.is_null() {
+                save_json(&dir, "session.json", &receipt)?;
+            }
+            if id == "start-plan" {
+                save_json(&dir, "desktop-create.json", &json!({
+                    "session":{"sessionId":"start-session","workspacePath":repo}
+                }))?;
+            }
+            work.attempts.push(Attempt {
+                id: id.into(),
+                stage: 0,
+                profile: Profile { client: Client::ZCode, model: selected.into(), executable: String::new(), check_command: String::new() },
+                repository: Some(repo.to_owned()),
+            });
+        }
+        Ok(work.id.clone())
+    })
 }
 
 pub(super) fn live(args: &mut Args) -> Result<()> {

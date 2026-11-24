@@ -349,7 +349,18 @@ impl Studio {
                 card = card.child(caption(format!("本轮决策 · 仓库 #{decision}")));
             }
             for (j, a) in r.agents.iter().enumerate() {
-                let mut bar = h_flex().justify_between().gap_2().child(
+                let zcode = a.client.eq_ignore_ascii_case("zcode");
+                let actual = a.actual_model.as_ref().map(|model| model.label());
+                let model = actual.clone().or_else(|| {
+                    if zcode {
+                        Some(aep::zcode_receipt::fallback(
+                            a.model.as_deref().unwrap_or_default(),
+                        ))
+                    } else {
+                        a.model.clone()
+                    }
+                });
+                let mut bar = h_flex().gap_2().flex_wrap().child(
                     t(
                         format!(
                             "{} · {} · {}",
@@ -366,6 +377,14 @@ impl Studio {
                     )
                     .font_semibold(),
                 );
+                if let Some(model) = &model {
+                    bar = bar.child(
+                        detail_text(format!("timeline-model-{i}-{j}"), model)
+                            .text_xs()
+                            .text_color(rgb(MUTED)),
+                    );
+                }
+                bar = bar.child(div().flex_1());
                 if let Some(dir) = a.desktop_dir.clone() {
                     bar = bar.child(
                         button(format!("timeline-open-{i}-{j}"), "打开 ZCode 原会话", false)
@@ -398,11 +417,28 @@ impl Studio {
                     ));
                 }
                 if expanded {
-                    if let Some(model) = &a.model {
+                    if zcode || actual.is_some() {
+                        card = card.child(field("实际模型", actual.as_deref().unwrap_or("未记录")));
+                        card = card.child(field(
+                            "选择的模型",
+                            a.model.as_deref().unwrap_or("客户端默认"),
+                        ));
+                    } else if let Some(model) = &a.model {
                         card = card.child(field("选择的模型", model));
                     }
+                    if let Some(error) = &a.actual_model_error {
+                        card = card.child(caption(error.clone()));
+                    }
                     if let Some(session) = &a.session {
-                        card = card.child(field("会话 ID", session));
+                        let session = match a
+                            .actual_model
+                            .as_ref()
+                            .and_then(|model| model.turn.as_deref())
+                        {
+                            Some(turn) => format!("{session} · turn {turn}"),
+                            None => session.clone(),
+                        };
+                        card = card.child(field("会话 ID", &session));
                     }
                     if !a.handoff.is_empty() {
                         card = card.child(field(

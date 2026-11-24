@@ -1,10 +1,13 @@
 use super::{Args, Driver, https_queue::until, project::click};
 use aep::{
+    project::{Kind, Library, RecordKind, save_json, timeline},
     studio::Snapshot,
+    workflow::Template,
     workspace::{Workspace, read, status},
 };
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
+use serde_json::json;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -26,6 +29,90 @@ struct Plan {
 }
 
 use aep_studio::stage_lifecycle::Models;
+
+pub(super) fn verify_actual_model_fixture(
+    ui: &mut Driver<'_>,
+    ws: &Workspace,
+    home: &Path,
+    runner: aep_studio::Runner,
+    relay: &str,
+    run: &str,
+) -> Result<()> {
+    let models = [
+        (
+            "edit",
+            "desktop",
+            "account:bigmodel-start-plan",
+            "BigModel Start Plan",
+        ),
+        (
+            "plan",
+            "app-server",
+            "account:bigmodel-individual-coding-plan",
+            "BigModel 个人 Coding Plan",
+        ),
+    ];
+    for (mode, transport, provider, _) in models {
+        let dir = ws.data.join("runs").join(run).join(format!("zcode-{mode}"));
+        fs::create_dir_all(&dir)?;
+        save_json(
+            &dir,
+            "session.json",
+            &json!({
+                "transport":transport,"providerId":provider,"modelId":"glm","reasoningLevel":"high",
+                "session":format!("model-{mode}"),"turn":format!("turn-{mode}"),"workspace":ws.root
+            }),
+        )?;
+    }
+    let mut library = Library::open(home)?;
+    let item = library.change(home, |library| {
+        let project = library.project_mut()?;
+        project.add_work("接力实际模型", Kind::Feature, Template::Software)?;
+        let work = project.selected_mut()?;
+        work.repositories = vec![ws.root.clone()];
+        let item = work.id.clone();
+        project.link_record(&item, &ws.root, RecordKind::Relay, relay)?;
+        Ok(item)
+    })?;
+    *ui = Driver::open_with_runner(ws, ui.args, runner)?;
+    ui.click("两轮接力")?;
+    press(ui, "relay-list", relay)?;
+    for (mode, _, _, plan) in models {
+        let id = format!("relay-second-{mode}-receipt");
+        ensure!(
+            ui.element(&id)?.label()
+                == Some(format!("{plan} / glm / high · 会话 model-{mode}").as_str()),
+            "wrong {mode} receipt on the relay card"
+        );
+    }
+    ui.reveal("relay-detail", "relay-second-edit-receipt")?;
+    ui.checkpoint("zcode-relay-actual-models")?;
+    ui.click("back-to-project")?;
+    super::stage_lifecycle::open_item(ui, &item)?;
+    click(ui, "work-timeline-tab")?;
+    let project = library.project().context("project")?;
+    let timeline = timeline::load(home, &project.id, project.selected().context("work")?)?;
+    let index = timeline
+        .rounds
+        .iter()
+        .position(|round| round.run == run)
+        .context("relay round")?;
+    let detail = format!("timeline-detail-{index}");
+    until(ui, &detail, 30, |ui| {
+        Ok((!ui.absent(&detail)?).then_some(()))
+    })?;
+    for (agent, (_, _, _, plan)) in models.into_iter().enumerate() {
+        let id = format!("timeline-model-{index}-{agent}");
+        ensure!(
+            ui.element(&id)?.label() == Some(format!("{plan} / glm / high").as_str()),
+            "wrong actual model on timeline agent {agent}"
+        );
+    }
+    ui.reveal("project-page", &detail)?;
+    ui.checkpoint("zcode-relay-timeline")?;
+    Ok(())
+}
+
 fn press(ui: &mut Driver<'_>, container: &str, id: &str) -> Result<()> {
     if !ui.element(id)?.visible() {
         ui.reveal(container, id)?;

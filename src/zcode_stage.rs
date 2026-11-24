@@ -1,5 +1,9 @@
 //! Use the installed ZCode app-server with its native settings or a pinned model.
-use aep::workflow::{Request, Role};
+use crate::zcode_desktop::{main_turn_usage, readonly, save_receipt, verify_model};
+use aep::{
+    workflow::{Request, Role},
+    zcode_receipt,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -7,6 +11,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
     process::Stdio,
+    time::{Duration, Instant},
 };
 
 /// Run a configured desktop plan in its native task, or an ordinary CLI model via app-server.
@@ -19,7 +24,7 @@ pub fn converse(
     desktop_workspace: &Path,
     repository: Option<&Path>,
 ) -> Result<String> {
-    if Path::new(aep::workflow::ZCODE_APP).is_file()
+    let result = if Path::new(aep::workflow::ZCODE_APP).is_file()
         && let Some(model) = model
         && model["providerId"]
             .as_str()
@@ -27,22 +32,26 @@ pub fn converse(
             .is_some()
     {
         let selection = json!({"providerId":model["providerId"], "modelId":model["modelId"]});
-        return crate::zcode_desktop::converse(
+        crate::zcode_desktop::converse(dir, desktop_workspace, mode, &selection, prompt, repository)
+    } else {
+        app_server(binary, dir, mode, model, prompt)
+    };
+    result.inspect_err(|error| {
+        let _ = aep::project::save_json(
             dir,
-            desktop_workspace,
-            mode,
-            &selection,
-            prompt,
-            repository,
-        )
-        .inspect_err(|e| {
-            let _ = aep::project::save_json(
-                dir,
-                "desktop-error.json",
-                &json!({"error":format!("{e:#}")}),
-            );
-        });
-    }
+            "desktop-error.json",
+            &json!({"error":format!("{error:#}")}),
+        );
+    })
+}
+
+fn app_server(
+    binary: &Path,
+    dir: &Path,
+    mode: &str,
+    model: Option<&Value>,
+    prompt: &str,
+) -> Result<String> {
     let mut child = aep::zcode_catalog::app_server(binary)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -54,6 +63,8 @@ pub fn converse(
         let output = BufReader::new(child.stdout.take().context("ZCode stdout")?);
         let cwd = std::env::current_dir()?;
         let session = format!("sess_{}", uuid::Uuid::new_v4().simple());
+        let selected = zcode_receipt::selected(model);
+        let mut settings = Value::Null;
         let mut create = json!({"sessionId":session,"workspace":{"workspaceKey":cwd,"workspacePath":cwd},"titleGenerationEnabled":false,"mode":mode});
         if let Some(model) = model {
             create["model"] = model.clone();
@@ -73,10 +84,23 @@ pub fn converse(
                     let e = &msg["params"];
                     match e["type"].as_str() {
                         Some("turn.failed") => bail!("ZCode: {}", e["payload"]["error"]),
-                        Some("turn.completed") => send(
-                            &mut input,
-                            json!({"id":4,"method":"session/messages","params":{"sessionId":session,"limit":24}}),
-                        )?,
+                        Some("turn.completed") => {
+                            let db = std::env::home_dir()
+                                .map(|home| home.join(".zcode/cli/db/db.sqlite"));
+                            let actual = app_server_receipt(
+                                db.as_deref(),
+                                &session,
+                                &cwd,
+                                model,
+                                &selected,
+                                &settings,
+                            )?;
+                            save_receipt(dir, &actual)?;
+                            send(
+                                &mut input,
+                                json!({"id":4,"method":"session/messages","params":{"sessionId":session,"limit":24}}),
+                            )?;
+                        }
                         Some("permission.requested" | "userInput.requested") => {
                             bail!("ZCode 等待工具权限或用户输入，请核对本机设置后重试")
                         }
@@ -92,23 +116,21 @@ pub fn converse(
             let result = &msg["result"];
             match msg["id"].as_u64() {
                 Some(1) => {
-                    let actual = &result["settings"]["model"]["current"];
-                    if let Some(model) = &model {
-                        ensure!(
-                            actual["providerId"] == model["providerId"]
-                                && actual["modelId"] == model["modelId"],
-                            "ZCode 未选中指定模型"
-                        );
-                    }
+                    settings = result["settings"]["model"]["current"].clone();
+                    verify_model(
+                        model,
+                        &selected,
+                        settings["providerId"].as_str().unwrap_or_default(),
+                        settings["modelId"].as_str().unwrap_or_default(),
+                        None,
+                        false,
+                    )?;
                     aep::project::save_json(
                         dir,
                         "session.json",
                         &json!({"client":"ZCode","transport":"app-server","session":session}),
-                    )?;
-                    fs::write(
-                        dir.join("zcode-model.json"),
-                        serde_json::to_vec_pretty(actual)?,
-                    )?;
+                    )
+                    .context("无法写入 ZCode 实际模型回执")?;
                     send(
                         &mut input,
                         json!({"id":2,"method":"session/subscribe","params":{"sessionId":session,"deliveryKind":"desktop-continuous"}}),
@@ -134,6 +156,48 @@ pub fn converse(
     let _ = child.kill();
     let _ = child.wait();
     talk
+}
+
+fn app_server_receipt(
+    db_path: Option<&Path>,
+    session: &str,
+    cwd: &Path,
+    model: Option<&Value>,
+    selected: &str,
+    settings: &Value,
+) -> Result<Value> {
+    if let Some(path) = db_path
+        && path.try_exists()?
+    {
+        let db = readonly(path)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(usage) = main_turn_usage(&db, session, None, model, selected)? {
+                return Ok(
+                    json!({"transport":"app-server","client":"ZCode","session":session,
+                    "turn":usage.turn,"message":usage.message,"providerId":usage.provider,
+                    "modelId":usage.model,"reasoningLevel":usage.variant,"workspace":cwd,
+                    "selected":selected,"source":"model_usage"}),
+                );
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100).min(remaining));
+        }
+    }
+    let field = |name: &str| {
+        settings[name]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .context("缺少 ZCode 主对话模型用量回执，且会话设置未记录模型")
+    };
+    Ok(
+        json!({"transport":"app-server","client":"ZCode","session":session,
+        "turn":null,"message":null,"providerId":field("providerId")?,"modelId":field("modelId")?,
+        "reasoningLevel":null,"workspace":cwd,"selected":selected,"source":"settings"}),
+    )
 }
 
 fn send(out: &mut impl Write, v: Value) -> Result<()> {

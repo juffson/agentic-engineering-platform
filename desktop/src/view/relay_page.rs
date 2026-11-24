@@ -641,28 +641,55 @@ impl Studio {
                     {
                         card = card.child(caption(reason.to_owned()).text_color(rgb(RED)));
                     }
-                    if let Ok(receipt) = aep::workspace::read(&dir.join("session.json"))
-                        && receipt["transport"] == "desktop"
-                    {
+                    if let Ok(Some(actual)) = aep::zcode_receipt::read(&dir) {
                         let text = format!(
-                            "{} · {}/{} · 实际档位 {}",
-                            receipt["session"].as_str().unwrap_or(""),
-                            receipt["providerId"].as_str().unwrap_or(""),
-                            receipt["modelId"].as_str().unwrap_or(""),
-                            receipt["reasoningLevel"].as_str().unwrap_or("未记录")
+                            "{} · 会话 {}",
+                            actual.label(),
+                            actual.session.as_deref().unwrap_or("—"),
                         );
-                        card = card.child(caption(format!("ZCode 桌面{role}回执"))).child(
-                            detail_text(
+                        card = card
+                            .child(caption(format!("{}{role}回执", actual.transport_label())))
+                            .child(detail_text(
                                 SharedString::from(format!("relay-{key}-{mode}-receipt")),
                                 &text,
-                            ),
-                        );
+                            ));
+                        if let Some(open) = self.zcode_open_button(&dir, cx) {
+                            card = card.child(open);
+                        }
                     } else if run.text("status") == "running"
                         && run.text("phase") == phase
                         && let Some(dispatch) =
                             self.desktop_dispatch(&dir, &format!("{title} · {role}"), cx)
                     {
                         card = card.child(dispatch);
+                    } else {
+                        let client = if mode == "edit" {
+                            "implementation_source"
+                        } else {
+                            "reviewer"
+                        };
+                        let current_phase = run.text("phase");
+                        let ended = match run.text("status") {
+                            "running" => {
+                                mode == "edit"
+                                    && matches!(
+                                        current_phase,
+                                        "checking" | "reviewing" | "complete"
+                                    )
+                            }
+                            "failed"
+                            | "cancelled"
+                            | "needs_reconciliation"
+                            | "awaiting_human_review" => {
+                                current_phase == phase
+                                    || matches!(current_phase, "reviewing" | "complete")
+                                    || (mode == "edit" && current_phase == "checking")
+                            }
+                            _ => false,
+                        };
+                        if ended && run.text(client) == "zcode" {
+                            card = card.child(caption(format!("{role} · 未记录实际模型")));
+                        }
                     }
                 }
                 for note in self.snapshot.notes.iter().filter(|n| {

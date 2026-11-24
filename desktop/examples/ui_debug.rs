@@ -827,7 +827,7 @@ fn studio_relay(args: &Args) -> Result<()> {
             .as_i64()
             .context("first question")?;
 
-        ui = Driver::open_with_runner(&ws, args, runner)?;
+        ui = Driver::open_with_runner(&ws, args, runner.clone())?;
         ui.click("两轮接力")?;
         ui.click(id)?;
         ensure!(
@@ -925,6 +925,7 @@ fn studio_relay(args: &Args) -> Result<()> {
             "first run evidence no longer links to its question"
         );
         verify_publication(&mut ui, &ws, fixture.path(), second, &second_run)?;
+        stage_relay::verify_actual_model_fixture(&mut ui, &ws, &home, runner.clone(), id, second)?;
         Ok(())
     })();
     if result.is_err() {

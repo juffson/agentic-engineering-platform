@@ -73,23 +73,8 @@ impl Studio {
             } else {
                 panel = panel.child(caption(format!("ZCode 桌面任务 {session} · 等待交接")));
             }
-            if dir.join("desktop-create.json").is_file() {
-                let folder = dir.to_owned();
-                panel = panel.child(
-                    button(
-                        format!("zcode-open-{session}"),
-                        "打开对应 ZCode 任务",
-                        false,
-                    )
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.open_zcode_task(folder.clone(), cx)),
-                    ),
-                );
-            }
-            if let Some((path, msg)) = &self.zcode_navigation
-                && path == dir
-            {
-                panel = panel.child(caption(msg.clone()));
+            if let Some(open) = self.zcode_open_button(dir, cx) {
+                panel = panel.child(open);
             }
             return Some(panel);
         }
@@ -104,6 +89,28 @@ impl Studio {
             "正在 ZCode 桌面创建{role}任务 · {plan} / {} / {level}",
             model["modelId"].as_str()?
         )))
+    }
+
+    pub(in crate::view) fn zcode_open_button(&self, dir: &Path, cx: &Context<Self>) -> Option<Div> {
+        let created = aep::workspace::read(&dir.join("desktop-create.json")).ok()?;
+        let session = created["session"]["sessionId"].as_str()?;
+        let folder = dir.to_owned();
+        let mut panel = v_flex().gap_1().child(
+            button(
+                format!("zcode-open-{session}"),
+                "打开对应 ZCode 任务",
+                false,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.open_zcode_task(folder.clone(), cx))),
+        );
+        if let Some((_, message)) = self
+            .zcode_navigation
+            .as_ref()
+            .filter(|(path, _)| path == dir)
+        {
+            panel = panel.child(caption(message.clone()));
+        }
+        Some(panel)
     }
 
     pub(super) fn open_zcode_task(&mut self, dir: PathBuf, cx: &mut Context<Self>) {

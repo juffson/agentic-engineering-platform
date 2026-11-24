@@ -160,6 +160,9 @@ impl Studio {
                 continue;
             }
             let dir = PathBuf::from(string(r, "dir"));
+            let model: Option<aep::zcode_receipt::ActualModel> =
+                serde_json::from_value(r["actual_model"].clone()).unwrap_or_default();
+            let model = model.as_ref().map(|model| model.label());
             let mut top = h_flex().justify_between().gap_2().child(
                 heading(
                     r["title"]
@@ -186,6 +189,7 @@ impl Studio {
                     string(r, "role"),
                     string(r, "run")
                 )))
+                .child(field("实际模型", model.as_deref().unwrap_or("未记录")))
                 .child(field(
                     "归属项目",
                     r["project_name"].as_str().unwrap_or("无可核对的桌面归属"),

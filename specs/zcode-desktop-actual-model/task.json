@@ -1,0 +1,152 @@
+{
+  "title": "ZCode 桌面双方案 · 实际模型与交接",
+  "allowed_paths": [
+    "src/lib.rs",
+    "src/zcode_receipt.rs",
+    "src/zcode_desktop.rs",
+    "src/zcode_stage.rs",
+    "src/workflow_stage.rs",
+    "src/project/timeline.rs",
+    "src/project/archive.rs",
+    "src/project_cli.rs",
+    "src/zcode_group/history.rs",
+    "desktop/src/view/relay_page.rs",
+    "desktop/src/view/project_page/console.rs",
+    "desktop/src/view/project_page/timeline.rs",
+    "desktop/src/view/project_page/zcode.rs",
+    "desktop/src/view/project_page/zcode_history.rs",
+    "desktop/examples/ui_debug.rs",
+    "desktop/examples/support/workflows.rs",
+    "desktop/examples/support/stage_relay.rs",
+    "desktop/examples/support/zcode_history.rs",
+    "tests/project_handoff.rs",
+    "specs/zcode-desktop-actual-model/"
+  ],
+  "check": [
+    "cargo",
+    "test",
+    "--locked"
+  ],
+  "checks": [
+    {
+      "id": "receipt",
+      "criteria": [
+        "统一格式、记忆作者、回退与不符文案、回执读取兼容（T1–T3）"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "zcode_receipt"
+      ]
+    },
+    {
+      "id": "timeline",
+      "criteria": [
+        "接力两端各自实际方案、旧轮次与损坏回执不报错（T10）"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "project::timeline"
+      ]
+    },
+    {
+      "id": "bridge",
+      "criteria": [
+        "桌面与 app-server 回执字段、selected、不符校验、--recover-desktop 回收、交接作者、归组历史 actual_model（T4–T7、T14）"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--bin",
+        "aep",
+        "zcode"
+      ]
+    },
+    {
+      "id": "cli",
+      "criteria": [
+        "app-server 客户端默认回执与 aep project show 的 actual_model（T8–T9）"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "project_handoff"
+      ]
+    },
+    {
+      "id": "all",
+      "criteria": [
+        "全部库与集成测试通过"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "--locked"
+      ]
+    },
+    {
+      "id": "studio",
+      "criteria": [
+        "Studio 与全部示例编译通过"
+      ],
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--all-targets"
+      ]
+    },
+    {
+      "id": "ui-workflows",
+      "criteria": [
+        "阶段轮次实际模型、完成后打开 ZCode 任务、客户端默认、旧轮次、不符红字；需可访问 macOS 桌面服务"
+      ],
+      "command": [
+        "cargo",
+        "run",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--example",
+        "ui_debug",
+        "--",
+        "--scenario",
+        "workflows",
+        "--output-dir",
+        "target/zcode-actual-model-ui",
+        "--screenshots"
+      ]
+    },
+    {
+      "id": "ui-relay",
+      "criteria": [
+        "接力两端两种方案的回执与时间线；需可访问 macOS 桌面服务"
+      ],
+      "command": [
+        "cargo",
+        "run",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--example",
+        "ui_debug",
+        "--",
+        "--scenario",
+        "studio-relay",
+        "--output-dir",
+        "target/zcode-actual-model-ui",
+        "--screenshots"
+      ]
+    }
+  ]
+}

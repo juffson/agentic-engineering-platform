@@ -327,6 +327,25 @@ impl Studio {
                 .and_then(|f| serde_json::from_reader(f).ok());
             let active = busy(&ev);
             running |= active;
+            let zcode = a.profile.client == aep::workflow::Client::ZCode;
+            let ended = zcode
+                && !active
+                && matches!(
+                    ev["status"].as_str(),
+                    Some("succeeded" | "failed" | "cancelled" | "needs_reconciliation")
+                );
+            let actual = ended
+                .then(|| aep::zcode_receipt::read(&d).ok().flatten())
+                .flatten();
+            let model = if let Some(actual) = &actual {
+                actual.label()
+            } else if ended {
+                aep::zcode_receipt::fallback(&a.profile.model)
+            } else if a.profile.model.is_empty() {
+                "默认模型".into()
+            } else {
+                a.profile.model.clone()
+            };
             let current = work.current_attempt.get(&i) == Some(&a.id);
             let tone = match ev["status"].as_str() {
                 Some("succeeded") => MINT,
@@ -346,19 +365,18 @@ impl Studio {
                         .font_semibold(),
                 )
                 .child(chip(agents::phase(&ev), tone))
-                .child(caption(format!(
-                    "{} · {} · {}",
-                    a.profile.client.label(),
-                    if a.profile.model.is_empty() {
-                        "默认模型"
-                    } else {
-                        &a.profile.model
-                    },
+                .child(caption(a.profile.client.label()))
+                .child(
+                    detail_text(format!("turn-model-{}", a.id), &model)
+                        .text_xs()
+                        .text_color(rgb(MUTED)),
+                )
+                .child(caption(
                     a.repository
                         .as_deref()
                         .map(basename)
-                        .unwrap_or_else(|| "项目文件".into())
-                )))
+                        .unwrap_or_else(|| "项目文件".into()),
+                ))
                 .when_some(elapsed(&ev), |b, s| b.child(caption(s)))
                 .when(current && !active && turns.len() > 1, |b| {
                     b.child(caption("· 当前结论"))
@@ -434,6 +452,24 @@ impl Studio {
                 .border_1()
                 .border_color(rgb(if active { BLUE } else { LINE }))
                 .child(bar);
+            if ended {
+                let mut receipt = h_flex().gap_2().flex_wrap();
+                if let Some(actual) = &actual {
+                    let mut session = format!("会话 {}", actual.session.as_deref().unwrap_or("—"));
+                    if let Some(id) = &actual.turn {
+                        session.push_str(&format!(" · turn {id}"));
+                    }
+                    receipt = receipt
+                        .child(caption(format!("{}实际模型", actual.transport_label())))
+                        .child(detail_text(format!("turn-receipt-{}", a.id), &session));
+                } else {
+                    receipt = receipt.child(caption("未记录实际模型"));
+                }
+                if let Some(open) = self.zcode_open_button(&d, cx) {
+                    receipt = receipt.child(open);
+                }
+                turn = turn.child(receipt);
+            }
             let asked = req.as_ref().map(|r| {
                 r.follow_up
                     .as_ref()

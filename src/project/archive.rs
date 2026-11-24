@@ -213,6 +213,7 @@ pub(super) fn seal(
             "implementation.log",
             "review-result.json",
             "session.json",
+            "zcode-model.json",
             "zcode-edit/session.json",
             "zcode-plan/session.json",
             "zcode-edit/desktop-task.json",
