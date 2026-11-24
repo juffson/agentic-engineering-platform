@@ -99,6 +99,12 @@ enum Action {
         #[arg(long)]
         job: PathBuf,
     },
+    /// Ask a model CLI to draft work items from a description (started by Studio).
+    #[command(hide = true)]
+    WorkDraft {
+        #[arg(long)]
+        job: PathBuf,
+    },
     Control(control::Control),
     /// Review and deliver a pinned task entirely in the local repository.
     Local {
@@ -295,6 +301,10 @@ fn app() -> Result<ExitCode> {
             aep::memory_tidy::run(&home.join("workflows").join(&project), &job)?;
             return Ok(ExitCode::SUCCESS);
         }
+        Action::WorkDraft { job } => {
+            aep::work_draft::run(&job)?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Action::Control(request) => {
             control::execute(&cli.repo, request)?;
             return Ok(ExitCode::SUCCESS);
@@ -311,7 +321,8 @@ fn app() -> Result<ExitCode> {
         | Action::ZcodeBridge { .. }
         | Action::WorkflowStage { .. }
         | Action::WorkflowAuto { .. }
-        | Action::MemoryTidy { .. } => {
+        | Action::MemoryTidy { .. }
+        | Action::WorkDraft { .. } => {
             unreachable!()
         }
         Action::Local { action } => return local::execute(&repo, action),

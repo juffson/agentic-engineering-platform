@@ -337,3 +337,21 @@ test("memory is tidied by a CLI: review the proposal, apply what you accept", as
   await expect(page.getByTestId("memory-note").filter({ hasText: "前端约定：行情只走" })).toHaveCount(1);
   await expect(page.getByTestId("memory-note").filter({ hasText: "旧版分时图下线" })).toHaveCount(1);
 });
+
+test("new items can be drafted by a CLI, edited, and created with their brief", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.goto("/");
+  await page.getByRole("button", { name: "新建事项" }).click();
+  const dialog = page.getByRole("dialog", { name: "新建事项" });
+  await dialog.getByRole("radio", { name: "用 CLI 起草" }).click();
+  const draft = dialog.getByTestId("draft");
+  await draft.getByLabel("需求描述").fill("对账单要能导出 CSV，空账户也要有表头");
+  await draft.getByRole("button", { name: "起草" }).click();
+  await expect(draft).toContainText("拆成两个事项", { timeout: 10_000 });
+  await draft.getByRole("textbox", { name: "事项名称" }).first().fill("对账单 · CSV 导出");
+  await draft.getByRole("checkbox", { name: /创建 对账单 · 空账户表头/ }).uncheck();
+  await shot(page, "26-draft-work");
+  await draft.getByRole("button", { name: "创建所选（1）" }).click();
+  await expect(page.locator(".work-header h1")).toHaveText("对账单 · CSV 导出");
+  await expect(page.getByRole("navigation", { name: "事项" }).getByText("对账单 · 空账户表头")).toHaveCount(0);
+});

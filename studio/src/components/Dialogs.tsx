@@ -1,17 +1,49 @@
-import { useEffect, useState } from "react";
-import { Download, FolderOpen, Plus, RefreshCw } from "lucide-react";
-import type { ImportFound, SyncPlan, Template } from "../api/types";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Download, FolderOpen, Plus, RefreshCw, Sparkles } from "lucide-react";
+import type { DraftItem, DraftStatus, ImportFound, SyncPlan, Template } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio } from "../state/store";
 import { Button, Field, Modal, Segmented, Spinner } from "./ui";
 
 export function NewWorkDialog({ onClose }: { onClose(): void }) {
+  const { project } = useStudio();
+  const [mode, setMode] = useState<"manual" | "draft">("manual");
+  const [repos, setRepos] = useState<string[]>(project?.repositories ?? []);
+  const picker = (
+    <Field label="仓库" hint={repos.length === 0 ? "至少选择一个仓库" : undefined}>
+      <div className="repo-checks">
+        {(project?.repositories ?? []).map((r) => (
+          <label key={r} className="check">
+            <input type="checkbox" checked={repos.includes(r)} onChange={(e) => setRepos((cur) => (e.target.checked ? [...cur, r] : cur.filter((x) => x !== r)))} />
+            <code>{r}</code>
+          </label>
+        ))}
+        {project?.repositories.length === 0 && <p className="muted">项目还没有仓库，请先在「仓库」页添加。</p>}
+      </div>
+    </Field>
+  );
+  return (
+    <Modal title="新建事项" onClose={onClose} width={640} footer={null}>
+      <Segmented<"manual" | "draft">
+        label="方式"
+        value={mode}
+        onChange={(v) => setMode(v)}
+        options={[
+          { value: "manual", label: "手动填写" },
+          { value: "draft", label: "用 CLI 起草" },
+        ]}
+      />
+      {mode === "manual" ? <ManualWork repos={repos} picker={picker} onClose={onClose} /> : <DraftWork repos={repos} picker={picker} onClose={onClose} />}
+    </Modal>
+  );
+}
+
+function ManualWork({ repos, picker, onClose }: { repos: string[]; picker: ReactNode; onClose(): void }) {
   const { snapshot, project, act, selectWork } = useStudio();
   const templates = snapshot?.templates ?? [];
   const [name, setName] = useState("");
   const [template, setTemplate] = useState<Template>(templates.find((t) => t.id === "Software")?.id ?? templates[0]?.id ?? "Software");
   const [release, setRelease] = useState(false);
-  const [repos, setRepos] = useState<string[]>(project?.repositories ?? []);
   const [busy, setBusy] = useState(false);
   const stages = templates.find((t) => t.id === template)?.stages ?? [];
 
@@ -27,21 +59,7 @@ export function NewWorkDialog({ onClose }: { onClose(): void }) {
   };
 
   return (
-    <Modal
-      title="新建事项"
-      onClose={onClose}
-      width={560}
-      footer={
-        <>
-          <Button variant="ghost" onClick={onClose}>
-            取消
-          </Button>
-          <Button variant="primary" onClick={create} busy={busy} disabled={!name.trim() || repos.length === 0}>
-            创建事项
-          </Button>
-        </>
-      }
-    >
+    <>
       <Field label="名称">
         <input
           className="input"
@@ -77,18 +95,154 @@ export function NewWorkDialog({ onClose }: { onClose(): void }) {
           </li>
         ))}
       </ol>
-      <Field label="仓库" hint={repos.length === 0 ? "至少选择一个仓库" : undefined}>
-        <div className="repo-checks">
-          {(project?.repositories ?? []).map((r) => (
-            <label key={r} className="check">
-              <input type="checkbox" checked={repos.includes(r)} onChange={(e) => setRepos((cur) => (e.target.checked ? [...cur, r] : cur.filter((x) => x !== r)))} />
-              <code>{r}</code>
-            </label>
-          ))}
-          {project?.repositories.length === 0 && <p className="muted">项目还没有仓库，请先在「仓库」页添加。</p>}
-        </div>
+      {picker}
+      <div className="modal-actions">
+        <Button variant="ghost" onClick={onClose}>
+          取消
+        </Button>
+        <Button variant="primary" onClick={create} busy={busy} disabled={!name.trim() || repos.length === 0}>
+          创建事项
+        </Button>
+      </div>
+    </>
+  );
+}
+
+/** Describe what to do; a CLI reads the repository and memory and drafts items to review. */
+function DraftWork({ repos, picker, onClose }: { repos: string[]; picker: ReactNode; onClose(): void }) {
+  const { snapshot, project, act, notify, selectWork } = useStudio();
+  const templates = snapshot?.templates ?? [];
+  const [request, setRequest] = useState("");
+  const [client, setClient] = useState<"Claude" | "Codex">("Claude");
+  const [model, setModel] = useState("");
+  const [status, setStatus] = useState<DraftStatus | null>(null);
+  const [items, setItems] = useState<(DraftItem & { on: boolean })[]>([]);
+  const [shown, setShown] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const pid = project?.id ?? "";
+
+  const poll = useCallback(async () => {
+    if (!pid) return null;
+    try {
+      const s = await api.draftStatus({ project: pid });
+      setStatus(s);
+      if (s.status === "succeeded" && s.draft && s.id !== shown) {
+        setItems(s.draft.items.map((i) => ({ ...i, on: true })));
+        setShown(s.id);
+      }
+      return s;
+    } catch {
+      return null;
+    }
+  }, [pid, shown]);
+  useEffect(() => {
+    void poll();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const running = status?.status === "running" || status?.status === "starting";
+  useEffect(() => {
+    if (!running) return;
+    const t = window.setInterval(() => void poll(), 2000);
+    return () => window.clearInterval(t);
+  }, [running, poll]);
+
+  const start = async () => {
+    setBusy(true);
+    const id = await act(() => api.draftStart({ project: pid, client, model, request, repository: repos[0] }));
+    setBusy(false);
+    if (id) {
+      setItems([]);
+      await poll();
+    }
+  };
+  const create = async () => {
+    setBusy(true);
+    let first: string | null = null;
+    let made = 0;
+    for (const item of items.filter((i) => i.on)) {
+      const id = await act(() => api.createWork({ project: pid, name: item.name.trim(), template: item.template, release: item.release, repositories: repos }));
+      if (!id) break;
+      await act(() => api.updateStage({ project: pid, work: id, stage: 0, note: item.brief.trim() }));
+      first ??= id;
+      made++;
+    }
+    setBusy(false);
+    if (first) {
+      notify(`已创建 ${made} 个事项，「产品需求」已写好说明`, "info");
+      selectWork(first);
+      onClose();
+    }
+  };
+  const set = (i: number, patch: Partial<DraftItem & { on: boolean }>) => setItems((cur) => cur.map((x, k) => (k === i ? { ...x, ...patch } : x)));
+
+  return (
+    <div className="draft" data-testid="draft">
+      <Field label="想做什么" hint="可以写得很随意，也可以贴 issue 内容；CLI 会只读地看仓库代码和项目记忆，拆成合适的事项并写好「产品需求」说明。">
+        <textarea className="input" rows={4} value={request} onChange={(e) => setRequest(e.target.value)} placeholder="例如：对账单要能导出 CSV，空账户也要有表头" aria-label="需求描述" />
       </Field>
-    </Modal>
+      <div className="draft-cli">
+        <Segmented<"Claude" | "Codex">
+          label="CLI"
+          value={client}
+          onChange={(v) => setClient(v)}
+          options={[
+            { value: "Claude", label: "Claude" },
+            { value: "Codex", label: "Codex" },
+          ]}
+        />
+        <input className="input mono" value={model} onChange={(e) => setModel(e.target.value)} placeholder="模型（留空用默认）" aria-label="起草模型" />
+        <Button variant="secondary" icon={<Sparkles size={14} />} busy={busy && !items.length} disabled={running || !request.trim() || repos.length === 0} onClick={start}>
+          起草
+        </Button>
+      </div>
+      {running && (
+        <p className="field-hint scan-hint">
+          <Spinner size={12} /> {status?.client} 正在看仓库和项目记忆、起草事项…
+        </p>
+      )}
+      {status?.status === "failed" && <p className="inline-error">起草失败：{status.error}</p>}
+      {items.length > 0 && (
+        <>
+          {status?.draft?.summary && <p className="tidy-summary">{status.draft.summary}</p>}
+          <ul className="draft-items">
+            {items.map((item, i) => (
+              <li key={i} className={item.on ? undefined : "off"}>
+                <div className="draft-head">
+                  <input type="checkbox" checked={item.on} onChange={(e) => set(i, { on: e.target.checked })} aria-label={`创建 ${item.name}`} />
+                  <input className="input" value={item.name} onChange={(e) => set(i, { name: e.target.value })} aria-label="事项名称" />
+                  <select className="input select" value={item.template} onChange={(e) => set(i, { template: e.target.value as Template })} aria-label="模板">
+                    {templates.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.label}
+                      </option>
+                    ))}
+                  </select>
+                  <label className="check">
+                    <input type="checkbox" checked={item.release} onChange={(e) => set(i, { release: e.target.checked })} />
+                    <span>发布</span>
+                  </label>
+                </div>
+                <textarea className="input" rows={4} value={item.brief} onChange={(e) => set(i, { brief: e.target.value })} aria-label="产品需求说明" />
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {picker}
+      <div className="modal-actions">
+        <Button variant="ghost" onClick={onClose}>
+          取消
+        </Button>
+        <Button
+          variant="primary"
+          icon={<Plus size={14} />}
+          busy={busy && items.length > 0}
+          disabled={repos.length === 0 || !items.some((i) => i.on && i.name.trim() && i.brief.trim())}
+          onClick={create}
+        >
+          创建所选（{items.filter((i) => i.on).length}）
+        </Button>
+      </div>
+    </div>
   );
 }
 

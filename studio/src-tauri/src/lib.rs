@@ -255,6 +255,31 @@ fn tidyApply(project: String, job: String, ops: Vec<usize>) -> Result<impl Seria
 }
 
 #[tauri::command(async)]
+fn draftStart(
+    project: String,
+    client: String,
+    model: String,
+    request: String,
+    repository: Option<String>,
+) -> Result<impl Serialize, String> {
+    run(move |h| {
+        api::draft_start(
+            &h,
+            &project,
+            &client,
+            &model,
+            &request,
+            repository.as_deref(),
+        )
+    })
+}
+
+#[tauri::command(async)]
+fn draftStatus(project: String) -> Result<impl Serialize, String> {
+    run(move |h| api::draft_status(&h, &project))
+}
+
+#[tauri::command(async)]
 fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
     run(move |h| api::cleanup(&h, &project, &work, force))
 }
@@ -359,6 +384,8 @@ pub fn start() {
             archive,
             unarchive,
             cleanup,
+            draftStart,
+            draftStatus,
             tidyStart,
             tidyStatus,
             tidyApply,

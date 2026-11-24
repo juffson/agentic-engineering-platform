@@ -298,6 +298,23 @@ export interface TidyStatus {
   proposal: { summary: string; ops: TidyOp[] } | null;
 }
 
+export interface DraftItem {
+  name: string;
+  release: boolean;
+  template: Template;
+  brief: string; // 产品需求 note
+}
+
+/** The latest work-item draft job of a project. */
+export interface DraftStatus {
+  id: string | null;
+  status: "starting" | "running" | "succeeded" | "failed" | null;
+  error: string | null;
+  client: Client | null;
+  request: string | null;
+  draft: { summary: string; items: DraftItem[] } | null;
+}
+
 /** Commands. Each returns a Promise of the given type; errors reject with a message string. */
 export interface Api {
   snapshot(): Snapshot;
@@ -347,6 +364,9 @@ export interface Api {
   /** Installed git tools (Fork, VS Code, lazygit…) plus plugins from `config`. */
   gitTools(): { tools: { id: string; label: string }[]; config: string };
   openGitTool(a: { id: string; path: string }): void;
+  /** Ask Codex or Claude to read the repository and memory and draft items from a description. */
+  draftStart(a: { project: string; client: "Codex" | "Claude"; model: string; request: string; repository?: string }): string;
+  draftStatus(a: { project: string }): DraftStatus;
   /** Ask Codex or Claude to propose merges, rewrites and retirements of project memory. */
   tidyStart(a: { project: string; client: "Codex" | "Claude"; model: string; instruction: string }): string;
   tidyStatus(a: { project: string }): TidyStatus;

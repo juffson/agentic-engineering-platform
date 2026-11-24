@@ -699,11 +699,18 @@ fn memory_is_tidied_by_a_cli_and_applied_by_choice() -> Result<()> {
         bin.join("claude"),
         format!(
             r#"#!/bin/sh
-cat > "{}/prompt-seen"
-answer='{{"summary":"合并重复","ops":[{{"op":"merge","ids":[{a},{b}],"text":"金额统一用整数分存储","why":"重复"}},{{"op":"retire","id":{c},"why":"已改为自动部署"}}]}}'
+input=$(cat)
+pwd > "{dir}/cwd-seen"
+if printf '%s' "$input" | grep -q '整理成开发事项'; then
+  printf '%s' "$input" > "{dir}/draft-seen"
+  answer='{{"summary":"拆成两件","items":[{{"name":"导出 · CSV","template":"Software","brief":"导出对账单为 CSV"}},{{"name":"导出 · 表头","brief":"空账户也导出表头"}}]}}'
+else
+  printf '%s' "$input" > "{dir}/prompt-seen"
+  answer='{{"summary":"合并重复","ops":[{{"op":"merge","ids":[{a},{b}],"text":"金额统一用整数分存储","why":"重复"}},{{"op":"retire","id":{c},"why":"已改为自动部署"}}]}}'
+fi
 printf '%s' "$answer" | python3 -c 'import json,sys; print(json.dumps({{"type":"result","result":sys.stdin.read(),"is_error":False}}))'
 "#,
-            t.path().display()
+            dir = t.path().display()
         ),
     )?;
     fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o700))?;
@@ -751,5 +758,37 @@ printf '%s' "$answer" | python3 -c 'import json,sys; print(json.dumps({{"type":"
     assert!(current.contains(&"金额统一用整数分存储") && current.contains(&"旧部署流程：手动 scp"));
     // Re-applying the merge is refused: its notes are no longer current.
     assert!(api::tidy_apply(&home, &pid, &job, &[0]).is_err());
+
+    // Drafting items: the CLI works in the repository and sees memory and existing items.
+    let repo = t.path().join("repo");
+    fs::create_dir_all(&repo)?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    api::add_repository(&home, &pid, &repo.display().to_string())?;
+    api::create_work(&home, &pid, "已有的事", "Software", false, &[])?;
+    let draft = api::draft_start(&home, &pid, "Claude", "", "支持导出对账单", None)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let s = api::draft_status(&home, &pid)?;
+        if s["status"] == "succeeded" || s["status"] == "failed" {
+            break s;
+        }
+        ensure!(Instant::now() < deadline, "draft did not finish: {s}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status["status"], "succeeded", "{status}");
+    assert_eq!(status["id"], draft.as_str());
+    assert_eq!(status["draft"]["items"][1]["name"], "导出 · 表头");
+    assert_eq!(status["draft"]["items"][1]["template"], "Software");
+    let seen = fs::read_to_string(t.path().join("draft-seen"))?;
+    assert!(
+        seen.contains("支持导出对账单")
+            && seen.contains("金额统一用整数分存储")
+            && seen.contains("- 已有的事"),
+        "{seen}"
+    );
+    assert_eq!(
+        Path::new(fs::read_to_string(t.path().join("cwd-seen"))?.trim()).canonicalize()?,
+        repo.canonicalize()?
+    );
     Ok(())
 }

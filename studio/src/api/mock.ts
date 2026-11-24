@@ -3,6 +3,7 @@
 // reveals one more transcript entry every `stepMs`, then finishes with its
 // scripted outcome. Mutations update this state so every flow is clickable.
 import type {
+  DraftStatus,
   TidyStatus,
   BranchGraph,
   SyncPlan,
@@ -630,6 +631,33 @@ class MockStore implements Api {
 
   openGitTool({ id }: { id: string; path: string }) {
     if (!id) throw new Error("找不到这个 git 工具");
+  }
+
+  drafts = new Map<string, DraftStatus & { polls: number }>();
+
+  draftStart({ project, client, request }: { project: string; client: "Codex" | "Claude"; model: string; request: string; repository?: string }) {
+    if (!request.trim()) throw new Error("请描述要做的事");
+    if (this.drafts.get(project)?.status === "running") throw new Error("已有一次起草在进行");
+    const id = String(Date.now());
+    this.drafts.set(project, { id, status: "running", error: null, client, request, draft: null, polls: 0 });
+    return id;
+  }
+
+  draftStatus({ project }: { project: string }): DraftStatus {
+    const d = this.drafts.get(project);
+    if (!d) return { id: null, status: null, error: null, client: null, request: null, draft: null };
+    if (d.status === "running" && ++d.polls >= 2) {
+      d.status = "succeeded";
+      d.draft = {
+        summary: "导出和表头是两件可以分开交付的事，拆成两个事项。",
+        items: [
+          { name: "对账单 · 导出 CSV", release: false, template: "Software", brief: "目标：用户可把对账单导出为 CSV。范围：src/features/statement 下新增导出按钮与服务端接口；不做 Excel。验收：金额按分转元、UTF-8 BOM。" },
+          { name: "对账单 · 空账户表头", release: false, template: "Software", brief: "目标：空账户导出时也带表头。待确认：是否需要提示「无数据」。" },
+        ],
+      };
+    }
+    const { polls: _polls, ...status } = d;
+    return clone(status);
   }
 
   tidy = new Map<string, TidyStatus & { polls: number }>();

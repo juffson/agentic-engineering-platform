@@ -115,3 +115,11 @@ pub fn memory_tidy(home: &Path, project: &str, job: &Path) -> Result<()> {
         &job.join("supervisor.log"),
     )
 }
+
+/// Draft work items in the background; the job folder receives status and draft.
+pub fn work_draft(job: &Path) -> Result<()> {
+    detached(
+        &["work-draft".as_ref(), "--job".as_ref(), job.as_os_str()],
+        &job.join("supervisor.log"),
+    )
+}

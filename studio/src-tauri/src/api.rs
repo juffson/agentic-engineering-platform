@@ -1118,11 +1118,6 @@ pub fn tidy_start(
     model: &str,
     instruction: &str,
 ) -> Result<String> {
-    let client = match client {
-        "Codex" => Client::Codex,
-        "Claude" => Client::Claude,
-        _ => bail!("整理记忆目前支持 Codex 和 Claude"),
-    };
     ensure!(
         !tidy_status(home, pid)?["status"]
             .as_str()
@@ -1132,12 +1127,7 @@ pub fn tidy_start(
     let id = format!("{}", chrono_stamp());
     let job = tidy_dir(home, pid)?.join(&id);
     fs::create_dir_all(&job)?;
-    let profile = Profile {
-        client,
-        executable: String::new(),
-        model: model.trim().to_owned(),
-        check_command: String::new(),
-    };
+    let profile = one_shot_profile(client, model)?;
     aep::project::save_json(
         &job,
         "job.json",
@@ -1154,10 +1144,9 @@ fn chrono_stamp() -> u128 {
         .map_or(0, |d| d.as_millis())
 }
 
-/// The latest tidy job: status, error, and its proposal once ready.
-pub fn tidy_status(home: &Path, pid: &str) -> Result<Value> {
-    let dir = tidy_dir(home, pid)?;
-    let latest = fs::read_dir(&dir)
+/// The latest background CLI job in `dir` (tidy or draft): status, error, spec, result.
+fn latest_job(dir: &Path, result: &str) -> Value {
+    let latest = fs::read_dir(dir)
         .ok()
         .into_iter()
         .flatten()
@@ -1166,13 +1155,13 @@ pub fn tidy_status(home: &Path, pid: &str) -> Result<Value> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .max_by_key(|n| n.parse::<u128>().unwrap_or(0));
     let Some(id) = latest else {
-        return Ok(json!({"id": null, "status": null}));
+        return json!({"id": null, "status": null});
     };
     let job = dir.join(&id);
     let status = aep::workspace::read(&job.join("status.json")).unwrap_or_default();
     let spec = aep::workspace::read(&job.join("job.json")).unwrap_or_default();
     let mut s = status["status"].as_str().unwrap_or("starting").to_owned();
-    // A job whose process died without writing a result.
+    // A job whose process died before it began.
     let age = job
         .join("status.json")
         .metadata()
@@ -1183,16 +1172,91 @@ pub fn tidy_status(home: &Path, pid: &str) -> Result<Value> {
     if s == "starting" && age > Duration::from_secs(30) {
         s = "failed".into();
     }
-    Ok(json!({
+    json!({
         "id": id,
         "status": s,
-        "error": status["error"].as_str().or_else(|| (s == "failed" && status["error"].is_null()).then_some("整理进程没有启动")),
+        "error": status["error"].as_str().or_else(|| (s == "failed" && status["error"].is_null()).then_some("后台进程没有启动")),
         "client": spec["profile"]["client"],
         "model": spec["profile"]["model"],
         "instruction": spec["instruction"],
+        "request": spec["request"],
         "applied": status["applied"],
-        "proposal": aep::workspace::read(&job.join("proposal.json")).ok(),
-    }))
+        "result": aep::workspace::read(&job.join(result)).ok(),
+    })
+}
+
+/// The latest tidy job: status, error, and its proposal once ready.
+pub fn tidy_status(home: &Path, pid: &str) -> Result<Value> {
+    let mut v = latest_job(&tidy_dir(home, pid)?, "proposal.json");
+    v["proposal"] = v["result"].take();
+    Ok(v)
+}
+
+fn one_shot_profile(client: &str, model: &str) -> Result<Profile> {
+    let client = match client {
+        "Codex" => Client::Codex,
+        "Claude" => Client::Claude,
+        _ => bail!("目前支持 Codex 和 Claude"),
+    };
+    Ok(Profile {
+        client,
+        executable: String::new(),
+        model: model.trim().to_owned(),
+        check_command: String::new(),
+    })
+}
+
+/// Draft work items from a description with a model CLI that reads the repository.
+pub fn draft_start(
+    home: &Path,
+    pid: &str,
+    client: &str,
+    model: &str,
+    request: &str,
+    repo_path: Option<&str>,
+) -> Result<String> {
+    ensure!(!request.trim().is_empty(), "请描述要做的事");
+    let profile = one_shot_profile(client, model)?;
+    let lib = Library::open(home)?;
+    let p = find(&lib, pid)?;
+    let repo = match repo_path.filter(|r| !r.trim().is_empty()) {
+        Some(r) => Some(repository(r)?),
+        None => p.repositories.first().cloned(),
+    };
+    let dir = memory_dir(home, pid)?.join("work-drafts");
+    ensure!(
+        !latest_job(&dir, "draft.json")["status"]
+            .as_str()
+            .is_some_and(|s| s == "running" || s == "starting"),
+        "已有一次起草在进行"
+    );
+    let notes: Vec<Value> = aep::memory_tidy::current(&memory_dir(home, pid)?)?
+        .into_iter()
+        .map(|n| json!({"id": n["id"], "body": n["body"]}))
+        .collect();
+    let existing: Vec<&str> = p
+        .work
+        .iter()
+        .filter(|w| w.shelved.is_none())
+        .map(|w| w.name.as_str())
+        .collect();
+    let id = chrono_stamp().to_string();
+    let job = dir.join(&id);
+    fs::create_dir_all(&job)?;
+    aep::project::save_json(
+        &job,
+        "job.json",
+        &json!({"profile": profile, "request": request.trim(), "repository": repo, "notes": notes, "existing": existing}),
+    )?;
+    aep::project::save_json(&job, "status.json", &json!({"status": "starting"}))?;
+    runner::work_draft(&job)?;
+    Ok(id)
+}
+
+pub fn draft_status(home: &Path, pid: &str) -> Result<Value> {
+    let mut v = latest_job(&memory_dir(home, pid)?.join("work-drafts"), "draft.json");
+    v["draft"] = v["result"].take();
+    Ok(v)
 }
 
 /// Apply the chosen operations (by index) of a tidy proposal.

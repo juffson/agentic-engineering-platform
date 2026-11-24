@@ -178,7 +178,7 @@ pub fn run(memory_dir: &Path, job: &Path) -> Result<()> {
         ensure!(!notes.is_empty(), "还没有项目记忆");
         let text = prompt(&notes, spec["instruction"].as_str().unwrap_or(""));
         fs::write(job.join("prompt.txt"), &text)?;
-        let answer = ask(&profile, &text, job)?;
+        let answer = ask(&profile, &text, job, job)?;
         fs::write(job.join("result.txt"), &answer)?;
         parse(&answer, &notes)
     })();
@@ -191,8 +191,8 @@ pub fn run(memory_dir: &Path, job: &Path) -> Result<()> {
     }
 }
 
-/// One non-interactive, read-only turn of the CLI in the job folder.
-fn ask(profile: &Profile, prompt: &str, dir: &Path) -> Result<String> {
+/// One non-interactive, read-only turn of the CLI, working in `cwd`; logs go to `dir`.
+pub fn ask(profile: &Profile, prompt: &str, dir: &Path, cwd: &Path) -> Result<String> {
     let bin = profile.program(&std::env::var_os("PATH").unwrap_or_default())?;
     let mut cmd = Command::new(&bin);
     let answer = dir.join("answer.txt");
@@ -203,9 +203,9 @@ fn ask(profile: &Profile, prompt: &str, dir: &Path) -> Result<String> {
                 .arg(&answer);
         }
         Client::Claude => {
-            cmd.args(["-p", "--output-format", "json", "--tools", "Read"]);
+            cmd.args(["-p", "--output-format", "json", "--tools", "Read,Grep,Glob"]);
         }
-        _ => bail!("整理记忆目前支持 Codex 和 Claude"),
+        _ => bail!("目前支持 Codex 和 Claude"),
     }
     if !profile.model.trim().is_empty() {
         cmd.args(["--model", profile.model.trim()]);
@@ -214,7 +214,7 @@ fn ask(profile: &Profile, prompt: &str, dir: &Path) -> Result<String> {
         cmd.arg("-");
     }
     let mut child = cmd
-        .current_dir(dir)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(fs::File::create(dir.join("stderr.log"))?)
