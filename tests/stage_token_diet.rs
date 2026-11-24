@@ -55,7 +55,7 @@ if [ -n "$res" ] && [ "$fork" = 0 ]; then sid="$res"; fi
 printf '%s\n' "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$sid\",\"model\":\"fake\",\"tools\":[\"Read\",\"Grep\",\"Glob\",\"Bash\"],\"mcp_servers\":[],\"skills\":[],\"plugins\":[{\"name\":\"agents-md\",\"path\":\"@builtin\"}],\"claude_code_version\":\"9.9.9\"}"
 printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"id\":\"m$n-a\",\"usage\":{\"input_tokens\":5,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":3000,\"output_tokens\":2},\"content\":[{\"type\":\"text\",\"text\":\"看一下\"}]}}"
 printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"id\":\"m$n-b\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":$rest,\"output_tokens\":4},\"content\":[{\"type\":\"text\",\"text\":\"第 ${n} 轮产出\"}]}}"
-printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"第 ${n} 轮产出 OUT-${n}\\nAEP-HANDOFF: 结论 R${n}；证据 specs/diet/；下一步 下一阶段\",\"is_error\":false,\"session_id\":\"$sid\"}"
+printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"第 ${n} 轮产出 OUT-${n}\\nAEP-HANDOFF: 结论 R${n}；证据 specs/diet/；下一步 下一阶段\\nAEP: PASS\",\"is_error\":false,\"session_id\":\"$sid\"}"
 "#
     .replace("@LOG@", &log.display().to_string());
     fs::write(&bin, script)?;
@@ -120,6 +120,16 @@ impl Item {
     }
 
     fn run(&mut self, stage: usize, model: &str) -> Result<Run> {
+        self.run_with(stage, model, |_| {})
+    }
+
+    /// Like `run`, with the request edited after reserving (as auto-run sets a subtask).
+    fn run_with(
+        &mut self,
+        stage: usize,
+        model: &str,
+        edit: impl FnOnce(&mut aep::workflow::Request),
+    ) -> Result<Run> {
         let profile = Profile {
             client: Client::Claude,
             executable: self.bin.display().to_string(),
@@ -140,6 +150,10 @@ impl Item {
                 },
             )
         })?;
+        let mut request: aep::workflow::Request =
+            serde_json::from_slice(&fs::read(dir.join("request.json"))?)?;
+        edit(&mut request);
+        fs::write(dir.join("request.json"), serde_json::to_vec(&request)?)?;
         let out = Command::new(env!("CARGO_BIN_EXE_aep"))
             .env("CLAUDE_CONFIG_DIR", &self.config)
             .args(["workflow-stage", "--request"])
@@ -431,5 +445,130 @@ fn a_lower_project_resume_limit_starts_a_new_session_sooner() -> Result<()> {
     assert_eq!(ui.ev["fresh_session_reason"], "context_over_threshold");
     assert_eq!(ui.ev["resume_context"], 30_000);
     assert_eq!(ui.ev["resume_threshold"], 20_000);
+    Ok(())
+}
+
+fn task(id: &str) -> aep::workflow::Subtask {
+    aep::workflow::Subtask {
+        id: id.into(),
+        title: format!("子任务 {id}"),
+        ..Default::default()
+    }
+}
+
+/// Auto-run's view of the build subtasks that passed, read back from the catalog.
+fn finished(item: &Item) -> Vec<aep::workflow::DoneSubtask> {
+    let p = item.lib.project().unwrap();
+    let work = p.work.iter().find(|w| w.id == item.wid).unwrap();
+    aep::autopilot::finished_subtasks(&item.home, &p.id, work, 3)
+}
+
+#[test]
+fn build_subtasks_continue_the_previous_subtask_and_acceptance_starts_clean() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut item = Item::new(temp.path(), "diet-subtasks")?;
+    for stage in 0..3 {
+        item.run(stage, "")?;
+        item.accept(stage)?;
+    }
+    // T1 forks the design session, as any build would.
+    let t1 = item.run_with(3, "", |r| r.subtask = Some(task("T1")))?;
+    assert!(
+        t1.has(&["--resume", "s-3", "--fork-session"]),
+        "{:?}",
+        t1.argv
+    );
+    assert!(t1.prompt.contains("本轮只实现子任务 T1"), "{}", t1.prompt);
+
+    // T2 continues from T1, which has just read and changed the same code.
+    let done = finished(&item);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].id, "T1");
+    assert_eq!(done[0].run, run_id(&t1));
+    assert!(done[0].summary.contains("R4"), "{:?}", done[0]);
+    // T2's last call reads a large context; the subtask after it should not continue it.
+    item.context(200_000)?;
+    let t2 = item.run_with(3, "", |r| {
+        r.subtask = Some(task("T2"));
+        r.subtasks_done = done;
+    })?;
+    assert!(
+        t2.has(&["--resume", "s-4", "--fork-session"]),
+        "{:?}",
+        t2.argv
+    );
+    assert_eq!(
+        t2.ev["reused_session"]["name"], "开发实现 · T1",
+        "{}",
+        t2.ev
+    );
+    assert_eq!(t2.ev["reused_session"]["run"], run_id(&t1));
+    assert!(t2.prompt.contains("本轮只实现子任务 T2"), "{}", t2.prompt);
+
+    // T3: the chain has grown past the resume limit, so a new session starts and reads what
+    // T1 and T2 did instead of rediscovering it.
+    item.context(9000)?;
+    let done = finished(&item);
+    assert_eq!(
+        done.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        ["T1", "T2"]
+    );
+    let t3 = item.run_with(3, "", |r| {
+        r.subtask = Some(task("T3"));
+        r.subtasks_done = done;
+    })?;
+    assert!(!t3.argv.iter().any(|a| a == "--resume"), "{:?}", t3.argv);
+    assert_eq!(
+        t3.ev["fresh_session_reason"], "context_over_threshold",
+        "{}",
+        t3.ev
+    );
+    assert!(t3.prompt.contains("本阶段已完成的子任务"), "{}", t3.prompt);
+    assert!(
+        t3.prompt
+            .contains(&format!("T1 子任务 T1（{}）", run_id(&t1))),
+        "{}",
+        t3.prompt
+    );
+    assert!(
+        t3.prompt
+            .contains(&format!("T2 子任务 T2（{}）", run_id(&t2))),
+        "{}",
+        t3.prompt
+    );
+    assert!(
+        t3.prompt.contains("OUT-5"),
+        "the last subtask's answer is carried: {}",
+        t3.prompt
+    );
+    item.accept(3)?;
+
+    // 测试验证 starts fresh (gate permissions differ from the build's write permissions).
+    let test = item.run(4, "")?;
+    assert_eq!(
+        test.ev["fresh_session_reason"], "permission_differs",
+        "{}",
+        test.ev
+    );
+    item.accept(4)?;
+    // 独立验收 has the same CLI, model and permissions as the test, but must not read its
+    // session: a new session with the full prompt.
+    let accept = item.run(5, "")?;
+    assert!(
+        !accept.argv.iter().any(|a| a == "--resume"),
+        "{:?}",
+        accept.argv
+    );
+    assert_eq!(
+        accept.ev["fresh_session_reason"], "independent_review",
+        "{}",
+        accept.ev
+    );
+    assert!(accept.ev["reused_session"].is_null(), "{}", accept.ev);
+    assert!(
+        accept.prompt.contains("前序执行 "),
+        "full prompt: {}",
+        accept.prompt
+    );
     Ok(())
 }

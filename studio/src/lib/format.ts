@@ -99,6 +99,8 @@ export function freshReason(s: Pick<SessionLike, "reason" | "context" | "thresho
       return "中间阶段用了其他 CLI";
     case "prior_not_passed":
       return "前序阶段未通过";
+    case "independent_review":
+      return "独立验收不沿用测试的会话";
     default:
       return "";
   }

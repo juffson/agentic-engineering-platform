@@ -61,7 +61,8 @@ export type SessionReason =
   | "prior_budget_stopped"
   | "session_busy"
   | "chain_broken"
-  | "prior_not_passed";
+  | "prior_not_passed"
+  | "independent_review";
 
 /**
  * How a run's session was chosen. `reused`: continued an adjacent stage's session

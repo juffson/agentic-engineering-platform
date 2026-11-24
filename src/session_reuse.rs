@@ -44,6 +44,8 @@ pub struct Side {
     pub model: String,
     pub sandbox: Sandbox,
     pub permission: &'static str,
+    /// Independent acceptance must not read the session of the run it is checking.
+    pub independent: bool,
     pub workspace: Option<PathBuf>,
 }
 impl Side {
@@ -60,6 +62,7 @@ impl Side {
             model: req.profile.model.trim().to_owned(),
             sandbox: req.sandbox,
             permission: permission(role),
+            independent: role == Role::Accept,
             workspace: workspace.map(Path::to_path_buf),
         }
     }
@@ -93,6 +96,7 @@ pub enum Reason {
     ChainBroken,
     ClientNotReusable,
     PriorNotPassed,
+    IndependentReview,
 }
 impl Reason {
     pub fn as_str(self) -> &'static str {
@@ -109,6 +113,7 @@ impl Reason {
             Self::ChainBroken => "chain_broken",
             Self::ClientNotReusable => "client_not_reusable",
             Self::PriorNotPassed => "prior_not_passed",
+            Self::IndependentReview => "independent_review",
         }
     }
     /// A new session that should still carry the source's answer and hand-off digest
@@ -152,6 +157,10 @@ pub fn decide(mode: Mode, current: &Side, source: Option<&Source>, threshold: u6
         return fresh(Reason::NoPrior, None);
     };
     if mode == Mode::Adjacent {
+        // Independent acceptance starts clean, or it would only re-read the tester's view.
+        if current.independent {
+            return fresh(Reason::IndependentReview, None);
+        }
         let s = &src.side;
         if s.client != current.client {
             // A skipped stage in between: the run before it used another CLI (E6).
@@ -237,6 +246,7 @@ mod tests {
             model: "opus".into(),
             sandbox: Sandbox::Standard,
             permission: "write",
+            independent: false,
             workspace: Some(PathBuf::from("/tmp/aep-session-reuse-ws")),
         }
     }
@@ -358,6 +368,28 @@ mod tests {
             },
             Reason::ChainBroken,
         );
+        // Independent acceptance never reads the tester's session, even when all else matches.
+        let accept = Side {
+            independent: true,
+            permission: "gate",
+            ..side(Client::Claude)
+        };
+        let mut tester = src(Client::Claude);
+        tester.side.permission = "gate";
+        assert_eq!(
+            reason(decide(
+                Mode::Adjacent,
+                &accept,
+                Some(&tester),
+                DEFAULT_LIMIT
+            )),
+            Reason::IndependentReview
+        );
+        // Its own follow-ups still continue its own session.
+        assert!(matches!(
+            decide(Mode::Continue, &accept, Some(&tester), DEFAULT_LIMIT),
+            Plan::Resume { .. }
+        ));
         // E6: skipped stage but same CLI still reuses.
         let mut s = src(Client::Claude);
         s.stage = 0;

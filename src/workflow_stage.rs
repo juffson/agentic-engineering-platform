@@ -279,6 +279,9 @@ fn perform(
         // A stage worktree moved out of `.git` since that turn is found again (main ad25597).
         let p = prior_turn(dir, f, req.repository.as_deref())?;
         let cwd = p.workspace.clone();
+        if let Some(note) = align_base(req, stage, &cwd, id, record)? {
+            record["base"]["note"] = json!(note);
+        }
         let current = Side::of(req, Some(&cwd));
         // A native session already holds the stage context; send only the new message,
         // unless it has grown past the resume limit (R2).
@@ -386,13 +389,26 @@ fn perform(
         req.stage_transfer.as_ref(),
         id,
     )?;
+    if let Some(note) = align_base(req, stage, &cwd, id, record)? {
+        record["base"]["note"] = json!(note);
+    }
     // Reuse the previous stage's session when it ran the same CLI, model, permissions and
     // workspace (R3); `prior_runs` already leaves out skipped stages (E6).
     let current = Side::of(req, Some(&cwd));
-    let source = req.prior_runs.last().map(|(s, run)| {
-        let name = req.template.stages().get(*s).map_or("", |st| st.name);
-        session_reuse::source(runs, *s, name, run)
-    });
+    // A build subtask continues from the subtask before it, which has just read and changed
+    // the same code; the first one continues from the design stage.
+    let source = match (&req.subtask, req.subtasks_done.last()) {
+        (Some(_), Some(done)) => Some(session_reuse::source(
+            runs,
+            req.stage,
+            &format!("{} · {}", stage.name, done.id),
+            &done.run,
+        )),
+        _ => req.prior_runs.last().map(|(s, run)| {
+            let name = req.template.stages().get(*s).map_or("", |st| st.name);
+            session_reuse::source(runs, *s, name, run)
+        }),
+    };
     let plan = match &source {
         Some(Err(_)) if matches!(req.profile.client, Client::Codex | Client::Claude) => {
             Plan::Fresh {
@@ -484,6 +500,183 @@ fn perform(
         write,
         (packet.project_ids, packet.repo_ids),
     )
+}
+
+/// Whether `cwd` is one of this repository's stage worktrees (found by branch, not path).
+fn stage_worktree(root: &Path, cwd: &Path) -> bool {
+    let Ok(cwd) = cwd.canonicalize() else {
+        return false;
+    };
+    aep::project::branches::stage_worktrees(root)
+        .iter()
+        .any(|(_, p)| p.canonicalize().is_ok_and(|p| p == cwd))
+}
+
+/// Git identity flags for platform commits when the repository has none configured.
+fn identity(cwd: &Path) -> Vec<&'static str> {
+    if git(cwd, &["config", "user.email"]).is_ok_and(|e| !e.trim().is_empty()) {
+        vec![]
+    } else {
+        vec![
+            "-c",
+            "user.name=AEP Studio",
+            "-c",
+            "user.email=aep-studio@localhost",
+        ]
+    }
+}
+
+/// Keep the item branch merged with its base (the branch checked out in the repository's main
+/// worktree, usually main), so a moved base shows up at the next stage, not at delivery.
+///
+/// - Writing stages and the test stage merge a base that merges cleanly before they start.
+/// - A conflicting merge is left to the build: it is told which files conflict.
+/// - Acceptance and delivery check an exact tested commit, so they do not merge: a moved base
+///   sends the item back to the test stage (clean) or the build (conflicts) without a model call.
+///
+/// Returns the note the stage's prompt gets, if any.
+fn align_base(
+    req: &Request,
+    stage: &Stage,
+    cwd: &Path,
+    id: &str,
+    record: &mut Value,
+) -> Result<Option<String>> {
+    let Some(repo) = &req.repository else {
+        return Ok(None);
+    };
+    let root = Workspace::open(repo)?.root;
+    if !stage_worktree(&root, cwd) {
+        return Ok(None);
+    }
+    let Some(base) = git(&root, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .ok()
+        .map(|b| b.trim().to_owned())
+        .filter(|b| !b.is_empty() && !b.starts_with(aep::project::branches::STAGE_PREFIX))
+    else {
+        return Ok(None);
+    };
+    let base_sha = aep::workspace::commit(&root, &format!("refs/heads/{base}"))?;
+    let contained = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["merge-base", "--is-ancestor", &base_sha, "HEAD"])
+        .status()?
+        .success();
+    if contained {
+        return Ok(None);
+    }
+    let behind: u64 = git(cwd, &["rev-list", "--count", &format!("HEAD..{base_sha}")])?
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    let tree = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "HEAD",
+            &base_sha,
+        ])
+        .output()?;
+    let conflicts: Vec<String> = match tree.status.code() {
+        Some(0) => vec![],
+        Some(1) => {
+            let mut files: Vec<String> = String::from_utf8_lossy(&tree.stdout)
+                .lines()
+                .skip(1)
+                .take_while(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect();
+            files.dedup();
+            files
+        }
+        _ => anyhow::bail!(
+            "无法检查事项分支能否合入 {base}：{}",
+            String::from_utf8_lossy(&tree.stderr).trim()
+        ),
+    };
+    let dirty = !git(cwd, &["status", "--porcelain", "--untracked-files=no"])?
+        .trim()
+        .is_empty();
+    record["base"] = json!({"branch":base,"sha":base_sha,"behind":behind,"conflicts":conflicts});
+    let listed = conflicts
+        .iter()
+        .take(12)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("、");
+    let stages = req.template.stages();
+    let before = |role: Role| (0..req.stage).rev().find(|&i| stages[i].role == role);
+    let back = |record: &mut Value, to: usize, question: String| -> Result<Option<String>> {
+        record["route_back"] = json!({"stage":to,"name":stages[to].name,"question":question});
+        anyhow::bail!("需要「{}」先解决：{question}", stages[to].name)
+    };
+    match stage.role {
+        Role::Plan | Role::Build | Role::Test if conflicts.is_empty() && !dirty => {
+            let message = format!("合入 {base}（{behind} 个新提交）\n\nAEP-Run: {id}");
+            let mut args = identity(cwd);
+            args.extend([
+                "merge",
+                "--no-edit",
+                "--no-verify",
+                "-q",
+                "-m",
+                &message,
+                &base_sha,
+            ]);
+            git(cwd, &args)?;
+            record["base"]["merged"] = json!(true);
+            Ok(Some(format!(
+                "平台已把 {base} 的 {behind} 个新提交合入事项分支（没有冲突），本阶段基于合并后的代码。"
+            )))
+        }
+        Role::Plan | Role::Build => Ok(Some(if conflicts.is_empty() {
+            format!(
+                "事项分支落后 {base} {behind} 个提交，工作区有未提交改动，平台没有自动合并。完成本阶段改动前请运行 git merge {base} 并处理冲突（不要提交，平台会自动提交）。"
+            )
+        } else {
+            format!(
+                "事项分支落后 {base} {behind} 个提交，合并会在这些文件冲突：{listed}。请先运行 git merge {base}，解决冲突并让测试通过，再继续本阶段（不要提交，平台会把合并一起提交）。"
+            )
+        })),
+        Role::Test => match before(Role::Build) {
+            Some(b) if !conflicts.is_empty() => back(
+                record,
+                b,
+                format!(
+                    "{base} 前进了 {behind} 个提交，合入时这些文件冲突：{listed}。请合入 {base} 并解决冲突。"
+                ),
+            ),
+            _ => Ok(None),
+        },
+        Role::Accept | Role::Deliver => {
+            let target = if conflicts.is_empty() {
+                before(Role::Test).or(before(Role::Build))
+            } else {
+                before(Role::Build)
+            };
+            match target {
+                Some(t) => back(
+                    record,
+                    t,
+                    if conflicts.is_empty() {
+                        format!(
+                            "{base} 在测试之后又前进了 {behind} 个提交，已验证的提交无法快进合入。请在合入 {base} 后的代码上重新验证。"
+                        )
+                    } else {
+                        format!(
+                            "{base} 在测试之后又前进了 {behind} 个提交，合入时这些文件冲突：{listed}。请合入 {base} 并解决冲突。"
+                        )
+                    },
+                ),
+                None => Ok(None),
+            }
+        }
+    }
 }
 
 /// Files that differ from HEAD (tracked or untracked), with spec contents kept for restore.
@@ -869,6 +1062,11 @@ fn invoke(
     (project_ids, repo_ids): (Vec<i64>, Vec<i64>),
 ) -> Result<()> {
     let cwd = cwd.to_path_buf();
+    // What happened with the base branch before this stage started (`align_base`).
+    let prompt = match record["base"]["note"].as_str() {
+        Some(note) => format!("{prompt}\n\n{note}"),
+        None => prompt,
+    };
     let (resume, fork) = match resume {
         Some((session, fork)) => (Some(session), fork),
         None => (None, false),
@@ -1214,27 +1412,19 @@ fn pin_worktree(
         return Ok(());
     }
     let repo = Workspace::open(repo)?;
-    let cwd_real = cwd.canonicalize()?;
-    if !aep::project::branches::stage_worktrees(&repo.root)
-        .iter()
-        .any(|(_, p)| p.canonicalize().is_ok_and(|p| p == cwd_real))
-    {
+    if !stage_worktree(&repo.root, cwd) {
         return Ok(());
     }
     let status = |cwd: &Path| git(cwd, &["status", "--porcelain", "--untracked-files=all"]);
     if matches!(stage.role, Role::Plan | Role::Build) && !status(cwd)?.trim().is_empty() {
         git(cwd, &["add", "-A"])?;
-        let message = format!("{} · {}\n\nAEP-Run: {id}", req.work, stage.name);
-        let named = git(cwd, &["config", "user.email"]).is_ok_and(|e| !e.trim().is_empty());
-        let mut args = vec![];
-        if !named {
-            args.extend([
-                "-c",
-                "user.name=AEP Studio",
-                "-c",
-                "user.email=aep-studio@localhost",
-            ]);
-        }
+        let title = match &req.subtask {
+            Some(t) if t.title.trim().is_empty() => format!("{} · {}", stage.name, t.id),
+            Some(t) => format!("{} · {} {}", stage.name, t.id, t.title.trim()),
+            None => stage.name.to_owned(),
+        };
+        let message = format!("{} · {title}\n\nAEP-Run: {id}", req.work);
+        let mut args = identity(cwd);
         args.extend(["commit", "--no-verify", "-q", "-m", &message]);
         git(cwd, &args)?;
         record["committed"] = json!(true);
@@ -1384,6 +1574,141 @@ mod tests {
         let next = root.join("runs").join("r3");
         fs::create_dir_all(&next).unwrap();
         next
+    }
+
+    /// A repository on `main` with an item branch checked out as a stage worktree.
+    struct Base {
+        _t: tempfile::TempDir,
+        root: PathBuf,
+        wt: PathBuf,
+    }
+    fn base_fixture() -> Base {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let g = |dir: &Path, args: &[&str]| git(dir, args).unwrap();
+        g(&root, &["init", "-q", "-b", "main"]);
+        g(&root, &["config", "user.email", "t@example.com"]);
+        g(&root, &["config", "user.name", "t"]);
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        fs::write(root.join("b.txt"), "one\n").unwrap();
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-q", "-m", "base"]);
+        let wt = t.path().join("wt");
+        g(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "aep-stage/item",
+                wt.to_str().unwrap(),
+            ],
+        );
+        fs::write(wt.join("a.txt"), "item\n").unwrap();
+        g(&wt, &["commit", "-q", "-am", "item"]);
+        Base { _t: t, root, wt }
+    }
+    fn advance(b: &Base, file: &str) {
+        fs::write(b.root.join(file), "main\n").unwrap();
+        git(&b.root, &["commit", "-q", "-am", "main moved"]).unwrap();
+    }
+    fn base_request(b: &Base, stage: usize) -> Request {
+        serde_json::from_value(json!({
+            "project":"p","work":"w","template":"Software","stage":stage,
+            "profile":{"client":"Claude","executable":"","model":"","check_command":""},
+            "repository":b.root,"brief":"","approved":[]
+        }))
+        .unwrap()
+    }
+    fn align(b: &Base, stage: usize) -> (Result<Option<String>>, Value) {
+        let req = base_request(b, stage);
+        let st = &req.template.stages()[stage];
+        let mut record = json!({});
+        let r = align_base(&req, st, &b.wt, "run1", &mut record);
+        (r, record)
+    }
+
+    #[test]
+    fn base_unchanged_does_nothing() {
+        let b = base_fixture();
+        let (r, record) = align(&b, 3);
+        assert_eq!(r.unwrap(), None);
+        assert!(record["base"].is_null());
+    }
+
+    #[test]
+    fn base_moved_cleanly_is_merged_before_the_build_and_the_test() {
+        for stage in [3, 4] {
+            let b = base_fixture();
+            advance(&b, "b.txt");
+            let (r, record) = align(&b, stage);
+            let note = r.unwrap().expect("a note for the prompt");
+            assert!(note.contains("main 的 1 个新提交"), "{note}");
+            assert_eq!(record["base"]["merged"], true, "{record}");
+            assert_eq!(fs::read_to_string(b.wt.join("b.txt")).unwrap(), "main\n");
+            assert_eq!(fs::read_to_string(b.wt.join("a.txt")).unwrap(), "item\n");
+            let main = aep::workspace::commit(&b.root, "main").unwrap();
+            assert!(git(&b.wt, &["merge-base", "--is-ancestor", &main, "HEAD"]).is_ok());
+            assert!(
+                git(&b.wt, &["log", "-1", "--format=%B"])
+                    .unwrap()
+                    .contains("AEP-Run: run1")
+            );
+            // Already contained now: the next stage has nothing to do.
+            assert_eq!(align(&b, stage).0.unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn base_conflicts_are_handed_to_the_build_and_send_the_test_back() {
+        let b = base_fixture();
+        advance(&b, "a.txt");
+        let head = aep::workspace::commit(&b.wt, "HEAD").unwrap();
+        let (r, record) = align(&b, 3);
+        let note = r.unwrap().unwrap();
+        assert!(
+            note.contains("a.txt") && note.contains("git merge main"),
+            "{note}"
+        );
+        assert_eq!(record["base"]["conflicts"], json!(["a.txt"]));
+        assert_eq!(
+            aep::workspace::commit(&b.wt, "HEAD").unwrap(),
+            head,
+            "nothing merged"
+        );
+        // The test stage cannot resolve conflicts: back to the build, no model call.
+        let (r, record) = align(&b, 4);
+        assert!(r.is_err());
+        assert_eq!(record["route_back"]["stage"], 3, "{record}");
+        assert!(
+            record["route_back"]["question"]
+                .as_str()
+                .unwrap()
+                .contains("a.txt")
+        );
+    }
+
+    #[test]
+    fn base_moved_after_testing_sends_acceptance_and_delivery_back() {
+        let b = base_fixture();
+        advance(&b, "b.txt");
+        let head = aep::workspace::commit(&b.wt, "HEAD").unwrap();
+        for stage in [5, 6] {
+            let (r, record) = align(&b, stage);
+            assert!(r.is_err());
+            // Merges cleanly: re-test on the merged code; the checked commit is untouched.
+            assert_eq!(record["route_back"]["stage"], 4, "{record}");
+            assert_eq!(aep::workspace::commit(&b.wt, "HEAD").unwrap(), head);
+        }
+        advance(&b, "a.txt");
+        let (r, record) = align(&b, 5);
+        assert!(r.is_err());
+        assert_eq!(
+            record["route_back"]["stage"], 3,
+            "conflicts go to the build: {record}"
+        );
     }
 
     #[test]

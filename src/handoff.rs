@@ -145,6 +145,18 @@ pub fn memory_body(req: &Request, header: &str, project: &str, repo: &str) -> St
             "\n前序执行 {id}。需要完整交付物、命令或文件时使用 aep project show --attempt <ID>。"
         ));
     }
+    if req.subtask.is_some() && !req.subtasks_done.is_empty() {
+        text.push_str("\n本阶段已完成的子任务（改动已提交到事项分支，不要重做；需要细节用 aep project show --attempt <ID>）：");
+        for d in &req.subtasks_done {
+            text.push_str(&format!(
+                "\n- {} {}（{}）：{}",
+                d.id,
+                clip(d.title.trim(), 80),
+                d.run,
+                clip(d.summary.trim(), 600)
+            ));
+        }
+    }
     text
 }
 /// Stage rules: decision precedence, commit policy, AEP-HANDOFF, specs ownership, subtask scope,
@@ -301,6 +313,7 @@ impl Work {
     pub fn request(&self, project: &str, stage: usize, assignment: Assignment) -> Request {
         Request {
             subtask: None,
+            subtasks_done: vec![],
             sandbox: self.sandbox(stage),
             follow_up: None,
             token_limit: None,

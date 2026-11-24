@@ -215,6 +215,19 @@ pub struct Subtask {
     #[serde(default)]
     pub check: Vec<String>,
 }
+/// A build subtask that already passed: the next subtask continues from its session and
+/// reads its hand-off line, so it does not have to rediscover what was done.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoneSubtask {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    /// The attempt that passed it.
+    pub run: String,
+    /// Its AEP-HANDOFF line (or the start of its answer).
+    #[serde(default)]
+    pub summary: String,
+}
 /// A message that continues an earlier attempt's native CLI conversation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FollowUp {
@@ -229,6 +242,9 @@ pub struct Request {
     /// Set when the build runs one planned subtask per session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtask: Option<Subtask>,
+    /// Subtasks of this build already passed, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtasks_done: Vec<DoneSubtask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_up: Option<FollowUp>,
     /// Tokens this attempt may use before it is stopped (what is left of the budgets).

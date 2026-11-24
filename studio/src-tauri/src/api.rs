@@ -1756,17 +1756,26 @@ fn session_preview(home: &Path, p: &Project, w: &Work, stage: usize) -> Value {
         model: profile.model.trim().to_owned(),
         sandbox: w.sandbox(stage),
         permission: session_reuse::permission(st.role),
+        independent: st.role == Role::Accept,
         workspace: None,
     };
     let threshold = session_reuse::limit(p.resume_limit);
-    let source = w
-        .current_attempt
-        .range(..stage)
-        .next_back()
-        .map(|(s, run)| {
-            let name = w.template.stages().get(*s).map_or("", |x| x.name);
-            let runs = workflow::attempt_dir(home, &p.id, &w.id, run);
-            session_reuse::source(runs.parent().unwrap_or(&runs), *s, name, run)
+    // The next build subtask continues from the last one that passed, as the runner does.
+    let subtask = (st.role == Role::Build
+        && !autopilot::subtasks(home, &p.id, w).is_empty())
+    .then(|| autopilot::finished_subtasks(home, &p.id, w, stage).pop())
+    .flatten()
+    .map(|d| (stage, format!("{} · {}", st.name, d.id), d.run));
+    let source = subtask
+        .or_else(|| {
+            w.current_attempt.range(..stage).next_back().map(|(s, run)| {
+                let name = w.template.stages().get(*s).map_or("", |x| x.name);
+                (*s, name.to_owned(), run.clone())
+            })
+        })
+        .map(|(s, name, run)| {
+            let runs = workflow::attempt_dir(home, &p.id, &w.id, &run);
+            session_reuse::source(runs.parent().unwrap_or(&runs), s, &name, &run)
         });
     let plan = match &source {
         Some(Err(_)) if matches!(current.client, Client::Codex | Client::Claude) => Plan::Fresh {
