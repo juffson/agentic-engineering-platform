@@ -116,7 +116,9 @@ test("primary loop against the mock backend", async ({ page }) => {
   // --- memory page ---
   await page.getByRole("button", { name: "项目记忆" }).click();
   await expect(page.getByRole("heading", { name: "项目记忆" })).toBeVisible();
-  await expect(page.locator(".memory.superseded")).toHaveCount(1);
+  // Replaced versions sit under their note's history, not in the list.
+  await expect(page.locator(".memory.superseded")).toHaveCount(0);
+  await expect(page.getByTestId("memory-note").filter({ hasText: "zustand" })).toContainText("第 2 版");
   await shot(page, "13-memory");
 
   // --- repository memory ---
