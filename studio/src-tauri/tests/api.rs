@@ -683,3 +683,73 @@ fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
     assert!(repo.join("README.md").is_file());
     Ok(())
 }
+
+#[test]
+fn memory_is_tidied_by_a_cli_and_applied_by_choice() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let home = t.path().join("catalog");
+    let pid = api::create_project(&home, "tidy", &[])?;
+    let a = api::add_memory(&home, &pid, "金额用分")?;
+    let b = api::add_memory(&home, &pid, "金额统一用分存储")?;
+    let c = api::add_memory(&home, &pid, "旧部署流程：手动 scp")?;
+    // A scripted Claude that proposes merging the two money notes and retiring the old one.
+    let bin = t.path().join("bin");
+    fs::create_dir_all(&bin)?;
+    fs::write(
+        bin.join("claude"),
+        format!(
+            r#"#!/bin/sh
+cat > "{}/prompt-seen"
+answer='{{"summary":"合并重复","ops":[{{"op":"merge","ids":[{a},{b}],"text":"金额统一用整数分存储","why":"重复"}},{{"op":"retire","id":{c},"why":"已改为自动部署"}}]}}'
+printf '%s' "$answer" | python3 -c 'import json,sys; print(json.dumps({{"type":"result","result":sys.stdin.read(),"is_error":False}}))'
+"#,
+            t.path().display()
+        ),
+    )?;
+    fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o700))?;
+    // SAFETY: only adds a directory in front of PATH; other tests use explicit executables.
+    unsafe {
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+    };
+
+    let job = api::tidy_start(&home, &pid, "Claude", "", "合并重复的")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        let s = api::tidy_status(&home, &pid)?;
+        if s["status"] == "succeeded" || s["status"] == "failed" {
+            break s;
+        }
+        ensure!(Instant::now() < deadline, "tidy did not finish: {s}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status["status"], "succeeded", "{status}");
+    assert_eq!(status["id"], job.as_str());
+    assert_eq!(status["proposal"]["ops"].as_array().unwrap().len(), 2);
+    let seen = fs::read_to_string(t.path().join("prompt-seen"))?;
+    assert!(
+        seen.contains("金额用分") && seen.contains("整理要求：合并重复的"),
+        "{seen}"
+    );
+    // Nothing changed yet; accept only the merge.
+    assert_eq!(api::tidy_apply(&home, &pid, &job, &[0])?, 1);
+    let notes = api::memories(&home, &pid)?;
+    let current: Vec<&str> = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["superseded"] == false)
+        .map(|n| n["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(current.len(), 2, "{current:?}");
+    assert!(current.contains(&"金额统一用整数分存储") && current.contains(&"旧部署流程：手动 scp"));
+    // Re-applying the merge is refused: its notes are no longer current.
+    assert!(api::tidy_apply(&home, &pid, &job, &[0]).is_err());
+    Ok(())
+}

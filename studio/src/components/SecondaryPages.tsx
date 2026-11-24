@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, Download, FolderGit2, FolderOpen, History, Pencil, Plus, RotateCcw } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Download, FolderGit2, FolderOpen, History, Pencil, Plus, RotateCcw, Sparkles } from "lucide-react";
 import { ImportDialog } from "./Dialogs";
-import type { MemoryNote, ProjectSummary } from "../api/types";
+import type { MemoryNote, ProjectSummary, TidyStatus } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio } from "../state/store";
 import { clock } from "../lib/format";
-import { Button, SectionLabel, Spinner } from "./ui";
+import { Button, SectionLabel, Segmented, Spinner } from "./ui";
 
 const KIND_LABEL: Record<string, string> = {
   note: "笔记",
@@ -85,6 +85,7 @@ export function MemoryPage({ project }: { project: ProjectSummary }) {
             </Button>
           </div>
         </section>
+        {notes && notes.some((n) => !n.superseded) && <TidyPanel project={project.id} notes={notes} onApplied={load} />}
         <SectionLabel right={notes && <span className="muted">{notes.filter((n) => !n.superseded).length} 条</span>}>全部记忆</SectionLabel>
         {error && <p className="inline-error">{error}</p>}
         {!notes && !error && <Spinner />}
@@ -197,6 +198,199 @@ function VersionedNote({ project, note, older }: { project: string; note: Memory
         </ol>
       )}
     </li>
+  );
+}
+
+/** Ask a CLI to tidy project memory, then review its proposal and apply what you accept. */
+function TidyPanel({ project, notes, onApplied }: { project: string; notes: MemoryNote[]; onApplied(): void }) {
+  const { act, notify } = useStudio();
+  const [status, setStatus] = useState<TidyStatus | null>(null);
+  const [open, setOpen] = useState(false);
+  const [client, setClient] = useState<"Claude" | "Codex">("Claude");
+  const [model, setModel] = useState("");
+  const [instruction, setInstruction] = useState("");
+  const [chosen, setChosen] = useState<Set<number>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const [dismissed, setDismissed] = useState<string | null>(null);
+
+  const poll = useCallback(async () => {
+    try {
+      const s = await api.tidyStatus({ project });
+      setStatus(s);
+      return s;
+    } catch {
+      return null;
+    }
+  }, [project]);
+  useEffect(() => {
+    void poll().then((s) => {
+      if (s?.proposal) setChosen(new Set(s.proposal.ops.map((_, i) => i).filter((i) => !s.applied?.includes(i))));
+    });
+  }, [poll]);
+  const running = status?.status === "running" || status?.status === "starting";
+  useEffect(() => {
+    if (!running) return;
+    const t = window.setInterval(async () => {
+      const s = await poll();
+      if (s?.proposal) setChosen(new Set(s.proposal.ops.map((_, i) => i)));
+    }, 2000);
+    return () => window.clearInterval(t);
+  }, [running, poll]);
+
+  const current = notes.filter((n) => !n.superseded);
+  const byId = new Map(notes.map((n) => [n.id, n]));
+  const start = async () => {
+    setBusy(true);
+    const id = await act(() => api.tidyStart({ project, client, model, instruction }));
+    setBusy(false);
+    if (id) {
+      setOpen(false);
+      await poll();
+    }
+  };
+  const apply = async () => {
+    if (!status?.id) return;
+    setBusy(true);
+    const n = await act(() => api.tidyApply({ project, job: status.id!, ops: [...chosen].sort((a, b) => a - b) }));
+    setBusy(false);
+    if (n !== undefined) {
+      notify(`已应用 ${n} 项整理，旧内容都在各条记忆的历史里`, "info");
+      onApplied();
+      await poll();
+    }
+  };
+
+  const proposal = status?.status === "succeeded" && status.id !== dismissed ? status.proposal : null;
+  const pending = proposal?.ops.map((op, i) => ({ op, i })).filter(({ i }) => !status?.applied?.includes(i)) ?? [];
+  return (
+    <section className="card tidy" data-testid="tidy">
+      <div className="row-between">
+        <div>
+          <span className="card-title">整理记忆</span>
+          <p className="card-text">
+            让 Claude 或 Codex 通读 {current.length} 条记忆，提出合并重复、改写含糊、移出过时的方案；你逐条确认后才会生效，旧内容留在历史里可恢复。
+            {current.length > 32 && " Agent 每次只读最新 32 条，记忆多时尤其值得整理。"}
+          </p>
+        </div>
+        {!running && !open && (
+          <Button variant="secondary" size="sm" icon={<Sparkles size={13} />} onClick={() => setOpen(true)}>
+            {proposal && pending.length ? "重新整理" : "开始整理"}
+          </Button>
+        )}
+      </div>
+      {open && (
+        <div className="tidy-form">
+          <Segmented<"Claude" | "Codex">
+            value={client}
+            onChange={(v) => setClient(v)}
+            label="CLI"
+            options={[
+              { value: "Claude", label: "Claude" },
+              { value: "Codex", label: "Codex" },
+            ]}
+          />
+          <input className="input mono" value={model} onChange={(e) => setModel(e.target.value)} placeholder="模型（留空使用 CLI 默认）" aria-label="整理模型" />
+          <textarea
+            className="input"
+            rows={2}
+            value={instruction}
+            onChange={(e) => setInstruction(e.target.value)}
+            placeholder="整理要求（可选），例如：战斗相关的合成一组；已合并的 PR 记录都移出"
+            aria-label="整理要求"
+          />
+          <div className="row-gap">
+            <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>
+              取消
+            </Button>
+            <Button variant="primary" size="sm" icon={<Sparkles size={13} />} busy={busy} onClick={start}>
+              开始整理
+            </Button>
+          </div>
+        </div>
+      )}
+      {running && (
+        <p className="field-hint scan-hint">
+          <Spinner size={12} /> {status?.client} 正在整理 {current.length} 条记忆，通常需要一两分钟…
+        </p>
+      )}
+      {status?.status === "failed" && status.id !== dismissed && (
+        <p className="inline-error">
+          整理失败：{status.error}
+          <button type="button" className="link-btn" onClick={() => setDismissed(status.id)}>
+            关闭
+          </button>
+        </p>
+      )}
+      {proposal && (
+        <div className="tidy-proposal">
+          {proposal.summary && <p className="tidy-summary">{proposal.summary}</p>}
+          {pending.length === 0 ? (
+            <p className="field-hint">{proposal.ops.length ? "这次整理的方案已全部处理。" : "Agent 认为当前记忆不需要整理。"}</p>
+          ) : (
+            <ul className="tidy-ops">
+              {pending.map(({ op, i }) => {
+                const ids = op.op === "merge" ? op.ids : [op.id];
+                const stale = ids.some((id) => byId.get(id)?.superseded !== false);
+                return (
+                  <li key={i} className={stale ? "stale" : undefined}>
+                    <label className="check">
+                      <input
+                        type="checkbox"
+                        disabled={stale}
+                        checked={chosen.has(i) && !stale}
+                        onChange={() => {
+                          const next = new Set(chosen);
+                          if (next.has(i)) next.delete(i);
+                          else next.add(i);
+                          setChosen(next);
+                        }}
+                      />
+                      <span>
+                        <span className={`tag tidy-${op.op}`}>{op.op === "merge" ? "合并" : op.op === "rewrite" ? "改写" : "移出"}</span>{" "}
+                        {ids.map((id) => `#${id}`).join(" + ")} <span className="muted">· {op.why}</span>
+                        {stale && <span className="muted">（记忆已变化，不能应用）</span>}
+                      </span>
+                    </label>
+                    <div className="tidy-detail">
+                      {op.op === "retire" && <p className="memory-diff diff-del">{byId.get(op.id)?.body}</p>}
+                      {op.op === "rewrite" && (
+                        <p className="memory-diff">
+                          {diffText(byId.get(op.id)?.body ?? "", op.text).map((seg, k) => (
+                            <span key={k} className={seg.kind === "same" ? undefined : `diff-${seg.kind}`}>
+                              {seg.text}
+                            </span>
+                          ))}
+                        </p>
+                      )}
+                      {op.op === "merge" && (
+                        <>
+                          {op.ids.map((id) => (
+                            <p key={id} className="memory-diff diff-del">
+                              #{id} {byId.get(id)?.body}
+                            </p>
+                          ))}
+                          <p className="memory-diff diff-add">→ {op.text}</p>
+                        </>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {pending.length > 0 && (
+            <div className="row-gap tidy-actions">
+              <Button variant="ghost" size="sm" onClick={() => setDismissed(status!.id)}>
+                放弃这次方案
+              </Button>
+              <Button variant="primary" size="sm" icon={<Check size={13} />} busy={busy} disabled={chosen.size === 0} onClick={apply}>
+                应用所选（{pending.filter(({ i }) => chosen.has(i)).length}）
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 

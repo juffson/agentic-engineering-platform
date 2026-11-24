@@ -4,6 +4,7 @@ pub mod cancel;
 pub mod delivery;
 pub mod deploy_keys;
 pub mod memory;
+pub mod memory_tidy;
 pub mod studio;
 pub mod task;
 pub mod transcript;

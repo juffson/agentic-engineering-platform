@@ -89,6 +89,16 @@ enum Action {
         #[arg(long)]
         until: usize,
     },
+    /// Ask a model CLI to propose a tidy-up of a project's memory (started by Studio).
+    #[command(hide = true)]
+    MemoryTidy {
+        #[arg(long)]
+        home: PathBuf,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        job: PathBuf,
+    },
     Control(control::Control),
     /// Review and deliver a pinned task entirely in the local repository.
     Local {
@@ -280,6 +290,11 @@ fn app() -> Result<ExitCode> {
             )?;
             return Ok(ExitCode::SUCCESS);
         }
+        Action::MemoryTidy { home, project, job } => {
+            aep::workspace::ident(&project, 64)?;
+            aep::memory_tidy::run(&home.join("workflows").join(&project), &job)?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Action::Control(request) => {
             control::execute(&cli.repo, request)?;
             return Ok(ExitCode::SUCCESS);
@@ -295,7 +310,8 @@ fn app() -> Result<ExitCode> {
         | Action::ZcodeOpen { .. }
         | Action::ZcodeBridge { .. }
         | Action::WorkflowStage { .. }
-        | Action::WorkflowAuto { .. } => {
+        | Action::WorkflowAuto { .. }
+        | Action::MemoryTidy { .. } => {
             unreachable!()
         }
         Action::Local { action } => return local::execute(&repo, action),

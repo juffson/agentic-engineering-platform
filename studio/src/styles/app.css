@@ -2906,3 +2906,57 @@ select.input {
   gap: 8px;
   padding-top: 8px;
 }
+
+/* Memory tidy-up. */
+.tidy {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.tidy-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tidy-form .row-gap,
+.tidy-actions {
+  justify-content: flex-end;
+}
+.tidy-summary {
+  font-size: 13px;
+}
+.tidy-ops {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 420px;
+  overflow: auto;
+}
+.tidy-ops li.stale {
+  opacity: 0.55;
+}
+.tidy-detail {
+  padding-left: 24px;
+}
+.tidy-merge {
+  color: var(--accent, #7c83ff);
+}
+.tidy-rewrite {
+  color: #d29922;
+}
+.tidy-retire {
+  color: var(--danger);
+}
+.tidy > .row-between > .btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.tidy-actions,
+.tidy-form .row-gap {
+  display: flex;
+  justify-content: flex-end;
+}

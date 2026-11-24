@@ -317,3 +317,23 @@ test("the branch page draws branches, their worktrees and items, and opens git t
   await list.getByText("fix/snapshot-paging").click();
   await expect(page.getByText("这个分支没有检出到工作区")).toBeVisible();
 });
+
+test("memory is tidied by a CLI: review the proposal, apply what you accept", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  await page.getByRole("button", { name: /^项目记忆/ }).click();
+  const tidy = page.getByTestId("tidy");
+  await tidy.getByRole("button", { name: "开始整理" }).click();
+  await tidy.getByRole("radio", { name: "Codex" }).click();
+  await tidy.getByLabel("整理要求").fill("前端约定合成一条");
+  await tidy.getByRole("button", { name: "开始整理" }).click();
+  await expect(tidy).toContainText("Codex 正在整理");
+  await expect(tidy).toContainText("合并两条前端约定", { timeout: 10_000 });
+  await expect(tidy.getByRole("button", { name: "应用所选（2）" })).toBeVisible();
+  await shot(page, "25-memory-tidy");
+  await tidy.getByRole("checkbox").nth(1).uncheck(); // keep the delivery note
+  await tidy.getByRole("button", { name: "应用所选（1）" }).click();
+  await expect(page.locator(".toast", { hasText: "已应用 1 项整理" })).toBeVisible();
+  await expect(page.getByTestId("memory-note").filter({ hasText: "前端约定：行情只走" })).toHaveCount(1);
+  await expect(page.getByTestId("memory-note").filter({ hasText: "旧版分时图下线" })).toHaveCount(1);
+});

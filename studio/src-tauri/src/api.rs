@@ -1106,6 +1106,113 @@ pub fn open_git_tool(home: &Path, id: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
+fn tidy_dir(home: &Path, pid: &str) -> Result<PathBuf> {
+    Ok(memory_dir(home, pid)?.join("memory-tidy"))
+}
+
+/// Start a memory tidy-up with a model CLI; returns the job id.
+pub fn tidy_start(
+    home: &Path,
+    pid: &str,
+    client: &str,
+    model: &str,
+    instruction: &str,
+) -> Result<String> {
+    let client = match client {
+        "Codex" => Client::Codex,
+        "Claude" => Client::Claude,
+        _ => bail!("整理记忆目前支持 Codex 和 Claude"),
+    };
+    ensure!(
+        !tidy_status(home, pid)?["status"]
+            .as_str()
+            .is_some_and(|s| s == "running" || s == "starting"),
+        "已有一次整理在进行"
+    );
+    let id = format!("{}", chrono_stamp());
+    let job = tidy_dir(home, pid)?.join(&id);
+    fs::create_dir_all(&job)?;
+    let profile = Profile {
+        client,
+        executable: String::new(),
+        model: model.trim().to_owned(),
+        check_command: String::new(),
+    };
+    aep::project::save_json(
+        &job,
+        "job.json",
+        &json!({"profile": profile, "instruction": instruction.trim()}),
+    )?;
+    aep::project::save_json(&job, "status.json", &json!({"status": "starting"}))?;
+    runner::memory_tidy(home, pid, &job)?;
+    Ok(id)
+}
+
+fn chrono_stamp() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
+}
+
+/// The latest tidy job: status, error, and its proposal once ready.
+pub fn tidy_status(home: &Path, pid: &str) -> Result<Value> {
+    let dir = tidy_dir(home, pid)?;
+    let latest = fs::read_dir(&dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .max_by_key(|n| n.parse::<u128>().unwrap_or(0));
+    let Some(id) = latest else {
+        return Ok(json!({"id": null, "status": null}));
+    };
+    let job = dir.join(&id);
+    let status = aep::workspace::read(&job.join("status.json")).unwrap_or_default();
+    let spec = aep::workspace::read(&job.join("job.json")).unwrap_or_default();
+    let mut s = status["status"].as_str().unwrap_or("starting").to_owned();
+    // A job whose process died without writing a result.
+    let age = job
+        .join("status.json")
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .unwrap_or_default();
+    if s == "starting" && age > Duration::from_secs(30) {
+        s = "failed".into();
+    }
+    Ok(json!({
+        "id": id,
+        "status": s,
+        "error": status["error"].as_str().or_else(|| (s == "failed" && status["error"].is_null()).then_some("整理进程没有启动")),
+        "client": spec["profile"]["client"],
+        "model": spec["profile"]["model"],
+        "instruction": spec["instruction"],
+        "applied": status["applied"],
+        "proposal": aep::workspace::read(&job.join("proposal.json")).ok(),
+    }))
+}
+
+/// Apply the chosen operations (by index) of a tidy proposal.
+pub fn tidy_apply(home: &Path, pid: &str, job: &str, ops: &[usize]) -> Result<usize> {
+    aep::workspace::ident(job, 64)?;
+    let dir = tidy_dir(home, pid)?.join(job);
+    let proposal: aep::memory_tidy::Proposal =
+        serde_json::from_value(aep::workspace::read(&dir.join("proposal.json"))?)?;
+    let chosen: Vec<_> = ops
+        .iter()
+        .map(|&i| proposal.ops.get(i).cloned().context("方案里没有这个操作"))
+        .collect::<Result<_>>()?;
+    ensure!(!chosen.is_empty(), "请至少选择一项");
+    let n = aep::memory_tidy::apply(&memory_dir(home, pid)?, &chosen)?;
+    let mut status = aep::workspace::read(&dir.join("status.json")).unwrap_or_default();
+    status["applied"] = json!(ops);
+    aep::project::save_json(&dir, "status.json", &status)?;
+    Ok(n)
+}
+
 pub fn reveal(path: &str) -> Result<()> {
     let p = Path::new(path);
     if !p.exists() {

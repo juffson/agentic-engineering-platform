@@ -281,6 +281,23 @@ export interface SyncPlan {
   items_stale: { id: string; name: string; reason: string }[]; // ran, left for a person
 }
 
+export type TidyOp =
+  | { op: "merge"; ids: number[]; text: string; why: string }
+  | { op: "rewrite"; id: number; text: string; why: string }
+  | { op: "retire"; id: number; why: string };
+
+/** The latest memory tidy-up job of a project. */
+export interface TidyStatus {
+  id: string | null;
+  status: "starting" | "running" | "succeeded" | "failed" | null;
+  error: string | null;
+  client: Client | null;
+  model: string | null;
+  instruction: string | null;
+  applied: number[] | null; // op indices already applied
+  proposal: { summary: string; ops: TidyOp[] } | null;
+}
+
 /** Commands. Each returns a Promise of the given type; errors reject with a message string. */
 export interface Api {
   snapshot(): Snapshot;
@@ -330,6 +347,11 @@ export interface Api {
   /** Installed git tools (Fork, VS Code, lazygit…) plus plugins from `config`. */
   gitTools(): { tools: { id: string; label: string }[]; config: string };
   openGitTool(a: { id: string; path: string }): void;
+  /** Ask Codex or Claude to propose merges, rewrites and retirements of project memory. */
+  tidyStart(a: { project: string; client: "Codex" | "Claude"; model: string; instruction: string }): string;
+  tidyStatus(a: { project: string }): TidyStatus;
+  /** Apply the chosen operations (indices into proposal.ops) through version history. */
+  tidyApply(a: { project: string; job: string; ops: number[] }): number;
   /** Take a project out of Studio (its repositories are untouched). */
   removeProject(a: { project: string }): void;
   /** What Claude Code, Codex and ZCode already hold for a repository folder. */

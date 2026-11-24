@@ -3,6 +3,7 @@
 // reveals one more transcript entry every `stepMs`, then finishes with its
 // scripted outcome. Mutations update this state so every flow is clickable.
 import type {
+  TidyStatus,
   BranchGraph,
   SyncPlan,
   ImportFound,
@@ -629,6 +630,61 @@ class MockStore implements Api {
 
   openGitTool({ id }: { id: string; path: string }) {
     if (!id) throw new Error("找不到这个 git 工具");
+  }
+
+  tidy = new Map<string, TidyStatus & { polls: number }>();
+
+  tidyStart({ project, client, model, instruction }: { project: string; client: "Codex" | "Claude"; model: string; instruction: string }) {
+    if (this.tidy.get(project)?.status === "running") throw new Error("已有一次整理在进行");
+    const id = String(Date.now());
+    this.tidy.set(project, { id, status: "running", error: null, client, model, instruction, applied: null, proposal: null, polls: 0 });
+    return id;
+  }
+
+  tidyStatus({ project }: { project: string }): TidyStatus {
+    const t = this.tidy.get(project);
+    if (!t) return { id: null, status: null, error: null, client: null, model: null, instruction: null, applied: null, proposal: null };
+    if (t.status === "running" && ++t.polls >= 2) {
+      const current = (this.memoryNotes.get(project) ?? []).filter((n) => !n.superseded);
+      const zustand = current.find((n) => n.body.includes("zustand"));
+      const gateway = current.find((n) => n.body.includes("quote-gateway"));
+      const timeline = current.find((n) => n.body.includes("分时图"));
+      t.status = "succeeded";
+      t.proposal = {
+        summary: "合并两条前端约定，改写一条含糊的笔记，移出已完成的下线记录。",
+        ops: [
+          ...(zustand && gateway
+            ? [{ op: "merge" as const, ids: [gateway.id, zustand.id], text: "前端约定：行情只走 quote-gateway 的 WebSocket；状态用 zustand 切片，不加全局单例。", why: "两条都是前端架构约定" }]
+            : []),
+          ...(timeline ? [{ op: "retire" as const, id: timeline.id, why: "旧分时图已下线，后续事项不需要" }] : []),
+        ],
+      };
+    }
+    const { polls: _polls, ...status } = t;
+    return clone(status);
+  }
+
+  tidyApply({ project, job, ops }: { project: string; job: string; ops: number[] }) {
+    const t = this.tidy.get(project);
+    if (!t || t.id !== job || !t.proposal) throw new Error("整理方案不存在");
+    for (const i of ops) {
+      const op = t.proposal.ops[i];
+      if (!op) throw new Error("方案里没有这个操作");
+      if (op.op === "rewrite") this.reviseMemory({ project, id: op.id, text: op.text });
+      if (op.op === "retire") this.retire(project, op.id);
+      if (op.op === "merge") {
+        this.reviseMemory({ project, id: op.ids[0], text: op.text });
+        for (const id of op.ids.slice(1)) this.retire(project, id);
+      }
+    }
+    t.applied = ops;
+    return ops.length;
+  }
+
+  private retire(project: string, id: number) {
+    const n = (this.memoryNotes.get(project) ?? []).find((x) => x.id === id);
+    if (!n || n.superseded) throw new Error(`记忆 #${id} 在提出方案后已被修改，请重新整理`);
+    n.superseded = true;
   }
 
   removeProject({ project }: { project: string }) {

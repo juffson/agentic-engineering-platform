@@ -99,3 +99,19 @@ pub fn autopilot(home: &Path, project: &str, work: &str, until: usize, dir: &Pat
         &dir.join("autopilot.log"),
     )
 }
+
+/// Propose a memory tidy-up in the background; the job folder receives status and proposal.
+pub fn memory_tidy(home: &Path, project: &str, job: &Path) -> Result<()> {
+    detached(
+        &[
+            "memory-tidy".as_ref(),
+            "--home".as_ref(),
+            home.as_os_str(),
+            "--project".as_ref(),
+            project.as_ref(),
+            "--job".as_ref(),
+            job.as_os_str(),
+        ],
+        &job.join("supervisor.log"),
+    )
+}

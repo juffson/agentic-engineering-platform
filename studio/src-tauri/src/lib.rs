@@ -235,6 +235,26 @@ fn importSync(
 }
 
 #[tauri::command(async)]
+fn tidyStart(
+    project: String,
+    client: String,
+    model: String,
+    instruction: String,
+) -> Result<impl Serialize, String> {
+    run(move |h| api::tidy_start(&h, &project, &client, &model, &instruction))
+}
+
+#[tauri::command(async)]
+fn tidyStatus(project: String) -> Result<impl Serialize, String> {
+    run(move |h| api::tidy_status(&h, &project))
+}
+
+#[tauri::command(async)]
+fn tidyApply(project: String, job: String, ops: Vec<usize>) -> Result<impl Serialize, String> {
+    run(move |h| api::tidy_apply(&h, &project, &job, &ops))
+}
+
+#[tauri::command(async)]
 fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
     run(move |h| api::cleanup(&h, &project, &work, force))
 }
@@ -339,6 +359,9 @@ pub fn start() {
             archive,
             unarchive,
             cleanup,
+            tidyStart,
+            tidyStatus,
+            tidyApply,
             importSyncPlan,
             importSync,
             branchGraph,
