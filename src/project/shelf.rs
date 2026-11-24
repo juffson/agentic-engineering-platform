@@ -130,6 +130,24 @@ impl Project {
         Ok(id)
     }
 
+    /// Delete an item that never ran: no attempts, no deliveries, no worktree. Anything an
+    /// agent has touched is archived instead, so its record survives.
+    pub fn remove_work(&mut self, home: &Path, wid: &str) -> Result<()> {
+        let work = self.work_by_id_mut(wid)?;
+        ensure!(
+            work.attempts.is_empty() && work.deliveries.is_empty() && work.worktrees().is_empty(),
+            "这个事项已经运行过，不能删除；交付后可以归档"
+        );
+        self.work.retain(|w| w.id != wid);
+        if self.selected.as_deref() == Some(wid) {
+            self.selected = self.work.last().map(|w| w.id.clone());
+        }
+        let dir = home.join("workflows").join(&self.id).join(wid);
+        if dir.is_dir() {
+            fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
     pub fn unarchive_work(&mut self, wid: &str) -> Result<()> {
         let work = self.work_by_id_mut(wid)?;
         ensure!(work.shelved.take().is_some(), "事项未归档");

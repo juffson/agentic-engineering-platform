@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ArrowRight, Check, CornerUpLeft, PackageCheck, Play, RotateCcw, ShieldCheck, SkipForward, Square, Undo2 } from "lucide-react";
+import { ArrowRight, Check, CornerUpLeft, PackageCheck, Play, RotateCcw, ShieldCheck, SkipForward, Square, Trash2, Undo2 } from "lucide-react";
 import type { StageDetail, WorkDetail } from "../api/types";
 import { api } from "../api/client";
 import { useStudio } from "../state/store";
@@ -33,6 +33,7 @@ export function DecisionPanel({ detail, viewed }: { detail: WorkDetail; viewed: 
         <StageConfigCard detail={detail} stage={viewed} collapsed={viewed.state === "done" || latestAttempt(viewed)?.status === "succeeded"} />
       )}
       {viewed && <More detail={detail} stage={viewed} />}
+      {!detail.running && !detail.autopilot.running && detail.stages.every((s) => s.attempts.length === 0) && <DeleteWork detail={detail} />}
     </aside>
   );
 }
@@ -278,5 +279,19 @@ function More({ detail, stage }: { detail: WorkDetail; stage: StageDetail }) {
         </button>
       )}
     </section>
+  );
+}
+
+/** An item nothing has run for yet can be deleted outright. */
+function DeleteWork({ detail }: { detail: WorkDetail }) {
+  const { act } = useStudio();
+  const remove = () => {
+    if (!window.confirm(`删除事项「${detail.name}」？它还没有运行过，删除后不可恢复。`)) return;
+    act(() => api.deleteWork({ project: detail.project, work: detail.id }), "已删除事项");
+  };
+  return (
+    <Button variant="ghost" className="block delete-work" icon={<Trash2 size={13} />} onClick={remove}>
+      删除事项
+    </Button>
   );
 }

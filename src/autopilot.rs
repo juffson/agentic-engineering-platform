@@ -118,6 +118,7 @@ fn drive(
     let mut ours: HashSet<String> = HashSet::new();
     // Stages whose CLI already crashed once in this run.
     let mut retried: HashSet<usize> = HashSet::new();
+    let mut path_fixes: HashSet<usize> = HashSet::new();
     loop {
         if stop_requested(dir) {
             return Ok(("stopped".into(), "已手动停止自动运行".into()));
@@ -231,6 +232,24 @@ fn drive(
                     save(dir, state)?;
                     let attempt = lib.change(catalog, |lib| {
                         start(project_mut(lib, pid)?, catalog, wid, i)
+                    })?;
+                    if !execute(exe, &attempt, dir, &mut ours)? {
+                        return Ok(("stopped".into(), "已手动停止自动运行".into()));
+                    }
+                    continue;
+                }
+                // The plan named files that do not exist: its own session fixes the plan, once.
+                if e["invalid_paths"].as_array().is_some_and(|a| !a.is_empty())
+                    && path_fixes.insert(i)
+                {
+                    let error = e["error"].as_str().unwrap_or("子任务路径无效");
+                    state.message = format!("「{name}」的子任务路径有误，已请它修正");
+                    save(dir, state)?;
+                    let message = format!(
+                        "{error}\n\n请在仓库里核对这些路径（ls / rg），修正 task.json 后照常给出本阶段结论。"
+                    );
+                    let attempt = lib.change(catalog, |lib| {
+                        continue_or_start(project_mut(lib, pid)?, catalog, wid, i, &message)
                     })?;
                     if !execute(exe, &attempt, dir, &mut ours)? {
                         return Ok(("stopped".into(), "已手动停止自动运行".into()));

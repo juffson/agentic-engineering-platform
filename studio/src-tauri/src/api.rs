@@ -406,9 +406,67 @@ pub fn attempt_view(home: &Path, pid: &str, wid: &str, attempt: &str) -> Result<
         "model": t.model,
         "error": ev["error"],
         "result": fs::read_to_string(dir.join("result.txt")).ok(),
+        "zcode": zcode_task(&dir),
         "dir": dir,
         "workspace": ev["workspace"],
     }))
+}
+
+/// The ZCode desktop task behind an attempt (in the attempt folder or a role sub-folder):
+/// whether it is waiting for a tool approval right now, and whether it can be opened.
+fn zcode_task(dir: &Path) -> Option<Value> {
+    let sub = [
+        dir.to_path_buf(),
+        dir.join("zcode-edit"),
+        dir.join("zcode-plan"),
+    ]
+    .into_iter()
+    .find(|d| {
+        d.join("desktop-create.json").is_file() || d.join("desktop-approvals.json").is_file()
+    })?;
+    let path = sub.join("desktop-approvals.json");
+    let observed = aep::workspace::read(&path).unwrap_or_default();
+    // The monitor rewrites the file every two seconds while the task runs.
+    let fresh = path
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_secs(15));
+    let state = &observed["state"];
+    let tools: Vec<Value> = state["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| json!({"name": t["tool"].as_str().unwrap_or("工具"), "detail": t["detail"].as_str().unwrap_or("")}))
+        .collect();
+    Some(json!({
+        "waiting": fresh && state["waiting"] == true,
+        "tools": tools,
+        "session": observed["session"].as_str(),
+        "openable": sub.join("desktop-create.json").is_file(),
+    }))
+}
+
+/// Bring up the exact ZCode desktop task an attempt dispatched, e.g. to approve a tool.
+pub fn zcode_open(home: &Path, pid: &str, wid: &str, attempt: &str) -> Result<()> {
+    let dir = workflow::attempt_dir(home, pid, wid, attempt);
+    let sub = [dir.clone(), dir.join("zcode-edit"), dir.join("zcode-plan")]
+        .into_iter()
+        .find(|d| d.join("desktop-create.json").is_file())
+        .context("这次执行没有可打开的 ZCode 桌面任务")?;
+    let out = std::process::Command::new(runner::binary()?)
+        .env("PATH", runner::path()?)
+        .arg("zcode-open")
+        .arg("--dir")
+        .arg(&sub)
+        .output()?;
+    ensure!(
+        out.status.success(),
+        "无法打开 ZCode 任务：{}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(())
 }
 
 fn parse_sandbox(s: &str) -> Result<Sandbox> {
@@ -693,6 +751,11 @@ pub fn cleanup(home: &Path, pid: &str, wid: &str, force: bool) -> Result<shelf::
     let w = item(find(&lib, pid)?, wid)?;
     ensure!(w.delivered(), "只有已交付的事项可以清理工作区和分支");
     w.clean(force)
+}
+
+/// Delete an item that never ran.
+pub fn delete_work(home: &Path, pid: &str, wid: &str) -> Result<()> {
+    change(home, |lib| find_mut(lib, pid)?.remove_work(home, wid))
 }
 
 pub fn unarchive(home: &Path, pid: &str, wid: &str) -> Result<()> {

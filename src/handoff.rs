@@ -188,7 +188,7 @@ pub fn packet(
             .iter()
             .any(|s| s.role == Role::Build)
     {
-        text.push_str("\n在 task.json 里用 subtasks 拆分开发：[{\"id\":\"T1\",\"title\":\"…\",\"paths\":[\"可改的文件或目录\"],\"criteria\":[\"覆盖的验收项\"],\"check\":[\"能单独验证它的命令\"]}]，按依赖顺序排列，每个子任务一个会话内能完成并单独验证。");
+        text.push_str("\n在 task.json 里用 subtasks 拆分开发：[{\"id\":\"T1\",\"title\":\"…\",\"paths\":[\"可改的文件或目录\"],\"criteria\":[\"覆盖的验收项\"],\"check\":[\"能单独验证它的命令\"]}]，按依赖顺序排列，每个子任务一个会话内能完成并单独验证。paths 只写仓库里真实存在的文件或目录，要新建的写到父目录已存在的那一级；平台会在本阶段结束时核对，找不到的路径会让本阶段不通过。");
     }
     if let Some(task) = &req.subtask {
         text.push_str(&format!(

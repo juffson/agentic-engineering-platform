@@ -194,12 +194,15 @@ fn planning_owns_specs_skips_optional_stages_and_builds_task_by_task() -> Result
             r#"#!/bin/sh
 input=$(cat)
 stage=$(printf '%s' "$input" | sed -n 's/^阶段：\([^（]*\)（.*/\1/p' | head -1)
+printf '%s' "$input" | grep -q '子任务路径在仓库中找不到' && stage=修正路径
 answer="$stage 完成"
 case "$stage" in
   产品需求) mkdir -p specs/demo; echo prd > specs/demo/spec.md
     answer="PRD 完成
 AEP-SKIP: 交互设计：无界面改动" ;;
-  技术方案) printf '%s' '{{"title":"demo","subtasks":[{{"id":"T1","title":"导出"}},{{"id":"T2","title":"表头"}}]}}' > specs/demo/task.json ;;
+  技术方案) printf '%s' '{{"title":"demo","subtasks":[{{"id":"T1","title":"导出","paths":["lib/exprot/csv.rs"]}},{{"id":"T2","title":"表头"}}]}}' > specs/demo/task.json ;;
+  修正路径) echo fixed >> "{d}/path-fix"
+    printf '%s' '{{"title":"demo","subtasks":[{{"id":"T1","title":"导出","paths":["src","README.md"]}},{{"id":"T2","title":"表头"}}]}}' > specs/demo/task.json ;;
   开发实现) id=$(printf '%s' "$input" | sed -n 's/.*本轮只实现子任务 \(T[0-9]*\).*/\1/p' | head -1)
     echo "$id" >> "{d}/built"; mkdir -p src; echo "$id" > "src/$id.txt" ;;
   测试验证) echo report > specs/demo/testing.md ;;
@@ -238,6 +241,19 @@ AEP: PASS' "$answer" | python3 -c 'import json,sys; print(json.dumps({{"type":"r
     assert!(work.skipped.contains_key(&1), "{:?}", work.skipped);
     assert!(work.notes[1].starts_with("已跳过"), "{}", work.notes[1]);
     assert!(!work.attempts.iter().any(|a| a.stage == 1));
+    // The plan first named a path that does not exist; its own session was asked to fix it.
+    assert_eq!(fs::read_to_string(t.path().join("path-fix"))?, "fixed\n");
+    let plan = work
+        .attempts
+        .iter()
+        .find(|a| a.stage == 2)
+        .expect("技术方案未运行");
+    let first = aep::workflow::evidence(&aep::workflow::attempt_dir(&home, &pid, &wid, &plan.id))?;
+    assert_eq!(first["status"], "failed", "{first}");
+    assert_eq!(
+        first["invalid_paths"],
+        serde_json::json!(["T1 lib/exprot/csv.rs"])
+    );
     // The build ran once per planned subtask, in order.
     assert_eq!(fs::read_to_string(t.path().join("built"))?, "T1\nT2\n");
     // The test stage's report left specs/ and went into its own run archive.

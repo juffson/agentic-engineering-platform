@@ -240,6 +240,11 @@ fn a_work_item_runs_chats_advances_delivers_merges_and_archives() -> Result<()> 
     assert_eq!(got[0]["note"], "导出格式已定：UTF-8 BOM");
     assert!(api::send_handoff(&home, &pid, &wid, &wid, "x").is_err());
 
+    // An item that never ran can be deleted; one that ran cannot.
+    api::delete_work(&home, &pid, &other)?;
+    assert!(api::work_detail(&home, &pid, &other).is_err());
+    assert!(api::delete_work(&home, &pid, &wid).is_err());
+
     // Repository memory, which stages also read.
     let id = api::add_repo_memory(&root, "金额统一用分存储")?;
     let notes = api::repo_memories(&root)?;

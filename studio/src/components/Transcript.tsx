@@ -1,11 +1,13 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AlertTriangle, Check, ChevronDown, ChevronRight, CornerUpLeft, FileEdit, Square, Terminal, Wrench, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, ChevronRight, CornerUpLeft, ExternalLink, FileEdit, ShieldQuestion, Square, Terminal, Wrench, X } from "lucide-react";
 import type { AttemptSummary, AttemptView, Entry } from "../api/types";
 import { clock, duration, parseTime, tokens } from "../lib/format";
 import { isLive, modelLabel } from "../lib/work";
 import { Spinner } from "./ui";
+import { api } from "../api/client";
+import { useStudio } from "../state/store";
 
 type Activity = Extract<Entry, { kind: "command" | "tool" | "edit" }>;
 type Block =
@@ -69,6 +71,7 @@ export function Turn({
             <EntryBlock key={b.key} entry={b.entry} />
           ),
         )}
+        {view?.zcode && <ZCodeTask attempt={attempt} task={view.zcode} />}
         <TurnStatus attempt={attempt} view={view} />
       </div>
     </article>
@@ -228,6 +231,39 @@ function useNow(active: boolean) {
     return () => window.clearInterval(t);
   }, [active]);
   return now;
+}
+
+/** A ZCode desktop task: tools waiting for approval in ZCode, and a way to jump there. */
+function ZCodeTask({ attempt, task }: { attempt: AttemptSummary; task: NonNullable<AttemptView["zcode"]> }) {
+  const { project, selected, act } = useStudio();
+  const waiting = isLive(attempt.status) && task.waiting;
+  if (!waiting && !task.openable) return null;
+  const open = () =>
+    project && selected && act(() => api.zcodeOpen({ project: project.id, work: selected, attempt: attempt.id }));
+  return (
+    <div className={`zcode-task${waiting ? " waiting" : ""}`} data-testid="zcode-task">
+      {waiting && (
+        <div className="zcode-task-head">
+          <ShieldQuestion size={14} />
+          <span>ZCode 正在等待工具审批，请在 ZCode 中批准后它会继续执行</span>
+        </div>
+      )}
+      {waiting && task.tools.length > 0 && (
+        <ul className="zcode-tools">
+          {task.tools.map((t, i) => (
+            <li key={i}>
+              <code>{t.name}</code> {t.detail}
+            </li>
+          ))}
+        </ul>
+      )}
+      {task.openable && (
+        <button type="button" className="link-btn" onClick={open}>
+          <ExternalLink size={12} /> 在 ZCode 中打开这个任务
+        </button>
+      )}
+    </div>
+  );
 }
 
 function TurnStatus({ attempt, view }: { attempt: AttemptSummary; view: AttemptView | undefined }) {

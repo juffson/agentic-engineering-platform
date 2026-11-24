@@ -2556,3 +2556,34 @@ select.input {
 .warn-text {
   color: var(--warning);
 }
+
+/* ZCode desktop task behind a turn. */
+.zcode-task {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0;
+  font-size: 12px;
+}
+.zcode-task.waiting {
+  padding: 10px 12px;
+  border: 1px solid var(--warning);
+  border-radius: 8px;
+}
+.zcode-task-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--warning);
+  font-weight: 600;
+}
+.zcode-tools {
+  margin: 0;
+  padding-left: 20px;
+}
+.zcode-task .link-btn {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}

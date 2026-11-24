@@ -157,6 +157,16 @@ fn archive(
 }
 
 #[tauri::command(async)]
+fn zcodeOpen(project: String, work: String, attempt: String) -> Result<impl Serialize, String> {
+    run(move |h| api::zcode_open(&h, &project, &work, &attempt))
+}
+
+#[tauri::command(async)]
+fn deleteWork(project: String, work: String) -> Result<impl Serialize, String> {
+    run(move |h| api::delete_work(&h, &project, &work))
+}
+
+#[tauri::command(async)]
 fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
     run(move |h| api::cleanup(&h, &project, &work, force))
 }
@@ -261,6 +271,8 @@ pub fn start() {
             archive,
             unarchive,
             cleanup,
+            deleteWork,
+            zcodeOpen,
             mergePreview,
             mergeConfirm,
             memories,

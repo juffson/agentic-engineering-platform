@@ -370,6 +370,44 @@ fn snapshot(cwd: &Path) -> Option<Snapshot> {
     Some(snap)
 }
 
+/// Subtask paths in the plan's `task.json` files that point nowhere: neither the path nor
+/// its parent directory exists in the worktree (a typo, or a guessed module layout).
+fn invalid_paths(cwd: &Path, specs: &[String]) -> Vec<String> {
+    let mut bad = Vec::new();
+    for file in specs.iter().filter(|f| f.ends_with("task.json")) {
+        let Some(plan) = fs::read(cwd.join(file))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        else {
+            continue;
+        };
+        let tasks: Vec<aep::workflow::Subtask> =
+            serde_json::from_value(plan["subtasks"].clone()).unwrap_or_default();
+        for task in tasks {
+            for raw in &task.paths {
+                // Globs are checked up to their first wildcard; absolute paths inside the
+                // worktree are fine, anything escaping it is not.
+                let literal = raw.split(['*', '?', '[']).next().unwrap_or_default();
+                let literal = literal.trim().trim_end_matches('/');
+                let path = Path::new(literal);
+                let path = path.strip_prefix(cwd).unwrap_or(path);
+                let escapes = path.is_absolute()
+                    || path
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir));
+                let full = cwd.join(path);
+                let found = literal.is_empty()
+                    || full.exists()
+                    || full.parent().is_some_and(|p| p.is_dir());
+                if escapes || !found {
+                    bad.push(format!("{} {raw}", task.id));
+                }
+            }
+        }
+    }
+    bad
+}
+
 /// Only planning stages own `specs/`. A planning stage that touched other files fails; any
 /// other stage's spec edits move into this run's archive and `specs/` is put back.
 fn documents(
@@ -399,6 +437,11 @@ fn documents(
             "规划阶段只能修改 specs/ 下的文档，本轮还改了：{}",
             other.iter().take(8).cloned().collect::<Vec<_>>().join("、")
         );
+        // Checked once the session is recorded, so the planner can be asked to fix them.
+        let invalid = invalid_paths(cwd, &specs);
+        if !invalid.is_empty() {
+            record["invalid_paths"] = json!(invalid);
+        }
         return Ok(());
     }
     for path in &specs {
@@ -710,6 +753,16 @@ fn invoke(
                 .iter()
                 .map(|(s, r)| json!({"stage":s,"name":req.template.stages()[*s].name,"reason":r}))
                 .collect::<Vec<_>>()
+        );
+    }
+    if let Some(invalid) = record["invalid_paths"].as_array().filter(|a| !a.is_empty()) {
+        anyhow::bail!(
+            "task.json 里有子任务路径在仓库中找不到：{}。请改成仓库里真实存在的文件或目录；要新建的，写到父目录已存在的那一级（例如新目录本身）",
+            invalid
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("、")
         );
     }
     // An earlier stage must act first: record where to and why, and do not let this pass.

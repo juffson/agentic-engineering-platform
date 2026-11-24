@@ -151,6 +151,8 @@ export interface AttemptView {
   model: string | null;
   error: string | null;
   result: string | null; // final answer text (result.txt)
+  /** The ZCode desktop task this attempt dispatched, if any. */
+  zcode: { waiting: boolean; tools: { name: string; detail: string }[]; session: string | null; openable: boolean } | null;
   dir: string; // attempt directory, for "reveal"
   workspace: string | null;
 }
@@ -273,6 +275,10 @@ export interface Api {
   autopilotStop(a: { project: string; work: string }): void;
   archive(a: { project: string; work: string; memory: string; removeWorktree: boolean }): void;
   unarchive(a: { project: string; work: string }): void;
+  /** Delete an item that never ran (no attempts, no worktree). */
+  deleteWork(a: { project: string; work: string }): void;
+  /** Bring up the ZCode desktop task an attempt dispatched (e.g. to approve a tool). */
+  zcodeOpen(a: { project: string; work: string; attempt: string }): void;
   /** Remove a delivered item's worktrees and merged branches; `force` also deletes unmerged ones. */
   cleanup(a: { project: string; work: string; force: boolean }): { worktrees: number; deleted: string[]; kept: string[] };
   mergePreview(a: { project: string; work: string; target?: string }): MergePreview;

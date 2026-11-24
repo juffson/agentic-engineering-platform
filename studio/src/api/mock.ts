@@ -430,6 +430,15 @@ class MockStore implements Api {
       model: a.summary.model || null,
       error: a.summary.error,
       result: a.summary.status === "succeeded" ? a.result : null,
+      zcode:
+        a.summary.client === "ZCode"
+          ? {
+              waiting: a.summary.status === "running",
+              tools: a.summary.status === "running" ? [{ name: "Bash", detail: "cargo test --locked" }] : [],
+              session: `sess_${a.summary.id}`,
+              openable: true,
+            }
+          : null,
       dir: `${HOME}/runs/${work}/${a.summary.id}`,
       workspace: `${HOME}/worktrees/${work}`,
     };
@@ -576,6 +585,21 @@ class MockStore implements Api {
       d.worktrees = [];
       d.branches = d.branches.filter((b) => !b.merged);
     }
+  }
+
+  deleteWork({ project, work }: { project: string; work: string }) {
+    const d = this.work(project, work).detail;
+    if (d.stages.some((s) => s.attempts.length > 0)) throw new Error("这个事项已经运行过，不能删除；交付后可以归档");
+    this.works.delete(work);
+    this.order = this.order.filter((id) => id !== work);
+    if (this.selected.get(project) === work) {
+      this.selected.set(project, this.order.find((id) => this.works.get(id)?.project === project) ?? null);
+    }
+  }
+
+  zcodeOpen({ project, work, attempt }: { project: string; work: string; attempt: string }) {
+    this.work(project, work);
+    if (!this.attempts.get(attempt)) throw new Error(`找不到运行记录 ${attempt}`);
   }
 
   cleanup({ project, work, force }: { project: string; work: string; force: boolean }) {

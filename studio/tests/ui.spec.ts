@@ -188,3 +188,31 @@ test("an archived item cleans up its worktree and merged branch", async ({ page 
   await expect(page.locator(".toast")).toContainText("删除分支 aep-stage/0d1e2f3a");
   await expect(page.getByTestId("cleanup")).toHaveCount(0);
 });
+
+test("a ZCode stage waiting for a tool approval says so and opens the task", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  const sidebar = page.getByRole("navigation", { name: "事项" });
+  await sidebar.getByText("港股暗盘报价").click();
+  await page.getByRole("radio", { name: "ZCode" }).click();
+  await page.getByRole("button", { name: "运行「产品需求」" }).click();
+  const task = page.getByTestId("zcode-task");
+  await expect(task).toContainText("ZCode 正在等待工具审批");
+  await expect(task).toContainText("cargo test --locked");
+  await shot(page, "19-zcode-approval");
+  await task.getByRole("button", { name: /在 ZCode 中打开这个任务/ }).click();
+  await expect(page.locator(".toast-error")).toHaveCount(0);
+});
+
+test("an item that never ran can be deleted", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  const sidebar = page.getByRole("navigation", { name: "事项" });
+  await sidebar.getByText("港股暗盘报价").click();
+  page.once("dialog", (d) => d.accept());
+  await page.getByRole("button", { name: "删除事项" }).click();
+  await expect(sidebar.getByText("港股暗盘报价")).toHaveCount(0);
+  // Items with runs offer no delete.
+  await sidebar.getByText("自选股分组支持拖拽排序").click();
+  await expect(page.getByRole("button", { name: "删除事项" })).toHaveCount(0);
+});
