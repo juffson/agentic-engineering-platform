@@ -5,7 +5,7 @@ use aep::{
     autopilot,
     handoff::{self, Assignment, busy},
     memory::{Key, Memory, TEXT_LIMIT},
-    project::{Kind, Library, Project, Work, merge, shelf},
+    project::{Kind, Library, Project, Work, import, merge, shelf},
     transcript::{self, Entry},
     workflow::{self, Client, Profile, Request, Role, Sandbox, Template},
     workspace::Workspace,
@@ -191,12 +191,47 @@ fn repository(path: &str) -> Result<PathBuf> {
     Ok(ws.root.canonicalize()?)
 }
 
-pub fn create_project(home: &Path, name: &str, repositories: &[String]) -> Result<()> {
+/// Create a project and return its ID.
+pub fn create_project(home: &Path, name: &str, repositories: &[String]) -> Result<String> {
     let repos = repositories
         .iter()
         .map(|r| repository(r))
         .collect::<Result<Vec<_>>>()?;
-    change(home, |lib| lib.create(name, repos.clone()))
+    change(home, |lib| {
+        lib.create(name, repos.clone())?;
+        lib.projects
+            .iter()
+            .find(|p| p.name == name.trim())
+            .map(|p| p.id.clone())
+            .context("项目创建失败")
+    })
+}
+
+/// What Claude Code, Codex and ZCode already hold for a repository folder.
+pub fn import_scan(path: &str) -> Result<import::Found> {
+    import::scan(&repository(path)?)
+}
+
+/// Import chosen Claude memory files and existing branches into a project. Returns how many
+/// notes and items were created.
+pub fn import_apply(
+    home: &Path,
+    pid: &str,
+    path: &str,
+    memories: &[String],
+    branches: &[(String, String)],
+) -> Result<Value> {
+    let repo = repository(path)?;
+    let lib = Library::open(home)?;
+    let notes = find(&lib, pid)?.import_memories(home, &repo, memories)?;
+    let items = change(home, |lib| {
+        let p = find_mut(lib, pid)?;
+        branches
+            .iter()
+            .map(|(branch, from)| p.import_branch(&repo, branch, Path::new(from)))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    Ok(json!({"notes": notes.len(), "items": items}))
 }
 
 /// Ask for a folder with the system folder chooser. A folder inside a git repository

@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod directory;
+pub mod import;
 pub mod merge;
 pub mod shelf;
 pub mod timeline;

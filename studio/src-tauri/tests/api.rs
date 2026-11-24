@@ -335,3 +335,151 @@ printf '%s' "$answer" | python3 -c 'import json,sys; print(json.dumps({"type":"r
     assert!(p.contains("补充说明：重点看空账户"), "{p}");
     Ok(())
 }
+
+#[test]
+fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let home = t.path().join("catalog");
+    let repo = t.path().join("repo");
+    fs::create_dir_all(&repo)?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    git(&repo, &["config", "user.name", "t"])?;
+    git(&repo, &["config", "user.email", "t@example.com"])?;
+    fs::write(repo.join("README.md"), "demo\n")?;
+    fs::write(repo.join("CLAUDE.md"), "rules\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-q", "-m", "init"])?;
+    // An agent's branch in its own worktree: one commit ahead, one uncommitted file.
+    let wt = t.path().join("wt");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/export",
+            wt.to_str().unwrap(),
+        ],
+    )?;
+    fs::write(wt.join("export.rs"), "// wip\n")?;
+    git(&wt, &["add", "."])?;
+    git(&wt, &["commit", "-q", "-m", "start export"])?;
+    fs::write(wt.join("notes.txt"), "dirty\n")?;
+    let tip = git(&repo, &["rev-parse", "feat/export"])?.trim().to_owned();
+
+    // What Claude Code and Codex keep about this folder.
+    let root = repo.canonicalize()?;
+    let slug: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if matches!(c, '/' | '.') { '-' } else { c })
+        .collect();
+    let claude = t.path().join("claude-home").join("projects").join(&slug);
+    fs::create_dir_all(claude.join("memory"))?;
+    fs::write(claude.join("memory/MEMORY.md"), "- index\n")?;
+    fs::write(
+        claude.join("memory/money.md"),
+        "---\nname: money-in-cents\ndescription: 金额统一用分\nmetadata:\n  type: project\n---\n\n所有金额字段用整数分存储。\n",
+    )?;
+    fs::write(claude.join("s1.jsonl"), "{}\n")?;
+    let codex = t.path().join("codex/sessions/2026/11");
+    fs::create_dir_all(&codex)?;
+    fs::write(
+        codex.join("rollout.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"cwd": root}})
+        ),
+    )?;
+    // SAFETY: only this test reads these variables.
+    unsafe {
+        std::env::set_var("CLAUDE_CONFIG_DIR", t.path().join("claude-home"));
+        std::env::set_var("CODEX_HOME", t.path().join("codex"));
+    }
+
+    let found = serde_json::to_value(api::import_scan(&repo.display().to_string())?)?;
+    assert_eq!(found["memories"][0]["file"], "money.md", "{found}");
+    assert_eq!(found["memories"][0]["title"], "money-in-cents");
+    assert_eq!(found["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(found["rules"], serde_json::json!(["CLAUDE.md"]));
+    assert_eq!(found["claude_sessions"], 1);
+    assert_eq!(found["codex_sessions"], 1);
+    let w = &found["worktrees"][0];
+    assert_eq!(w["branch"], "feat/export", "{found}");
+    assert_eq!(
+        (w["ahead"].as_u64(), w["dirty"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(w["source"], "Git");
+
+    let pid = api::create_project(&home, "demo", &[repo.display().to_string()])?;
+    let wt_path = w["path"].as_str().unwrap().to_owned();
+    let done = api::import_apply(
+        &home,
+        &pid,
+        &repo.display().to_string(),
+        &["money.md".into()],
+        &[("feat/export".into(), wt_path.clone())],
+    )?;
+    assert_eq!(done["notes"], 1, "{done}");
+    let wid = done["items"][0].as_str().unwrap().to_owned();
+    let notes = api::memories(&home, &pid)?;
+    assert!(
+        notes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["body"].as_str().is_some_and(|b| b
+                .contains("导入自 Claude 记忆：money-in-cents")
+                && b.contains("整数分"))),
+        "{notes}"
+    );
+    // Importing the same memory again adds nothing.
+    let again = api::import_apply(
+        &home,
+        &pid,
+        &repo.display().to_string(),
+        &["money.md".into()],
+        &[],
+    )?;
+    assert_eq!(again["notes"], 0);
+
+    // The branch became an item at 开发实现 with its own branch at the same commit.
+    let d = api::work_detail(&home, &pid, &wid)?;
+    assert_eq!(d["name"], "feat/export");
+    assert_eq!(d["stage"], 3);
+    for i in 0..3 {
+        assert_eq!(d["stages"][i]["state"], "skipped", "{}", d["stages"][i]);
+    }
+    assert_eq!(
+        git(&repo, &["rev-parse", &format!("aep-stage/{wid}")])?.trim(),
+        tip
+    );
+
+    // Its build runs in a fresh worktree on that branch; the original worktree is untouched.
+    let profile: aep::workflow::Profile = serde_json::from_value(serde_json::json!({
+        "client": "Claude", "executable": fake_claude(t.path())?, "model": "", "check_command": ""
+    }))?;
+    api::update_stage(&home, &pid, &wid, 3, None, Some(profile), None)?;
+    let run = api::run_stage(&home, &pid, &wid, 3, None)?;
+    let d = wait_idle(&home, &pid, &wid)?;
+    let turn = &d["stages"][3]["attempts"][0];
+    assert_eq!(turn["status"], "succeeded", "{d}");
+    assert!(
+        turn["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("接手已有分支 `feat/export`")
+    );
+    let view = api::attempt_view(&home, &pid, &wid, &run)?;
+    let workspace = Path::new(view["workspace"].as_str().unwrap());
+    assert!(workspace.join("export.rs").is_file());
+    assert!(workspace.join("src/main.rs").is_file());
+    assert!(
+        git(&repo, &["log", "--format=%s", &format!("aep-stage/{wid}")])?.contains("start export")
+    );
+    assert!(Path::new(&wt_path).join("notes.txt").is_file());
+    assert_eq!(git(&repo, &["rev-parse", "feat/export"])?.trim(), tip);
+    Ok(())
+}

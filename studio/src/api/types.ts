@@ -234,12 +234,28 @@ export interface ZCodeModel {
   selection: string; // value to put in profile.model, e.g. "bigmodel/glm-5.3@high"
 }
 
+export interface ImportFound {
+  repository: string;
+  memories: { file: string; title: string; description: string; chars: number }[];
+  rules: string[]; // CLAUDE.md / AGENTS.md already in the repo
+  claude_sessions: number;
+  codex_sessions: number;
+  zcode_tasks: number;
+  worktrees: {
+    path: string;
+    branch: string | null;
+    ahead: number;
+    dirty: number;
+    source: "Claude" | "ZCode" | "Git" | string;
+  }[];
+}
+
 /** Commands. Each returns a Promise of the given type; errors reject with a message string. */
 export interface Api {
   snapshot(): Snapshot;
   openProject(a: { project: string }): void;
   selectWork(a: { project: string; work: string }): void;
-  createProject(a: { name: string; repositories: string[] }): void;
+  createProject(a: { name: string; repositories: string[] }): string; // new project id
   addRepository(a: { project: string; path: string }): void;
   createWork(a: {
     project: string;
@@ -275,6 +291,16 @@ export interface Api {
   autopilotStop(a: { project: string; work: string }): void;
   archive(a: { project: string; work: string; memory: string; removeWorktree: boolean }): void;
   unarchive(a: { project: string; work: string }): void;
+  /** What Claude Code, Codex and ZCode already hold for a repository folder. */
+  importScan(a: { path: string }): ImportFound;
+  /** Import chosen Claude memory files (by file name) and existing branches (each becomes an
+   *  item starting at 开发实现) into a project. */
+  importApply(a: {
+    project: string;
+    path: string;
+    memories: string[];
+    branches: { branch: string; path: string }[];
+  }): { notes: number; items: string[] };
   /** System folder chooser; a folder inside a git repo resolves to its root. null = cancelled. */
   pickFolder(a: { prompt: string }): string | null;
   /** Delete an item that never ran (no attempts, no worktree). */

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { FolderOpen, Plus } from "lucide-react";
-import type { Template } from "../api/types";
+import type { ImportFound, Template } from "../api/types";
 import { api } from "../api/client";
 import { useStudio } from "../state/store";
 import { Button, Field, Modal, Segmented } from "./ui";
@@ -93,30 +93,69 @@ export function NewWorkDialog({ onClose }: { onClose(): void }) {
 }
 
 export function NewProjectDialog({ onClose }: { onClose(): void }) {
-  const { act } = useStudio();
+  const { act, notify } = useStudio();
   const [name, setName] = useState("");
   const [repos, setRepos] = useState("");
   const [busy, setBusy] = useState(false);
+  const [found, setFound] = useState<Record<string, ImportFound>>({});
+  const [memories, setMemories] = useState<Record<string, Set<string>>>({});
+  const [branches, setBranches] = useState<Record<string, Set<string>>>({});
+  const list = repos
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  /** Look at what the coding agents already have for a folder; all memory files start selected. */
+  const scan = async (path: string) => {
+    if (!path || found[path]) return;
+    try {
+      const f = await api.importScan({ path });
+      setFound((m) => ({ ...m, [path]: f }));
+      setMemories((m) => ({ ...m, [path]: new Set(f.memories.map((x) => x.file)) }));
+      setBranches((m) => ({ ...m, [path]: new Set() }));
+    } catch {
+      // Not a repository (yet): creating the project reports it.
+    }
+  };
   const pick = async () => {
     const path = await act(() => api.pickFolder({ prompt: "选择项目的 git 仓库文件夹" }));
     if (!path) return;
     setRepos((r) => (r.split("\n").map((x) => x.trim()).includes(path) ? r : r.trim() ? `${r.trim()}\n${path}` : path));
     if (!name.trim()) setName(path.split("/").pop() ?? "");
+    void scan(path);
   };
   const create = async () => {
     setBusy(true);
-    const list = repos
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const ok = await act(() => api.createProject({ name: name.trim(), repositories: list }), "项目已创建");
+    const pid = await act(() => api.createProject({ name: name.trim(), repositories: list }), "项目已创建");
+    if (pid !== undefined) {
+      let notes = 0;
+      let items = 0;
+      for (const path of list) {
+        const f = found[path];
+        if (!f) continue;
+        const chosen = {
+          memories: [...(memories[path] ?? [])],
+          branches: f.worktrees
+            .filter((w) => w.branch && branches[path]?.has(w.path))
+            .map((w) => ({ branch: w.branch!, path: w.path })),
+        };
+        if (chosen.memories.length === 0 && chosen.branches.length === 0) continue;
+        const r = await act(() => api.importApply({ project: pid, path, ...chosen }));
+        if (r) {
+          notes += r.notes;
+          items += r.items.length;
+        }
+      }
+      if (notes || items) notify(`已导入 ${notes} 条记忆、${items} 个事项`, "info");
+      onClose();
+    }
     setBusy(false);
-    if (ok !== undefined) onClose();
   };
   return (
     <Modal
       title="新建项目"
       onClose={onClose}
+      width={620}
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>
@@ -132,11 +171,113 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
         <input className="input" autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：行情终端" aria-label="项目名称" />
       </Field>
       <Field label="仓库路径" hint="选择本地 git 仓库文件夹，或每行填一个绝对路径；之后也可以在「仓库」页添加。">
-        <textarea className="input mono" rows={3} value={repos} onChange={(e) => setRepos(e.target.value)} placeholder="/Users/you/code/app" aria-label="仓库路径" />
+        <textarea
+          className="input mono"
+          rows={3}
+          value={repos}
+          onChange={(e) => setRepos(e.target.value)}
+          onBlur={() => list.forEach((p) => void scan(p))}
+          placeholder="/Users/you/code/app"
+          aria-label="仓库路径"
+        />
         <Button variant="secondary" size="sm" icon={<FolderOpen size={13} />} onClick={pick} className="pick-folder">
           选择文件夹…
         </Button>
       </Field>
+      {list
+        .filter((p) => found[p])
+        .map((p) => (
+          <ImportSection
+            key={p}
+            found={found[p]}
+            memories={memories[p] ?? new Set()}
+            branches={branches[p] ?? new Set()}
+            setMemories={(s) => setMemories((m) => ({ ...m, [p]: s }))}
+            setBranches={(s) => setBranches((m) => ({ ...m, [p]: s }))}
+          />
+        ))}
     </Modal>
+  );
+}
+
+/** What to bring over from Claude Code / Codex / ZCode for one repository. */
+function ImportSection({
+  found,
+  memories,
+  branches,
+  setMemories,
+  setBranches,
+}: {
+  found: ImportFound;
+  memories: Set<string>;
+  branches: Set<string>;
+  setMemories(s: Set<string>): void;
+  setBranches(s: Set<string>): void;
+}) {
+  const toggle = (set: Set<string>, key: string, apply: (s: Set<string>) => void) => {
+    const next = new Set(set);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    apply(next);
+  };
+  const all = found.memories.length > 0 && memories.size === found.memories.length;
+  const repoName = found.repository.split("/").pop();
+  const nothing = found.memories.length === 0 && found.worktrees.length === 0;
+  return (
+    <section className="import" data-testid="import">
+      <div className="import-head">
+        <span className="field-label">从 Claude / Codex / ZCode 导入 · {repoName}</span>
+      </div>
+      {nothing && <p className="field-hint">没有找到可导入的记忆或分支。</p>}
+      {found.memories.length > 0 && (
+        <div className="import-group">
+          <label className="check">
+            <input type="checkbox" checked={all} onChange={() => setMemories(all ? new Set() : new Set(found.memories.map((m) => m.file)))} />
+            <span>
+              Claude 记忆 {memories.size}/{found.memories.length} 条 → 项目记忆（各阶段 Agent 都会读到）
+            </span>
+          </label>
+          <ul className="import-list">
+            {found.memories.map((m) => (
+              <li key={m.file}>
+                <label className="check">
+                  <input type="checkbox" checked={memories.has(m.file)} onChange={() => toggle(memories, m.file, setMemories)} />
+                  <span>
+                    <b>{m.title}</b>
+                    {m.description && <span className="muted"> · {m.description}</span>}
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {found.worktrees.length > 0 && (
+        <div className="import-group">
+          <span className="import-sub">已有工作区分支 → 新事项（从「开发实现」继续，原工作区不动）</span>
+          <ul className="import-list">
+            {found.worktrees.map((w) => (
+              <li key={w.path}>
+                <label className={`check${w.branch ? "" : " disabled"}`}>
+                  <input type="checkbox" disabled={!w.branch} checked={branches.has(w.path)} onChange={() => toggle(branches, w.path, setBranches)} />
+                  <span>
+                    <code>{w.branch ?? "（分离 HEAD）"}</code>
+                    <span className="muted">
+                      {" "}
+                      · {w.source} · 领先 {w.ahead} 个提交
+                      {w.dirty > 0 && ` · ${w.dirty} 个未提交改动留在原工作区`}
+                    </span>
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <p className="field-hint">
+        {found.rules.length > 0 && <>{found.rules.join("、")} 已在仓库中，Agent 会直接读取。</>}
+        会话记录：Claude {found.claude_sessions} · Codex {found.codex_sessions} · ZCode {found.zcode_tasks}（只统计，不导入）。
+      </p>
+    </section>
   );
 }

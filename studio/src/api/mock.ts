@@ -3,6 +3,7 @@
 // reveals one more transcript entry every `stepMs`, then finishes with its
 // scripted outcome. Mutations update this state so every flow is clickable.
 import type {
+  ImportFound,
   Api,
   AttemptSummary,
   AttemptView,
@@ -390,6 +391,7 @@ class MockStore implements Api {
     this.projects.push({ id, name: name.trim(), repositories: repositories.filter(Boolean) });
     this.memoryNotes.set(id, []);
     this.active = id;
+    return id;
   }
 
   addRepository({ project, path }: { project: string; path: string }) {
@@ -586,6 +588,35 @@ class MockStore implements Api {
       d.worktrees = [];
       d.branches = d.branches.filter((b) => !b.merged);
     }
+  }
+
+  importScan({ path }: { path: string }): ImportFound {
+    const repository = path.trim().replace(/\/$/, "");
+    if (!repository.startsWith("/")) throw new Error("不是 Git 仓库");
+    return {
+      repository,
+      memories: [
+        { file: "money-in-cents.md", title: "money-in-cents", description: "金额统一用分存储", chars: 120 },
+        { file: "release-flow.md", title: "release-flow", description: "发版前先跑回归和打包", chars: 340 },
+        { file: "android-build.md", title: "android-build", description: "Android 构建需要 JDK 17", chars: 210 },
+      ],
+      rules: ["CLAUDE.md", "AGENTS.md"],
+      claude_sessions: 19,
+      codex_sessions: 3,
+      zcode_tasks: 38,
+      worktrees: [
+        { path: `${HOME}/.zcode/worktrees/8ab3/app`, branch: "chore/code-structure-review", ahead: 4, dirty: 0, source: "ZCode" },
+        { path: `${repository}/.claude/worktrees/fix1448`, branch: "fix/1448", ahead: 2, dirty: 3, source: "Claude" },
+        { path: "/tmp/pr1932wt", branch: null, ahead: 0, dirty: 0, source: "Git" },
+      ],
+    };
+  }
+
+  importApply(a: { project: string; path: string; memories: string[]; branches: { branch: string; path: string }[] }) {
+    if (!this.projects.some((p) => p.id === a.project)) throw new Error("项目不存在");
+    for (const m of a.memories) this.addMemory({ project: a.project, text: `【导入自 Claude 记忆：${m.replace(/\.md$/, "")}】` });
+    const items = a.branches.map((b) => this.createWork({ project: a.project, name: b.branch, template: "Software", release: false, repositories: [a.path] }));
+    return { notes: a.memories.length, items };
   }
 
   pickFolder(_: { prompt: string }): string | null {

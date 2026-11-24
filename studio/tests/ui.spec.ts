@@ -225,5 +225,17 @@ test("a new project's repository can be picked from a folder", async ({ page }) 
   await page.getByRole("button", { name: "选择文件夹…" }).click();
   await expect(page.getByLabel("仓库路径")).toHaveValue(/\/code\/picked-1$/);
   await expect(page.getByLabel("项目名称")).toHaveValue("picked-1");
+
+  // What the coding agents already know about the folder can be imported.
+  const imp = page.getByTestId("import");
+  await expect(imp).toContainText("Claude 记忆 3/3 条");
+  await expect(imp).toContainText("会话记录：Claude 19 · Codex 3 · ZCode 38");
+  await imp.getByText("android-build").click(); // deselect one memory
+  await expect(imp).toContainText("Claude 记忆 2/3 条");
+  await imp.getByText("fix/1448").click(); // import one branch as an item
+  await expect(imp.getByRole("checkbox").last()).toBeDisabled(); // detached HEAD
   await shot(page, "20-new-project-folder");
+  await page.getByRole("button", { name: "创建项目" }).click();
+  await expect(page.locator(".toast", { hasText: "已导入" })).toContainText("已导入 2 条记忆、1 个事项");
+  await expect(page.getByRole("navigation", { name: "事项" }).getByText("fix/1448")).toBeVisible();
 });

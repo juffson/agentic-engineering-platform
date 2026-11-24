@@ -172,6 +172,29 @@ fn pickFolder(prompt: String) -> Result<impl Serialize, String> {
 }
 
 #[tauri::command(async)]
+fn importScan(path: String) -> Result<impl Serialize, String> {
+    api::import_scan(&path).map_err(|e| format!("{e:#}"))
+}
+
+#[derive(serde::Deserialize)]
+struct ImportBranch {
+    branch: String,
+    path: String,
+}
+
+#[tauri::command(async)]
+fn importApply(
+    project: String,
+    path: String,
+    memories: Vec<String>,
+    branches: Vec<ImportBranch>,
+) -> Result<impl Serialize, String> {
+    let branches: Vec<(String, String)> =
+        branches.into_iter().map(|b| (b.branch, b.path)).collect();
+    run(move |h| api::import_apply(&h, &project, &path, &memories, &branches))
+}
+
+#[tauri::command(async)]
 fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
     run(move |h| api::cleanup(&h, &project, &work, force))
 }
@@ -276,6 +299,8 @@ pub fn start() {
             archive,
             unarchive,
             cleanup,
+            importScan,
+            importApply,
             pickFolder,
             deleteWork,
             zcodeOpen,

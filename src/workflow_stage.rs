@@ -69,17 +69,29 @@ fn workspace(
     let branch = format!("aep-stage/{checkout}");
     if !path.exists() {
         fs::create_dir_all(path.parent().unwrap())?;
-        git(
-            &repo.root,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch,
-                path.to_str().context("invalid workspace path")?,
-                pinned.unwrap_or("HEAD"),
-            ],
-        )?;
+        let target = path.to_str().context("invalid workspace path")?;
+        // An item imported from an existing branch already has its branch; check it out.
+        let prepared = pinned.is_none()
+            && git(
+                &repo.root,
+                &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+            )
+            .is_ok();
+        if prepared {
+            git(&repo.root, &["worktree", "add", target, &branch])?;
+        } else {
+            git(
+                &repo.root,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch,
+                    target,
+                    pinned.unwrap_or("HEAD"),
+                ],
+            )?;
+        }
     }
     ensure!(
         git(&path, &["branch", "--show-current"])?.trim() == branch,
