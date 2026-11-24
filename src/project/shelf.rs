@@ -33,15 +33,9 @@ impl Work {
             let Ok(ws) = Workspace::open(repo) else {
                 continue;
             };
-            let Ok(entries) = fs::read_dir(ws.data.join("workflow-worktrees")) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if (name == self.id || name.starts_with(&format!("{}-", self.id)))
-                    && entry.path().is_dir()
-                {
-                    found.push(entry.path());
+            for (name, path) in super::branches::stage_worktrees(&ws.root) {
+                if name == self.id || name.starts_with(&format!("{}-", self.id)) {
+                    found.push(path);
                 }
             }
         }

@@ -467,6 +467,7 @@ select.input {
 .modal-body {
   padding: 4px 20px 8px;
   overflow: auto;
+  min-height: 0;
 }
 .modal-foot,
 .drawer-foot {
@@ -478,6 +479,8 @@ select.input {
 }
 .overlay-drawer {
   place-items: stretch end;
+  /* One row exactly as tall as the window, so the drawer body scrolls instead of growing. */
+  grid-template-rows: 100%;
 }
 .drawer {
   width: 560px;
@@ -503,6 +506,7 @@ select.input {
 }
 .drawer-body {
   flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 4px 20px 16px;
 }

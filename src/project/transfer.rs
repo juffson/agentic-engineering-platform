@@ -59,11 +59,12 @@ impl Transfer {
             && let Some(repo) = &a.repository
             && let Some(path) = ev["workspace"].as_str()
         {
-            let root = Workspace::open(repo)?.data.join("workflow-worktrees");
+            let root = Workspace::open(repo)?.root;
             let path = Path::new(path);
-            if path.parent() == Some(root.as_path()) {
-                self.checkout = path.file_name().and_then(|s| s.to_str()).map(str::to_owned);
-            }
+            self.checkout = super::branches::stage_worktrees(&root)
+                .into_iter()
+                .find(|(_, p)| p == path)
+                .map(|(name, _)| name);
         }
         self.decision = handoff::summary(&result);
         let project_store = home.join("workflows").join(&self.project);

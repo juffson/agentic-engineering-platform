@@ -87,7 +87,8 @@ pub fn header(req: &Request) -> Result<String> {
         stage.name,
         req.template.label(),
         stage.brief,
-        clip(req.brief.trim(), 850)
+        // The person's own instructions for this run: keep them whole (the note size limit).
+        clip(req.brief.trim(), 8000)
     );
     if let Some(transfer) = &req.stage_transfer {
         text.push('\n');

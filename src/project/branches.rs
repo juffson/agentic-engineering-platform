@@ -3,7 +3,10 @@
 use crate::workspace::{Workspace, git};
 use anyhow::Result;
 use serde::Serialize;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Commit {
@@ -48,17 +51,40 @@ pub struct Graph {
     pub truncated: bool,
 }
 
-pub fn source(path: &std::path::Path) -> &'static str {
+pub fn source(path: &std::path::Path, branch: Option<&str>) -> &'static str {
     let p = path.to_string_lossy();
-    if p.contains("/.zcode/worktrees/") {
+    if branch.is_some_and(|b| b.starts_with(STAGE_PREFIX)) {
+        "AEP"
+    } else if p.contains("/.zcode/worktrees/") {
         "ZCode"
     } else if p.contains("/.claude/worktrees/") {
         "Claude"
-    } else if p.contains("/.git/aep/workflow-worktrees/") {
-        "AEP"
     } else {
         "Git"
     }
+}
+
+/// Branches of AEP stage worktrees: `aep-stage/<checkout>`.
+pub const STAGE_PREFIX: &str = "aep-stage/";
+
+/// Where new stage worktrees of a repository go: under the Studio catalog, outside `.git`
+/// (Claude Code refuses to write anywhere inside `.git`).
+pub fn worktree_home(catalog: &Path, root: &Path) -> PathBuf {
+    catalog
+        .join("worktrees")
+        .join(root.to_string_lossy().replace(['/', '\\', ':'], "-"))
+}
+
+/// The stage worktrees of a repository, wherever they live: (checkout name, path).
+pub fn stage_worktrees(root: &Path) -> Vec<(String, PathBuf)> {
+    worktrees(root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(path, branch)| {
+            let checkout = branch?.strip_prefix(STAGE_PREFIX)?.to_owned();
+            Some((checkout, path))
+        })
+        .collect()
 }
 
 /// `git status` counts for a checkout: changed tracked files, untracked files.
@@ -136,10 +162,11 @@ pub fn graph(repo: &std::path::Path, limit: usize) -> Result<Graph> {
         let ahead = counts_ab.next().and_then(|n| n.parse().ok()).unwrap_or(0);
         let behind = counts_ab.next().and_then(|n| n.parse().ok()).unwrap_or(0);
         let worktree = by_branch.get(name).map(|p| {
-            let (changed, untracked) = counts.get(*p).copied().unwrap_or_default();
+            let p: &PathBuf = p;
+            let (changed, untracked) = counts.get(p).copied().unwrap_or_default();
             Worktree {
-                path: (*p).clone(),
-                source: source(p).into(),
+                path: p.clone(),
+                source: source(p, Some(name)).into(),
                 changed,
                 untracked,
             }
