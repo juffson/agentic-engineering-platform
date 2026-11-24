@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     ffi::OsStr,
+    fs,
     io::{BufRead, BufReader, Write},
     os::unix::process::CommandExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
     time::Duration,
@@ -81,7 +82,7 @@ pub fn app_server(binary: &Path) -> Command {
             .is_ok_and(|p| p == Path::new(ZCODE_APP)))
         && std::env::var_os("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE").is_none()
     {
-        command.env("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE", BUILTIN);
+        command.env("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE", builtin());
     }
     command.arg("app-server");
     command
@@ -173,6 +174,34 @@ fn resolved_models(path: &OsStr) -> Result<Vec<Model>> {
 const BUILTIN: &str =
     "/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json";
 
+/// ZCode's provider rules. The app downloads newer rules (new models such as a plan's latest
+/// GLM) into `~/.zcode/v2/runtime/provider/<platform>/<version>/<endpoint>/`; use the highest
+/// version there, else the copy bundled with the app.
+pub fn builtin() -> PathBuf {
+    let version = |s: &str| -> Vec<u64> { s.split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    std::env::home_dir()
+        .map(|h| h.join(".zcode/v2/runtime/provider"))
+        .and_then(|root| fs::read_dir(root).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|platform| fs::read_dir(platform.path()).ok())
+        .flatten()
+        .flatten()
+        .filter_map(|ver| {
+            let v = version(&ver.file_name().to_string_lossy());
+            let file = fs::read_dir(ver.path())
+                .ok()?
+                .flatten()
+                .map(|e| e.path().join("zcode-builtin.json"))
+                .find(|f| f.is_file())?;
+            Some((v, file))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, f)| f)
+        .unwrap_or_else(|| PathBuf::from(BUILTIN))
+}
+
 pub fn desktop_plan(id: &str) -> Option<&'static str> {
     match id {
         "account:bigmodel-start-plan" => Some("BigModel Start Plan"),
@@ -188,7 +217,7 @@ fn rows<'a>(doc: &'a Value, path: &str) -> impl Iterator<Item = &'a Value> {
         .flatten()
 }
 
-fn desktop_models(local: &Value, builtin: &Value) -> Vec<Model> {
+fn desktop_models(local: &Value, builtin: &Value, bundled: Option<&Value>) -> Vec<Model> {
     let mut result = Vec::new();
     let rules: Vec<_> = rows(builtin, "/config/modelConfigRules/modelRules")
         .filter_map(|r| {
@@ -219,9 +248,19 @@ fn desktop_models(local: &Value, builtin: &Value) -> Vec<Model> {
         };
         let builtin_ids = rows(base, "/config/builtinModelIds").collect::<Vec<_>>();
         let personal = rows(provider, "/config/personalModelIds").collect::<Vec<_>>();
+        // A saved order hides the plan's models it leaves out, but it predates models the
+        // plan gained in a later rules download (absent from the app's bundled rules): list
+        // those after it.
+        let known = bundled
+            .and_then(|b| {
+                rows(b, "/config/providerConfigRules/providerRules").find(|p| p["providerId"] == id)
+            })
+            .map(|b| rows(b, "/config/builtinModelIds").collect::<Vec<_>>());
         let mut order = rows(provider, "/config/modelOrder").collect::<Vec<_>>();
         if order.is_empty() {
             order.extend(builtin_ids.iter().copied());
+        } else if let Some(known) = &known {
+            order.extend(builtin_ids.iter().copied().filter(|m| !known.contains(m)));
         }
         order.extend(personal.iter().copied());
         let mut seen = std::collections::HashSet::new();
@@ -268,15 +307,20 @@ pub fn discover(path: &OsStr) -> Result<Vec<Model>> {
     let cli = resolved_models(path);
     let Some(config) = std::env::home_dir()
         .map(|h| h.join(".zcode/v2/provider_config.json"))
-        .filter(|p| p.is_file() && Path::new(BUILTIN).is_file())
+        .filter(|p| p.is_file() && builtin().is_file())
     else {
         let models = cli?;
         ensure!(!models.is_empty(), "ZCode 未配置可用模型");
         return Ok(models);
     };
+    let rules = builtin();
+    let bundled = (rules != Path::new(BUILTIN))
+        .then(|| crate::workspace::read(Path::new(BUILTIN)).ok())
+        .flatten();
     let desktop = desktop_models(
         &crate::workspace::read(&config)?,
-        &crate::workspace::read(Path::new(BUILTIN))?,
+        &crate::workspace::read(&rules)?,
+        bundled.as_ref(),
     );
     let mut models = if desktop.is_empty() {
         cli?
@@ -329,11 +373,32 @@ mod tests {
           ]},
           "modelConfigRules":{"modelRules":[{"modelMatch":"^FLASH$","config":{"optionSpecs":{"reasoningLevel":{"values":["low","max"]}}}}]}
         }});
-        let models = desktop_models(&local, &builtin);
+        let models = desktop_models(&local, &builtin, None);
         assert_eq!(models.len(), 3);
         assert_eq!(models[0].default_selection(), format!("{start}/flash"));
         assert!(!models[0].accepts(&format!("{start}/flash@max")));
         assert!(models[1].accepts(&format!("{individual}/flash")));
         assert!(models[2].accepts(&format!("{individual}/extra")));
+    }
+
+    #[test]
+    fn a_model_added_by_a_rules_download_shows_after_the_saved_order() {
+        let plan = "account:bigmodel-individual-coding-plan";
+        let local = json!({"config":{"providerConfigRules":{"providerRules":[
+            {"providerId":plan,"config":{"modelOrder":["glm-5.3"]}}
+        ]}}});
+        let rules = |ids: serde_json::Value| {
+            json!({"config":{"providerConfigRules":{"providerRules":[
+                {"providerId":plan,"config":{"builtinModelIds":ids}}
+            ]}}})
+        };
+        // glm-5.2 was in the bundled rules but left out of the order: still hidden.
+        let bundled = rules(json!(["glm-5.3", "glm-5.2"]));
+        let downloaded = rules(json!(["glm-5.4", "glm-5.3", "glm-5.2"]));
+        let names: Vec<String> = desktop_models(&local, &downloaded, Some(&bundled))
+            .into_iter()
+            .map(|m| m.label)
+            .collect();
+        assert_eq!(names, ["glm-5.3", "glm-5.4"]);
     }
 }
