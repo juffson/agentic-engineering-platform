@@ -90,6 +90,8 @@ enum Action {
         #[arg(long)]
         release: bool,
     },
+    /// Delete the selected item; only allowed when nothing has run for it yet.
+    RemoveWork,
     /// Send or update a short handoff to another item in this project.
     Handoff {
         #[arg(long)]
@@ -770,6 +772,12 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             };
             c.edit_project(|p| p.add_work(&name, kind, template))?;
             print(&json!({"project":c.project()?.id,"work":c.project()?.selected}))
+        }
+        Action::RemoveWork => {
+            let wid = c.work()?.id.clone();
+            let home = c.dir.clone();
+            c.edit_project(|p| p.remove_work(&home, &wid))?;
+            print(&json!({"project":c.project()?.id,"removed":wid}))
         }
         Action::Handoff { to, note } => {
             let source = c.work()?.id.clone();
