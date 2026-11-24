@@ -17,6 +17,7 @@ fn row(db: &Connection, dir: &Path, repo: &Path) -> Result<Value> {
     let source = optional(dir, "desktop-source-project.json")?;
     let cleaned = optional(dir, "desktop-cleanup.json")?;
     let legacy = optional(dir, "session.json")?;
+    let actual = aep::zcode_receipt::ActualModel::from_receipt(&legacy);
     let task = optional(dir, "desktop-task.json")?;
     let session = task["session"]
         .as_str()
@@ -95,7 +96,7 @@ fn row(db: &Connection, dir: &Path, repo: &Path) -> Result<Value> {
         .filter(|s| !s.trim().is_empty());
     Ok(
         json!({"dir":dir,"run":run.file_name().and_then(|n|n.to_str()),"role":role,"session":session,
-        "title":title,"workspace":workspace,"isolated":isolated,"workspace_exists":Path::new(workspace).is_dir(),
+        "title":title,"workspace":workspace,"isolated":isolated,"workspace_exists":Path::new(workspace).is_dir(),"actual_model":actual,
         "project":current.as_ref().map(|c|&c.0),"project_name":current.as_ref().map(|c|&c.1),
         "grouped":current.as_ref().is_some_and(|c|Some(&c.0)==target.as_ref()),
         "cleanup":cleanup,"source_project":source_id,"cleaned":confirmed_cleanup,
@@ -178,6 +179,7 @@ mod tests {
             &json!({"project":"source","created":true}),
         )?;
         let original = row(&db, dir, repo)?;
+        assert_eq!(original.get("actual_model"), Some(&Value::Null));
         assert_eq!(original["grouped"], false);
         assert_eq!(original["can_open"], true);
         assert_eq!(original["project_name"], "aep-work-x");
@@ -185,7 +187,15 @@ mod tests {
             "UPDATE tasks SET project_id='target' WHERE task_id='task'",
             [],
         )?;
+        save_json(
+            dir,
+            "session.json",
+            &json!({"session":"task","workspace":path,"transport":"desktop",
+            "providerId":"account:bigmodel-start-plan","modelId":"glm","reasoningLevel":"high"}),
+        )?;
         let grouped = row(&db, dir, repo)?;
+        assert_eq!(grouped["actual_model"]["plan"], "BigModel Start Plan");
+        assert_eq!(grouped["actual_model"]["modelId"], "glm");
         assert_eq!(grouped["grouped"], true);
         assert_eq!(grouped["workspace"], path);
         assert_eq!(grouped["cleanup"], "保留原项目 · 1 条任务记录");

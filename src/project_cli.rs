@@ -456,7 +456,8 @@ fn view(work: &Work, project: &Project, dir: &Path) -> Result<Value> {
     for a in &work.attempts {
         let d = workflow::attempt_dir(dir, &project.id, &work.id, &a.id);
         let e = workflow::evidence(&d)?;
-        attempts.push(json!({"id":a.id,"stage":a.stage+1,"status":e["status"],"session":e["session"],"client":a.profile.client,"model":a.profile.model,"error":e["error"]}));
+        let actual = aep::zcode_receipt::read(&d).ok().flatten();
+        attempts.push(json!({"id":a.id,"stage":a.stage+1,"status":e["status"],"session":e["session"],"client":a.profile.client,"model":a.profile.model,"actual_model":actual,"error":e["error"]}));
     }
     Ok(
         json!({"project":project.id,"work":work.id,"name":work.name,"template":work.template,"stage_name":work.stage_name(),"stage":(work.stage<work.notes.len()).then_some(work.stage+1),"repositories":work.repositories,"records":work.records,"https":https,"handoffs":work.handoffs,"stage_transfers":work.stage_transfers,"deliveries":work.deliveries,"stages":work.template.stages().iter().enumerate().map(|(i,s)|json!({"stage":i+1,"name":s.name,"profile":work.profile(i),"attempt":work.current_attempt.get(&i)})).collect::<Vec<_>>(),"attempts":attempts}),
@@ -559,7 +560,7 @@ impl Catalog {
     }
     fn show(&self, id: &str, part: &str, artifact: Option<PathBuf>) -> Result<()> {
         let dir = self.attempt(id)?;
-        let ev = workflow::evidence(&dir)?;
+        let mut ev = workflow::evidence(&dir)?;
         let path = if let Some(file) = artifact {
             ensure!(
                 ev["artifacts"]
@@ -570,7 +571,10 @@ impl Catalog {
             dir.join("submission/files").join(file)
         } else {
             match part {
-                "receipt" => return print(&ev),
+                "receipt" => {
+                    ev["actual_model"] = json!(aep::zcode_receipt::read(&dir).ok().flatten());
+                    return print(&ev);
+                }
                 "files" => return print(&json!({"directory":dir,"submitted":ev["artifacts"]})),
                 "result" => dir.join("result.txt"),
                 "request" => dir.join("request.json"),

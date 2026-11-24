@@ -2,8 +2,9 @@ use crate::{agent::logged, run::save};
 use aep::{
     cancel::Cancellation,
     memory::{Key, Memory, TEXT_LIMIT},
-    workflow::{Client, Request, Role, Sandbox, Stage, tail},
+    workflow::{Client, Profile, Request, Role, Sandbox, Stage, tail},
     workspace::{Workspace, git},
+    zcode_receipt::ActualModel,
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -13,6 +14,23 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
+
+fn handoff_author(profile: &Profile, actual: Option<&ActualModel>) -> String {
+    if profile.client == Client::ZCode
+        && let Some(actual) = actual
+    {
+        return actual.author();
+    }
+    format!(
+        "{} / {}",
+        profile.client.label(),
+        if profile.model.is_empty() {
+            "客户端默认"
+        } else {
+            &profile.model
+        }
+    )
+}
 
 fn workspace(
     work: &Path,
@@ -505,19 +523,7 @@ fn invoke(
     save(dir, record)?;
     let profile = &req.profile;
     let bin = profile.program(&std::env::var_os("PATH").unwrap_or_default())?;
-    let bundled_zcode = bin == Path::new(aep::workflow::ZCODE_APP)
-        || (profile.client == Client::ZCode
-            && bin
-                .canonicalize()
-                .is_ok_and(|p| p == Path::new(aep::workflow::ZCODE_APP)));
-    let bridge = profile.client == Client::ZCode && (bundled_zcode || !profile.model.is_empty());
     let mut args = vec![bin.display().to_string()];
-    if bin == Path::new(aep::workflow::ZCODE_APP)
-        && std::env::var_os("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE").is_none()
-    {
-        args.insert(0,"ZCODE_BUILTIN_PROVIDER_CONFIG_FILE=/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json".into());
-        args.insert(0, "/usr/bin/env".into());
-    }
     let result_path = dir.join("result.txt");
     match profile.client {
         Client::Codex => {
@@ -579,7 +585,7 @@ fn invoke(
                 args.extend(["--allowedTools".into(), "Bash".into()]);
             }
         }
-        Client::ZCode if bridge => {
+        Client::ZCode => {
             args = vec![
                 std::env::current_exe()?.display().to_string(),
                 "zcode-stage".into(),
@@ -589,23 +595,6 @@ fn invoke(
                 dir.join("request.json").display().to_string(),
             ];
         }
-        Client::ZCode => args.extend(
-            [
-                "--mode",
-                if write {
-                    "edit"
-                } else if gate {
-                    "guarded"
-                } else {
-                    "plan"
-                },
-                "--no-color",
-                "--prompt",
-                "完成附件中的 AEP 阶段任务。",
-                "--attach",
-            ]
-            .map(String::from),
-        ),
         Client::Custom => {}
     }
     if !profile.check_command.is_empty() {
@@ -627,9 +616,6 @@ fn invoke(
     if profile.client == Client::Codex {
         args.push("-".into());
     }
-    if profile.client == Client::ZCode && !bridge {
-        args.push(dir.join("prompt.txt").display().to_string());
-    }
     let stdout = dir.join("stdout.log");
     let stderr = dir.join("stderr.log");
     let before = snapshot(&cwd);
@@ -649,10 +635,24 @@ fn invoke(
     }
     // Codex and Claude now keep their sessions on disk, so this run can be continued.
     record["resumable"] = json!(matches!(profile.client, Client::Codex | Client::Claude));
-    if dir.join("session.json").is_file() {
-        let native = aep::workspace::read(&dir.join("session.json"))?;
-        record["native_session"] = native;
-    }
+    let actual = if profile.client == Client::ZCode {
+        match aep::workspace::read(&dir.join("session.json")) {
+            Ok(native) => {
+                let actual = ActualModel::from_receipt(&native);
+                record["native_session"] = native;
+                actual
+            }
+            Err(error) => {
+                if dir.join("session.json").exists() {
+                    eprintln!("实际模型回执无法读取：{error:#}");
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    record["actual_model"] = json!(actual);
     if profile.client == Client::Codex {
         record["commands"] = json!(command_receipts(&stdout)?);
         for line in BufReader::new(fs::File::open(&stdout)?).lines().take(20) {
@@ -730,15 +730,7 @@ fn invoke(
     }
     let _lock = stop.lock()?;
     stop.check()?;
-    let author = format!(
-        "{} / {}",
-        profile.client.label(),
-        if profile.model.is_empty() {
-            "客户端默认"
-        } else {
-            &profile.model
-        }
-    );
+    let author = handoff_author(profile, actual.as_ref());
     pin_worktree(req, stage, &cwd, id, record)?;
     let mut memory = Memory::open(work.parent().context("missing project directory")?)?;
     let summary = format!(
@@ -852,7 +844,7 @@ pub fn execute(request: &Path) -> Result<()> {
         !dir.join("evidence.json").exists(),
         "此执行已有记录，请新建重试"
     );
-    let mut record = json!({"request":"request.json","run_id":id,"status":"running","stage":stage.name,"profile":req.profile,"started_at":chrono::Utc::now().to_rfc3339()});
+    let mut record = json!({"request":"request.json","run_id":id,"status":"running","stage":stage.name,"profile":req.profile,"actual_model":null,"started_at":chrono::Utc::now().to_rfc3339()});
     save(dir, &record)?;
     let result = lock(work.join("workflow.lock"))
         .map_err(anyhow::Error::from)
@@ -912,4 +904,33 @@ pub(crate) fn metrics(dir: &Path) -> Result<Value> {
     Ok(
         json!({"attempt":e["run_id"],"stage":e["stage"],"client":profile["client"],"status":e["status"],"mode":e["mode"].as_str().unwrap_or("managed"),"elapsed_ms":elapsed,"prompt_bytes":dir.join("prompt.txt").metadata().ok().map(|m|m.len()),"provider_usage":(!usage.is_empty()).then_some(usage)}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zcode_handoff_author_uses_the_receipt_not_the_selected_model() {
+        let mut profile = Profile {
+            client: Client::ZCode,
+            model: "selected/glm".into(),
+            executable: String::new(),
+            check_command: String::new(),
+        };
+        let actual = ActualModel::from_receipt(&json!({
+            "transport":"desktop","providerId":"account:bigmodel-start-plan","modelId":"glm"
+        }))
+        .unwrap();
+        assert_eq!(
+            handoff_author(&profile, Some(&actual)),
+            "ZCode / BigModel Start Plan / glm@默认"
+        );
+        assert_eq!(handoff_author(&profile, None), "ZCode / selected/glm");
+        profile.client = Client::Claude;
+        assert_eq!(
+            handoff_author(&profile, Some(&actual)),
+            "Claude / selected/glm"
+        );
+    }
 }

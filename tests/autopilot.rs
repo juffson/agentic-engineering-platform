@@ -377,7 +377,10 @@ fn a_delivery_sent_back_rechecks_and_still_seals() -> Result<()> {
     let ev: serde_json::Value = serde_json::from_slice(&fs::read(
         aep::workflow::attempt_dir(&home, &pid, &wid, &delivery.run).join("evidence.json"),
     )?)?;
-    assert!(ev["follow_up"].is_object(), "delivery re-checked in its session: {ev}");
+    assert!(
+        ev["follow_up"].is_object(),
+        "delivery re-checked in its session: {ev}"
+    );
     assert_eq!(ev["source_evidence"]["run"], accepted.run.as_str(), "{ev}");
     Ok(())
 }

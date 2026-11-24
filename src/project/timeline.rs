@@ -4,6 +4,7 @@ use crate::{
     memory::Memory,
     workflow,
     workspace::{Workspace, ident, read},
+    zcode_receipt::{self, ActualModel},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,10 @@ pub struct Agent {
     pub role: String,
     pub client: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub actual_model: Option<ActualModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_model_error: Option<String>,
     #[serde(rename = "stage_index")]
     pub stage: Option<usize>,
     pub session: Option<String>,
@@ -104,8 +109,18 @@ fn optional(path: PathBuf) -> Result<Value> {
     }
 }
 
-fn session(dir: &Path) -> Result<Option<String>> {
-    let saved = optional(dir.join("session.json"))?;
+struct Receipt {
+    desktop_dir: Option<PathBuf>,
+    session: Option<String>,
+    actual_model: Option<ActualModel>,
+    actual_model_error: Option<String>,
+}
+
+fn receipt(dir: &Path) -> Result<Receipt> {
+    let (saved, actual_model_error) = match zcode_receipt::read_value(dir) {
+        Ok(value) => (value.unwrap_or(Value::Null), None),
+        Err(_) => (Value::Null, Some("实际模型回执无法读取".into())),
+    };
     let created = optional(dir.join("desktop-create.json"))?;
     let native = created["session"]["sessionId"].as_str();
     let completed = saved["session"]
@@ -117,7 +132,19 @@ fn session(dir: &Path) -> Result<Option<String>> {
         ),
         "桌面会话回执不一致"
     );
-    Ok(native.or(completed).map(str::to_owned))
+    let desktop_session = native.or(completed);
+    Ok(Receipt {
+        desktop_dir: desktop_session.map(|_| dir.to_owned()),
+        session: desktop_session
+            .or_else(|| {
+                (saved["transport"] == "app-server")
+                    .then(|| saved["session"].as_str())
+                    .flatten()
+            })
+            .map(str::to_owned),
+        actual_model: ActualModel::from_receipt(&saved),
+        actual_model_error,
+    })
 }
 
 /// A relay attempt ID is generated from its relay, round and attempt number. Require membership in the manifest as well.
@@ -168,8 +195,7 @@ fn repository_run(
         ("reviewer", "审查", "reviewer", "zcode-plan"),
     ] {
         let path = dir.join(folder);
-        let desktop_session = session(&path)?;
-        let desktop_dir = desktop_session.as_ref().map(|_| path);
+        let receipt = receipt(&path)?;
         let client = text(&ev, client);
         let request = &ev["request"];
         let model = match (role, client) {
@@ -182,7 +208,8 @@ fn repository_run(
         .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-        let session = desktop_session
+        let session = receipt
+            .session
             .or_else(|| ev["sessions"][role].as_str().map(str::to_owned))
             .or_else(|| {
                 if client == "codex" && role == "implementer" {
@@ -207,12 +234,14 @@ fn repository_run(
             role: name.into(),
             client: client.into(),
             model,
+            actual_model: receipt.actual_model,
+            actual_model_error: receipt.actual_model_error,
             stage: session
                 .as_ref()
                 .and_then(|id| link.session_stages.get(id))
                 .copied()
                 .or(link.stage),
-            desktop_dir,
+            desktop_dir: receipt.desktop_dir,
             session,
             reads: notes(db, "仓库", &ev["memory_inputs"][role])?,
             writes: notes(db, "仓库", &ev["memory_outputs"][role])?,
@@ -335,15 +364,19 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
                     replaces: None,
                 });
             }
-            let session = session(&dir)?;
+            let receipt = receipt(&dir)?;
             let stage = work.template.stages().get(a.stage).context("阶段不存在")?;
             let agent = Agent {
                 role: stage.name.into(),
                 client: a.profile.client.label().into(),
                 model: (!a.profile.model.is_empty()).then(|| a.profile.model.clone()),
+                actual_model: receipt.actual_model,
+                actual_model_error: receipt.actual_model_error,
                 stage: Some(a.stage),
-                desktop_dir: session.as_ref().map(|_| dir.clone()),
-                session: session.or_else(|| ev["session"].as_str().map(str::to_string)),
+                desktop_dir: receipt.desktop_dir,
+                session: receipt
+                    .session
+                    .or_else(|| ev["session"].as_str().map(str::to_owned)),
                 reads,
                 writes: notes(project_db.as_ref(), "项目", &ev["written_memory"])?,
                 handoff: crate::handoff::summary(&workflow::tail(&dir.join("result.txt"), 8192)),
@@ -395,13 +428,38 @@ mod tests {
             save_json(
                 &dir,
                 "evidence.json",
-                &json!({"run_id":id,"implementation_source":"zcode","reviewer":"claude","status":"complete","memory_inputs":{"implementer":[5]}}),
+                &json!({"run_id":id,"implementation_source":"zcode","reviewer":"zcode","status":"complete","memory_inputs":{"implementer":[5]}}),
             )?;
-            save_json(
-                &dir.join("zcode-edit"),
-                "session.json",
-                &json!({"session":id,"transport":"desktop"}),
-            )?;
+            if id == "relay-test-r1-1" {
+                save_json(
+                    &dir.join("zcode-edit"),
+                    "session.json",
+                    &json!({"session":id,"transport":"desktop"}),
+                )?;
+            } else if id == "relay-test-r1-2" {
+                fs::write(dir.join("zcode-edit/session.json"), "{")?;
+            } else if id == "relay-test-r2-3" {
+                for (folder, transport, provider) in [
+                    ("zcode-edit", "desktop", "account:bigmodel-start-plan"),
+                    (
+                        "zcode-plan",
+                        "app-server",
+                        "account:bigmodel-individual-coding-plan",
+                    ),
+                ] {
+                    let path = dir.join(folder);
+                    fs::create_dir_all(&path)?;
+                    save_json(
+                        &path,
+                        "session.json",
+                        &json!({
+                            "session":if folder == "zcode-edit" { id } else { "review-session" },
+                            "transport":transport,"providerId":provider,
+                            "modelId":"glm","turn":"turn"
+                        }),
+                    )?;
+                }
+            }
         }
         save_json(
             &archive,
@@ -448,6 +506,28 @@ mod tests {
         assert_eq!(timeline.rounds[2].agents[0].stage, Some(3));
         assert_eq!(timeline.rounds[2].agents[1].stage, Some(2));
         assert_eq!(timeline.rounds[2].agents[0].reads[0].id, 5);
+        let old = &timeline.rounds[0].agents[0];
+        assert_eq!(
+            serde_json::to_value(old)?.get("actual_model"),
+            Some(&Value::Null)
+        );
+        assert!(old.actual_model_error.is_none());
+        let corrupt = &timeline.rounds[1].agents[0];
+        assert!(corrupt.actual_model.is_none());
+        assert_eq!(
+            corrupt.actual_model_error.as_deref(),
+            Some("实际模型回执无法读取")
+        );
+        let agents = &timeline.rounds[2].agents;
+        assert_eq!(
+            agents[0].actual_model.as_ref().unwrap().plan,
+            "BigModel Start Plan"
+        );
+        assert_eq!(
+            agents[1].actual_model.as_ref().unwrap().plan,
+            "BigModel 个人 Coding Plan"
+        );
+        assert!(agents[1].desktop_dir.is_none());
         assert!(load(&home, &p.id, &p.work[1])?.rounds.is_empty());
         assert!(RecordKind::Run.verify(&ws, "relay-test-r1-1").is_err());
         assert!(!ws.data.join("memory.sqlite3").exists());
