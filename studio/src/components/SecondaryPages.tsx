@@ -104,6 +104,10 @@ export function ReposPage({ project }: { project: ProjectSummary }) {
     setBusy(false);
     if (ok !== undefined) setPath("");
   };
+  const pick = async () => {
+    const picked = await act(() => api.pickFolder({ prompt: "选择要添加的 git 仓库文件夹" }));
+    if (picked) setPath(picked);
+  };
   return (
     <div className="page">
       <div className="page-inner">
@@ -121,6 +125,9 @@ export function ReposPage({ project }: { project: ProjectSummary }) {
               placeholder="/Users/you/code/repository"
               aria-label="仓库路径"
             />
+            <Button variant="secondary" icon={<FolderOpen size={14} />} onClick={pick}>
+              选择文件夹…
+            </Button>
             <Button variant="primary" icon={<Plus size={14} />} disabled={!path.trim()} busy={busy} onClick={add}>
               添加仓库
             </Button>

@@ -127,6 +127,7 @@ class MockStore implements Api {
   handoffInbox = new Map<string, ItemHandoff[]>();
   repoNotes = new Map<string, MemoryNote[]>();
   zcodeCalls = 0;
+  picks = 0;
 
   constructor() {
     seed(this);
@@ -585,6 +586,10 @@ class MockStore implements Api {
       d.worktrees = [];
       d.branches = d.branches.filter((b) => !b.merged);
     }
+  }
+
+  pickFolder(_: { prompt: string }): string | null {
+    return `${HOME}/code/picked-${++this.picks}`;
   }
 
   deleteWork({ project, work }: { project: string; work: string }) {

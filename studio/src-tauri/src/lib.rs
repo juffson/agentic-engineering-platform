@@ -167,6 +167,11 @@ fn deleteWork(project: String, work: String) -> Result<impl Serialize, String> {
 }
 
 #[tauri::command(async)]
+fn pickFolder(prompt: String) -> Result<impl Serialize, String> {
+    api::pick_folder(&prompt).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command(async)]
 fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
     run(move |h| api::cleanup(&h, &project, &work, force))
 }
@@ -271,6 +276,7 @@ pub fn start() {
             archive,
             unarchive,
             cleanup,
+            pickFolder,
             deleteWork,
             zcodeOpen,
             mergePreview,

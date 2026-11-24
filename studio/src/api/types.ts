@@ -275,6 +275,8 @@ export interface Api {
   autopilotStop(a: { project: string; work: string }): void;
   archive(a: { project: string; work: string; memory: string; removeWorktree: boolean }): void;
   unarchive(a: { project: string; work: string }): void;
+  /** System folder chooser; a folder inside a git repo resolves to its root. null = cancelled. */
+  pickFolder(a: { prompt: string }): string | null;
   /** Delete an item that never ran (no attempts, no worktree). */
   deleteWork(a: { project: string; work: string }): void;
   /** Bring up the ZCode desktop task an attempt dispatched (e.g. to approve a tool). */

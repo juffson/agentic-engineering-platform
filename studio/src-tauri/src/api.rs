@@ -199,6 +199,32 @@ pub fn create_project(home: &Path, name: &str, repositories: &[String]) -> Resul
     change(home, |lib| lib.create(name, repos.clone()))
 }
 
+/// Ask for a folder with the system folder chooser. A folder inside a git repository
+/// resolves to the repository root; `None` when the user cancels.
+pub fn pick_folder(prompt: &str) -> Result<Option<String>> {
+    let script = format!(
+        "POSIX path of (choose folder with prompt {})",
+        serde_json::to_string(prompt)?
+    );
+    let out = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        // -128: the user pressed Cancel.
+        ensure!(err.contains("-128"), "无法打开文件夹选择：{}", err.trim());
+        return Ok(None);
+    }
+    let picked = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .trim_end_matches('/')
+        .to_owned();
+    let root = aep::workspace::git(Path::new(&picked), &["rev-parse", "--show-toplevel"])
+        .map(|r| r.trim().to_owned())
+        .unwrap_or(picked);
+    Ok(Some(root))
+}
+
 pub fn add_repository(home: &Path, pid: &str, path: &str) -> Result<()> {
     let repo = repository(path)?;
     change(home, |lib| {

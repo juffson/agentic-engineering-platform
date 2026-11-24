@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Plus } from "lucide-react";
+import { FolderOpen, Plus } from "lucide-react";
 import type { Template } from "../api/types";
 import { api } from "../api/client";
 import { useStudio } from "../state/store";
@@ -97,6 +97,12 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
   const [name, setName] = useState("");
   const [repos, setRepos] = useState("");
   const [busy, setBusy] = useState(false);
+  const pick = async () => {
+    const path = await act(() => api.pickFolder({ prompt: "选择项目的 git 仓库文件夹" }));
+    if (!path) return;
+    setRepos((r) => (r.split("\n").map((x) => x.trim()).includes(path) ? r : r.trim() ? `${r.trim()}\n${path}` : path));
+    if (!name.trim()) setName(path.split("/").pop() ?? "");
+  };
   const create = async () => {
     setBusy(true);
     const list = repos
@@ -125,8 +131,11 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
       <Field label="项目名称">
         <input className="input" autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：行情终端" aria-label="项目名称" />
       </Field>
-      <Field label="仓库路径" hint="每行一个本地 git 仓库的绝对路径，之后也可以在「仓库」页添加。">
+      <Field label="仓库路径" hint="选择本地 git 仓库文件夹，或每行填一个绝对路径；之后也可以在「仓库」页添加。">
         <textarea className="input mono" rows={3} value={repos} onChange={(e) => setRepos(e.target.value)} placeholder="/Users/you/code/app" aria-label="仓库路径" />
+        <Button variant="secondary" size="sm" icon={<FolderOpen size={13} />} onClick={pick} className="pick-folder">
+          选择文件夹…
+        </Button>
       </Field>
     </Modal>
   );

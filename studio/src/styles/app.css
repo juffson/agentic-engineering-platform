@@ -2587,3 +2587,8 @@ select.input {
   align-items: center;
   gap: 4px;
 }
+
+.pick-folder {
+  margin-top: 6px;
+  align-self: flex-start;
+}

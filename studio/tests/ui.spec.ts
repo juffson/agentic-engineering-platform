@@ -216,3 +216,14 @@ test("an item that never ran can be deleted", async ({ page }) => {
   await sidebar.getByText("自选股分组支持拖拽排序").click();
   await expect(page.getByRole("button", { name: "删除事项" })).toHaveCount(0);
 });
+
+test("a new project's repository can be picked from a folder", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.goto("/");
+  await page.locator(".project-btn").click();
+  await page.getByText("新建项目").click();
+  await page.getByRole("button", { name: "选择文件夹…" }).click();
+  await expect(page.getByLabel("仓库路径")).toHaveValue(/\/code\/picked-1$/);
+  await expect(page.getByLabel("项目名称")).toHaveValue("picked-1");
+  await shot(page, "20-new-project-folder");
+});
