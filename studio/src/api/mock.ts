@@ -4,6 +4,7 @@
 // scripted outcome. Mutations update this state so every flow is clickable.
 import type {
   BranchGraph,
+  SyncPlan,
   ImportFound,
   Api,
   AttemptSummary,
@@ -660,10 +661,47 @@ class MockStore implements Api {
     };
   }
 
+  importSyncPlan({ project, path }: { project: string; path: string }): SyncPlan {
+    const imported = this.order.map((id) => this.works.get(id)!).filter((w) => w.project === project && /\//.test(w.detail.name));
+    const seen = new Set<string>();
+    const remove: SyncPlan["items_remove"] = [];
+    const keep: SyncPlan["items_keep"] = [];
+    for (const w of [...imported].reverse()) {
+      const name = w.detail.name;
+      if (seen.has(name)) remove.push({ id: w.detail.id, name, reason: "重复导入" });
+      else if (name === "fix/1448") remove.push({ id: w.detail.id, name, reason: "原工作区已删除" });
+      else keep.push({ id: w.detail.id, name, reason: "工作区仍在" });
+      seen.add(name);
+    }
+    const found = this.importScan({ path });
+    return {
+      memories_add: ["android-build.md"],
+      memories_update: ["release-flow.md"],
+      memories_unchanged: 1,
+      memories_remove: [{ id: 99, title: "old-deploy" }],
+      items_add: found.worktrees.filter((w) => w.branch && w.branch !== "fix/1448" && !seen.has(w.branch)).map((w) => ({ branch: w.branch!, path: w.path })),
+      items_keep: keep,
+      items_remove: remove,
+      items_stale: [],
+    };
+  }
+
+  importSync(a: { project: string; path: string; memories: boolean; items: boolean }): SyncPlan {
+    const plan = this.importSyncPlan(a);
+    if (a.items) {
+      for (const r of plan.items_remove) this.deleteWork({ project: a.project, work: r.id });
+      for (const b of plan.items_add) this.createWork({ project: a.project, name: b.branch, template: "Software", release: false, repositories: [a.path] });
+    }
+    return plan;
+  }
+
   importApply(a: { project: string; path: string; memories: string[]; branches: { branch: string; path: string }[] }) {
     if (!this.projects.some((p) => p.id === a.project)) throw new Error("项目不存在");
     for (const m of a.memories) this.addMemory({ project: a.project, text: `【导入自 Claude 记忆：${m.replace(/\.md$/, "")}】` });
-    const items = a.branches.map((b) => this.createWork({ project: a.project, name: b.branch, template: "Software", release: false, repositories: [a.path] }));
+    const items = a.branches.map((b) => {
+      const existing = [...this.works.values()].find((w) => w.project === a.project && w.detail.name === b.branch);
+      return existing ? existing.detail.id : this.createWork({ project: a.project, name: b.branch, template: "Software", release: false, repositories: [a.path] });
+    });
     return { notes: a.memories.length, items };
   }
 

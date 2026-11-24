@@ -1,19 +1,78 @@
 //! Bring what Claude Code, Codex and ZCode already know about a repository into a project:
 //! Claude's memory files become project memory, and existing worktree branches become items
 //! that continue from 开发实现 on their own `aep-stage/<id>` branch.
-use super::{Kind, Project};
+use super::{Kind, Project, Work};
 use crate::{
     memory::{Key, Memory, TEXT_LIMIT},
     workflow::{Role, Template},
     workspace::{Workspace, git},
 };
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
+
+/// Where an imported item came from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Imported {
+    pub branch: String,
+    pub path: PathBuf,
+}
+
+impl Work {
+    /// The branch this item was imported from (also for items imported before this was
+    /// recorded, recognised by their brief).
+    pub fn import_source(&self) -> Option<&str> {
+        if let Some(i) = &self.imported {
+            return Some(&i.branch);
+        }
+        let brief = format!("接手已有分支 `{}`", self.name);
+        self.notes
+            .iter()
+            .any(|n| n.starts_with(&brief))
+            .then_some(self.name.as_str())
+    }
+}
+
+/// What a sync would change (or did change) so that the project matches its sources.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SyncPlan {
+    /// Claude memory files with no note yet, and notes whose file changed.
+    pub memories_add: Vec<String>,
+    pub memories_update: Vec<String>,
+    pub memories_unchanged: usize,
+    /// Imported notes whose Claude file is gone: retired (kept in history, no longer read).
+    pub memories_remove: Vec<SyncNote>,
+    /// Worktree branches not imported yet.
+    pub items_add: Vec<SyncBranch>,
+    pub items_keep: Vec<SyncItem>,
+    /// Imported items that never ran whose worktree is gone, or that duplicate another.
+    pub items_remove: Vec<SyncItem>,
+    /// Imported items whose worktree is gone but which already ran: left for a person.
+    pub items_stale: Vec<SyncItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SyncNote {
+    pub id: i64,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SyncBranch {
+    pub branch: String,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SyncItem {
+    pub id: String,
+    pub name: String,
+    pub reason: String,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Found {
@@ -112,6 +171,23 @@ fn memory_files(repo: &Path) -> Result<Vec<(PathBuf, MemoryFile)>> {
     }
     out.sort_by(|a, b| a.1.file.cmp(&b.1.file));
     Ok(out)
+}
+
+/// The project memory text an imported Claude memory file becomes.
+fn memory_note(path: &Path, meta: &MemoryFile) -> Result<String> {
+    let (_, description, body) = parse_memory(&fs::read_to_string(path)?);
+    let mut note = format!("【导入自 Claude 记忆：{}】", meta.title);
+    if !description.is_empty() {
+        note.push_str(&description);
+    }
+    note.push('\n');
+    note.push_str(&body);
+    if note.chars().count() > TEXT_LIMIT {
+        let tail = format!("…（全文见 {}）", path.display());
+        let keep = TEXT_LIMIT.saturating_sub(tail.chars().count());
+        note = note.chars().take(keep).collect::<String>() + &tail;
+    }
+    Ok(note)
 }
 
 fn inside(path: &str, repo: &Path) -> bool {
@@ -269,18 +345,7 @@ impl Project {
                 .iter()
                 .find(|(_, m)| &m.file == file)
                 .with_context(|| format!("找不到 Claude 记忆 {file}"))?;
-            let (_, description, body) = parse_memory(&fs::read_to_string(path)?);
-            let mut note = format!("【导入自 Claude 记忆：{}】", meta.title);
-            if !description.is_empty() {
-                note.push_str(&description);
-            }
-            note.push('\n');
-            note.push_str(&body);
-            if note.chars().count() > TEXT_LIMIT {
-                let tail = format!("…（全文见 {}）", path.display());
-                let keep = TEXT_LIMIT.saturating_sub(tail.chars().count());
-                note = note.chars().take(keep).collect::<String>() + &tail;
-            }
+            let note = memory_note(path, meta)?;
             let marker = format!("【导入自 Claude 记忆：{}】", meta.title);
             match current.iter().find(|(_, body)| body.starts_with(&marker)) {
                 Some((_, body)) if body == &note => {}
@@ -310,6 +375,10 @@ impl Project {
             "仓库 {} 不在这个项目里",
             root.display()
         );
+        // Importing a branch twice gives back the item it already became.
+        if let Some(w) = self.work.iter().find(|w| w.import_source() == Some(branch)) {
+            return Ok(w.id.clone());
+        }
         let template = Template::Software;
         let build = template
             .stages()
@@ -325,11 +394,129 @@ impl Project {
             work.skipped.insert(i, reason);
         }
         work.stage = build;
+        work.imported = Some(Imported {
+            branch: branch.to_owned(),
+            path: from.to_owned(),
+        });
         work.notes[build] = format!(
             "接手已有分支 `{branch}`（原工作区 {}）上的工作：先读该分支的提交记录和相对主分支的改动，弄清目标和进度，补完未完成的部分，并让测试通过。",
             from.display()
         );
         git(&root, &["branch", &format!("aep-stage/{id}"), &tip])?;
         Ok(id)
+    }
+
+    /// Compare the project with what Claude Code and the repository's worktrees hold now.
+    pub fn sync_plan(&self, home: &Path, repo: &Path) -> Result<SyncPlan> {
+        let found = scan(repo)?;
+        let mut plan = SyncPlan::default();
+
+        let dir = home.join("workflows").join(&self.id);
+        let current: Vec<(i64, String)> = Memory::browse(&dir)?
+            .iter()
+            .filter(|n| n["successor"].is_null() && n["scope"] != "retired")
+            .filter_map(|n| Some((n["id"].as_i64()?, n["body"].as_str()?.to_owned())))
+            .collect();
+        let files = memory_files(&found.repository)?;
+        for (path, meta) in &files {
+            let note = memory_note(path, meta)?;
+            let marker = format!("【导入自 Claude 记忆：{}】", meta.title);
+            match current.iter().find(|(_, b)| b.starts_with(&marker)) {
+                Some((_, b)) if b == &note => plan.memories_unchanged += 1,
+                Some(_) => plan.memories_update.push(meta.file.clone()),
+                None => plan.memories_add.push(meta.file.clone()),
+            }
+        }
+        for (id, body) in &current {
+            let Some(title) = body
+                .strip_prefix("【导入自 Claude 记忆：")
+                .and_then(|r| r.split_once('】'))
+                .map(|(t, _)| t)
+            else {
+                continue;
+            };
+            if !files.iter().any(|(_, m)| m.title == title) {
+                plan.memories_remove.push(SyncNote {
+                    id: *id,
+                    title: title.to_owned(),
+                });
+            }
+        }
+
+        let live: Vec<&FoundWorktree> = found
+            .worktrees
+            .iter()
+            .filter(|w| w.branch.is_some())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for w in &self.work {
+            let Some(branch) = w.import_source() else {
+                continue;
+            };
+            let ran = !w.attempts.is_empty() || !w.deliveries.is_empty();
+            let item = |reason: &str| SyncItem {
+                id: w.id.clone(),
+                name: w.name.clone(),
+                reason: reason.to_owned(),
+            };
+            if !seen.insert(branch.to_owned()) {
+                if ran {
+                    plan.items_stale.push(item("重复导入，且已运行过"));
+                } else {
+                    plan.items_remove.push(item("重复导入"));
+                }
+            } else if live.iter().any(|f| f.branch.as_deref() == Some(branch)) {
+                plan.items_keep.push(item("工作区仍在"));
+            } else if ran {
+                plan.items_stale
+                    .push(item("原工作区已删除，但事项已运行过"));
+            } else {
+                plan.items_remove.push(item("原工作区已删除"));
+            }
+        }
+        for f in live {
+            let branch = f.branch.clone().unwrap_or_default();
+            if !seen.contains(&branch) {
+                plan.items_add.push(SyncBranch {
+                    branch,
+                    path: f.path.clone(),
+                });
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Make the project match its sources: memory files added, changed or removed in Claude
+    /// Code, and worktree branches added or removed. Items that already ran are never removed.
+    pub fn sync(
+        &mut self,
+        home: &Path,
+        repo: &Path,
+        memories: bool,
+        items: bool,
+    ) -> Result<SyncPlan> {
+        let plan = self.sync_plan(home, repo)?;
+        if memories {
+            let files: Vec<String> = plan
+                .memories_add
+                .iter()
+                .chain(&plan.memories_update)
+                .cloned()
+                .collect();
+            self.import_memories(home, repo, &files)?;
+            let mut db = Memory::open(&home.join("workflows").join(&self.id))?;
+            for note in &plan.memories_remove {
+                db.retire(note.id, "来源的 Claude 记忆已删除，同步时移出项目记忆")?;
+            }
+        }
+        if items {
+            for item in &plan.items_remove {
+                self.remove_work(home, &item.id)?;
+            }
+            for b in &plan.items_add {
+                self.import_branch(repo, &b.branch, &b.path)?;
+            }
+        }
+        Ok(plan)
     }
 }

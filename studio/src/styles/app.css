@@ -2875,3 +2875,34 @@ select.input {
   flex-shrink: 0;
   white-space: nowrap;
 }
+
+/* Import and sync. */
+.sync {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+.sync-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 24px;
+  max-height: 180px;
+  overflow: auto;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.sync-add {
+  color: var(--success, #3fb950);
+}
+.sync-del {
+  color: var(--danger);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 8px;
+}

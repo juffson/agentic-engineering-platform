@@ -269,6 +269,18 @@ export interface BranchGraph {
   truncated: boolean;
 }
 
+/** What a sync changes so the project matches Claude Code memory and the repo's worktrees. */
+export interface SyncPlan {
+  memories_add: string[]; // file names
+  memories_update: string[];
+  memories_unchanged: number;
+  memories_remove: { id: number; title: string }[]; // retired: kept in history, no longer read
+  items_add: { branch: string; path: string }[];
+  items_keep: { id: string; name: string; reason: string }[];
+  items_remove: { id: string; name: string; reason: string }[]; // never ran
+  items_stale: { id: string; name: string; reason: string }[]; // ran, left for a person
+}
+
 /** Commands. Each returns a Promise of the given type; errors reject with a message string. */
 export interface Api {
   snapshot(): Snapshot;
@@ -330,6 +342,10 @@ export interface Api {
     memories: string[];
     branches: { branch: string; path: string }[];
   }): { notes: number; items: string[] };
+  /** Preview a sync of one repository's Claude memory and worktree branches. */
+  importSyncPlan(a: { project: string; path: string }): SyncPlan;
+  /** Apply it: add/update/retire imported memory, create/remove imported items. */
+  importSync(a: { project: string; path: string; memories: boolean; items: boolean }): SyncPlan;
   /** System folder chooser; a folder inside a git repo resolves to its root. null = cancelled. */
   pickFolder(a: { prompt: string }): string | null;
   /** Delete an item that never ran (no attempts, no worktree). */

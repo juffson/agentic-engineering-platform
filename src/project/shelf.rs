@@ -138,6 +138,12 @@ impl Project {
             work.attempts.is_empty() && work.deliveries.is_empty() && work.worktrees().is_empty(),
             "这个事项已经运行过，不能删除；交付后可以归档"
         );
+        // An item imported from a branch got its own `aep-stage/<id>` pointer; drop it too.
+        for repo in &work.repositories {
+            if let Ok(ws) = Workspace::open(repo) {
+                let _ = git(&ws.root, &["branch", "-D", &format!("aep-stage/{wid}")]);
+            }
+        }
         self.work.retain(|w| w.id != wid);
         if self.selected.as_deref() == Some(wid) {
             self.selected = self.work.last().map(|w| w.id.clone());

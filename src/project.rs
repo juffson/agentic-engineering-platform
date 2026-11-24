@@ -292,6 +292,9 @@ pub struct Work {
     /// Stages to pass over, with the reason (a person's choice or an earlier stage's AEP-SKIP).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skipped: BTreeMap<usize, String>,
+    /// The existing branch this item was imported from, for re-import and sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<import::Imported>,
     /// Per-stage sandbox choice; unset stages use the role default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sandboxes: BTreeMap<usize, workflow::Sandbox>,
@@ -540,6 +543,7 @@ impl Project {
         self.selected = Some(id.clone());
         let mut work = Work {
             skipped: BTreeMap::new(),
+            imported: None,
             sandboxes: BTreeMap::new(),
             reworks: vec![],
             shelved: None,

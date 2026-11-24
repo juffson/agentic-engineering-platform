@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Download, FolderOpen, Plus } from "lucide-react";
-import type { ImportFound, Template } from "../api/types";
+import { Download, FolderOpen, Plus, RefreshCw } from "lucide-react";
+import type { ImportFound, SyncPlan, Template } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio } from "../state/store";
 import { Button, Field, Modal, Segmented, Spinner } from "./ui";
@@ -291,8 +291,124 @@ export function ImportSection({
   );
 }
 
-/** Import into an existing project from one of its repositories. */
+/** Import into an existing project from one of its repositories, or sync it: make the
+ *  project match what Claude Code and the repository's worktrees hold now. */
 export function ImportDialog({ project, path, onClose }: { project: string; path: string; onClose(): void }) {
+  const [mode, setMode] = useState<"sync" | "pick">("sync");
+  return (
+    <Modal title="导入与同步" onClose={onClose} width={640} footer={null}>
+      <Segmented<"sync" | "pick">
+        value={mode}
+        onChange={(v) => setMode(v)}
+        label="方式"
+        options={[
+          { value: "sync", label: "同步（与来源保持一致）" },
+          { value: "pick", label: "挑选导入" },
+        ]}
+      />
+      {mode === "sync" ? <SyncPane project={project} path={path} onClose={onClose} /> : <PickPane project={project} path={path} onClose={onClose} />}
+    </Modal>
+  );
+}
+
+function SyncPane({ project, path, onClose }: { project: string; path: string; onClose(): void }) {
+  const { act, notify } = useStudio();
+  const [plan, setPlan] = useState<SyncPlan | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [memories, setMemories] = useState(true);
+  const [items, setItems] = useState(true);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    api
+      .importSyncPlan({ project, path })
+      .then(setPlan)
+      .catch((e) => setError(errorMessage(e)));
+  }, [project, path]);
+  if (error) return <p className="inline-error">{error}</p>;
+  if (!plan)
+    return (
+      <p className="field-hint scan-hint">
+        <Spinner size={12} /> 正在对比 Claude 记忆和仓库工作区…
+      </p>
+    );
+  const memChanges = plan.memories_add.length + plan.memories_update.length + plan.memories_remove.length;
+  const itemChanges = plan.items_add.length + plan.items_remove.length;
+  const apply = async () => {
+    setBusy(true);
+    const r = await act(() => api.importSync({ project, path, memories, items }));
+    setBusy(false);
+    if (r) {
+      const parts = [];
+      if (memories && memChanges) parts.push(`记忆 +${r.memories_add.length} ~${r.memories_update.length} −${r.memories_remove.length}`);
+      if (items && itemChanges) parts.push(`事项 +${r.items_add.length} −${r.items_remove.length}`);
+      notify(parts.length ? `已同步：${parts.join("，")}` : "已是最新，没有需要同步的内容", "info");
+      onClose();
+    }
+  };
+  return (
+    <div className="sync" data-testid="sync">
+      <label className="check">
+        <input type="checkbox" checked={memories} onChange={(e) => setMemories(e.target.checked)} />
+        <span>
+          <b>Claude 记忆 → 项目记忆</b>
+          <span className="muted">
+            {" "}
+            · 新增 {plan.memories_add.length} · 更新 {plan.memories_update.length} · 移出 {plan.memories_remove.length} · 未变 {plan.memories_unchanged}
+          </span>
+        </span>
+      </label>
+      {plan.memories_remove.length > 0 && (
+        <ul className="sync-list">
+          {plan.memories_remove.map((m) => (
+            <li key={m.id} className="sync-del">
+              − {m.title} <span className="muted">（Claude 里已删除，移出后仍留在历史）</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <label className="check">
+        <input type="checkbox" checked={items} onChange={(e) => setItems(e.target.checked)} />
+        <span>
+          <b>工作区分支 → 事项</b>
+          <span className="muted">
+            {" "}
+            · 新增 {plan.items_add.length} · 移除 {plan.items_remove.length} · 保留 {plan.items_keep.length}
+          </span>
+        </span>
+      </label>
+      <ul className="sync-list">
+        {plan.items_add.map((b) => (
+          <li key={b.path} className="sync-add">
+            + <code>{b.branch}</code>
+          </li>
+        ))}
+        {plan.items_remove.map((i) => (
+          <li key={i.id} className="sync-del">
+            − <code>{i.name}</code> <span className="muted">（{i.reason}，未运行过）</span>
+          </li>
+        ))}
+        {plan.items_stale.map((i) => (
+          <li key={i.id}>
+            ! <code>{i.name}</code> <span className="muted">（{i.reason}，保留，需要你处理）</span>
+          </li>
+        ))}
+      </ul>
+      <p className="field-hint">
+        已运行过的事项不会被移除；移出的记忆保留在历史里。Agent 每次最多读取 32 条最新的项目记忆，记忆很多时只挑关键的导入效果更好。
+      </p>
+      <div className="modal-actions">
+        <Button variant="ghost" onClick={onClose}>
+          取消
+        </Button>
+        <Button variant="primary" icon={<RefreshCw size={14} />} busy={busy} onClick={apply} disabled={(!memories || memChanges === 0) && (!items || itemChanges === 0)}>
+          同步
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function PickPane({ project, path, onClose }: { project: string; path: string; onClose(): void }) {
   const { act, notify } = useStudio();
   const [found, setFound] = useState<ImportFound | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -326,21 +442,7 @@ export function ImportDialog({ project, path, onClose }: { project: string; path
     }
   };
   return (
-    <Modal
-      title="导入现有信息"
-      onClose={onClose}
-      width={620}
-      footer={
-        <>
-          <Button variant="ghost" onClick={onClose}>
-            取消
-          </Button>
-          <Button variant="primary" icon={<Download size={14} />} onClick={apply} busy={busy} disabled={!found || (memories.size === 0 && branches.size === 0)}>
-            导入所选
-          </Button>
-        </>
-      }
-    >
+    <>
       {!found && !error && (
         <p className="field-hint scan-hint">
           <Spinner size={12} /> 正在查找 Claude / Codex / ZCode 里可导入的记忆和分支…
@@ -348,7 +450,15 @@ export function ImportDialog({ project, path, onClose }: { project: string; path
       )}
       {error && <p className="inline-error">{error}</p>}
       {found && <ImportSection found={found} memories={memories} branches={branches} setMemories={setMemories} setBranches={setBranches} />}
-      {found && <p className="field-hint">已导入过的记忆不会重复添加。</p>}
-    </Modal>
+      {found && <p className="field-hint">已导入过的记忆和分支不会重复添加；记忆文件变了会生成新版本。</p>}
+      <div className="modal-actions">
+        <Button variant="ghost" onClick={onClose}>
+          取消
+        </Button>
+        <Button variant="primary" icon={<Download size={14} />} onClick={apply} busy={busy} disabled={!found || (memories.size === 0 && branches.size === 0)}>
+          导入所选
+        </Button>
+      </div>
+    </>
   );
 }

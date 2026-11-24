@@ -220,6 +220,21 @@ fn openGitTool(id: String, path: String) -> Result<impl Serialize, String> {
 }
 
 #[tauri::command(async)]
+fn importSyncPlan(project: String, path: String) -> Result<impl Serialize, String> {
+    run(move |h| api::import_sync_plan(&h, &project, &path))
+}
+
+#[tauri::command(async)]
+fn importSync(
+    project: String,
+    path: String,
+    memories: bool,
+    items: bool,
+) -> Result<impl Serialize, String> {
+    run(move |h| api::import_sync(&h, &project, &path, memories, items))
+}
+
+#[tauri::command(async)]
 fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
     run(move |h| api::cleanup(&h, &project, &work, force))
 }
@@ -324,6 +339,8 @@ pub fn start() {
             archive,
             unarchive,
             cleanup,
+            importSyncPlan,
+            importSync,
             branchGraph,
             gitTools,
             openGitTool,

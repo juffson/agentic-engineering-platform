@@ -96,6 +96,13 @@ enum Action {
     ImportScan {
         path: PathBuf,
     },
+    /// Show (or with --apply, make) the changes that bring this project in line with a
+    /// repository's Claude memory and worktree branches.
+    ImportSync {
+        path: PathBuf,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Send or update a short handoff to another item in this project.
     Handoff {
         #[arg(long)]
@@ -778,6 +785,17 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             print(&json!({"project":c.project()?.id,"work":c.project()?.selected}))
         }
         Action::ImportScan { path } => print(&project::import::scan(&path)?),
+        Action::ImportSync { path, apply } => {
+            let repo = aep::workspace::Workspace::open(&path)?
+                .root
+                .canonicalize()?;
+            let home = c.dir.clone();
+            if apply {
+                print(&c.edit_project(|p| p.sync(&home, &repo, true, true))?)
+            } else {
+                print(&c.project()?.sync_plan(&home, &repo)?)
+            }
+        }
         Action::RemoveWork => {
             let wid = c.work()?.id.clone();
             let home = c.dir.clone();

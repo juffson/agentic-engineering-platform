@@ -329,7 +329,7 @@ function RepoRow({ path, project }: { path: string; project: string }) {
           <span className="repo-hint">{open ? "收起记忆" : "仓库记忆"}</span>
         </button>
         <Button variant="secondary" size="sm" icon={<Download size={13} />} onClick={() => setImporting(true)}>
-          从 Claude / Codex / ZCode 导入
+          导入 / 同步
         </Button>
         <button type="button" className="icon-btn" title="在访达中显示" aria-label="在访达中显示" onClick={() => act(() => api.reveal({ path }))}>
           <FolderOpen size={15} />

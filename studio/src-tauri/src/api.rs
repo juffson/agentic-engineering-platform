@@ -922,6 +922,8 @@ pub fn memories(home: &Path, pid: &str) -> Result<Value> {
     Ok(json!(
         notes
             .iter()
+            // Tombstones of notes taken out by a sync; the note itself shows as replaced.
+            .filter(|n| n["scope"] != "retired")
             .map(|n| json!({
                 "id": n["id"], "kind": n["kind"], "author": n["author"], "body": n["body"],
                 "created_at": n["created_at"], "superseded": !n["successor"].is_null(),
@@ -954,6 +956,26 @@ pub fn revise_memory(home: &Path, pid: &str, id: i64, text: &str) -> Result<i64>
         _ => aep::memory::Kind::Decision,
     };
     Memory::open(&dir)?.revise(id, kind, text.trim())
+}
+
+/// What syncing a repository's Claude memory and worktree branches would change.
+pub fn import_sync_plan(home: &Path, pid: &str, path: &str) -> Result<import::SyncPlan> {
+    let lib = Library::open(home)?;
+    find(&lib, pid)?.sync_plan(home, &repository(path)?)
+}
+
+/// Make the project match its sources (see `Project::sync`); returns what changed.
+pub fn import_sync(
+    home: &Path,
+    pid: &str,
+    path: &str,
+    memories: bool,
+    items: bool,
+) -> Result<import::SyncPlan> {
+    let repo = repository(path)?;
+    change(home, |lib| {
+        find_mut(lib, pid)?.sync(home, &repo, memories, items)
+    })
 }
 
 /// A repository's branches and recent commit graph, with each `aep-stage/<id>` branch

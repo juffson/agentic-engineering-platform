@@ -246,14 +246,33 @@ test("an existing project imports from its repository page, and can be removed",
   await page.emulateMedia({ colorScheme: "dark" });
   await page.goto("/");
   await page.getByRole("button", { name: /^仓库/ }).click();
-  await page.getByRole("button", { name: "从 Claude / Codex / ZCode 导入" }).first().click();
-  const dialog = page.getByRole("dialog", { name: "导入现有信息" });
+  await page.getByRole("button", { name: "导入 / 同步" }).first().click();
+  const dialog = page.getByRole("dialog", { name: "导入与同步" });
+  await dialog.getByRole("radio", { name: "挑选导入" }).click();
   await expect(dialog.getByTestId("import")).toContainText("Claude 记忆 3/3 条");
   await dialog.getByText("chore/code-structure-review").click();
   await shot(page, "21-import-existing");
   await dialog.getByRole("button", { name: "导入所选" }).click();
   await expect(page.locator(".toast", { hasText: "已导入" })).toContainText("已导入 3 条记忆、1 个事项");
   await expect(page.getByRole("navigation", { name: "事项" }).getByText("chore/code-structure-review")).toBeVisible();
+
+  // Importing the same branch again does not add a copy.
+  await page.getByRole("button", { name: /^仓库/ }).click();
+  await page.getByRole("button", { name: "导入 / 同步" }).first().click();
+  await dialog.getByRole("radio", { name: "挑选导入" }).click();
+  await dialog.getByText("chore/code-structure-review").click();
+  await dialog.getByRole("button", { name: "导入所选" }).click();
+  await expect(page.getByRole("navigation", { name: "事项" }).getByText("chore/code-structure-review")).toHaveCount(1);
+
+  // Sync previews what it changes, then makes the project match its sources.
+  await page.getByRole("button", { name: "导入 / 同步" }).first().click();
+  const sync = dialog.getByTestId("sync");
+  await expect(sync).toContainText("新增 1 · 更新 1 · 移出 1 · 未变 1");
+  await expect(sync).toContainText("− old-deploy");
+  await expect(sync).toContainText("新增 0 · 移除 0"); // the branch imported above is not added again
+  await shot(page, "24-sync");
+  await dialog.getByRole("button", { name: "同步" }).click();
+  await expect(page.locator(".toast", { hasText: "已同步" })).toBeVisible();
 
   await page.locator(".project-btn").click();
   page.once("dialog", (d) => d.accept());

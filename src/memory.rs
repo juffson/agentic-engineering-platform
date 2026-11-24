@@ -220,6 +220,27 @@ impl Memory {
             .context("read original memory")?;
         self.add(&key, kind.as_str(), body, Some(id))
     }
+    /// Take a note out of every context agents read, keeping it in history: a tombstone
+    /// successor in a scope no context query includes.
+    pub fn retire(&mut self, id: i64, why: &str) -> Result<i64> {
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM notes WHERE replaces=?1))",
+            [id],
+            |row| row.get(0),
+        )?;
+        ensure!(current, RevisionConflict);
+        tx.execute(
+            "INSERT INTO notes(scope,task,spec_sha,candidate_sha,origin_sha,kind,author,body,created_at,replaces,run_id)
+             SELECT 'retired',task,spec_sha,candidate_sha,origin_sha,kind,'retired',?2,?3,id,NULL FROM notes WHERE id=?1",
+            params![id, text(why, false)?, Utc::now().to_rfc3339()],
+        )?;
+        let new = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(new)
+    }
     pub fn context(&self, k: &Key, run: Option<&str>) -> Result<Vec<Value>> {
         self.context_with_required(k, run, None)
     }

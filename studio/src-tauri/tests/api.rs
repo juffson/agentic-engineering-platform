@@ -592,6 +592,84 @@ fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // Importing the same branch again gives back the same item instead of a copy.
+    let again = api::import_apply(
+        &home,
+        &pid,
+        &repo.display().to_string(),
+        &[],
+        &[("feat/export".into(), wt_path.clone())],
+    )?;
+    assert_eq!(again["items"][0], wid.as_str());
+
+    // Sync: a new worktree branch appears, then its worktree and a memory file go away.
+    let wt2 = t.path().join("wt2");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/b",
+            wt2.to_str().unwrap(),
+        ],
+    )?;
+    let plan = serde_json::to_value(api::import_sync_plan(
+        &home,
+        &pid,
+        &repo.display().to_string(),
+    )?)?;
+    assert_eq!(plan["items_add"][0]["branch"], "feat/b", "{plan}");
+    assert_eq!(plan["items_keep"][0]["id"], wid.as_str());
+    // The note was restored to an older text above, so sync brings it back to the file.
+    assert_eq!(plan["memories_update"], serde_json::json!(["money.md"]));
+    api::import_sync(&home, &pid, &repo.display().to_string(), true, true)?;
+    let synced = api::snapshot(&home)?["projects"][0]["work"].clone();
+    let b = synced
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "feat/b")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    git(&repo, &["worktree", "remove", wt2.to_str().unwrap()])?;
+    fs::remove_file(claude.join("memory/money.md"))?;
+    let plan = serde_json::to_value(api::import_sync_plan(
+        &home,
+        &pid,
+        &repo.display().to_string(),
+    )?)?;
+    assert_eq!(plan["items_remove"][0]["id"], b.as_str(), "{plan}");
+    assert_eq!(plan["memories_remove"][0]["title"], "money-in-cents");
+    assert!(plan["items_add"].as_array().unwrap().is_empty());
+    api::import_sync(&home, &pid, &repo.display().to_string(), true, true)?;
+    assert!(api::work_detail(&home, &pid, &b).is_err());
+    assert!(
+        git(&repo, &["branch", "--list", &format!("aep-stage/{b}")])?
+            .trim()
+            .is_empty()
+    );
+    assert!(
+        api::work_detail(&home, &pid, &wid).is_ok(),
+        "the item that ran stays"
+    );
+    let notes = api::memories(&home, &pid)?;
+    assert!(
+        !notes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["superseded"] == false
+                && n["body"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("导入自 Claude 记忆")),
+        "{notes}"
+    );
+
     // The project can be taken out of Studio; its records are set aside, the repo stays.
     api::remove_project(&home, &pid)?;
     assert!(
