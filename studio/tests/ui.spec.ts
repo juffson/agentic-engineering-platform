@@ -355,3 +355,37 @@ test("new items can be drafted by a CLI, edited, and created with their brief", 
   await expect(page.locator(".work-header h1")).toHaveText("对账单 · CSV 导出");
   await expect(page.getByRole("navigation", { name: "事项" }).getByText("对账单 · 空账户表头")).toHaveCount(0);
 });
+
+test("a stage stops at its token budget, continues after more budget, and the project shows where tokens went", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  const sidebar = page.getByRole("navigation", { name: "事项" });
+  await sidebar.getByText("港股暗盘报价").click();
+  const stage = (await page.locator(".work-header h1").textContent()) ?? "";
+  expect(stage).toBe("港股暗盘报价");
+  const budget = page.getByRole("textbox", { name: /Token 预算$/ }).first();
+  await budget.fill("10k");
+  await budget.press("Enter");
+  await expect(page.locator(".config-summary, .stage-budget").first()).toBeVisible();
+  await page.getByRole("button", { name: /^运行「/ }).click();
+  const decision = page.getByTestId("decision");
+  await expect(decision).toContainText("Token 预算已用完", { timeout: 30_000 });
+  await expect(page.locator(".turn-status.warn")).toContainText("Token 预算已用完");
+  await page.locator(".turn-status.warn").getByRole("button", { name: "消耗分析" }).click();
+  await expect(page.getByTestId("usage-breakdown")).toContainText("次模型调用");
+  await shot(page, "27-budget-exhausted");
+  await decision.getByRole("button", { name: "追加预算并继续" }).click();
+  await expect(page.locator(".turn").last().locator(".turn-meta")).toContainText("继续对话");
+
+  await page.getByRole("button", { name: "Token 消耗" }).click();
+  await expect(page.getByRole("heading", { name: "Token 消耗" })).toBeVisible();
+  await expect(page.getByRole("table", { name: "按阶段" })).toBeVisible();
+  await expect(page.getByText("Claude 账号额度")).toBeVisible();
+  const def = page.getByRole("textbox", { name: "项目默认阶段 Token 预算" });
+  await def.fill("2M");
+  await def.press("Enter");
+  await expect(def).toHaveValue("2.0M");
+  await page.locator(".usage-run").first().click();
+  await expect(page.getByTestId("usage-breakdown")).toBeVisible();
+  await shot(page, "28-project-usage");
+});

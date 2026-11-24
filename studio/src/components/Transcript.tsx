@@ -1,9 +1,10 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AlertTriangle, Check, ChevronDown, ChevronRight, CornerUpLeft, ExternalLink, FileEdit, ShieldQuestion, Square, Terminal, Wrench, X } from "lucide-react";
+import { AlertTriangle, BarChart3, Check, ChevronDown, ChevronRight, CornerUpLeft, ExternalLink, FileEdit, Gauge, ShieldQuestion, Square, Terminal, Wrench, X } from "lucide-react";
 import type { AttemptSummary, AttemptView, Entry } from "../api/types";
-import { clock, duration, parseTime, tokens } from "../lib/format";
+import { clock, duration, parseTime, tokens, usd } from "../lib/format";
+import { BudgetMeter, tokenTitle, UsageBreakdown } from "./Budget";
 import { isLive, modelLabel } from "../lib/work";
 import { Spinner } from "./ui";
 import { api } from "../api/client";
@@ -272,15 +273,38 @@ function TurnStatus({ attempt, view }: { attempt: AttemptSummary; view: AttemptV
   const start = parseTime(attempt.started_at);
   const end = parseTime(attempt.finished_at) ?? now;
   const took = start !== null ? duration(end - start) : null;
-  const usage = view && (view.input_tokens || view.output_tokens) ? `${tokens(view.input_tokens)} 输入 · ${tokens(view.output_tokens)} 输出` : null;
+  const t = view?.usage?.tokens;
+  const used = t ? t.input + t.cache_read + t.cache_write + t.output : attempt.tokens ?? 0;
+  const cost = view?.usage?.cost_usd;
+  const usage = used ? (
+    <span className="muted" title={t ? tokenTitle(t) : undefined}>
+      · {tokens(used)} tokens{cost ? ` · ${usd(cost)}` : ""}
+    </span>
+  ) : null;
 
   if (live) {
+    const limit = view?.token_limit ?? null;
     return (
       <div className="turn-status live">
         <Spinner size={12} />
         <span>{attempt.status === "initializing" ? "正在启动" : "正在执行"}</span>
         {took && <span className="muted">· {took}</span>}
-        {usage && <span className="muted">· {usage}</span>}
+        {limit ? <BudgetMeter used={used} limit={limit} /> : usage}
+        {limit && used >= limit * 0.8 && <span className="budget-note">接近本轮预算，用完会停下等你追加</span>}
+      </div>
+    );
+  }
+  if (attempt.status === "budget_exhausted") {
+    return (
+      <div className="turn-status warn">
+        <div className="turn-status-line">
+          <Gauge size={13} />
+          <span>Token 预算已用完</span>
+          {took && <span className="muted">· 用时 {took}</span>}
+          {usage}
+        </div>
+        {(attempt.error ?? view?.error) && <p className="turn-error">{attempt.error ?? view?.error}</p>}
+        <UsageToggle attempt={attempt} />
       </div>
     );
   }
@@ -290,7 +314,8 @@ function TurnStatus({ attempt, view }: { attempt: AttemptSummary; view: AttemptV
         <Check size={13} />
         <span>完成</span>
         {took && <span className="muted">· 用时 {took}</span>}
-        {usage && <span className="muted">· {usage}</span>}
+        {usage}
+        <UsageToggle attempt={attempt} inline />
       </div>
     );
   }
@@ -301,6 +326,7 @@ function TurnStatus({ attempt, view }: { attempt: AttemptSummary; view: AttemptV
           <X size={13} />
           <span>未通过</span>
           {took && <span className="muted">· 用时 {took}</span>}
+          {usage}
         </div>
         {(attempt.error ?? view?.error) && <p className="turn-error">{attempt.error ?? view?.error}</p>}
         {attempt.route_back && (
@@ -320,6 +346,7 @@ function TurnStatus({ attempt, view }: { attempt: AttemptSummary; view: AttemptV
         <Square size={11} />
         <span>已停止</span>
         {took && <span>· {took}</span>}
+        {usage}
       </div>
     );
   }
@@ -327,5 +354,20 @@ function TurnStatus({ attempt, view }: { attempt: AttemptSummary; view: AttemptV
     <div className="turn-status muted">
       <span>{attempt.status || "未知状态"}</span>
     </div>
+  );
+}
+
+/** "消耗分析" link that opens the run's token breakdown below the turn. */
+function UsageToggle({ attempt, inline }: { attempt: AttemptSummary; inline?: boolean }) {
+  const { project, selected } = useStudio();
+  const [open, setOpen] = useState(false);
+  if (!project || !selected || !attempt.tokens) return null;
+  return (
+    <>
+      <button type="button" className={`link-btn${inline ? " inline" : ""}`} onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+        <BarChart3 size={12} /> 消耗分析
+      </button>
+      {open && <UsageBreakdown project={project.id} work={selected} attempt={attempt.id} />}
+    </>
   );
 }

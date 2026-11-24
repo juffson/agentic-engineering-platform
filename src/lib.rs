@@ -8,6 +8,7 @@ pub mod memory_tidy;
 pub mod studio;
 pub mod task;
 pub mod transcript;
+pub mod usage;
 pub mod work_draft;
 pub mod workspace;
 

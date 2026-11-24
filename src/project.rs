@@ -304,6 +304,13 @@ pub struct Work {
     /// Set once a delivered item is put away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shelved: Option<shelf::Shelved>,
+    /// Token budget per stage (every attempt of the stage counts); unset stages use the
+    /// project default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub budgets: BTreeMap<usize, u64>,
+    /// Token budget for all stages together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_total: Option<u64>,
     #[serde(default)]
     pub tickets: std::collections::BTreeMap<PathBuf, String>,
     pub id: String,
@@ -392,6 +399,9 @@ pub struct Project {
     pub selected: Option<String>,
     #[serde(default)]
     pub cli_defaults: Vec<Profile>,
+    /// Default token budget for a stage that has none of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_budget: Option<u64>,
 }
 impl Project {
     pub fn configure_site(&mut self, repo: &Path, site: Option<HttpsSite>) -> Result<()> {
@@ -547,6 +557,8 @@ impl Project {
             sandboxes: BTreeMap::new(),
             reworks: vec![],
             shelved: None,
+            budgets: BTreeMap::new(),
+            budget_total: None,
             deliveries: vec![],
             stage_transfers: vec![],
             active_transfers: BTreeMap::new(),
@@ -630,6 +642,7 @@ impl Library {
             work: vec![],
             selected: None,
             cli_defaults: vec![],
+            stage_budget: None,
         });
         self.active = Some(id);
         Ok(())

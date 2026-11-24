@@ -792,3 +792,104 @@ printf '%s' "$answer" | python3 -c 'import json,sys; print(json.dumps({{"type":"
     );
     Ok(())
 }
+
+#[test]
+fn a_stage_is_stopped_at_its_token_budget_and_continues_after_more_is_added() -> Result<()> {
+    let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/aep");
+    ensure!(
+        runner.is_file(),
+        "build the runner first: cargo build --bin aep"
+    );
+    let t = tempfile::tempdir()?;
+    let home = t.path().join("catalog");
+    let repo = t.path().join("repo");
+    fs::create_dir_all(&repo)?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    git(&repo, &["config", "user.name", "t"])?;
+    git(&repo, &["config", "user.email", "t@example.com"])?;
+    fs::write(repo.join("README.md"), "demo\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-q", "-m", "init"])?;
+    // Spends 6000 tokens per model call, one call a second, and never finishes on its own
+    // unless resumed.
+    let bin = t.path().join("claude");
+    fs::write(
+        &bin,
+        r#"#!/bin/sh
+cat > /dev/null
+echo '{"type":"system","subtype":"init","session_id":"s-budget","model":"sonnet"}'
+case "$*" in
+  *--resume*)
+    echo '{"type":"assistant","message":{"id":"m9","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":0,"output_tokens":5},"content":[{"type":"text","text":"继续完成"}]}}'
+    printf '完成\nAEP: PASS' | python3 -c 'import json,sys; print(json.dumps({"type":"result","result":sys.stdin.read(),"is_error":False,"session_id":"s-budget","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":0,"output_tokens":5}}))'
+    exit 0 ;;
+esac
+i=0
+while [ $i -lt 30 ]; do
+  i=$((i+1))
+  echo "{\"type\":\"assistant\",\"message\":{\"id\":\"m$i\",\"usage\":{\"input_tokens\":1000,\"cache_read_input_tokens\":5000,\"cache_creation_input_tokens\":0,\"output_tokens\":0},\"content\":[{\"type\":\"tool_use\",\"id\":\"t$i\",\"name\":\"Read\",\"input\":{\"file_path\":\"README.md\"}}]}}"
+  sleep 1
+done
+"#,
+    )?;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
+
+    api::create_project(&home, "demo", &[repo.display().to_string()])?;
+    let snap = api::snapshot(&home)?;
+    let pid = snap["active"].as_str().unwrap().to_owned();
+    let root = snap["projects"][0]["repositories"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let wid = api::create_work(
+        &home,
+        &pid,
+        "预算",
+        "Software",
+        false,
+        std::slice::from_ref(&root),
+    )?;
+    let profile: aep::workflow::Profile = serde_json::from_value(serde_json::json!({
+        "client": "Claude", "executable": bin.display().to_string(), "model": "", "check_command": ""
+    }))?;
+    api::update_stage(
+        &home,
+        &pid,
+        &wid,
+        0,
+        Some("做点事".into()),
+        Some(profile),
+        None,
+    )?;
+    api::set_budget(&home, &pid, &wid, Some(0), Some(15_000))?;
+
+    let first = api::run_stage(&home, &pid, &wid, 0, None)?;
+    let d = wait_idle(&home, &pid, &wid)?;
+    let a = &d["stages"][0]["attempts"][0];
+    assert_eq!(a["status"], "budget_exhausted", "{d}");
+    assert!(a["error"].as_str().unwrap().contains("Token 预算已用完"));
+    let used = d["stages"][0]["budget"]["used"].as_u64().unwrap();
+    assert!(
+        (18_000..40_000).contains(&used),
+        "stopped soon after the limit: {used}"
+    );
+    // Nothing more runs until budget is added.
+    assert!(api::run_stage(&home, &pid, &wid, 0, None).is_err());
+    let view = api::attempt_view(&home, &pid, &wid, &first)?;
+    assert_eq!(view["token_limit"], 15_000);
+    let analysis = api::usage_analysis(&home, &pid, &wid, &first)?;
+    assert_eq!(analysis["by_kind"][0]["kind"], "读取");
+
+    let next = api::extend_budget(&home, &pid, &wid, 0, 50_000, "")?;
+    let d = wait_idle(&home, &pid, &wid)?;
+    let a = &d["stages"][0]["attempts"][1];
+    assert_eq!(a["id"], next);
+    assert_eq!(a["status"], "succeeded", "{d}");
+    assert_eq!(a["follow_up"], true);
+    assert!(d["stages"][0]["budget"]["limit"].as_u64().unwrap() >= used + 50_000);
+
+    let usage = api::project_usage(&home, &pid)?;
+    assert_eq!(usage["total"]["runs"], 2);
+    assert_eq!(usage["stages"][0]["key"], "产品需求");
+    Ok(())
+}

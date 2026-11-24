@@ -142,6 +142,19 @@ fn drive(
         }
         let name = stages[i].name;
         state.stage = Some(i);
+        let budget = crate::usage::budget(catalog, p, work, i);
+        if let Some(reason) = budget.exhausted() {
+            // A finished stage can still be confirmed; anything that would run a CLI cannot.
+            let current_ok = work
+                .current_attempt
+                .get(&i)
+                .map(|id| workflow::evidence(&workflow::attempt_dir(catalog, pid, wid, id)))
+                .transpose()?
+                .is_some_and(|e| e["status"] == "succeeded");
+            if !current_ok {
+                return Ok(("stopped".into(), format!("「{name}」：{reason}")));
+            }
+        }
         if let Some(reason) = work
             .skipped
             .get(&i)
@@ -193,6 +206,15 @@ fn drive(
                 if !wait_for(&attempt, dir, None)? {
                     return Ok(("stopped".into(), "已手动停止自动运行".into()));
                 }
+            }
+            // Out of budget: wait for a person to add budget, send back or approve; never retry.
+            Some("budget_exhausted") => {
+                return Ok((
+                    "stopped".into(),
+                    format!(
+                        "「{name}」的 Token 预算已用完，追加预算后可继续对话，或退回 / 人工放行"
+                    ),
+                ));
             }
             Some("succeeded") => {
                 state.message = format!("「{name}」已通过，确认并进入下一阶段");

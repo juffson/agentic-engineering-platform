@@ -252,6 +252,7 @@ impl Work {
             subtask: None,
             sandbox: self.sandbox(stage),
             follow_up: None,
+            token_limit: None,
             stage_transfer: self.incoming(stage).cloned(),
             handoffs: self.handoffs.clone(),
             project: project.to_owned(),
@@ -318,6 +319,15 @@ impl Project {
         }
         let project = self.name.clone();
         let pid = self.id.clone();
+        let budget = self
+            .work
+            .iter()
+            .find(|w| w.id == work_id)
+            .filter(|_| external.is_none())
+            .map(|w| crate::usage::budget(catalog, self, w, stage));
+        if let Some(reason) = budget.as_ref().and_then(|b| b.exhausted()) {
+            anyhow::bail!(reason);
+        }
         let item = self.work_by_id_mut(work_id)?;
         ensure!(
             stage == item.stage && stage < item.template.stages().len(),
@@ -348,7 +358,7 @@ impl Project {
         );
         let id = uuid::Uuid::new_v4().simple().to_string();
         let dir = workflow::attempt_dir(catalog, &pid, work_id, &id);
-        let request = item.request(
+        let mut request = item.request(
             &project,
             stage,
             Assignment {
@@ -358,6 +368,7 @@ impl Project {
                 external,
             },
         );
+        request.token_limit = budget.and_then(|b| b.remaining());
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)

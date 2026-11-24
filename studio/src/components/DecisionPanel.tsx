@@ -8,6 +8,7 @@ import { isGate, latestAttempt, needsRecheck, sendBackTarget } from "../lib/work
 import { StageConfigCard } from "./StageConfig";
 import { ArchiveCard, DeliveryCard, ShelvedCard } from "./Delivery";
 import { Button, Spinner } from "./ui";
+import { ExtendBudget } from "./Budget";
 
 export function DecisionPanel({ detail, viewed }: { detail: WorkDetail; viewed: StageDetail | undefined }) {
   if (detail.shelved) {
@@ -105,19 +106,21 @@ function Decision({ detail, current }: { detail: WorkDetail; current: StageDetai
         </div>
       </div>
     );
-  } else if (latest.status === "failed" || latest.route_back) {
+  } else if (latest.status === "failed" || latest.status === "budget_exhausted" || latest.route_back) {
+    const outOfBudget = latest.status === "budget_exhausted";
     // Gates go back to the build; any stage that named an owner with AEP-BACK goes there.
-    const target = isGate(current) || latest.route_back ? sendBackTarget(detail, current.index) : null;
+    const target = outOfBudget || isGate(current) || latest.route_back ? sendBackTarget(detail, current.index) : null;
     const targetStage = target !== null ? detail.stages[target] : undefined;
     body = (
       <>
-        <div className="decision-state fail">
+        <div className={`decision-state ${outOfBudget ? "warn" : "fail"}`}>
           <span className="state-dot" />
           <div>
-            <p className="decision-title">「{current.name}」未通过</p>
+            <p className="decision-title">{outOfBudget ? `「${current.name}」Token 预算已用完` : `「${current.name}」未通过`}</p>
             {latest.error && <p className="decision-text">{latest.error}</p>}
           </div>
         </div>
+        {outOfBudget && <ExtendBudget detail={detail} stage={current} />}
         {latest.route_back && (
           <p className="routeback-note">
             <CornerUpLeft size={13} />
@@ -127,8 +130,8 @@ function Decision({ detail, current }: { detail: WorkDetail; current: StageDetai
         {targetStage ? (
           <>
             <Button
-              variant="primary"
-              size="lg"
+              variant={outOfBudget ? "ghost" : "primary"}
+              size={outOfBudget ? "md" : "lg"}
               className="block"
               icon={<CornerUpLeft size={14} />}
               busy={busy === "back"}
@@ -140,9 +143,9 @@ function Decision({ detail, current }: { detail: WorkDetail; current: StageDetai
             >
               退回「{targetStage.name}」修复
             </Button>
-            <p className="decision-foot">退回后 Agent 会立即在「{targetStage.name}」开始修复，修好后再回到「{current.name}」。</p>
+            {!outOfBudget && <p className="decision-foot">退回后 Agent 会立即在「{targetStage.name}」开始修复，修好后再回到「{current.name}」。</p>}
           </>
-        ) : (
+        ) : outOfBudget ? null : (
           <Button variant="primary" size="lg" className="block" icon={<RotateCcw size={14} />} busy={busy === "rerun"} onClick={() => run("rerun", () => api.runStage({ ...base, stage: current.index }))}>
             重新运行「{current.name}」
           </Button>

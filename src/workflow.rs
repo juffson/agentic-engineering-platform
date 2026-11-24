@@ -231,6 +231,9 @@ pub struct Request {
     pub subtask: Option<Subtask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_up: Option<FollowUp>,
+    /// Tokens this attempt may use before it is stopped (what is left of the budgets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_transfer: Option<crate::project::transfer::Transfer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

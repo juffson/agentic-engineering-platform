@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { api, errorMessage } from "../api/client";
 import type { ProjectSummary, Snapshot, ZCodeModel } from "../api/types";
 
-export type Page = "work" | "memory" | "repos" | "branches";
+export type Page = "work" | "memory" | "repos" | "branches" | "usage";
 
 export interface ZCodeState {
   models: ZCodeModel[] | null;

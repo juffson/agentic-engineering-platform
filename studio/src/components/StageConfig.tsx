@@ -5,6 +5,8 @@ import { api } from "../api/client";
 import { useStudio } from "../state/store";
 import { clientLabel, modelLabel, sandboxLabel } from "../lib/work";
 import { Chip, Segmented } from "./ui";
+import { StageBudget } from "./Budget";
+import { tokens } from "../lib/format";
 
 /** CLI / model / sandbox pickers for one stage; shared by the decision panel and the autopilot drawer. */
 export function StagePickers({
@@ -127,7 +129,17 @@ export function StageConfigCard({ detail, stage, collapsed: initiallyCollapsed }
           </button>
         )}
       </div>
-      {collapsed ? <p className="config-summary">{summary}</p> : <StagePickers detail={detail} stage={stage} />}
+      {collapsed ? (
+        <p className="config-summary">
+          {summary}
+          {stage.budget.limit ? ` · 预算 ${tokens(stage.budget.used)} / ${tokens(stage.budget.limit)}` : stage.budget.used ? ` · 已用 ${tokens(stage.budget.used)}` : ""}
+        </p>
+      ) : (
+        <>
+          <StagePickers detail={detail} stage={stage} />
+          <StageBudget detail={detail} stage={stage} />
+        </>
+      )}
     </section>
   );
 }

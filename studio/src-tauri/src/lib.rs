@@ -280,6 +280,42 @@ fn draftStatus(project: String) -> Result<impl Serialize, String> {
 }
 
 #[tauri::command(async)]
+fn setBudget(
+    project: String,
+    work: String,
+    stage: Option<usize>,
+    tokens: Option<u64>,
+) -> Result<impl Serialize, String> {
+    run(move |h| api::set_budget(&h, &project, &work, stage, tokens))
+}
+
+#[tauri::command(async)]
+fn setProjectBudget(project: String, tokens: Option<u64>) -> Result<impl Serialize, String> {
+    run(move |h| api::set_project_budget(&h, &project, tokens))
+}
+
+#[tauri::command(async)]
+fn extendBudget(
+    project: String,
+    work: String,
+    stage: usize,
+    extra: u64,
+    message: String,
+) -> Result<impl Serialize, String> {
+    run(move |h| api::extend_budget(&h, &project, &work, stage, extra, &message))
+}
+
+#[tauri::command(async)]
+fn usageAnalysis(project: String, work: String, attempt: String) -> Result<impl Serialize, String> {
+    run(move |h| api::usage_analysis(&h, &project, &work, &attempt))
+}
+
+#[tauri::command(async)]
+fn projectUsage(project: String) -> Result<impl Serialize, String> {
+    run(move |h| api::project_usage(&h, &project))
+}
+
+#[tauri::command(async)]
 fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
     run(move |h| api::cleanup(&h, &project, &work, force))
 }
@@ -363,6 +399,11 @@ pub fn start() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             snapshot,
+            setBudget,
+            setProjectBudget,
+            extendBudget,
+            usageAnalysis,
+            projectUsage,
             openProject,
             selectWork,
             createProject,

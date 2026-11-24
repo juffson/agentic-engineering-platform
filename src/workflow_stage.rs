@@ -522,6 +522,69 @@ fn prior_turn(dir: &Path, follow: &aep::workflow::FollowUp) -> Result<Prior> {
     })
 }
 
+fn first_event(stdout: &Path, kind: &str) -> Option<Value> {
+    BufReader::new(fs::File::open(stdout).ok()?)
+        .lines()
+        .take(40)
+        .map_while(Result::ok)
+        .filter_map(|l| serde_json::from_str::<Value>(&l).ok())
+        .find(|v| v["type"] == kind && (v["session_id"].is_string() || v["thread_id"].is_string()))
+}
+
+/// Watch the CLI's own token counters while it runs and stop it once it has used `limit`.
+fn watch_budget(
+    dir: &Path,
+    work: &Path,
+    id: &str,
+    limit: u64,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let done = Arc::new(AtomicBool::new(false));
+    let flag = done.clone();
+    let (dir, work, id) = (dir.to_owned(), work.to_owned(), id.to_owned());
+    let handle = std::thread::spawn(move || {
+        let mut warned = false;
+        while !flag.load(Ordering::Relaxed) {
+            for _ in 0..10 {
+                if flag.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let Ok(report) = aep::usage::measure(&dir) else {
+                continue;
+            };
+            let used = report.summary.tokens.total();
+            if !warned && used * 10 >= limit * 8 {
+                warned = true;
+                let _ = aep::project::save_json(
+                    &dir,
+                    "budget-warning.json",
+                    &json!({"limit": limit, "used": used}),
+                );
+            }
+            if used >= limit {
+                let _ = aep::project::save_json(
+                    &dir,
+                    "budget.json",
+                    &json!({"limit": limit, "used": used, "at": chrono::Utc::now().to_rfc3339()}),
+                );
+                if let Ok(stop) = Cancellation::new(&work, &id) {
+                    let _ = stop.request();
+                }
+                return;
+            }
+        }
+    });
+    (done, handle)
+}
+
 /// The CLI could not find the session it was asked to resume (pruned or never saved).
 fn session_missing(dir: &Path) -> bool {
     ["stderr.log", "stdout.log"].iter().any(|name| {
@@ -674,16 +737,49 @@ fn invoke(
     let stdout = dir.join("stdout.log");
     let stderr = dir.join("stderr.log");
     let before = snapshot(&cwd);
+    let watch = req
+        .token_limit
+        .map(|limit| watch_budget(dir, work, id, limit));
     let code = logged(
         &args,
         &cwd,
         &stdout,
-        // Stage sessions run until they finish or the user cancels them.
+        // Stage sessions run until they finish, the user cancels them or the budget runs out.
         u64::MAX,
         (profile.client != Client::ZCode).then_some(prompt.as_str()),
         Some(stderr.clone()),
         stop,
-    )?;
+    );
+    if let Some((done, handle)) = watch {
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = handle.join();
+    }
+    let code = match code {
+        Ok(code) => code,
+        Err(e) => {
+            if dir.join("budget.json").is_file() {
+                // Stopped for its budget: keep the session so a follow-up can continue it.
+                record["workspace"] = json!(cwd);
+                record["resumable"] =
+                    json!(matches!(profile.client, Client::Codex | Client::Claude));
+                record["session"] = match profile.client {
+                    Client::Claude => first_event(&stdout, "system")
+                        .map(|v| v["session_id"].clone())
+                        .unwrap_or(Value::Null),
+                    Client::Codex => first_event(&stdout, "thread.started")
+                        .map(|v| v["thread_id"].clone())
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
+                if record["session"].is_null()
+                    && let Some(session) = &resume
+                {
+                    record["session"] = json!(session);
+                }
+            }
+            return Err(e);
+        }
+    };
     record["exit_code"] = json!(code);
     if let Some(before) = &before {
         documents(stage, dir, &cwd, before, record)?;
@@ -919,12 +1015,22 @@ pub fn execute(request: &Path) -> Result<()> {
         });
     if let Err(e) = &result {
         let _guard = stop.lock()?;
-        record["status"] = json!(if stop.requested()? {
+        let budget = aep::workspace::read(&dir.join("budget.json")).ok();
+        record["status"] = json!(if budget.is_some() {
+            "budget_exhausted"
+        } else if stop.requested()? {
             "cancelled"
         } else {
             "failed"
         });
-        record["error"] = json!(format!("{e:#}"));
+        record["error"] = json!(match &budget {
+            Some(b) => format!(
+                "Token 预算已用完：这一轮用了 {}，本轮可用 {}。追加预算后可在原会话继续",
+                aep::usage::compact(b["used"].as_u64().unwrap_or(0)),
+                aep::usage::compact(b["limit"].as_u64().unwrap_or(0))
+            ),
+            None => format!("{e:#}"),
+        });
         record["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
         save(dir, &record)?;
     }

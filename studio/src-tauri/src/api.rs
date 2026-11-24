@@ -7,6 +7,7 @@ use aep::{
     memory::{Key, Memory, TEXT_LIMIT},
     project::{Kind, Library, Project, Work, import, merge, shelf},
     transcript::{self, Entry},
+    usage,
     workflow::{self, Client, Profile, Request, Role, Sandbox, Template},
     workspace::Workspace,
 };
@@ -369,6 +370,7 @@ fn attempt_summary(home: &Path, pid: &str, wid: &str, id: &str) -> Value {
         "route_back": if ev["route_back"].is_object() { ev["route_back"].clone() } else { Value::Null },
         "committed": ev["committed"] == true,
         "head_sha": ev["head_sha"],
+        "tokens": usage::summary(&dir).tokens.total(),
     })
 }
 
@@ -381,6 +383,13 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
     let dir = autopilot_dir(home, pid, wid);
     let autopilot_running = autopilot::running(&dir);
     let running = running_attempt(home, pid, w);
+    let mut budget_used: std::collections::BTreeMap<usize, u64> = Default::default();
+    for a in &w.attempts {
+        *budget_used.entry(a.stage).or_default() +=
+            usage::summary(&workflow::attempt_dir(home, pid, wid, &a.id))
+                .tokens
+                .total();
+    }
     let stages: Vec<Value> = w
         .template
         .stages()
@@ -411,6 +420,11 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
                 "sandbox": format!("{:?}", w.sandbox(i)),
                 "attempts": attempts,
                 "current_attempt": w.current_attempt.get(&i),
+                "budget": {
+                    "limit": w.budgets.get(&i).copied().or(p.stage_budget),
+                    "own": w.budgets.get(&i),
+                    "used": budget_used.get(&i).copied().unwrap_or(0),
+                },
             })
         })
         .collect();
@@ -459,6 +473,11 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
         },
         "deliveries": deliveries,
         "memory_draft": draft,
+        "budget": {
+            "total_limit": w.budget_total,
+            "total_used": budget_used.values().sum::<u64>(),
+            "stage_default": p.stage_budget,
+        },
     }))
 }
 
@@ -491,7 +510,14 @@ pub fn attempt_view(home: &Path, pid: &str, wid: &str, attempt: &str) -> Result<
     let ev = read_evidence(&dir);
     let raw = fs::read_to_string(dir.join("stdout.log")).unwrap_or_default();
     let t = transcript::parse(&raw);
+    let used = usage::measure(&dir).unwrap_or_default();
+    let limit = fs::read(dir.join("request.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Request>(&b).ok())
+        .and_then(|r| r.token_limit);
     Ok(json!({
+        "usage": used.summary,
+        "token_limit": limit,
         "id": attempt,
         "status": ev["status"].as_str().unwrap_or("initializing"),
         "entries": t.entries.into_iter().map(entry).collect::<Vec<_>>(),
@@ -1378,4 +1404,188 @@ pub fn repo_memories(path: &str) -> Result<Value> {
 
 pub fn add_repo_memory(path: &str, text: &str) -> Result<i64> {
     Memory::open(&repo_data(path)?)?.add_manual(&Key::new("", "", ""), "decision", text, None, None)
+}
+
+fn parse_tokens(v: Option<u64>) -> Option<u64> {
+    v.filter(|n| *n > 0)
+}
+
+/// Set a stage's token budget, or (stage None) the item's total; None or 0 removes it.
+pub fn set_budget(
+    home: &Path,
+    pid: &str,
+    wid: &str,
+    stage: Option<usize>,
+    tokens: Option<u64>,
+) -> Result<()> {
+    change(home, |lib| {
+        let w = find_mut(lib, pid)?.work_by_id_mut(wid)?;
+        match stage {
+            Some(i) => {
+                ensure!(i < w.template.stages().len(), "阶段不存在");
+                match parse_tokens(tokens) {
+                    Some(n) => w.budgets.insert(i, n),
+                    None => w.budgets.remove(&i),
+                };
+            }
+            None => w.budget_total = parse_tokens(tokens),
+        }
+        Ok(())
+    })
+}
+
+/// The project's default per-stage budget.
+pub fn set_project_budget(home: &Path, pid: &str, tokens: Option<u64>) -> Result<()> {
+    change(home, |lib| {
+        find_mut(lib, pid)?.stage_budget = parse_tokens(tokens);
+        Ok(())
+    })
+}
+
+/// Raise the budget that stopped a stage by `extra` tokens and continue its session.
+pub fn extend_budget(
+    home: &Path,
+    pid: &str,
+    wid: &str,
+    stage: usize,
+    extra: u64,
+    message: &str,
+) -> Result<String> {
+    ensure!(extra > 0, "请填写要追加的 Token 数");
+    let lib = Library::open(home)?;
+    let p = find(&lib, pid)?;
+    let w = item(p, wid)?;
+    let b = usage::budget(home, p, w, stage);
+    change(home, |lib| {
+        let w = find_mut(lib, pid)?.work_by_id_mut(wid)?;
+        if let Some(l) = b.stage_limit {
+            w.budgets.insert(stage, l.max(b.stage_used) + extra);
+        }
+        if let Some(l) = b.total_limit
+            && b.total_used + extra > l
+        {
+            w.budget_total = Some(l.max(b.total_used) + extra);
+        }
+        Ok(())
+    })?;
+    let text = message.trim();
+    follow_up(
+        home,
+        pid,
+        wid,
+        stage,
+        if text.is_empty() {
+            "预算已追加。请从中断的地方继续完成本阶段的任务，不要重复已经做完的步骤。"
+        } else {
+            text
+        },
+    )
+}
+
+/// Where one attempt's tokens went.
+pub fn usage_analysis(home: &Path, pid: &str, wid: &str, attempt: &str) -> Result<Value> {
+    aep::workspace::ident(attempt, 64)?;
+    let dir = workflow::attempt_dir(home, pid, wid, attempt);
+    ensure!(dir.is_dir(), "执行记录不存在");
+    let report = usage::measure(&dir)?;
+    let mut v = usage::analysis(&report);
+    v["summary"] = json!(report.summary);
+    Ok(v)
+}
+
+/// Token use across the project: totals, per item, per stage, per CLI/model, per day, the
+/// heaviest runs and the account quota each CLI reported last.
+pub fn project_usage(home: &Path, pid: &str) -> Result<Value> {
+    let lib = Library::open(home)?;
+    let p = find(&lib, pid)?;
+    #[derive(Default)]
+    struct Sum {
+        tokens: usage::Tokens,
+        cost: f64,
+        runs: usize,
+    }
+    fn add(m: &mut Vec<(String, Sum)>, key: &str, s: &usage::Summary) {
+        let i = m.iter().position(|(k, _)| k == key).unwrap_or_else(|| {
+            m.push((key.to_owned(), Sum::default()));
+            m.len() - 1
+        });
+        let e = &mut m[i].1;
+        e.tokens.add(&s.tokens);
+        e.cost += s.cost_usd.unwrap_or(0.0);
+        e.runs += 1;
+    }
+    let row = |(k, s): &(String, Sum)| json!({"key": k, "tokens": s.tokens, "total": s.tokens.total(), "cost_usd": s.cost, "runs": s.runs});
+    let mut total = Sum::default();
+    let (mut items, mut stages, mut models, mut days) = (vec![], vec![], vec![], vec![]);
+    let mut runs: Vec<Value> = vec![];
+    let mut quota: std::collections::BTreeMap<String, (String, Value)> = Default::default();
+    for w in &p.work {
+        let mut item_sum = Sum::default();
+        for a in &w.attempts {
+            let dir = workflow::attempt_dir(home, pid, &w.id, &a.id);
+            let ev = read_evidence(&dir);
+            let s = usage::summary(&dir);
+            if s.tokens.total() == 0 {
+                continue;
+            }
+            let stage = w.template.stages().get(a.stage).map_or("?", |s| s.name);
+            let client = format!("{:?}", a.profile.client);
+            let model = s
+                .models
+                .first()
+                .cloned()
+                .unwrap_or_else(|| a.profile.model.clone());
+            let day = ev["started_at"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(10)
+                .collect::<String>();
+            add(&mut stages, stage, &s);
+            add(&mut models, &format!("{client} · {model}"), &s);
+            add(&mut days, &day, &s);
+            item_sum.tokens.add(&s.tokens);
+            item_sum.cost += s.cost_usd.unwrap_or(0.0);
+            item_sum.runs += 1;
+            total.tokens.add(&s.tokens);
+            total.cost += s.cost_usd.unwrap_or(0.0);
+            total.runs += 1;
+            if let Some(q) = &s.quota {
+                let at = ev["started_at"].as_str().unwrap_or("").to_owned();
+                if quota.get(&client).is_none_or(|(t, _)| *t < at) {
+                    quota.insert(client.clone(), (at, q.clone()));
+                }
+            }
+            runs.push(json!({
+                "work": w.id, "work_name": w.name, "attempt": a.id, "stage": stage,
+                "stage_index": a.stage, "client": client, "model": model,
+                "status": ev["status"], "started_at": ev["started_at"],
+                "tokens": s.tokens, "total": s.tokens.total(), "cost_usd": s.cost_usd, "calls": s.calls,
+            }));
+        }
+        if item_sum.runs > 0 {
+            items.push(json!({
+                "key": w.id, "name": w.name, "shelved": w.shelved.is_some(),
+                "tokens": item_sum.tokens, "total": item_sum.tokens.total(),
+                "cost_usd": item_sum.cost, "runs": item_sum.runs,
+                "budget": w.budget_total,
+            }));
+        }
+    }
+    items.sort_by_key(|v| std::cmp::Reverse(v["total"].as_u64().unwrap_or(0)));
+    runs.sort_by_key(|v| std::cmp::Reverse(v["total"].as_u64().unwrap_or(0)));
+    runs.truncate(12);
+    stages.sort_by_key(|(_, s)| std::cmp::Reverse(s.tokens.total()));
+    models.sort_by_key(|(_, s)| std::cmp::Reverse(s.tokens.total()));
+    days.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(json!({
+        "total": {"tokens": total.tokens, "total": total.tokens.total(), "cost_usd": total.cost, "runs": total.runs},
+        "stage_budget": p.stage_budget,
+        "items": items,
+        "stages": stages.iter().map(row).collect::<Vec<_>>(),
+        "models": models.iter().map(row).collect::<Vec<_>>(),
+        "days": days.iter().map(row).collect::<Vec<_>>(),
+        "runs": runs,
+        "quota": quota.into_iter().map(|(client, (at, q))| json!({"client": client, "at": at, "windows": q})).collect::<Vec<_>>(),
+    }))
 }

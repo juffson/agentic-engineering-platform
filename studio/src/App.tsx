@@ -5,6 +5,7 @@ import { Sidebar } from "./components/Sidebar";
 import { WorkPage } from "./components/WorkPage";
 import { MemoryPage, ReposPage } from "./components/SecondaryPages";
 import { BranchesPage } from "./components/Branches";
+import { UsagePage } from "./components/Usage";
 import { NewProjectDialog, NewWorkDialog } from "./components/Dialogs";
 import { Toasts } from "./components/Toasts";
 import { Button, Spinner } from "./components/ui";
@@ -38,6 +39,8 @@ function Shell() {
     main = <ReposPage project={project} />;
   } else if (page === "branches") {
     main = <BranchesPage project={project} />;
+  } else if (page === "usage") {
+    main = <UsagePage project={project} />;
   } else if (selected && project.work.some((w) => w.id === selected)) {
     main = <WorkPage key={`${project.id}/${selected}`} project={project.id} work={selected} />;
   } else {

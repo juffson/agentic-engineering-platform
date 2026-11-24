@@ -14,7 +14,69 @@ export type RunStatus =
   | "succeeded"
   | "failed"
   | "cancelled"
+  | "budget_exhausted"
   | string;
+
+/** Token counts with cached input apart from fresh input (same for every CLI). */
+export interface Tokens {
+  input: number;
+  cache_read: number;
+  cache_write: number;
+  output: number; // includes reasoning
+  reasoning: number;
+}
+
+export interface UsageSummary {
+  tokens: Tokens;
+  cost_usd: number | null; // only Claude reports a cost
+  models: string[];
+  calls: number;
+  /** Account quota the CLI reported last, 0–1 per window, e.g. { five_hour: 0.41 }. */
+  quota?: Record<string, number> | null;
+}
+
+/** Where one run's tokens went. */
+export interface UsageAnalysis {
+  summary: UsageSummary;
+  by_kind: { kind: string; calls: number; tokens: Tokens; total: number; output_bytes: number }[];
+  /** Context size and output of every model call, in order. */
+  calls: { kind: string; detail: string; context: number; output: number }[];
+  /** Steps that grew the context most; `carried` = growth × calls that read it again. */
+  heaviest: { call: number; kind: string; detail: string; bytes: number; tokens: number; carried: number }[];
+}
+
+export interface UsageRow {
+  key: string;
+  tokens: Tokens;
+  total: number;
+  cost_usd: number;
+  runs: number;
+}
+
+export interface ProjectUsage {
+  total: { tokens: Tokens; total: number; cost_usd: number; runs: number };
+  stage_budget: number | null;
+  items: (UsageRow & { name: string; shelved: boolean; budget: number | null })[];
+  stages: UsageRow[];
+  models: UsageRow[];
+  days: UsageRow[];
+  runs: {
+    work: string;
+    work_name: string;
+    attempt: string;
+    stage: string;
+    stage_index: number;
+    client: Client;
+    model: string;
+    status: RunStatus;
+    started_at: string;
+    tokens: Tokens;
+    total: number;
+    cost_usd: number | null;
+    calls: number;
+  }[];
+  quota: { client: Client; at: string; windows: Record<string, number> }[];
+}
 
 export interface Profile {
   client: Client;
@@ -69,6 +131,7 @@ export interface AttemptSummary {
   route_back: { stage: number; name: string; question: string } | null;
   committed: boolean; // platform committed worktree changes after this run
   head_sha: string | null;
+  tokens: number; // total tokens this attempt used
 }
 
 export type StageState = "done" | "current" | "upcoming" | "skipped";
@@ -86,6 +149,8 @@ export interface StageDetail {
   sandbox: Sandbox;
   attempts: AttemptSummary[]; // oldest first
   current_attempt: string | null;
+  /** Tokens used by every attempt of this stage; `limit` = own budget or the project default. */
+  budget: { limit: number | null; own: number | null; used: number };
 }
 
 export interface Rework {
@@ -130,6 +195,7 @@ export interface WorkDetail {
   autopilot: AutopilotState;
   deliveries: DeliveryInfo[];
   memory_draft: string | null; // only for delivered, unarchived items
+  budget: { total_limit: number | null; total_used: number; stage_default: number | null };
 }
 
 export type Entry =
@@ -148,6 +214,9 @@ export interface AttemptView {
   entries: Entry[];
   input_tokens: number;
   output_tokens: number;
+  usage: UsageSummary;
+  /** Tokens this attempt was allowed before being stopped; null = unlimited. */
+  token_limit: number | null;
   model: string | null;
   error: string | null;
   result: string | null; // final answer text (result.txt)
@@ -412,4 +481,12 @@ export interface Api {
   /** Repository-scoped shared memory (stages read it too). Notes reuse MemoryNote. */
   repoMemories(a: { path: string }): MemoryNote[];
   addRepoMemory(a: { path: string; text: string }): number;
+  /** Set a stage's token budget (stage omitted: the item's total); null removes it. */
+  setBudget(a: { project: string; work: string; stage?: number; tokens: number | null }): void;
+  /** The project's default budget for stages without their own. */
+  setProjectBudget(a: { project: string; tokens: number | null }): void;
+  /** Raise the budget that stopped the stage by `extra` and continue its session. */
+  extendBudget(a: { project: string; work: string; stage: number; extra: number; message: string }): string;
+  usageAnalysis(a: { project: string; work: string; attempt: string }): UsageAnalysis;
+  projectUsage(a: { project: string }): ProjectUsage;
 }

@@ -38,6 +38,22 @@ export function relative(value: string | null | undefined): string {
 }
 
 export function tokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 100_000_000 ? 0 : 1)}M`;
   if (n >= 1000) return `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k`;
   return String(n);
+}
+
+/** "2M", "500k", "1.5m", "300000" → tokens; "" → null; NaN when unreadable. */
+export function parseTokens(text: string): number | null {
+  const t = text.trim().toLowerCase().replace(/,/g, "");
+  if (!t) return null;
+  const m = /^(\d+(?:\.\d+)?)\s*([km万]?)$/.exec(t);
+  if (!m) return NaN;
+  const scale = m[2] === "m" ? 1_000_000 : m[2] === "k" ? 1000 : m[2] === "万" ? 10_000 : 1;
+  return Math.round(parseFloat(m[1]) * scale);
+}
+
+export function usd(n: number | null | undefined): string {
+  if (n === null || n === undefined) return "";
+  return n >= 100 ? `$${n.toFixed(0)}` : `$${n.toFixed(2)}`;
 }

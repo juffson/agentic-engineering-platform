@@ -5,6 +5,8 @@ import { api } from "../api/client";
 import { useStudio } from "../state/store";
 import { StagePickers } from "./StageConfig";
 import { Button, Drawer } from "./ui";
+import { BudgetField, BudgetMeter, StageBudget } from "./Budget";
+import { tokens } from "../lib/format";
 
 export function AutopilotDrawer({ detail, onClose }: { detail: WorkDetail; onClose(): void }) {
   const { act } = useStudio();
@@ -45,8 +47,21 @@ export function AutopilotDrawer({ detail, onClose }: { detail: WorkDetail; onClo
     >
       <p className="ap-explain">
         <Info size={14} />
-        <span>测试或验收发现问题时，会自动退回负责的前序阶段修复（最多循环 2 次）；Agent 报告 BLOCKED 时停下等人处理。</span>
+        <span>测试或验收发现问题时，会自动退回负责的前序阶段修复（最多循环 2 次）；Agent 报告 BLOCKED 或 Token 预算用完时停下等人处理，不会自动重试。</span>
       </p>
+      <div className="ap-budget">
+        <span className="picker-label">事项总预算</span>
+        <BudgetField
+          value={detail.budget.total_limit}
+          placeholder="不限"
+          label="事项 Token 总预算"
+          onSave={(n) => act(() => api.setBudget({ project: detail.project, work: detail.id, tokens: n }))}
+        />
+        <BudgetMeter used={detail.budget.total_used} limit={detail.budget.total_limit} />
+        <span className="field-hint">
+          所有阶段合计；用完时自动运行停下等你。单个阶段的预算在下面设置{detail.budget.stage_default ? `，未设置的阶段用项目默认 ${tokens(detail.budget.stage_default)}` : ""}。
+        </span>
+      </div>
       {ap.message && !ap.running && (
         <p className="ap-last">
           <span className="muted">上次结果</span>
@@ -91,6 +106,7 @@ export function AutopilotDrawer({ detail, onClose }: { detail: WorkDetail; onClo
               {!skipped && !after && (
                 <div className="ap-row-body">
                   <StagePickers detail={detail} stage={s} compact />
+                  <StageBudget detail={detail} stage={s} compact />
                 </div>
               )}
             </li>

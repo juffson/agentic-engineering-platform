@@ -28,6 +28,9 @@ import type {
   HistoryRound,
   ItemHandoff,
   ZCodeModel,
+  Tokens,
+  UsageAnalysis,
+  ProjectUsage,
 } from "./types";
 
 type StageDef = { name: string; role: Role; brief: string; skippable: boolean };
@@ -97,6 +100,8 @@ interface MockAttempt {
   outcome: Pick<AttemptSummary, "status" | "error" | "route_back">;
   tokens: [number, number];
   result: string | null;
+  /** Tokens the run may use before it is stopped (what was left of the budgets). */
+  limit: number | null;
 }
 
 interface MockWork {
@@ -105,7 +110,23 @@ interface MockWork {
   createdMs: number;
   autopilotRan: Set<number>;
   autopilotLoops: number;
+  budgets?: Record<number, number>;
+  budgetTotal?: number | null;
 }
+
+/** A mock run's tokens so far, split the way the real CLIs report them (mostly cache reads). */
+function mockTokens(a: MockAttempt): Tokens {
+  const progress = a.summary.status === "running" ? a.entries.length / Math.max(1, a.entries.length + a.script.length) : 1;
+  const input = Math.round(a.tokens[0] * progress);
+  return {
+    input: Math.round(input * 0.15),
+    cache_read: input - Math.round(input * 0.15),
+    cache_write: 0,
+    output: Math.round(a.tokens[1] * progress),
+    reasoning: 0,
+  };
+}
+const sumTokens = (t: Tokens) => t.input + t.cache_read + t.cache_write + t.output;
 
 const HOME = "/Users/demo/.aep";
 const REPOS = ["/Users/demo/code/quote-terminal", "/Users/demo/code/quote-gateway"];
@@ -187,7 +208,10 @@ class MockStore implements Api {
       route_back: null,
       committed: false,
       head_sha: null,
+      tokens: 0,
     };
+    const budget = this.budget(w, stageIndex);
+    if (budget.exhausted) throw new Error(budget.exhausted);
     const attempt: MockAttempt = {
       work: w.detail.id,
       stage: stageIndex,
@@ -199,6 +223,7 @@ class MockStore implements Api {
       outcome,
       tokens: opts.tokens ?? [18000 + Math.round(Math.random() * 30000), 2400 + Math.round(Math.random() * 4000)],
       result: opts.result ?? null,
+      limit: budget.remaining,
     };
     if (opts.done) {
       attempt.entries = [...opts.script];
@@ -219,6 +244,7 @@ class MockStore implements Api {
     s.error = attempt.outcome.error;
     s.route_back = attempt.outcome.route_back;
     s.finished_at = iso(at);
+    s.tokens = sumTokens(mockTokens(attempt));
     if (s.status === "succeeded") {
       s.committed = true;
       s.head_sha = Math.random().toString(16).slice(2, 12);
@@ -235,6 +261,18 @@ class MockStore implements Api {
       const due = Math.floor((now - a.startMs) / a.stepMs);
       while (a.entries.length < due && a.script.length > 0) {
         a.entries.push(a.script.shift()!);
+      }
+      a.summary.tokens = sumTokens(mockTokens(a));
+      if (a.limit !== null && a.summary.tokens >= a.limit) {
+        a.outcome = { status: "budget_exhausted", error: `Token 预算已用完：这一轮用了 ${Math.round(a.summary.tokens / 1000)}k，本轮可用 ${Math.round(a.limit / 1000)}k。追加预算后可在原会话继续`, route_back: null };
+        // Freeze the run at what it had used when it was stopped.
+        const t = mockTokens(a);
+        a.tokens = [t.input + t.cache_read, t.output];
+        a.script = [];
+        this.finish(a, now);
+        const w = this.works.get(a.work);
+        if (w?.detail.autopilot.running) this.stopAutopilot(w, "stopped", `「${w.detail.stages[a.stage]?.name}」的 Token 预算已用完，追加预算后可继续对话，或退回 / 人工放行`);
+        continue;
       }
       if (a.script.length === 0 && now - a.startMs >= (a.entries.length + 1) * a.stepMs) {
         this.finish(a, now);
@@ -419,7 +457,126 @@ class MockStore implements Api {
 
   workDetail({ project, work }: { project: string; work: string }): WorkDetail {
     this.tick();
-    return clone(this.work(project, work).detail);
+    const w = this.work(project, work);
+    const d = w.detail;
+    const fallback = this.projectBudget.get(project) ?? null;
+    d.stages.forEach((st, i) => {
+      st.budget = { limit: w.budgets?.[i] ?? fallback, own: w.budgets?.[i] ?? null, used: st.attempts.reduce((n, a) => n + (a.tokens ?? 0), 0) };
+    });
+    d.budget = {
+      total_limit: w.budgetTotal ?? null,
+      total_used: d.stages.reduce((n, st) => n + st.budget.used, 0),
+      stage_default: fallback,
+    };
+    return clone(d);
+  }
+
+  projectBudget = new Map<string, number | null>();
+
+  budget(w: MockWork, stage: number): { remaining: number | null; exhausted: string | null } {
+    const used = (i: number | null) =>
+      w.detail.stages.filter((_, j) => i === null || j === i).reduce((n, st) => n + st.attempts.reduce((m, a) => m + (a.tokens ?? 0), 0), 0);
+    const stageLimit = w.budgets?.[stage] ?? this.projectBudget.get(w.project) ?? null;
+    const totalLimit = w.budgetTotal ?? null;
+    const left = [stageLimit !== null ? stageLimit - used(stage) : null, totalLimit !== null ? totalLimit - used(null) : null].filter((x): x is number => x !== null);
+    const remaining = left.length ? Math.max(0, Math.min(...left)) : null;
+    let exhausted: string | null = null;
+    if (totalLimit !== null && used(null) >= totalLimit) exhausted = "事项 Token 总预算已用完，请追加预算";
+    else if (stageLimit !== null && used(stage) >= stageLimit) exhausted = "此阶段 Token 预算已用完，请追加预算";
+    return { remaining, exhausted };
+  }
+
+  setBudget({ project, work, stage, tokens }: { project: string; work: string; stage?: number; tokens: number | null }) {
+    const w = this.work(project, work);
+    if (stage === undefined || stage === null) {
+      w.budgetTotal = tokens || null;
+      return;
+    }
+    w.budgets = { ...(w.budgets ?? {}) };
+    if (tokens) w.budgets[stage] = tokens;
+    else delete w.budgets[stage];
+  }
+
+  setProjectBudget({ project, tokens }: { project: string; tokens: number | null }) {
+    this.projectBudget.set(project, tokens || null);
+  }
+
+  extendBudget({ project, work, stage, extra, message }: { project: string; work: string; stage: number; extra: number; message: string }): string {
+    const w = this.work(project, work);
+    const st = this.stage(w, stage);
+    const used = st.attempts.reduce((n, a) => n + (a.tokens ?? 0), 0);
+    const limit = w.budgets?.[stage] ?? this.projectBudget.get(project) ?? null;
+    if (limit !== null) w.budgets = { ...(w.budgets ?? {}), [stage]: Math.max(limit, used) + extra };
+    if (w.budgetTotal) {
+      const total = w.detail.stages.reduce((n, s2) => n + s2.attempts.reduce((m, a) => m + (a.tokens ?? 0), 0), 0);
+      if (total + extra > w.budgetTotal) w.budgetTotal = Math.max(w.budgetTotal, total) + extra;
+    }
+    return this.followUp({ project, work, stage, message: message.trim() || "预算已追加。请从中断的地方继续完成本阶段的任务。" });
+  }
+
+  usageAnalysis({ attempt }: { project: string; work: string; attempt: string }): UsageAnalysis {
+    const a = this.attempts.get(attempt);
+    if (!a) throw new Error(`找不到运行记录 ${attempt}`);
+    const t = mockTokens(a);
+    const kinds = ["读取", "命令", "编辑", "回答"];
+    const calls = Array.from({ length: 12 }, (_, i) => ({ kind: kinds[i % 4], detail: i % 4 === 1 ? "cargo test --locked" : i % 4 === 0 ? "src/features/export/csv.ts" : "", context: 9000 + i * 2600, output: 300 + (i % 3) * 120 }));
+    const part = (f: number): Tokens => ({ input: Math.round(t.input * f), cache_read: Math.round(t.cache_read * f), cache_write: 0, output: Math.round(t.output * f), reasoning: 0 });
+    const by = [0.42, 0.31, 0.17, 0.1].map((f, i) => ({ kind: kinds[i], calls: 3, tokens: part(f), total: sumTokens(part(f)), output_bytes: Math.round(f * 40000) }));
+    return {
+      summary: { tokens: t, cost_usd: a.summary.client === "Claude" ? 0.42 : null, models: [a.summary.model || "default"], calls: 12 },
+      by_kind: by,
+      calls,
+      heaviest: [{ call: 1, kind: "命令", detail: "cargo test --locked", bytes: 18000, tokens: 4600, carried: 46000 }],
+    };
+  }
+
+  projectUsage({ project }: { project: string }): ProjectUsage {
+    this.tick();
+    const rows = new Map<string, Map<string, { tokens: Tokens; runs: number; cost: number }>>();
+    const add = (group: string, key: string, t: Tokens, cost: number) => {
+      const g = rows.get(group) ?? new Map();
+      rows.set(group, g);
+      const r = g.get(key) ?? { tokens: { input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0 }, runs: 0, cost: 0 };
+      r.tokens = { input: r.tokens.input + t.input, cache_read: r.tokens.cache_read + t.cache_read, cache_write: 0, output: r.tokens.output + t.output, reasoning: 0 };
+      r.runs += 1;
+      r.cost += cost;
+      g.set(key, r);
+    };
+    const runs: ProjectUsage["runs"] = [];
+    for (const a of this.attempts.values()) {
+      const w = this.works.get(a.work);
+      if (!w || w.project !== project) continue;
+      const t = mockTokens(a);
+      const cost = a.summary.client === "Claude" ? sumTokens(t) / 200000 : 0;
+      const stage = w.detail.stages[a.stage]?.name ?? "?";
+      add("items", w.detail.id, t, cost);
+      add("stages", stage, t, cost);
+      add("models", `${a.summary.client} · ${a.summary.model || "默认"}`, t, cost);
+      add("days", (a.summary.started_at ?? "").slice(0, 10), t, cost);
+      runs.push({ work: w.detail.id, work_name: w.detail.name, attempt: a.summary.id, stage, stage_index: a.stage, client: a.summary.client, model: a.summary.model, status: a.summary.status, started_at: a.summary.started_at ?? "", tokens: t, total: sumTokens(t), cost_usd: cost || null, calls: 12 });
+    }
+    const list = (group: string) =>
+      [...(rows.get(group) ?? new Map()).entries()]
+        .map(([key, r]) => ({ key, tokens: r.tokens, total: sumTokens(r.tokens), cost_usd: r.cost, runs: r.runs }))
+        .sort((x, y) => y.total - x.total);
+    const items = list("items").map((r) => {
+      const w = this.works.get(r.key)!;
+      return { ...r, name: w.detail.name, shelved: !!w.detail.shelved, budget: w.budgetTotal ?? null };
+    });
+    const all = list("stages").reduce(
+      (acc, r) => ({ tokens: { input: acc.tokens.input + r.tokens.input, cache_read: acc.tokens.cache_read + r.tokens.cache_read, cache_write: 0, output: acc.tokens.output + r.tokens.output, reasoning: 0 }, cost: acc.cost + r.cost_usd, runs: acc.runs + r.runs }),
+      { tokens: { input: 0, cache_read: 0, cache_write: 0, output: 0, reasoning: 0 } as Tokens, cost: 0, runs: 0 },
+    );
+    return {
+      total: { tokens: all.tokens, total: sumTokens(all.tokens), cost_usd: all.cost, runs: all.runs },
+      stage_budget: this.projectBudget.get(project) ?? null,
+      items,
+      stages: list("stages"),
+      models: list("models"),
+      days: list("days").sort((x, y) => x.key.localeCompare(y.key)),
+      runs: runs.sort((x, y) => y.total - x.total).slice(0, 12),
+      quota: [{ client: "Claude", at: new Date().toISOString(), windows: { five_hour: 0.41, seven_day: 0.33 } }],
+    };
   }
 
   attemptView({ project, work, attempt }: { project: string; work: string; attempt: string }): AttemptView {
@@ -434,6 +591,8 @@ class MockStore implements Api {
       entries: clone(a.entries),
       input_tokens: Math.round(a.tokens[0] * (a.summary.status === "running" ? progress : 1)),
       output_tokens: Math.round(a.tokens[1] * (a.summary.status === "running" ? progress : 1)),
+      usage: { tokens: mockTokens(a), cost_usd: a.summary.client === "Claude" ? 0.42 : null, models: [a.summary.model || "default"], calls: 12 },
+      token_limit: a.limit,
       model: a.summary.model || null,
       error: a.summary.error,
       result: a.summary.status === "succeeded" ? a.result : null,
@@ -1216,6 +1375,7 @@ function newWork(project: string, name: string, template: Template, kind: "Featu
       sandbox: s.role === "Build" || s.role === "Test" ? "Network" : "Standard",
       attempts: [],
       current_attempt: null,
+      budget: { limit: null, own: null, used: 0 },
     };
   });
   const short = id.slice(1, 9).padEnd(8, "0");
@@ -1244,6 +1404,7 @@ function newWork(project: string, name: string, template: Template, kind: "Featu
       autopilot: { running: false, status: null, message: null, stage: null, until: null },
       deliveries: [],
       memory_draft: null,
+      budget: { total_limit: null, total_used: 0, stage_default: null },
     },
   };
 }
