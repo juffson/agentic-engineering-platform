@@ -348,6 +348,8 @@ export interface SyncPlan {
   items_keep: { id: string; name: string; reason: string }[];
   items_remove: { id: string; name: string; reason: string }[]; // never ran
   items_stale: { id: string; name: string; reason: string }[]; // ran, left for a person
+  /** Worktree branches not made into items (merged with nothing left, or deleted before). */
+  items_skip: { branch: string; reason: string }[];
 }
 
 export type TidyOp =

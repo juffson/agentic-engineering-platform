@@ -53,6 +53,15 @@ pub struct SyncPlan {
     pub items_remove: Vec<SyncItem>,
     /// Imported items whose worktree is gone but which already ran: left for a person.
     pub items_stale: Vec<SyncItem>,
+    /// Worktree branches not made into items: already merged with nothing left to do, or
+    /// deleted by a person before.
+    pub items_skip: Vec<SyncSkip>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SyncSkip {
+    pub branch: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -362,6 +371,7 @@ impl Project {
     /// Turn an existing branch into an item that starts at the build stage. The item gets its
     /// own `aep-stage/<id>` branch at the same commit, so the original worktree is left alone.
     pub fn import_branch(&mut self, repo: &Path, branch: &str, from: &Path) -> Result<String> {
+        self.dismissed_imports.retain(|b| b != branch);
         let root = Workspace::open(repo)?.root.canonicalize()?;
         let tip = git(
             &root,
@@ -448,6 +458,9 @@ impl Project {
             .iter()
             .filter(|w| w.branch.is_some())
             .collect();
+        // A worktree whose branch adds nothing to HEAD and has no uncommitted changes holds no
+        // unfinished work: it is not (or no longer) an item.
+        let finished = |f: &FoundWorktree| f.ahead == 0 && f.dirty == 0 && f.untracked == 0;
         let mut seen = std::collections::HashSet::new();
         for w in &self.work {
             let Some(branch) = w.import_source() else {
@@ -465,8 +478,12 @@ impl Project {
                 } else {
                     plan.items_remove.push(item("重复导入"));
                 }
-            } else if live.iter().any(|f| f.branch.as_deref() == Some(branch)) {
-                plan.items_keep.push(item("工作区仍在"));
+            } else if let Some(f) = live.iter().find(|f| f.branch.as_deref() == Some(branch)) {
+                if !ran && finished(f) {
+                    plan.items_remove.push(item("分支已合并，没有未完成的改动"));
+                } else {
+                    plan.items_keep.push(item("工作区仍在"));
+                }
             } else if ran {
                 plan.items_stale
                     .push(item("原工作区已删除，但事项已运行过"));
@@ -476,11 +493,25 @@ impl Project {
         }
         for f in live {
             let branch = f.branch.clone().unwrap_or_default();
-            if !seen.contains(&branch) {
-                plan.items_add.push(SyncBranch {
+            if seen.contains(&branch) {
+                continue;
+            }
+            let skip = if self.dismissed_imports.contains(&branch) {
+                Some("你删除过这个导入的事项")
+            } else if finished(f) {
+                Some("分支已合并，没有未完成的改动")
+            } else {
+                None
+            };
+            match skip {
+                Some(reason) => plan.items_skip.push(SyncSkip {
+                    branch,
+                    reason: reason.into(),
+                }),
+                None => plan.items_add.push(SyncBranch {
                     branch,
                     path: f.path.clone(),
-                });
+                }),
             }
         }
         Ok(plan)

@@ -399,6 +399,9 @@ pub struct Project {
     pub selected: Option<String>,
     #[serde(default)]
     pub cli_defaults: Vec<Profile>,
+    /// Branches whose imported item a person deleted; sync does not bring them back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed_imports: Vec<String>,
     /// Default token budget for a stage that has none of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_budget: Option<u64>,
@@ -642,6 +645,7 @@ impl Library {
             work: vec![],
             selected: None,
             cli_defaults: vec![],
+            dismissed_imports: vec![],
             stage_budget: None,
         });
         self.active = Some(id);

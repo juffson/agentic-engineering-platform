@@ -926,6 +926,7 @@ class MockStore implements Api {
       items_keep: keep,
       items_remove: remove,
       items_stale: [],
+      items_skip: [{ branch: "feature/merged-already", reason: "分支已合并，没有未完成的改动" }],
     };
   }
 

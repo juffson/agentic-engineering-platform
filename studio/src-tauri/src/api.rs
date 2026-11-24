@@ -875,7 +875,18 @@ pub fn cleanup(home: &Path, pid: &str, wid: &str, force: bool) -> Result<shelf::
 
 /// Delete an item that never ran.
 pub fn delete_work(home: &Path, pid: &str, wid: &str) -> Result<()> {
-    change(home, |lib| find_mut(lib, pid)?.remove_work(home, wid))
+    change(home, |lib| {
+        let p = find_mut(lib, pid)?;
+        let source = item(p, wid)?.import_source().map(str::to_owned);
+        p.remove_work(home, wid)?;
+        // Deleting an imported item is a decision: the next sync must not bring it back.
+        if let Some(branch) = source
+            && !p.dismissed_imports.contains(&branch)
+        {
+            p.dismissed_imports.push(branch);
+        }
+        Ok(())
+    })
 }
 
 pub fn unarchive(home: &Path, pid: &str, wid: &str) -> Result<()> {

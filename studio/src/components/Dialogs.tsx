@@ -546,6 +546,11 @@ function SyncPane({ project, path, onClose }: { project: string; path: string; o
             ! <code>{i.name}</code> <span className="muted">（{i.reason}，保留，需要你处理）</span>
           </li>
         ))}
+        {plan.items_skip.map((b) => (
+          <li key={b.branch} className="muted">
+            · <code>{b.branch}</code> 不导入（{b.reason}）
+          </li>
+        ))}
       </ul>
       <p className="field-hint">
         已运行过的事项不会被移除；移出的记忆保留在历史里。Agent 每次最多读取 32 条最新的项目记忆，记忆很多时只挑关键的导入效果更好。

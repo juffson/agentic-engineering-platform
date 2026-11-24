@@ -66,8 +66,13 @@ pub fn status(path: &std::path::Path) -> (usize, usize) {
     let Ok(out) = git(path, &["status", "--porcelain"]) else {
         return (0, 0);
     };
-    let untracked = out.lines().filter(|l| l.starts_with("??")).count();
-    (out.lines().count() - untracked, untracked)
+    // Agent tools keep their own state in the worktree (`.zcode/`, `.claude/`); not changes.
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| !matches!(l.get(3..), Some(".zcode/" | ".claude/")))
+        .collect();
+    let untracked = lines.iter().filter(|l| l.starts_with("??")).count();
+    (lines.len() - untracked, untracked)
 }
 
 /// Every worktree of the repository (including the main checkout) and its branch.

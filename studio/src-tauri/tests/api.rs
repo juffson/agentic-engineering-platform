@@ -615,6 +615,19 @@ fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
             wt2.to_str().unwrap(),
         ],
     )?;
+    // Nothing on it yet (and ZCode's own folder is not a change): not an item.
+    fs::create_dir_all(wt2.join(".zcode"))?;
+    fs::write(wt2.join(".zcode/state.json"), "{}")?;
+    let plan = serde_json::to_value(api::import_sync_plan(
+        &home,
+        &pid,
+        &repo.display().to_string(),
+    )?)?;
+    assert!(plan["items_add"].as_array().unwrap().is_empty(), "{plan}");
+    assert_eq!(plan["items_skip"][0]["branch"], "feat/b", "{plan}");
+    fs::write(wt2.join("b.txt"), "b\n")?;
+    git(&wt2, &["add", "b.txt"])?;
+    git(&wt2, &["commit", "-q", "-m", "b"])?;
     let plan = serde_json::to_value(api::import_sync_plan(
         &home,
         &pid,
@@ -635,7 +648,28 @@ fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
         .as_str()
         .unwrap()
         .to_owned();
-    git(&repo, &["worktree", "remove", wt2.to_str().unwrap()])?;
+    // Deleting the imported item is remembered: sync does not bring it back.
+    api::delete_work(&home, &pid, &b)?;
+    let plan = serde_json::to_value(api::import_sync_plan(
+        &home,
+        &pid,
+        &repo.display().to_string(),
+    )?)?;
+    assert!(plan["items_add"].as_array().unwrap().is_empty(), "{plan}");
+    assert_eq!(plan["items_skip"][0]["reason"], "你删除过这个导入的事项");
+    // Importing it on purpose brings it back.
+    let back = api::import_apply(
+        &home,
+        &pid,
+        &repo.display().to_string(),
+        &[],
+        &[("feat/b".into(), wt2.display().to_string())],
+    )?;
+    let b = back["items"][0].as_str().unwrap().to_owned();
+    git(
+        &repo,
+        &["worktree", "remove", "--force", wt2.to_str().unwrap()],
+    )?;
     fs::remove_file(claude.join("memory/money.md"))?;
     let plan = serde_json::to_value(api::import_sync_plan(
         &home,
