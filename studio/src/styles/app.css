@@ -2640,3 +2640,50 @@ select.input {
 .menu-item.danger {
   color: var(--danger);
 }
+
+/* Project memory versions. */
+.memory-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 12px;
+}
+.memory-actions .link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.memory-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+.row-gap {
+  display: inline-flex;
+  gap: 8px;
+}
+.memory-history {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0 0 0 12px;
+  border-left: 2px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.memory-diff {
+  margin: 4px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  color: var(--text-2);
+}
+.diff-del {
+  color: var(--danger);
+  text-decoration: line-through;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+.diff-add {
+  color: var(--success, #3fb950);
+  background: color-mix(in srgb, var(--success, #3fb950) 14%, transparent);
+}

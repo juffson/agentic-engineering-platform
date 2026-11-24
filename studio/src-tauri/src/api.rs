@@ -925,6 +925,7 @@ pub fn memories(home: &Path, pid: &str) -> Result<Value> {
             .map(|n| json!({
                 "id": n["id"], "kind": n["kind"], "author": n["author"], "body": n["body"],
                 "created_at": n["created_at"], "superseded": !n["successor"].is_null(),
+                "replaces": n["replaces"],
             }))
             .collect::<Vec<_>>()
     ))
@@ -933,6 +934,26 @@ pub fn memories(home: &Path, pid: &str) -> Result<Value> {
 pub fn add_memory(home: &Path, pid: &str, text: &str) -> Result<i64> {
     let mut db = Memory::open(&memory_dir(home, pid)?)?;
     db.add_manual(&Key::new("", "", ""), "decision", text, None, None)
+}
+
+/// Save a new version of a project memory note; the old one stays in its history and
+/// agents read only the newest version. Restoring an old version is saving its text again.
+pub fn revise_memory(home: &Path, pid: &str, id: i64, text: &str) -> Result<i64> {
+    let dir = memory_dir(home, pid)?;
+    let notes = Memory::browse(&dir)?;
+    let note = notes.iter().find(|n| n["id"] == id).context("记忆不存在")?;
+    ensure!(
+        note["successor"].is_null(),
+        "这条记忆已有更新的版本，请在最新版本上修改"
+    );
+    ensure!(note["body"].as_str() != Some(text.trim()), "内容没有变化");
+    let kind = match note["kind"].as_str() {
+        Some("handoff") => aep::memory::Kind::Handoff,
+        Some("open_question") => aep::memory::Kind::OpenQuestion,
+        Some("review") => aep::memory::Kind::Review,
+        _ => aep::memory::Kind::Decision,
+    };
+    Memory::open(&dir)?.revise(id, kind, text.trim())
 }
 
 pub fn reveal(path: &str) -> Result<()> {
@@ -1028,6 +1049,7 @@ pub fn repo_memories(path: &str) -> Result<Value> {
             .map(|n| json!({
                 "id": n["id"], "kind": n["kind"], "author": n["author"], "body": n["body"],
                 "created_at": n["created_at"], "superseded": !n["successor"].is_null(),
+                "replaces": n["replaces"],
             }))
             .collect::<Vec<_>>()
     ))

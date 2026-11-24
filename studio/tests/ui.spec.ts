@@ -258,3 +258,24 @@ test("an existing project imports from its repository page, and can be removed",
   await page.getByRole("menuitem", { name: /移除项目「行情终端」/ }).click();
   await expect(page.locator(".project-name")).not.toHaveText("行情终端");
 });
+
+test("project memory keeps versions: edit, see what changed, restore", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  await page.getByRole("button", { name: /^项目记忆/ }).click();
+  const note = page.getByTestId("memory-note").filter({ hasText: "zustand" });
+  await expect(note).toContainText("第 2 版");
+  await expect(page.getByText("前端状态管理使用 zustand（替代旧的 redux store）。")).toHaveCount(0); // old version hidden
+
+  await note.getByRole("button", { name: /编辑/ }).click();
+  await note.getByLabel("编辑记忆").fill("前端状态使用 zustand，跨组件共享通过 store 切片完成。");
+  await note.getByRole("button", { name: "保存为新版本" }).click();
+  const latest = page.getByTestId("memory-note").filter({ hasText: "zustand" });
+  await expect(latest).toContainText("第 3 版");
+  await latest.getByRole("button", { name: /历史 2/ }).click();
+  await expect(latest.locator(".diff-del").first()).toContainText("禁止新增全局单例");
+  await shot(page, "22-memory-versions");
+  await latest.getByRole("button", { name: "恢复此版本" }).first().click();
+  await expect(page.getByTestId("memory-note").filter({ hasText: "zustand" })).toContainText("禁止新增全局单例");
+  await expect(page.getByTestId("memory-note").filter({ hasText: "zustand" })).toContainText("第 4 版");
+});

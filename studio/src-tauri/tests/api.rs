@@ -444,6 +444,57 @@ fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
         &[],
     )?;
     assert_eq!(again["notes"], 0);
+    // A changed file becomes a new version of its note; agents see only the newest.
+    fs::write(
+        claude.join("memory/money.md"),
+        "---\nname: money-in-cents\ndescription: 金额统一用分\n---\n\n所有金额字段用整数分存储，展示时再换算。\n",
+    )?;
+    let changed = api::import_apply(
+        &home,
+        &pid,
+        &repo.display().to_string(),
+        &["money.md".into()],
+        &[],
+    )?;
+    assert_eq!(changed["notes"], 1);
+    let notes = api::memories(&home, &pid)?;
+    let notes = notes.as_array().unwrap();
+    let current: Vec<_> = notes.iter().filter(|n| n["superseded"] == false).collect();
+    assert_eq!(current.len(), 1, "{notes:?}");
+    assert!(
+        current[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("展示时再换算")
+    );
+    let first = current[0]["replaces"]
+        .as_i64()
+        .expect("new version replaces the old");
+    // Editing makes another version; restoring the first is revising with its text.
+    let edited = api::revise_memory(
+        &home,
+        &pid,
+        current[0]["id"].as_i64().unwrap(),
+        "改用 Decimal",
+    )?;
+    let original = notes.iter().find(|n| n["id"] == first).unwrap()["body"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        api::revise_memory(&home, &pid, first, "x").is_err(),
+        "only the newest can be revised"
+    );
+    let restored = api::revise_memory(&home, &pid, edited, &original)?;
+    let notes = api::memories(&home, &pid)?;
+    let newest = notes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == restored)
+        .unwrap();
+    assert_eq!(newest["body"], original.as_str());
+    assert_eq!(newest["replaces"], edited);
 
     // The branch became an item at 开发实现 with its own branch at the same commit.
     let d = api::work_detail(&home, &pid, &wid)?;

@@ -200,6 +200,11 @@ fn removeProject(project: String) -> Result<impl Serialize, String> {
 }
 
 #[tauri::command(async)]
+fn reviseMemory(project: String, id: i64, text: String) -> Result<impl Serialize, String> {
+    run(move |h| api::revise_memory(&h, &project, id, &text))
+}
+
+#[tauri::command(async)]
 fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
     run(move |h| api::cleanup(&h, &project, &work, force))
 }
@@ -304,6 +309,7 @@ pub fn start() {
             archive,
             unarchive,
             cleanup,
+            reviseMemory,
             removeProject,
             importScan,
             importApply,

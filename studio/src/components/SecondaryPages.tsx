@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, Download, FolderGit2, FolderOpen, Plus } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, FolderGit2, FolderOpen, History, Pencil, Plus, RotateCcw } from "lucide-react";
 import { ImportDialog } from "./Dialogs";
 import type { MemoryNote, ProjectSummary } from "../api/types";
 import { api, errorMessage } from "../api/client";
@@ -85,14 +85,152 @@ export function MemoryPage({ project }: { project: ProjectSummary }) {
             </Button>
           </div>
         </section>
-        <SectionLabel right={notes && <span className="muted">{notes.length} 条</span>}>全部记忆</SectionLabel>
+        <SectionLabel right={notes && <span className="muted">{notes.filter((n) => !n.superseded).length} 条</span>}>全部记忆</SectionLabel>
         {error && <p className="inline-error">{error}</p>}
         {!notes && !error && <Spinner />}
         {notes && notes.length === 0 && <p className="empty-text">还没有记忆。归档交付时也可以自动写入。</p>}
-        {notes && <NoteList notes={notes} />}
+        {notes && <VersionedNotes project={project.id} notes={notes} />}
       </div>
     </div>
   );
+}
+
+/** Project memory, newest versions only; each can be edited (a new version) and shows its
+ *  older versions with what changed, any of which can be restored. */
+function VersionedNotes({ project, notes }: { project: string; notes: MemoryNote[] }) {
+  const byId = new Map(notes.map((n) => [n.id, n]));
+  const current = notes.filter((n) => !n.superseded).sort((a, b) => b.id - a.id);
+  const history = (n: MemoryNote) => {
+    const chain: MemoryNote[] = [];
+    let prev = n.replaces != null ? byId.get(n.replaces) : undefined;
+    while (prev) {
+      chain.push(prev);
+      prev = prev.replaces != null ? byId.get(prev.replaces) : undefined;
+    }
+    return chain;
+  };
+  return (
+    <ul className="memory-list">
+      {current.map((n) => (
+        <VersionedNote key={n.id} project={project} note={n} older={history(n)} />
+      ))}
+    </ul>
+  );
+}
+
+function VersionedNote({ project, note, older }: { project: string; note: MemoryNote; older: MemoryNote[] }) {
+  const { act } = useStudio();
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState(note.body);
+  const [showHistory, setShowHistory] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const save = async (body: string, done: string) => {
+    setBusy(true);
+    const id = await act(() => api.reviseMemory({ project, id: note.id, text: body }), done);
+    setBusy(false);
+    if (id !== undefined) setEditing(false);
+  };
+  const versions = [note, ...older];
+  return (
+    <li className="memory" data-testid="memory-note">
+      <div className="memory-meta">
+        <span className="memory-id">#{note.id}</span>
+        <span className="tag">{KIND_LABEL[note.kind] ?? note.kind}</span>
+        <span>{note.author}</span>
+        <span>{clock(note.created_at)}</span>
+        {older.length > 0 && <span className="tag tag-dashed">第 {versions.length} 版</span>}
+        <span className="memory-actions">
+          {!editing && (
+            <button type="button" className="link-btn" onClick={() => (setText(note.body), setEditing(true))}>
+              <Pencil size={12} /> 编辑
+            </button>
+          )}
+          {older.length > 0 && (
+            <button type="button" className="link-btn" onClick={() => setShowHistory((v) => !v)} aria-expanded={showHistory}>
+              <History size={12} /> 历史 {older.length}
+            </button>
+          )}
+        </span>
+      </div>
+      {editing ? (
+        <div className="memory-edit">
+          <textarea className="input" rows={4} value={text} onChange={(e) => setText(e.target.value)} aria-label="编辑记忆" />
+          <div className="row-between">
+            <span className={`count${text.length > 1000 ? " over" : ""}`}>{text.length}/1000 · 保存后旧版本保留在历史里</span>
+            <span className="row-gap">
+              <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>
+                取消
+              </Button>
+              <Button variant="primary" size="sm" busy={busy} disabled={!text.trim() || text.length > 1000 || text.trim() === note.body} onClick={() => save(text.trim(), "已保存为新版本")}>
+                保存为新版本
+              </Button>
+            </span>
+          </div>
+        </div>
+      ) : (
+        <p className="memory-body">{note.body}</p>
+      )}
+      {showHistory && (
+        <ol className="memory-history">
+          {older.map((v, i) => (
+            <li key={v.id}>
+              <div className="memory-meta">
+                <span className="memory-id">#{v.id}</span>
+                <span>第 {versions.length - 1 - i} 版</span>
+                <span>{v.author}</span>
+                <span>{clock(v.created_at)}</span>
+                <span className="memory-actions">
+                  <button type="button" className="link-btn" disabled={busy} onClick={() => save(v.body, `已恢复到 #${v.id} 的内容`)}>
+                    <RotateCcw size={12} /> 恢复此版本
+                  </button>
+                </span>
+              </div>
+              <p className="memory-diff" aria-label={`#${v.id} 到下一版的改动`}>
+                {diffText(v.body, versions[i].body).map((seg, k) => (
+                  <span key={k} className={seg.kind === "same" ? undefined : `diff-${seg.kind}`}>
+                    {seg.text}
+                  </span>
+                ))}
+              </p>
+            </li>
+          ))}
+        </ol>
+      )}
+    </li>
+  );
+}
+
+/** Character diff of two short texts (memory notes are at most 1000 characters). */
+function diffText(a: string, b: string): { kind: "same" | "add" | "del"; text: string }[] {
+  const x = [...a];
+  const y = [...b];
+  const n = x.length;
+  const m = y.length;
+  const dp = new Uint16Array((n + 1) * (m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i * (m + 1) + j] = x[i] === y[j] ? dp[(i + 1) * (m + 1) + j + 1] + 1 : Math.max(dp[(i + 1) * (m + 1) + j], dp[i * (m + 1) + j + 1]);
+    }
+  }
+  const out: { kind: "same" | "add" | "del"; text: string }[] = [];
+  const push = (kind: "same" | "add" | "del", ch: string) => {
+    const last = out[out.length - 1];
+    if (last && last.kind === kind) last.text += ch;
+    else out.push({ kind, text: ch });
+  };
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (x[i] === y[j]) {
+      push("same", x[i]);
+      i++;
+      j++;
+    } else if (dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1]) push("del", x[i++]);
+    else push("add", y[j++]);
+  }
+  while (i < n) push("del", x[i++]);
+  while (j < m) push("add", y[j++]);
+  return out;
 }
 
 export function ReposPage({ project }: { project: ProjectSummary }) {

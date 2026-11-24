@@ -249,14 +249,17 @@ pub fn scan(repo: &Path) -> Result<Found> {
 }
 
 impl Project {
-    /// Copy the chosen Claude memory files into project memory, one note each; a file whose
-    /// note already exists is skipped. Returns the new note IDs.
+    /// Copy the chosen Claude memory files into project memory, one note each. A file imported
+    /// before is skipped when unchanged and becomes a new version of its note when it changed.
+    /// Returns the IDs written.
     pub fn import_memories(&self, home: &Path, repo: &Path, files: &[String]) -> Result<Vec<i64>> {
         let available = memory_files(repo)?;
         let dir = home.join("workflows").join(&self.id);
-        let existing: Vec<String> = Memory::browse(&dir)?
+        // The newest version of each note, to update an earlier import of the same file.
+        let current: Vec<(i64, String)> = Memory::browse(&dir)?
             .iter()
-            .filter_map(|n| n["body"].as_str().map(str::to_owned))
+            .filter(|n| n["successor"].is_null())
+            .filter_map(|n| Some((n["id"].as_i64()?, n["body"].as_str()?.to_owned())))
             .collect();
         let mut db = Memory::open(&dir)?;
         let mut ids = Vec::new();
@@ -277,10 +280,13 @@ impl Project {
                 let keep = TEXT_LIMIT.saturating_sub(tail.chars().count());
                 note = note.chars().take(keep).collect::<String>() + &tail;
             }
-            if existing.contains(&note) {
-                continue;
+            let marker = format!("【导入自 Claude 记忆：{}】", meta.title);
+            match current.iter().find(|(_, body)| body.starts_with(&marker)) {
+                Some((_, body)) if body == &note => {}
+                // The file changed since it was imported: a new version of that note.
+                Some((id, _)) => ids.push(db.revise(*id, crate::memory::Kind::Decision, &note)?),
+                None => ids.push(db.add_manual(&Key::new("", "", ""), "decision", &note, None, None)?),
             }
-            ids.push(db.add_manual(&Key::new("", "", ""), "decision", &note, None, None)?);
         }
         Ok(ids)
     }

@@ -747,6 +747,18 @@ class MockStore implements Api {
     return id;
   }
 
+  reviseMemory({ project, id, text }: { project: string; id: number; text: string }): number {
+    const notes = this.memoryNotes.get(project) ?? [];
+    const old = notes.find((n) => n.id === id);
+    if (!old) throw new Error("记忆不存在");
+    if (old.superseded) throw new Error("这条记忆已有更新的版本，请在最新版本上修改");
+    if (old.body === text.trim()) throw new Error("内容没有变化");
+    old.superseded = true;
+    const next = notes.reduce((m, n) => Math.max(m, n.id), 0) + 1;
+    notes.push({ id: next, kind: old.kind, author: "manual", body: text.trim(), created_at: iso(Date.now()), superseded: false, replaces: id });
+    return next;
+  }
+
   repoMemories({ path }: { path: string }): MemoryNote[] {
     if (!this.projects.some((p) => p.repositories.includes(path))) throw new Error(`仓库未在任何项目中：${path}`);
     return clone(this.repoNotes.get(path) ?? []);
@@ -1101,7 +1113,7 @@ function seed(store: MockStore) {
   store.memoryNotes.set("quote", [
     { id: 9, kind: "decision", author: "陈一", body: "行情数据统一走 quote-gateway 的 WebSocket 通道，前端不直接请求行情源。", created_at: iso(now - 30 * 24 * 60 * min), superseded: false },
     { id: 10, kind: "note", author: "AEP", body: "前端状态管理使用 zustand（替代旧的 redux store）。", created_at: iso(now - 20 * 24 * 60 * min), superseded: true },
-    { id: 11, kind: "convention", author: "林舟", body: "前端状态使用 zustand，禁止新增全局单例；跨组件共享通过 store 切片完成。", created_at: iso(now - 12 * 24 * 60 * min), superseded: false },
+    { id: 11, kind: "convention", author: "林舟", body: "前端状态使用 zustand，禁止新增全局单例；跨组件共享通过 store 切片完成。", created_at: iso(now - 12 * 24 * 60 * min), superseded: false, replaces: 10 },
     { id: 12, kind: "delivery", author: "AEP", body: "【旧版分时图下线】已移除 legacy/timeline 目录及其路由；新分时图组件位于 src/features/chart/intraday，埋点事件名保持不变。", created_at: iso(now - 3 * 24 * 60 * min), superseded: false },
   ]);
   store.memoryNotes.set("tools", []);

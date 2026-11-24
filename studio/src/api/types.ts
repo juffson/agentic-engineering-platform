@@ -164,6 +164,8 @@ export interface MemoryNote {
   body: string;
   created_at: string;
   superseded: boolean;
+  /** The older version this note replaced, for project memory version history. */
+  replaces?: number | null;
 }
 
 export interface MergeBranch {
@@ -291,6 +293,9 @@ export interface Api {
   autopilotStop(a: { project: string; work: string }): void;
   archive(a: { project: string; work: string; memory: string; removeWorktree: boolean }): void;
   unarchive(a: { project: string; work: string }): void;
+  /** Save a new version of a project memory note (agents read only the newest); restoring an
+   *  old version is revising the newest with its text. Returns the new note id. */
+  reviseMemory(a: { project: string; id: number; text: string }): number;
   /** Take a project out of Studio (its repositories are untouched). */
   removeProject(a: { project: string }): void;
   /** What Claude Code, Codex and ZCode already hold for a repository folder. */
