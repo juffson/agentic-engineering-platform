@@ -1,0 +1,255 @@
+{
+  "title": "ZCode 项目默认模型 · 两轮验证",
+  "allowed_paths": [
+    "desktop/examples/support/zcode_two_rounds.rs",
+    "desktop/examples/ui_debug.rs",
+    "specs/zcode-default-model-two-rounds/",
+    "tests/support/zcode_two_rounds.rs",
+    "tests/zcode_default_two_rounds.rs"
+  ],
+  "forbidden_paths": [
+    "src/",
+    "desktop/src/"
+  ],
+  "subtasks": [
+    {
+      "id": "T1",
+      "title": "根集成测试：默认值存取、项目隔离与目录校验（测试替身 zcode）",
+      "paths": [
+        "tests/zcode_default_two_rounds.rs",
+        "tests/support/zcode_two_rounds.rs"
+      ],
+      "criteria": [
+        "AC-1",
+        "AC-2",
+        "AC-9"
+      ],
+      "check": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "zcode_default_two_rounds",
+        "default_"
+      ]
+    },
+    {
+      "id": "T2",
+      "title": "根集成测试：两次运行证据 evidence.json.request、时间线取值、旧记录兼容",
+      "paths": [
+        "tests/zcode_default_two_rounds.rs",
+        "tests/support/zcode_two_rounds.rs"
+      ],
+      "criteria": [
+        "AC-3",
+        "AC-4",
+        "AC-6",
+        "AC-8"
+      ],
+      "check": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "zcode_default_two_rounds"
+      ]
+    },
+    {
+      "id": "T3",
+      "title": "Studio 场景 zcode-two-rounds：按 AC-3→AC-5→AC-7 走两轮并保存证据",
+      "paths": [
+        "desktop/examples/ui_debug.rs",
+        "desktop/examples/support/zcode_two_rounds.rs"
+      ],
+      "criteria": [
+        "AC-3",
+        "AC-4",
+        "AC-5",
+        "AC-7"
+      ],
+      "check": [
+        "cargo",
+        "check",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--all-targets"
+      ]
+    },
+    {
+      "id": "T3b",
+      "title": "Studio 场景 zcode-default-projects / zcode-timeline-reopen / zcode-legacy-open（见 design.md 5a）",
+      "paths": [
+        "desktop/examples/ui_debug.rs",
+        "desktop/examples/support/zcode_two_rounds.rs"
+      ],
+      "criteria": [
+        "AC-2",
+        "AC-6",
+        "AC-8"
+      ],
+      "check": [
+        "cargo",
+        "check",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--all-targets"
+      ]
+    },
+    {
+      "id": "T4",
+      "title": "回归、GUI 实跑与验证记录",
+      "paths": [
+        "specs/zcode-default-model-two-rounds/validation.md"
+      ],
+      "criteria": [
+        "AC-1",
+        "AC-2",
+        "AC-3",
+        "AC-4",
+        "AC-5",
+        "AC-6",
+        "AC-7",
+        "AC-8",
+        "AC-9"
+      ],
+      "check": [
+        "cargo",
+        "test",
+        "--locked"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "id": "root",
+      "criteria": [
+        "AC-1",
+        "AC-2",
+        "AC-3",
+        "AC-4",
+        "AC-6",
+        "AC-8"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "zcode_default_two_rounds"
+      ]
+    },
+    {
+      "id": "regression",
+      "criteria": [
+        "AC-9"
+      ],
+      "command": [
+        "cargo",
+        "test",
+        "--locked"
+      ]
+    },
+    {
+      "id": "studio",
+      "criteria": [
+        "Studio 与全部示例编译通过"
+      ],
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--all-targets"
+      ]
+    },
+    {
+      "id": "ui",
+      "criteria": [
+        "AC-3",
+        "AC-5",
+        "AC-7（需 macOS 桌面服务）"
+      ],
+      "command": [
+        "cargo",
+        "run",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--example",
+        "ui_debug",
+        "--",
+        "--scenario",
+        "zcode-two-rounds",
+        "--output-dir",
+        "target/zcode-default-two-rounds-ui",
+        "--screenshots"
+      ]
+    },
+    {
+      "id": "ui-zcode-default-projects",
+      "criteria": [
+        "AC-2（需 macOS 桌面服务）"
+      ],
+      "command": [
+        "cargo",
+        "run",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--example",
+        "ui_debug",
+        "--",
+        "--scenario",
+        "zcode-default-projects",
+        "--output-dir",
+        "target/zcode-default-projects-ui",
+        "--screenshots"
+      ]
+    },
+    {
+      "id": "ui-zcode-timeline-reopen",
+      "criteria": [
+        "AC-6（需 macOS 桌面服务）"
+      ],
+      "command": [
+        "cargo",
+        "run",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--example",
+        "ui_debug",
+        "--",
+        "--scenario",
+        "zcode-timeline-reopen",
+        "--output-dir",
+        "target/zcode-timeline-reopen-ui",
+        "--screenshots"
+      ]
+    },
+    {
+      "id": "ui-zcode-legacy-open",
+      "criteria": [
+        "AC-8（需 macOS 桌面服务）"
+      ],
+      "command": [
+        "cargo",
+        "run",
+        "--locked",
+        "--manifest-path",
+        "desktop/Cargo.toml",
+        "--example",
+        "ui_debug",
+        "--",
+        "--scenario",
+        "zcode-legacy-open",
+        "--output-dir",
+        "target/zcode-legacy-open-ui",
+        "--screenshots"
+      ]
+    }
+  ]
+}
