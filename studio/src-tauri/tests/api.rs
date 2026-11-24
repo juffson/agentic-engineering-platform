@@ -161,6 +161,12 @@ fn a_work_item_runs_chats_advances_delivers_merges_and_archives() -> Result<()> 
     assert!(preview["error"].is_null(), "{preview}");
     assert_eq!(preview["target"], "main");
     assert!(preview["diff"].as_str().unwrap().contains("src/main.rs"));
+    let before = api::work_detail(&home, &pid, &wid)?;
+    assert_eq!(
+        before["branches"][0]["merged"], false,
+        "{}",
+        before["branches"]
+    );
     api::merge_confirm(
         &home,
         &pid,
@@ -172,14 +178,40 @@ fn a_work_item_runs_chats_advances_delivers_merges_and_archives() -> Result<()> 
     let d = api::work_detail(&home, &pid, &wid)?;
     assert_eq!(d["deliveries"][0]["merged"]["target"], "main");
 
-    // Archive: memory written, worktree removed, branch kept.
+    assert_eq!(d["branches"][0]["merged"], true, "{}", d["branches"]);
+
+    // An unmerged restart branch of the same item survives a normal cleanup.
+    let extra = format!("aep-stage/{wid}-restart");
+    let stray = git(
+        &repo,
+        &["commit-tree", "-p", "main", "-m", "unmerged", "main^{tree}"],
+    )?;
+    git(&repo, &["branch", &extra, stray.trim()])?;
+
+    // Archive: memory written, worktree and merged branch removed, unmerged branch kept.
     let draft = d["memory_draft"].as_str().unwrap().to_owned();
     assert!(draft.contains("「导出」已交付"));
     api::archive(&home, &pid, &wid, &draft, true)?;
     let d = api::work_detail(&home, &pid, &wid)?;
     assert!(d["shelved"]["memory"].is_i64());
     assert!(d["worktrees"].as_array().unwrap().is_empty());
-    assert!(git(&repo, &["branch", "--list", "aep-stage/*"])?.contains("aep-stage/"));
+    let left = git(&repo, &["branch", "--list", "aep-stage/*"])?;
+    assert_eq!(left.trim(), extra, "{left}");
+    assert_eq!(
+        d["branches"].as_array().unwrap().len(),
+        1,
+        "{}",
+        d["branches"]
+    );
+    assert_eq!(d["branches"][0]["merged"], false);
+    // Forcing removes it too.
+    let cleaned = api::cleanup(&home, &pid, &wid, true)?;
+    assert_eq!(cleaned.deleted, vec![extra.clone()]);
+    assert!(
+        git(&repo, &["branch", "--list", "aep-stage/*"])?
+            .trim()
+            .is_empty()
+    );
     let notes = api::memories(&home, &pid)?;
     assert!(notes.as_array().unwrap().iter().any(|n| n["body"] == draft));
     assert_eq!(

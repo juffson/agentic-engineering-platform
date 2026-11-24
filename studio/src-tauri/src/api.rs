@@ -322,12 +322,16 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
         .collect();
     let state = autopilot::read(&dir);
     let trees = w.worktrees();
-    let branch = trees.first().and_then(|t| {
-        aep::workspace::git(t, &["branch", "--show-current"])
-            .ok()
-            .map(|b| b.trim().to_owned())
-            .filter(|b| !b.is_empty())
-    });
+    let branches = w.branches();
+    let branch = trees
+        .first()
+        .and_then(|t| {
+            aep::workspace::git(t, &["branch", "--show-current"])
+                .ok()
+                .map(|b| b.trim().to_owned())
+                .filter(|b| !b.is_empty())
+        })
+        .or_else(|| branches.first().map(|b| b.name.clone()));
     let deliveries: Vec<Value> = w
         .deliveries
         .iter()
@@ -348,6 +352,7 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
         "template": template_id(w.template), "template_label": w.template.label(),
         "stage": w.stage, "delivered": w.delivered(), "shelved": w.shelved,
         "repositories": w.repositories, "branch": branch, "worktrees": trees,
+        "branches": branches.iter().map(|b| json!({"name": b.name, "merged": b.merged})).collect::<Vec<_>>(),
         "stages": stages,
         "reworks": w.reworks.iter().map(|r| json!({"from": r.from, "to": r.to, "reason": r.reason, "at": r.at})).collect::<Vec<_>>(),
         "running": running,
@@ -670,16 +675,24 @@ pub fn archive(
         "记忆最多 {TEXT_LIMIT} 字"
     );
     if remove_worktree {
-        // A dirty worktree stops the archive before anything is written.
-        for path in w.worktrees() {
-            shelf::remove_worktree(&path)?;
-        }
+        // A dirty worktree stops the archive before anything is written; unmerged
+        // branches are kept.
+        w.clean(false)?;
     }
     change(home, |lib| {
         find_mut(lib, pid)?
             .archive_work(home, wid, memory)
             .map(|_| ())
     })
+}
+
+/// Remove a delivered item's worktrees and merged branches; `force` also deletes
+/// unmerged branches.
+pub fn cleanup(home: &Path, pid: &str, wid: &str, force: bool) -> Result<shelf::Cleaned> {
+    let lib = Library::open(home)?;
+    let w = item(find(&lib, pid)?, wid)?;
+    ensure!(w.delivered(), "只有已交付的事项可以清理工作区和分支");
+    w.clean(force)
 }
 
 pub fn unarchive(home: &Path, pid: &str, wid: &str) -> Result<()> {

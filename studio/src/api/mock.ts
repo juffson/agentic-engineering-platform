@@ -574,7 +574,19 @@ class MockStore implements Api {
     d.memory_draft = null;
     if (removeWorktree) {
       d.worktrees = [];
+      d.branches = d.branches.filter((b) => !b.merged);
     }
+  }
+
+  cleanup({ project, work, force }: { project: string; work: string; force: boolean }) {
+    const d = this.work(project, work).detail;
+    if (!d.delivered) throw new Error("只有已交付的事项可以清理工作区和分支");
+    const worktrees = d.worktrees.length;
+    const deleted = d.branches.filter((b) => b.merged || force).map((b) => b.name);
+    const kept = d.branches.filter((b) => !b.merged && !force).map((b) => b.name);
+    d.worktrees = [];
+    d.branches = d.branches.filter((b) => kept.includes(b.name));
+    return { worktrees, deleted, kept };
   }
 
   unarchive({ project, work }: { project: string; work: string }) {
@@ -651,6 +663,7 @@ class MockStore implements Api {
     const delivery = d.deliveries[0];
     if (!delivery) throw new Error("没有可合并的交付");
     delivery.merged = { target, sha: Math.random().toString(16).slice(2, 14), at: iso(Date.now()) };
+    d.branches = d.branches.map((b) => ({ ...b, merged: true }));
   }
 
   memories({ project }: { project: string }): MemoryNote[] {
@@ -982,6 +995,7 @@ function newWork(project: string, name: string, template: Template, kind: "Featu
       repositories: [...repositories],
       branch: `aep-stage/${short}`,
       worktrees: repositories.map((r) => `${HOME}/worktrees/${short}/${r.split("/").pop()}`),
+      branches: [{ name: `aep-stage/${short}`, merged: false }],
       stages,
       reworks: [],
       running: null,
@@ -1171,6 +1185,7 @@ function seed(store: MockStore) {
   const w4 = newWork("quote", "港股暗盘报价", "Software", "Feature", REPOS, now - 30 * min);
   w4.detail.branch = null;
   w4.detail.worktrees = [];
+  w4.detail.branches = [];
   add(w4);
 
   // 5. Delivered, not merged yet.
@@ -1191,6 +1206,7 @@ function seed(store: MockStore) {
   // 6. Release, delivered and merged.
   const w6 = newWork("quote", "v2.3 发布", "Software", "Release", REPOS, now - 7 * 24 * 60 * min);
   w6.detail.branch = "aep-stage/91ab3c7d";
+  w6.detail.branches = [{ name: "aep-stage/91ab3c7d", merged: true }];
   w6.detail.stages.forEach((s, i) => {
     if (s.skippable) {
       s.state = "skipped";
@@ -1212,6 +1228,7 @@ function seed(store: MockStore) {
   w7.detail.deliveries = [{ run: "r-0d1e", archived_at: iso(now - 3 * 24 * 60 * min), merged: { target: "main", sha: "77aa88bb99cc", at: iso(now - 3 * 24 * 60 * min) } }];
   w7.detail.shelved = { at: iso(now - 3 * 24 * 60 * min), memory: 12 };
   w7.detail.worktrees = [];
+  w7.detail.branches = [{ name: "aep-stage/0d1e2f3a", merged: true }];
   add(w7);
 
   store.handoffInbox.set(w1.detail.id, [

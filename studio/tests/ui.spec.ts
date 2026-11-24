@@ -173,3 +173,18 @@ test("primary loop against the mock backend", async ({ page }) => {
   await expect(page.getByRole("button", { name: "退回「开发实现」修复" })).toBeVisible();
   await shot(page, "14-light-failed-gate");
 });
+
+test("an archived item cleans up its worktree and merged branch", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  const sidebar = page.getByRole("navigation", { name: "事项" });
+  await sidebar.getByRole("button", { name: /已归档/ }).click();
+  await sidebar.getByText("旧版分时图下线").click();
+  const cleanup = page.getByTestId("cleanup");
+  await expect(cleanup).toContainText("aep-stage/0d1e2f3a");
+  await expect(cleanup).toContainText("已合并");
+  await shot(page, "18-archived-cleanup");
+  await cleanup.getByRole("button", { name: "清理工作区和已合并分支" }).click();
+  await expect(page.locator(".toast")).toContainText("删除分支 aep-stage/0d1e2f3a");
+  await expect(page.getByTestId("cleanup")).toHaveCount(0);
+});

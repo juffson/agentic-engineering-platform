@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Archive, ArchiveRestore, BookmarkPlus, ChevronDown, ChevronRight, GitMerge, Info } from "lucide-react";
+import { Archive, ArchiveRestore, BookmarkPlus, ChevronDown, ChevronRight, GitBranch, GitMerge, Info, Trash2 } from "lucide-react";
 import type { MergePreview, WorkDetail } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio } from "../state/store";
@@ -165,7 +165,7 @@ export function ArchiveCard({ detail }: { detail: WorkDetail }) {
       <div className="row-between">
         <label className="check">
           <input type="checkbox" checked={remove} onChange={(e) => setRemove(e.target.checked)} />
-          <span>同时移除事项工作区（分支保留）</span>
+          <span>同时清理事项工作区和已合并的分支</span>
         </label>
         <span className={`count${over ? " over" : ""}`}>{memory.length}/1000</span>
       </div>
@@ -210,9 +210,53 @@ export function ShelvedCard({ detail }: { detail: WorkDetail }) {
           )}
         </div>
       </div>
+      <Cleanup detail={detail} />
       <Button variant="secondary" className="block" icon={<ArchiveRestore size={14} />} onClick={() => act(() => api.unarchive({ project: detail.project, work: detail.id }), "已取消归档")}>
         取消归档
       </Button>
     </section>
+  );
+}
+
+/** Leftover worktrees and branches of an archived item, and the button that removes them. */
+function Cleanup({ detail }: { detail: WorkDetail }) {
+  const { act, notify } = useStudio();
+  const [busy, setBusy] = useState(false);
+  const { worktrees, branches } = detail;
+  if (worktrees.length === 0 && branches.length === 0) return null;
+  const unmerged = branches.filter((b) => !b.merged);
+  const clean = async (force: boolean) => {
+    if (force && !window.confirm(`删除未合并的分支 ${unmerged.map((b) => b.name).join("、")}？\n分支上的提交仍可从阶段引用 refs/aep/stages/* 找回。`)) return;
+    setBusy(true);
+    const r = await act(() => api.cleanup({ project: detail.project, work: detail.id, force }));
+    if (r) {
+      const parts = [];
+      if (r.worktrees) parts.push(`移除 ${r.worktrees} 个工作区`);
+      if (r.deleted.length) parts.push(`删除分支 ${r.deleted.join("、")}`);
+      if (r.kept.length) parts.push(`保留未合并分支 ${r.kept.join("、")}`);
+      notify(parts.join("，") || "没有需要清理的内容", "info");
+    }
+    setBusy(false);
+  };
+  return (
+    <div className="cleanup" data-testid="cleanup">
+      <ul className="cleanup-list">
+        {worktrees.length > 0 && <li>事项工作区 {worktrees.length} 个</li>}
+        {branches.map((b) => (
+          <li key={b.name}>
+            <GitBranch size={12} /> <code>{b.name}</code> {b.merged ? <span className="muted">已合并</span> : <span className="warn-text">未合并</span>}
+          </li>
+        ))}
+      </ul>
+      {worktrees.length > 0 || branches.some((b) => b.merged) ? (
+        <Button variant="secondary" className="block" icon={<Trash2 size={13} />} busy={busy} onClick={() => clean(false)}>
+          清理工作区和已合并分支
+        </Button>
+      ) : (
+        <Button variant="danger" className="block" icon={<Trash2 size={13} />} busy={busy} onClick={() => clean(true)}>
+          删除未合并的分支
+        </Button>
+      )}
+    </div>
   );
 }

@@ -122,6 +122,8 @@ export interface WorkDetail {
   repositories: string[];
   branch: string | null; // aep-stage/<id> when a worktree exists
   worktrees: string[];
+  /** The item's local branches; `merged` = another non-item branch contains its tip. */
+  branches: { name: string; merged: boolean }[];
   stages: StageDetail[];
   reworks: Rework[];
   running: string | null; // attempt id of the running agent
@@ -271,6 +273,8 @@ export interface Api {
   autopilotStop(a: { project: string; work: string }): void;
   archive(a: { project: string; work: string; memory: string; removeWorktree: boolean }): void;
   unarchive(a: { project: string; work: string }): void;
+  /** Remove a delivered item's worktrees and merged branches; `force` also deletes unmerged ones. */
+  cleanup(a: { project: string; work: string; force: boolean }): { worktrees: number; deleted: string[]; kept: string[] };
   mergePreview(a: { project: string; work: string; target?: string }): MergePreview;
   mergeConfirm(a: { project: string; work: string; target: string; digest: string }): void;
   memories(a: { project: string }): MemoryNote[];

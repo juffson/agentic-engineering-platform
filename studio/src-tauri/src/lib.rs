@@ -157,6 +157,11 @@ fn archive(
 }
 
 #[tauri::command(async)]
+fn cleanup(project: String, work: String, force: bool) -> Result<impl Serialize, String> {
+    run(move |h| api::cleanup(&h, &project, &work, force))
+}
+
+#[tauri::command(async)]
 fn unarchive(project: String, work: String) -> Result<impl Serialize, String> {
     run(move |h| api::unarchive(&h, &project, &work))
 }
@@ -255,6 +260,7 @@ pub fn start() {
             autopilotStop,
             archive,
             unarchive,
+            cleanup,
             mergePreview,
             mergeConfirm,
             memories,

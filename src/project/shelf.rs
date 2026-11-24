@@ -1,5 +1,5 @@
 //! Put a delivered item away. What it taught can first be written to project memory, which
-//! every later stage of every item reads; its worktree can be removed while its branch stays.
+//! every later stage of every item reads; its worktree and merged branches can then be removed.
 use super::{Project, Work};
 use crate::{
     memory::{Key, Memory, TEXT_LIMIT},
@@ -163,4 +163,82 @@ pub fn remove_worktree(path: &Path) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// One of an item's local branches (`aep-stage/<id>`, or `aep-stage/<id>-<run>` for a pinned
+/// restart). `merged` means another local, non-item branch already contains its tip.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ItemBranch {
+    pub repository: PathBuf,
+    pub name: String,
+    pub merged: bool,
+}
+
+/// What a cleanup removed, and the unmerged branches it kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Cleaned {
+    pub worktrees: usize,
+    pub deleted: Vec<String>,
+    pub kept: Vec<String>,
+}
+
+impl Work {
+    pub fn branches(&self) -> Vec<ItemBranch> {
+        let mut found = Vec::new();
+        for repo in &self.repositories {
+            let Ok(ws) = Workspace::open(repo) else {
+                continue;
+            };
+            let exact = format!("refs/heads/aep-stage/{}", self.id);
+            let pinned = format!("refs/heads/aep-stage/{}-*", self.id);
+            let Ok(names) = git(
+                &ws.root,
+                &["for-each-ref", "--format=%(refname:short)", &exact, &pinned],
+            ) else {
+                continue;
+            };
+            for name in names.lines().map(str::trim).filter(|n| !n.is_empty()) {
+                let merged = git(
+                    &ws.root,
+                    &[
+                        "for-each-ref",
+                        "--format=%(refname:short)",
+                        "--contains",
+                        name,
+                        "refs/heads",
+                    ],
+                )
+                .is_ok_and(|c| c.lines().any(|b| !b.trim().starts_with("aep-stage/")));
+                found.push(ItemBranch {
+                    repository: ws.root.clone(),
+                    name: name.to_owned(),
+                    merged,
+                });
+            }
+        }
+        found
+    }
+
+    /// Remove the item's worktrees (refused while one has uncommitted changes), then its
+    /// branches: merged ones always, unmerged ones only when `force` (their commits stay
+    /// reachable from the pinned stage refs `refs/aep/stages/*`).
+    pub fn clean(&self, force: bool) -> Result<Cleaned> {
+        let trees = self.worktrees();
+        for path in &trees {
+            remove_worktree(path)?;
+        }
+        let mut out = Cleaned {
+            worktrees: trees.len(),
+            ..Cleaned::default()
+        };
+        for b in self.branches() {
+            if b.merged || force {
+                git(&b.repository, &["branch", "-D", &b.name])?;
+                out.deleted.push(b.name);
+            } else {
+                out.kept.push(b.name);
+            }
+        }
+        Ok(out)
+    }
 }
