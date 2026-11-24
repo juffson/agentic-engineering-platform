@@ -2,6 +2,7 @@ use crate::{agent::logged, run::save};
 use aep::{
     cancel::Cancellation,
     memory::{Key, Memory, TEXT_LIMIT},
+    session_reuse::{self, Mode, Plan, Reason, Side},
     workflow::{Client, Profile, Request, Role, Sandbox, Stage, tail},
     workspace::{Workspace, git},
     zcode_receipt::ActualModel,
@@ -231,6 +232,34 @@ fn source_receipt(req: &Request, stage: &Stage, dir: &Path) -> Result<Option<Pat
     Ok(Some(file))
 }
 
+/// Record how the session was chosen: why a new one started, and the context that was
+/// compared with the resume limit.
+fn record_plan(record: &mut Value, plan: &Plan, threshold: u64) {
+    let context = match plan {
+        Plan::Resume { context, .. } => *context,
+        Plan::Fresh { reason, context } => {
+            if *reason == Reason::ClientNotReusable {
+                return;
+            }
+            record["fresh_session_reason"] = json!(reason.as_str());
+            *context
+        }
+    };
+    if let Some(c) = context {
+        record["resume_context"] = json!(c);
+        record["resume_threshold"] = json!(threshold);
+    }
+}
+
+/// A resume the CLI could not perform (session pruned or never saved, E4): note it and let
+/// the caller start a new session with the hand-off digest instead.
+fn resume_failed(record: &mut Value, error: &anyhow::Error) {
+    record["fresh_session_reason"] = json!(Reason::SessionUnavailable.as_str());
+    record["resume_error"] = json!(format!("{error:#}"));
+    record["reused_session"] = Value::Null;
+    record["session"] = Value::Null;
+}
+
 fn perform(
     req: &Request,
     stage: &Stage,
@@ -244,26 +273,48 @@ fn perform(
     let gate = matches!(stage.role, Role::Test | Role::Accept);
     // Planning stages write the spec documents; the build writes code.
     let write = matches!(stage.role, Role::Build | Role::Plan);
-    let prior = req
-        .follow_up
-        .as_ref()
-        .map(|f| prior_turn(dir, f, req.repository.as_deref()))
-        .transpose()?;
-    let cwd = match &prior {
-        Some(p) => p.workspace.clone(),
-        None => workspace(
-            work,
-            req.repository.as_deref(),
-            req.stage_transfer.as_ref(),
-            id,
-        )?,
-    };
-    // A native session already holds the stage context; send only the new message.
-    let resume = prior
-        .as_ref()
-        .filter(|_| matches!(req.profile.client, Client::Codex | Client::Claude))
-        .and_then(|p| p.session.clone());
-    if let (Some(p), Some(f)) = (&prior, &req.follow_up) {
+    let threshold = session_reuse::limit(req.resume_limit);
+    let runs = dir.parent().context("missing runs directory")?;
+    if let Some(f) = &req.follow_up {
+        // A stage worktree moved out of `.git` since that turn is found again (main ad25597).
+        let p = prior_turn(dir, f, req.repository.as_deref())?;
+        let cwd = p.workspace.clone();
+        if let Some(note) = align_base(req, stage, &cwd, id, record)? {
+            record["base"]["note"] = json!(note);
+        }
+        let current = Side::of(req, Some(&cwd));
+        // A native session already holds the stage context; send only the new message,
+        // unless it has grown past the resume limit (R2).
+        let plan = match &p.session_run {
+            Some(run) => match session_reuse::source(runs, req.stage, stage.name, run) {
+                Ok(src) => session_reuse::decide(Mode::Continue, &current, Some(&src), threshold),
+                Err(_) => session_reuse::decide(Mode::Continue, &current, None, threshold),
+            },
+            None => session_reuse::decide(Mode::Continue, &current, None, threshold),
+        };
+        // ZCode is outside `decide` (no adjacent reuse), but its app-server sessions can be
+        // continued by a follow-up (R7); desktop tasks keep re-running.
+        let plan = if req.profile.client == Client::ZCode {
+            zcode_continue(runs, req.stage, &p)
+        } else {
+            plan
+        };
+        let plan = match plan {
+            // The round being continued exists; what is missing is a session to resume.
+            Plan::Fresh {
+                reason: Reason::NoPrior,
+                context,
+            } => Plan::Fresh {
+                reason: Reason::SessionUnavailable,
+                context,
+            },
+            other => other,
+        };
+        record_plan(record, &plan, threshold);
+        let resume = match &plan {
+            Plan::Resume { session, .. } => Some(session.clone()),
+            Plan::Fresh { .. } => None,
+        };
         record["follow_up"] = json!({"attempt":f.attempt,"resumed_session":resume});
         // A re-check after a send-back continues the session but consumes the new hand-off:
         // pin the upstream receipt again so delivery can prove which acceptance it read.
@@ -275,7 +326,7 @@ fn perform(
             ));
             record["source_evidence"] = json!({"run":req.stage_transfer.as_ref().map(|t|&t.run),"file":"inputs/source-evidence.json"});
         }
-        if resume.is_some() {
+        if let Some(session) = resume {
             let mut prompt = message.clone();
             if gate {
                 prompt.push_str(
@@ -293,7 +344,7 @@ fn perform(
                 &cwd,
                 prompt,
                 None,
-                resume,
+                Some((session, false)),
                 gate,
                 write,
                 (vec![], vec![]),
@@ -302,17 +353,18 @@ fn perform(
                     // Fall back to sending the context and the previous answer.
                     record["follow_up"]["resume_error"] = json!(format!("{e:#}"));
                     record["follow_up"]["resumed_session"] = Value::Null;
-                    record["session"] = Value::Null;
+                    resume_failed(record, &e);
                 }
                 other => return other,
             }
         }
         let packet = context(req, dir, &cwd, None)?;
-        let prompt = format!(
-            "{}\n\n## 上一轮答复\n{}\n\n## 继续的要求\n{}",
-            packet.text,
-            p.result.chars().take(8000).collect::<String>(),
-            message
+        aep::workspace::ident(&f.attempt, 64)?;
+        let prompt = aep::handoff::with_previous(
+            &packet.text,
+            &p.result,
+            &runs.join(&f.attempt).join("evidence.json"),
+            Some(&message),
         );
         return invoke(
             req,
@@ -331,18 +383,106 @@ fn perform(
             (packet.project_ids, packet.repo_ids),
         );
     }
+    let cwd = workspace(
+        work,
+        req.repository.as_deref(),
+        req.stage_transfer.as_ref(),
+        id,
+    )?;
+    if let Some(note) = align_base(req, stage, &cwd, id, record)? {
+        record["base"]["note"] = json!(note);
+    }
+    // Reuse the previous stage's session when it ran the same CLI, model, permissions and
+    // workspace (R3); `prior_runs` already leaves out skipped stages (E6).
+    let current = Side::of(req, Some(&cwd));
+    // A build subtask continues from the subtask before it, which has just read and changed
+    // the same code; the first one continues from the design stage.
+    let source = match (&req.subtask, req.subtasks_done.last()) {
+        (Some(_), Some(done)) => Some(session_reuse::source(
+            runs,
+            req.stage,
+            &format!("{} · {}", stage.name, done.id),
+            &done.run,
+        )),
+        _ => req.prior_runs.last().map(|(s, run)| {
+            let name = req.template.stages().get(*s).map_or("", |st| st.name);
+            session_reuse::source(runs, *s, name, run)
+        }),
+    };
+    let plan = match &source {
+        Some(Err(_)) if matches!(req.profile.client, Client::Codex | Client::Claude) => {
+            Plan::Fresh {
+                reason: Reason::SessionUnavailable,
+                context: None,
+            }
+        }
+        Some(Ok(src)) => session_reuse::decide(Mode::Adjacent, &current, Some(src), threshold),
+        _ => session_reuse::decide(Mode::Adjacent, &current, None, threshold),
+    };
+    record_plan(record, &plan, threshold);
+    let source = source.and_then(Result::ok);
+    let receipt = source_receipt(req, stage, dir)?;
+    let receipt_text = |prompt: &mut String, record: &mut Value| {
+        if let Some(file) = &receipt {
+            prompt.push_str(&format!(
+                "\n请读取前序阶段的原始执行回执 {}，核对来源会话、结论和决策，再形成自己的结论。",
+                file.display()
+            ));
+            if stage.role == Role::Accept {
+                prompt.push_str("请在独立验收报告中引用你从该回执读到的完整 run_id，并列出决策编号和一项具体测试结果。");
+            }
+            record["source_evidence"] = json!({"run":req.stage_transfer.as_ref().map(|t|&t.run),"file":"inputs/source-evidence.json"});
+        }
+    };
+    let mut carry = matches!(&plan, Plan::Fresh { reason, .. } if reason.carries_previous());
+    if let (
+        Plan::Resume {
+            session,
+            fork,
+            source_stage,
+            source_run,
+            ..
+        },
+        Some(src),
+    ) = (&plan, &source)
+    {
+        record["reused_session"] = json!({"stage":source_stage,"name":src.stage_name,"run":source_run,"session":session,"forked":fork});
+        // The session already holds memory and earlier outputs: send the short prompt.
+        let mut prompt = aep::handoff::adjacent(req, dir)?;
+        receipt_text(&mut prompt, record);
+        match invoke(
+            req,
+            stage,
+            dir,
+            work,
+            id,
+            stop,
+            record,
+            &cwd,
+            prompt,
+            receipt.clone(),
+            Some((session.clone(), *fork)),
+            gate,
+            write,
+            (vec![], vec![]),
+        ) {
+            Err(e) if !stop.requested()? && session_missing(dir) => {
+                resume_failed(record, &e);
+                carry = true;
+            }
+            other => return other,
+        }
+    }
     let packet = context(req, dir, &cwd, None)?;
     let mut prompt = packet.text;
-    let receipt = source_receipt(req, stage, dir)?;
-    if let Some(file) = &receipt {
-        prompt.push_str(&format!(
-            "\n请读取前序阶段的原始执行回执 {}，核对来源会话、结论和决策，再形成自己的结论。",
-            file.display()
-        ));
-        if stage.role == Role::Accept {
-            prompt.push_str("请在独立验收报告中引用你从该回执读到的完整 run_id，并列出决策编号和一项具体测试结果。");
-        }
-        record["source_evidence"] = json!({"run":req.stage_transfer.as_ref().map(|t|&t.run),"file":"inputs/source-evidence.json"});
+    receipt_text(&mut prompt, record);
+    // The source session exists but is too large or cannot be continued: start a new one
+    // that carries its answer and hand-off digest (R2, E4, E5).
+    if carry && let Some(src) = &source {
+        let src_dir = runs.join(&src.run);
+        let previous = fs::read_to_string(src_dir.join("result.txt")).unwrap_or_default();
+        prompt =
+            aep::handoff::with_previous(&prompt, &previous, &src_dir.join("evidence.json"), None);
     }
     invoke(
         req,
@@ -360,6 +500,183 @@ fn perform(
         write,
         (packet.project_ids, packet.repo_ids),
     )
+}
+
+/// Whether `cwd` is one of this repository's stage worktrees (found by branch, not path).
+fn stage_worktree(root: &Path, cwd: &Path) -> bool {
+    let Ok(cwd) = cwd.canonicalize() else {
+        return false;
+    };
+    aep::project::branches::stage_worktrees(root)
+        .iter()
+        .any(|(_, p)| p.canonicalize().is_ok_and(|p| p == cwd))
+}
+
+/// Git identity flags for platform commits when the repository has none configured.
+fn identity(cwd: &Path) -> Vec<&'static str> {
+    if git(cwd, &["config", "user.email"]).is_ok_and(|e| !e.trim().is_empty()) {
+        vec![]
+    } else {
+        vec![
+            "-c",
+            "user.name=AEP Studio",
+            "-c",
+            "user.email=aep-studio@localhost",
+        ]
+    }
+}
+
+/// Keep the item branch merged with its base (the branch checked out in the repository's main
+/// worktree, usually main), so a moved base shows up at the next stage, not at delivery.
+///
+/// - Writing stages and the test stage merge a base that merges cleanly before they start.
+/// - A conflicting merge is left to the build: it is told which files conflict.
+/// - Acceptance and delivery check an exact tested commit, so they do not merge: a moved base
+///   sends the item back to the test stage (clean) or the build (conflicts) without a model call.
+///
+/// Returns the note the stage's prompt gets, if any.
+fn align_base(
+    req: &Request,
+    stage: &Stage,
+    cwd: &Path,
+    id: &str,
+    record: &mut Value,
+) -> Result<Option<String>> {
+    let Some(repo) = &req.repository else {
+        return Ok(None);
+    };
+    let root = Workspace::open(repo)?.root;
+    if !stage_worktree(&root, cwd) {
+        return Ok(None);
+    }
+    let Some(base) = git(&root, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .ok()
+        .map(|b| b.trim().to_owned())
+        .filter(|b| !b.is_empty() && !b.starts_with(aep::project::branches::STAGE_PREFIX))
+    else {
+        return Ok(None);
+    };
+    let base_sha = aep::workspace::commit(&root, &format!("refs/heads/{base}"))?;
+    let contained = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["merge-base", "--is-ancestor", &base_sha, "HEAD"])
+        .status()?
+        .success();
+    if contained {
+        return Ok(None);
+    }
+    let behind: u64 = git(cwd, &["rev-list", "--count", &format!("HEAD..{base_sha}")])?
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    let tree = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "HEAD",
+            &base_sha,
+        ])
+        .output()?;
+    let conflicts: Vec<String> = match tree.status.code() {
+        Some(0) => vec![],
+        Some(1) => {
+            let mut files: Vec<String> = String::from_utf8_lossy(&tree.stdout)
+                .lines()
+                .skip(1)
+                .take_while(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect();
+            files.dedup();
+            files
+        }
+        _ => anyhow::bail!(
+            "无法检查事项分支能否合入 {base}：{}",
+            String::from_utf8_lossy(&tree.stderr).trim()
+        ),
+    };
+    let dirty = !git(cwd, &["status", "--porcelain", "--untracked-files=no"])?
+        .trim()
+        .is_empty();
+    record["base"] = json!({"branch":base,"sha":base_sha,"behind":behind,"conflicts":conflicts});
+    let listed = conflicts
+        .iter()
+        .take(12)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("、");
+    let stages = req.template.stages();
+    let before = |role: Role| (0..req.stage).rev().find(|&i| stages[i].role == role);
+    let back = |record: &mut Value, to: usize, question: String| -> Result<Option<String>> {
+        record["route_back"] = json!({"stage":to,"name":stages[to].name,"question":question});
+        anyhow::bail!("需要「{}」先解决：{question}", stages[to].name)
+    };
+    match stage.role {
+        Role::Plan | Role::Build | Role::Test if conflicts.is_empty() && !dirty => {
+            let message = format!("合入 {base}（{behind} 个新提交）\n\nAEP-Run: {id}");
+            let mut args = identity(cwd);
+            args.extend([
+                "merge",
+                "--no-edit",
+                "--no-verify",
+                "-q",
+                "-m",
+                &message,
+                &base_sha,
+            ]);
+            git(cwd, &args)?;
+            record["base"]["merged"] = json!(true);
+            Ok(Some(format!(
+                "平台已把 {base} 的 {behind} 个新提交合入事项分支（没有冲突），本阶段基于合并后的代码。"
+            )))
+        }
+        Role::Plan | Role::Build => Ok(Some(if conflicts.is_empty() {
+            format!(
+                "事项分支落后 {base} {behind} 个提交，工作区有未提交改动，平台没有自动合并。完成本阶段改动前请运行 git merge {base} 并处理冲突（不要提交，平台会自动提交）。"
+            )
+        } else {
+            format!(
+                "事项分支落后 {base} {behind} 个提交，合并会在这些文件冲突：{listed}。请先运行 git merge {base}，解决冲突并让测试通过，再继续本阶段（不要提交，平台会把合并一起提交）。"
+            )
+        })),
+        Role::Test => match before(Role::Build) {
+            Some(b) if !conflicts.is_empty() => back(
+                record,
+                b,
+                format!(
+                    "{base} 前进了 {behind} 个提交，合入时这些文件冲突：{listed}。请合入 {base} 并解决冲突。"
+                ),
+            ),
+            _ => Ok(None),
+        },
+        Role::Accept | Role::Deliver => {
+            let target = if conflicts.is_empty() {
+                before(Role::Test).or(before(Role::Build))
+            } else {
+                before(Role::Build)
+            };
+            match target {
+                Some(t) => back(
+                    record,
+                    t,
+                    if conflicts.is_empty() {
+                        format!(
+                            "{base} 在测试之后又前进了 {behind} 个提交，已验证的提交无法快进合入。请在合入 {base} 后的代码上重新验证。"
+                        )
+                    } else {
+                        format!(
+                            "{base} 在测试之后又前进了 {behind} 个提交，合入时这些文件冲突：{listed}。请合入 {base} 并解决冲突。"
+                        )
+                    },
+                ),
+                None => Ok(None),
+            }
+        }
+    }
 }
 
 /// Files that differ from HEAD (tracked or untracked), with spec contents kept for restore.
@@ -499,7 +816,8 @@ fn documents(
 
 struct Prior {
     workspace: PathBuf,
-    session: Option<String>,
+    /// The newest round whose session was saved; its evidence decides whether to resume.
+    session_run: Option<String>,
     result: String,
 }
 /// Load what a follow-up continues: the latest workspace, the newest session that was
@@ -514,6 +832,7 @@ fn prior_turn(
     let mut id = follow.attempt.clone();
     let mut workspace = None;
     let mut session = None;
+    let mut session_run = None;
     let mut result = String::new();
     for _ in 0..64 {
         aep::workspace::ident(&id, 64)?;
@@ -523,8 +842,15 @@ fn prior_turn(
             workspace = ev["workspace"].as_str().map(PathBuf::from);
         }
         // Runs from before sessions were persisted (`--ephemeral`) cannot be resumed.
-        if session.is_none() && ev["resumable"] == true {
-            session = ev["session"].as_str().map(str::to_owned);
+        if session.is_none() {
+            session = if ev["resumable"] == true {
+                ev["session"].as_str().map(str::to_owned)
+            } else {
+                zcode_app_session(&ev)
+            };
+            if session.is_some() {
+                session_run = Some(id.clone());
+            }
         }
         if result.trim().is_empty() {
             result = fs::read_to_string(previous.join("result.txt")).unwrap_or_default();
@@ -556,9 +882,39 @@ fn prior_turn(
     ensure!(workspace.is_dir(), "上一轮执行的工作区已移除，请重新执行");
     Ok(Prior {
         workspace,
-        session,
+        session_run,
         result,
     })
+}
+
+/// The ZCode app-server session a run saved (`native_session`); desktop tasks have none.
+fn zcode_app_session(ev: &Value) -> Option<String> {
+    let native = &ev["native_session"];
+    (native["client"] == "ZCode" && native["transport"] == "app-server")
+        .then(|| native["session"].as_str().map(str::to_owned))
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// A ZCode follow-up continues the newest app-server session of the rounds it follows.
+fn zcode_continue(runs: &Path, stage: usize, prior: &Prior) -> Plan {
+    let found = prior.session_run.as_ref().and_then(|run| {
+        let ev = aep::workflow::evidence(&runs.join(run)).ok()?;
+        Some((run.clone(), zcode_app_session(&ev)?))
+    });
+    match found {
+        Some((run, session)) => Plan::Resume {
+            session,
+            fork: false,
+            source_stage: stage,
+            source_run: run,
+            context: None,
+        },
+        None => Plan::Fresh {
+            reason: Reason::SessionUnavailable,
+            context: None,
+        },
+    }
 }
 
 fn first_event(stdout: &Path, kind: &str) -> Option<Value> {
@@ -631,7 +987,47 @@ fn session_missing(dir: &Path) -> bool {
         log.contains("no rollout found")
             || log.contains("no conversation found")
             || log.contains("thread/resume failed")
+            || log.contains(crate::zcode_stage::RESUME_FAILED)
     })
+}
+
+/// Adds what the Claude run actually loaded (init event, first call's context) to `launch`.
+fn claude_launch_stats(client: Client, stdout: &Path, record: &mut Value) {
+    if client != Client::Claude || !record["launch"].is_object() {
+        return;
+    }
+    let stats = fs::read_to_string(stdout)
+        .ok()
+        .and_then(|raw| aep::launch::claude_init_stats(&raw));
+    record["launch"] = aep::launch::with_stats(record["launch"].take(), stats);
+}
+
+/// This run's own calls and the context of its last call, read by the next run deciding
+/// whether to continue the session (R2) and shown as the stage's window usage (AC-8).
+fn usage_window(client: Client, dir: &Path, record: &mut Value) {
+    if !matches!(client, Client::Codex | Client::Claude) {
+        return;
+    }
+    if let Ok(report) = aep::usage::measure(dir) {
+        record["usage_window"] = json!({"calls": report.summary.calls});
+        if let Some(c) = report.summary.last_context {
+            record["last_context"] = json!(c);
+        }
+    }
+}
+
+/// Codex's last reported usage, cumulative over the thread after `exec resume`: the next
+/// resume of this session subtracts it when the rollout cannot be read.
+fn codex_session_total(client: Client, stdout: &Path, record: &mut Value) {
+    if client != Client::Codex {
+        return;
+    }
+    if let Some(total) = fs::read_to_string(stdout)
+        .ok()
+        .and_then(|raw| aep::usage::codex_session_total(&raw))
+    {
+        record["codex_session_total"] = total;
+    }
 }
 
 /// Claude's stream-json output ends with one `result` event; older single-object
@@ -660,12 +1056,21 @@ fn invoke(
     cwd: &Path,
     prompt: String,
     receipt: Option<PathBuf>,
-    resume: Option<String>,
+    resume: Option<(String, bool)>,
     gate: bool,
     write: bool,
     (project_ids, repo_ids): (Vec<i64>, Vec<i64>),
 ) -> Result<()> {
     let cwd = cwd.to_path_buf();
+    // What happened with the base branch before this stage started (`align_base`).
+    let prompt = match record["base"]["note"].as_str() {
+        Some(note) => format!("{prompt}\n\n{note}"),
+        None => prompt,
+    };
+    let (resume, fork) = match resume {
+        Some((session, fork)) => (Some(session), fork),
+        None => (None, false),
+    };
     fs::write(dir.join("prompt.txt"), &prompt)?;
     // Follow-ups carry the stage's current incoming hand-off; a re-check is how a resumed
     // session reads a new one, so it is recorded the same way as a fresh brief.
@@ -743,6 +1148,10 @@ fn invoke(
                 // Print mode cannot ask for approval; let the stage run its test commands.
                 args.extend(["--allowedTools".into(), "Bash".into()]);
             }
+            // No user MCP, settings, skills or auto memory: the stage starts from the project.
+            let launch = aep::launch::claude_minimal(&bin, &profile.model);
+            args.extend(launch.args.iter().cloned());
+            record["launch"] = launch.evidence();
         }
         Client::ZCode => {
             args = vec![
@@ -767,6 +1176,12 @@ fn invoke(
     }
     if let Some(session) = &resume {
         if profile.client == Client::Claude {
+            args.extend(["--resume".into(), session.clone()]);
+            if fork {
+                // A later stage gets its own session ID; the earlier one stays as it was.
+                args.push("--fork-session".into());
+            }
+        } else if profile.client == Client::ZCode {
             args.extend(["--resume".into(), session.clone()]);
         } else {
             args.push(session.clone());
@@ -795,9 +1210,12 @@ fn invoke(
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = handle.join();
     }
+    usage_window(profile.client, dir, record);
+    codex_session_total(profile.client, &stdout, record);
     let code = match code {
         Ok(code) => code,
         Err(e) => {
+            claude_launch_stats(profile.client, &stdout, record);
             if dir.join("budget.json").is_file() {
                 // Stopped for its budget: keep the session so a follow-up can continue it.
                 record["workspace"] = json!(cwd);
@@ -817,11 +1235,18 @@ fn invoke(
                 {
                     record["session"] = json!(session);
                 }
+                // A ZCode app-server session saved before the stop can be continued (R7).
+                if profile.client == Client::ZCode
+                    && let Ok(native) = aep::workspace::read(&dir.join("session.json"))
+                {
+                    record["native_session"] = native;
+                }
             }
             return Err(e);
         }
     };
     record["exit_code"] = json!(code);
+    claude_launch_stats(profile.client, &stdout, record);
     if let Some(before) = &before {
         documents(stage, dir, &cwd, before, record)?;
     }
@@ -987,27 +1412,19 @@ fn pin_worktree(
         return Ok(());
     }
     let repo = Workspace::open(repo)?;
-    let cwd_real = cwd.canonicalize()?;
-    if !aep::project::branches::stage_worktrees(&repo.root)
-        .iter()
-        .any(|(_, p)| p.canonicalize().is_ok_and(|p| p == cwd_real))
-    {
+    if !stage_worktree(&repo.root, cwd) {
         return Ok(());
     }
     let status = |cwd: &Path| git(cwd, &["status", "--porcelain", "--untracked-files=all"]);
     if matches!(stage.role, Role::Plan | Role::Build) && !status(cwd)?.trim().is_empty() {
         git(cwd, &["add", "-A"])?;
-        let message = format!("{} · {}\n\nAEP-Run: {id}", req.work, stage.name);
-        let named = git(cwd, &["config", "user.email"]).is_ok_and(|e| !e.trim().is_empty());
-        let mut args = vec![];
-        if !named {
-            args.extend([
-                "-c",
-                "user.name=AEP Studio",
-                "-c",
-                "user.email=aep-studio@localhost",
-            ]);
-        }
+        let title = match &req.subtask {
+            Some(t) if t.title.trim().is_empty() => format!("{} · {}", stage.name, t.id),
+            Some(t) => format!("{} · {} {}", stage.name, t.id, t.title.trim()),
+            None => stage.name.to_owned(),
+        };
+        let message = format!("{} · {title}\n\nAEP-Run: {id}", req.work);
+        let mut args = identity(cwd);
         args.extend(["commit", "--no-verify", "-q", "-m", &message]);
         git(cwd, &args)?;
         record["committed"] = json!(true);
@@ -1145,6 +1562,293 @@ pub(crate) fn metrics(dir: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `<root>/runs/<id>/evidence.json`; returns the directory of a new round.
+    fn zcode_rounds(root: &Path, rounds: &[(&str, Value)]) -> PathBuf {
+        for (id, ev) in rounds {
+            let d = root.join("runs").join(id);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("evidence.json"), ev.to_string()).unwrap();
+            fs::write(d.join("result.txt"), format!("answer of {id}")).unwrap();
+        }
+        let next = root.join("runs").join("r3");
+        fs::create_dir_all(&next).unwrap();
+        next
+    }
+
+    /// A repository on `main` with an item branch checked out as a stage worktree.
+    struct Base {
+        _t: tempfile::TempDir,
+        root: PathBuf,
+        wt: PathBuf,
+    }
+    fn base_fixture() -> Base {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let g = |dir: &Path, args: &[&str]| git(dir, args).unwrap();
+        g(&root, &["init", "-q", "-b", "main"]);
+        g(&root, &["config", "user.email", "t@example.com"]);
+        g(&root, &["config", "user.name", "t"]);
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        fs::write(root.join("b.txt"), "one\n").unwrap();
+        g(&root, &["add", "-A"]);
+        g(&root, &["commit", "-q", "-m", "base"]);
+        let wt = t.path().join("wt");
+        g(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "aep-stage/item",
+                wt.to_str().unwrap(),
+            ],
+        );
+        fs::write(wt.join("a.txt"), "item\n").unwrap();
+        g(&wt, &["commit", "-q", "-am", "item"]);
+        Base { _t: t, root, wt }
+    }
+    fn advance(b: &Base, file: &str) {
+        fs::write(b.root.join(file), "main\n").unwrap();
+        git(&b.root, &["commit", "-q", "-am", "main moved"]).unwrap();
+    }
+    fn base_request(b: &Base, stage: usize) -> Request {
+        serde_json::from_value(json!({
+            "project":"p","work":"w","template":"Software","stage":stage,
+            "profile":{"client":"Claude","executable":"","model":"","check_command":""},
+            "repository":b.root,"brief":"","approved":[]
+        }))
+        .unwrap()
+    }
+    fn align(b: &Base, stage: usize) -> (Result<Option<String>>, Value) {
+        let req = base_request(b, stage);
+        let st = &req.template.stages()[stage];
+        let mut record = json!({});
+        let r = align_base(&req, st, &b.wt, "run1", &mut record);
+        (r, record)
+    }
+
+    #[test]
+    fn base_unchanged_does_nothing() {
+        let b = base_fixture();
+        let (r, record) = align(&b, 3);
+        assert_eq!(r.unwrap(), None);
+        assert!(record["base"].is_null());
+    }
+
+    #[test]
+    fn base_moved_cleanly_is_merged_before_the_build_and_the_test() {
+        for stage in [3, 4] {
+            let b = base_fixture();
+            advance(&b, "b.txt");
+            let (r, record) = align(&b, stage);
+            let note = r.unwrap().expect("a note for the prompt");
+            assert!(note.contains("main 的 1 个新提交"), "{note}");
+            assert_eq!(record["base"]["merged"], true, "{record}");
+            assert_eq!(fs::read_to_string(b.wt.join("b.txt")).unwrap(), "main\n");
+            assert_eq!(fs::read_to_string(b.wt.join("a.txt")).unwrap(), "item\n");
+            let main = aep::workspace::commit(&b.root, "main").unwrap();
+            assert!(git(&b.wt, &["merge-base", "--is-ancestor", &main, "HEAD"]).is_ok());
+            assert!(
+                git(&b.wt, &["log", "-1", "--format=%B"])
+                    .unwrap()
+                    .contains("AEP-Run: run1")
+            );
+            // Already contained now: the next stage has nothing to do.
+            assert_eq!(align(&b, stage).0.unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn base_conflicts_are_handed_to_the_build_and_send_the_test_back() {
+        let b = base_fixture();
+        advance(&b, "a.txt");
+        let head = aep::workspace::commit(&b.wt, "HEAD").unwrap();
+        let (r, record) = align(&b, 3);
+        let note = r.unwrap().unwrap();
+        assert!(
+            note.contains("a.txt") && note.contains("git merge main"),
+            "{note}"
+        );
+        assert_eq!(record["base"]["conflicts"], json!(["a.txt"]));
+        assert_eq!(
+            aep::workspace::commit(&b.wt, "HEAD").unwrap(),
+            head,
+            "nothing merged"
+        );
+        // The test stage cannot resolve conflicts: back to the build, no model call.
+        let (r, record) = align(&b, 4);
+        assert!(r.is_err());
+        assert_eq!(record["route_back"]["stage"], 3, "{record}");
+        assert!(
+            record["route_back"]["question"]
+                .as_str()
+                .unwrap()
+                .contains("a.txt")
+        );
+    }
+
+    #[test]
+    fn base_moved_after_testing_sends_acceptance_and_delivery_back() {
+        let b = base_fixture();
+        advance(&b, "b.txt");
+        let head = aep::workspace::commit(&b.wt, "HEAD").unwrap();
+        for stage in [5, 6] {
+            let (r, record) = align(&b, stage);
+            assert!(r.is_err());
+            // Merges cleanly: re-test on the merged code; the checked commit is untouched.
+            assert_eq!(record["route_back"]["stage"], 4, "{record}");
+            assert_eq!(aep::workspace::commit(&b.wt, "HEAD").unwrap(), head);
+        }
+        advance(&b, "a.txt");
+        let (r, record) = align(&b, 5);
+        assert!(r.is_err());
+        assert_eq!(
+            record["route_back"]["stage"], 3,
+            "conflicts go to the build: {record}"
+        );
+    }
+
+    #[test]
+    fn zcode_stage_follow_up_continues_the_saved_app_server_session() {
+        let t = tempfile::tempdir().unwrap();
+        let ws = t.path().join("ws");
+        fs::create_dir(&ws).unwrap();
+        let native = json!({"client":"ZCode","transport":"app-server","session":"sess_a"});
+        // r2 (budget-stopped or failed without a session) follows r1, which saved one.
+        let dir = zcode_rounds(
+            t.path(),
+            &[
+                (
+                    "r1",
+                    json!({"status":"succeeded","workspace":ws,"resumable":false,"native_session":native}),
+                ),
+                (
+                    "r2",
+                    json!({"status":"failed","workspace":ws,"resumable":false,"follow_up":{"attempt":"r1"}}),
+                ),
+            ],
+        );
+        let follow = aep::workflow::FollowUp {
+            attempt: "r2".into(),
+            message: "继续".into(),
+        };
+        let prior = prior_turn(&dir, &follow, None).unwrap();
+        assert_eq!(prior.session_run.as_deref(), Some("r1"));
+        match zcode_continue(&t.path().join("runs"), 3, &prior) {
+            Plan::Resume {
+                session,
+                fork,
+                source_run,
+                ..
+            } => {
+                assert_eq!(session, "sess_a");
+                assert!(!fork);
+                assert_eq!(source_run, "r1");
+            }
+            other => panic!("expected a resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zcode_stage_desktop_tasks_are_not_continued() {
+        let t = tempfile::tempdir().unwrap();
+        let ws = t.path().join("ws");
+        fs::create_dir(&ws).unwrap();
+        let native = json!({"client":"ZCode","transport":"desktop","session":"task_1"});
+        let dir = zcode_rounds(
+            t.path(),
+            &[(
+                "r1",
+                json!({"status":"succeeded","workspace":ws,"native_session":native}),
+            )],
+        );
+        let follow = aep::workflow::FollowUp {
+            attempt: "r1".into(),
+            message: "继续".into(),
+        };
+        let prior = prior_turn(&dir, &follow, None).unwrap();
+        assert_eq!(prior.session_run, None);
+        assert!(matches!(
+            zcode_continue(&t.path().join("runs"), 3, &prior),
+            Plan::Fresh {
+                reason: Reason::SessionUnavailable,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn zcode_stage_resume_failure_falls_back_to_full_context() {
+        let t = tempfile::tempdir().unwrap();
+        assert!(!session_missing(t.path()));
+        fs::write(
+            t.path().join("stderr.log"),
+            format!(
+                "{}: session not found\nError: ZCode\n",
+                crate::zcode_stage::RESUME_FAILED
+            ),
+        )
+        .unwrap();
+        assert!(session_missing(t.path()));
+        let mut record = json!({"session":"sess_a","reused_session":{"session":"sess_a"}});
+        resume_failed(&mut record, &anyhow::anyhow!("resume failed"));
+        assert_eq!(record["fresh_session_reason"], "session_unavailable");
+        assert!(record["session"].is_null());
+    }
+
+    #[test]
+    fn launch_stats_are_added_to_claude_evidence_only() {
+        let t = tempfile::tempdir().unwrap();
+        let out = t.path().join("stdout.log");
+        fs::write(
+            &out,
+            concat!(
+                r#"{"type":"system","subtype":"init","tools":["Read","Bash"],"mcp_servers":[],"skills":[],"plugins":[{"name":"agents-md","source":"agents-md@builtin"}],"claude_code_version":"9"}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":5,"cache_creation_input_tokens":7000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let launch = aep::launch::compose(Err("x"), "m", None);
+        let mut record = json!({"launch": launch.evidence()});
+        claude_launch_stats(Client::Claude, &out, &mut record);
+        let l = &record["launch"];
+        assert_eq!(l["diet"], aep::launch::DIET);
+        assert_eq!(l["mcp_servers"], 0);
+        assert_eq!(l["skills"], 0);
+        assert_eq!(l["tools"], 2);
+        assert_eq!(l["builtin_plugins"], json!(["agents-md"]));
+        assert_eq!(l["first_context"], 7005);
+        let mut codex = json!({});
+        claude_launch_stats(Client::Codex, &out, &mut codex);
+        assert!(codex["launch"].is_null());
+    }
+
+    #[test]
+    fn codex_records_its_last_reported_session_total() {
+        let t = tempfile::tempdir().unwrap();
+        let out = t.path().join("stdout.log");
+        fs::write(
+            &out,
+            concat!(
+                r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":1}}"#,
+                "\n",
+                r#"{"type":"turn.completed","usage":{"input_tokens":30,"output_tokens":2}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let mut record = json!({});
+        codex_session_total(Client::Codex, &out, &mut record);
+        assert_eq!(record["codex_session_total"]["input_tokens"], 30);
+        let mut claude = json!({});
+        codex_session_total(Client::Claude, &out, &mut claude);
+        assert!(claude["codex_session_total"].is_null());
+    }
 
     #[test]
     fn zcode_handoff_author_uses_the_receipt_not_the_selected_model() {

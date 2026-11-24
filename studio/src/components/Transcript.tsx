@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { AlertTriangle, BarChart3, Check, ChevronDown, ChevronRight, CornerUpLeft, ExternalLink, FileEdit, Gauge, ShieldQuestion, Square, Terminal, Wrench, X } from "lucide-react";
 import type { AttemptSummary, AttemptView, Entry } from "../api/types";
-import { clock, duration, parseTime, tokens, usd } from "../lib/format";
+import { carriesSummary, clock, duration, parseTime, sessionLabel, tokens, usd } from "../lib/format";
 import { BudgetMeter, tokenTitle, UsageBreakdown } from "./Budget";
 import { isLive, modelLabel } from "../lib/work";
 import { Spinner } from "./ui";
@@ -60,6 +60,7 @@ export function Turn({
           <span>
             {clientName} · {modelLabel(view?.model ?? attempt.model)}
           </span>
+          <SessionTag attempt={attempt} />
           <span>{clock(attempt.started_at)}</span>
         </div>
       </div>
@@ -76,6 +77,36 @@ export function Turn({
         <TurnStatus attempt={attempt} view={view} />
       </div>
     </article>
+  );
+}
+
+/** Asks the work page to show another stage and scroll to one of its turns. */
+export const VIEW_ATTEMPT = "aep:view-attempt";
+export function viewAttempt(stage: number, attempt: string | undefined) {
+  window.dispatchEvent(new CustomEvent(VIEW_ATTEMPT, { detail: { stage, attempt } }));
+}
+
+/** How this turn's session was chosen (interaction §2.1, §4.2); shown from the start of the run. */
+function SessionTag({ attempt }: { attempt: AttemptSummary }) {
+  const s = attempt.session;
+  const label = sessionLabel(s);
+  if (!s || !label) return null;
+  if (s.kind === "reused" && s.stage !== undefined) {
+    return (
+      <span className="session-tag reuse" data-testid="session-tag">
+        复用自
+        <button type="button" className="link-btn inline" onClick={() => viewAttempt(s.stage!, s.run)} title="查看被复用的那一轮">
+          「{s.stage_name}」
+        </button>
+        的会话
+      </span>
+    );
+  }
+  return (
+    <span className={`session-tag ${label.tone}`} data-testid="session-tag">
+      {label.text}
+      {carriesSummary(s) && <em className="session-carried">已带上一轮结果和交接摘要</em>}
+    </span>
   );
 }
 
@@ -284,6 +315,19 @@ function TurnStatus({ attempt, view }: { attempt: AttemptSummary; view: AttemptV
 
   if (live) {
     const limit = view?.token_limit ?? null;
+    // Codex without a session log reports usage only at the end: a meter would sit at 0 (R8).
+    if (attempt.client === "Codex" && view && view.live_usage === false) {
+      return (
+        <div className="turn-status live">
+          <Spinner size={12} />
+          <span>{attempt.status === "initializing" ? "正在启动" : "正在执行"}</span>
+          {took && <span className="muted">· {took}</span>}
+          <span className="budget-note" data-testid="count-at-end">
+            只在结束时计数，预算无法中途生效
+          </span>
+        </div>
+      );
+    }
     return (
       <div className="turn-status live">
         <Spinner size={12} />
@@ -367,7 +411,7 @@ function UsageToggle({ attempt, inline }: { attempt: AttemptSummary; inline?: bo
       <button type="button" className={`link-btn${inline ? " inline" : ""}`} onClick={() => setOpen((o) => !o)} aria-expanded={open}>
         <BarChart3 size={12} /> 消耗分析
       </button>
-      {open && <UsageBreakdown project={project.id} work={selected} attempt={attempt.id} />}
+      {open && <UsageBreakdown project={project.id} work={selected} attempt={attempt.id} client={attempt.client} session={attempt.session} />}
     </>
   );
 }

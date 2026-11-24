@@ -14,6 +14,7 @@ fn fake(dir: &Path) -> Result<Profile> {
         &bin,
         format!(
             r#"#!/bin/sh
+[ "$1" = --help ] && exit 0
 input=$(cat)
 stage=$(printf '%s' "$input" | sed -n 's/^阶段：\([^（]*\)（.*/\1/p' | head -1)
 [ -n "$stage" ] || stage=continue
@@ -192,6 +193,7 @@ fn planning_owns_specs_skips_optional_stages_and_builds_task_by_task() -> Result
         &bin,
         format!(
             r#"#!/bin/sh
+[ "$1" = --help ] && exit 0
 input=$(cat)
 stage=$(printf '%s' "$input" | sed -n 's/^阶段：\([^（]*\)（.*/\1/p' | head -1)
 printf '%s' "$input" | grep -q '子任务路径在仓库中找不到' && stage=修正路径

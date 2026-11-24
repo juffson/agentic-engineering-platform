@@ -53,6 +53,9 @@ enum Action {
         binary: PathBuf,
         #[arg(long)]
         request: PathBuf,
+        /// Continue this app-server session instead of creating one (desktop tasks ignore it).
+        #[arg(long)]
+        resume: Option<String>,
     },
     #[command(hide = true)]
     ZcodeBridge {
@@ -230,8 +233,12 @@ fn app() -> Result<ExitCode> {
             project_cli::execute(opt, &cli.repo)?;
             return Ok(ExitCode::SUCCESS);
         }
-        Action::ZcodeStage { binary, request } => {
-            zcode_stage::run(&binary, &request)?;
+        Action::ZcodeStage {
+            binary,
+            request,
+            resume,
+        } => {
+            zcode_stage::run(&binary, &request, resume.as_deref())?;
             return Ok(ExitCode::SUCCESS);
         }
         Action::ZcodeGroup {
@@ -273,6 +280,7 @@ fn app() -> Result<ExitCode> {
                 &text,
                 &workspace,
                 repository.as_deref(),
+                None,
             )?;
             println!("{reply}");
             return Ok(ExitCode::SUCCESS);
