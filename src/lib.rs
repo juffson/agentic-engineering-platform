@@ -3,6 +3,7 @@ pub mod autopilot;
 pub mod cancel;
 pub mod delivery;
 pub mod deploy_keys;
+pub mod launch;
 pub mod memory;
 pub mod memory_tidy;
 pub mod studio;

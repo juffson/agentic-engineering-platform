@@ -595,6 +595,17 @@ fn session_missing(dir: &Path) -> bool {
     })
 }
 
+/// Adds what the Claude run actually loaded (init event, first call's context) to `launch`.
+fn claude_launch_stats(client: Client, stdout: &Path, record: &mut Value) {
+    if client != Client::Claude || !record["launch"].is_object() {
+        return;
+    }
+    let stats = fs::read_to_string(stdout)
+        .ok()
+        .and_then(|raw| aep::launch::claude_init_stats(&raw));
+    record["launch"] = aep::launch::with_stats(record["launch"].take(), stats);
+}
+
 /// Claude's stream-json output ends with one `result` event; older single-object
 /// output (and test doubles) carry the same fields without a `type`.
 fn claude_result(stdout: &Path) -> Result<Value> {
@@ -702,6 +713,10 @@ fn invoke(
                 // Print mode cannot ask for approval; let the stage run its test commands.
                 args.extend(["--allowedTools".into(), "Bash".into()]);
             }
+            // No user MCP, settings, skills or auto memory: the stage starts from the project.
+            let launch = aep::launch::claude_minimal(&bin, &profile.model);
+            args.extend(launch.args.iter().cloned());
+            record["launch"] = launch.evidence();
         }
         Client::ZCode => {
             args = vec![
@@ -757,6 +772,7 @@ fn invoke(
     let code = match code {
         Ok(code) => code,
         Err(e) => {
+            claude_launch_stats(profile.client, &stdout, record);
             if dir.join("budget.json").is_file() {
                 // Stopped for its budget: keep the session so a follow-up can continue it.
                 record["workspace"] = json!(cwd);
@@ -781,6 +797,7 @@ fn invoke(
         }
     };
     record["exit_code"] = json!(code);
+    claude_launch_stats(profile.client, &stdout, record);
     if let Some(before) = &before {
         documents(stage, dir, &cwd, before, record)?;
     }
@@ -1080,6 +1097,35 @@ pub(crate) fn metrics(dir: &Path) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_stats_are_added_to_claude_evidence_only() {
+        let t = tempfile::tempdir().unwrap();
+        let out = t.path().join("stdout.log");
+        fs::write(
+            &out,
+            concat!(
+                r#"{"type":"system","subtype":"init","tools":["Read","Bash"],"mcp_servers":[],"skills":[],"plugins":[{"name":"agents-md","source":"agents-md@builtin"}],"claude_code_version":"9"}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":5,"cache_creation_input_tokens":7000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let launch = aep::launch::compose(Err("x"), "m", None);
+        let mut record = json!({"launch": launch.evidence()});
+        claude_launch_stats(Client::Claude, &out, &mut record);
+        let l = &record["launch"];
+        assert_eq!(l["diet"], aep::launch::DIET);
+        assert_eq!(l["mcp_servers"], 0);
+        assert_eq!(l["skills"], 0);
+        assert_eq!(l["tools"], 2);
+        assert_eq!(l["builtin_plugins"], json!(["agents-md"]));
+        assert_eq!(l["first_context"], 7005);
+        let mut codex = json!({});
+        claude_launch_stats(Client::Codex, &out, &mut codex);
+        assert!(codex["launch"].is_null());
+    }
 
     #[test]
     fn zcode_handoff_author_uses_the_receipt_not_the_selected_model() {

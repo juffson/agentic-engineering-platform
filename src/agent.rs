@@ -601,6 +601,13 @@ impl Agents<'_> {
                 if let Some(model) = self.review_model {
                     cmd.extend(["--model".to_owned(), model.to_owned()]);
                 }
+                // The reviewer reads only the prompt; user MCP, settings and skills add nothing.
+                let launch = aep::launch::claude_minimal(
+                    &aep::launch::on_path("claude"),
+                    self.review_model.unwrap_or(""),
+                );
+                cmd.extend(launch.args.iter().cloned());
+                record["launch"]["reviewer"] = launch.evidence();
                 let prompt = self.prompt("reviewer", key, base, record, None)?;
                 let rc = logged(
                     &cmd,
