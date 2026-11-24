@@ -1,5 +1,7 @@
 # AEP 单仓库试点
 
+> 注：GPUI 版 Studio（`desktop/`）已于 2026-11 移除，文中 `ui_debug` 界面演练命令随之失效；控制面、Worker 与 CLI 步骤仍然适用。新版 Studio 见 README「AEP Studio 项目工作台」。
+
 试点包含两条入口。Studio 管理本机任务队列、两轮记忆接力、PR、CI 和收尾。需要独立控制面时，用 Rust CLI 派发，并由本地 Worker 主动领取。Studio 可打开该 Worker 的仓库，查看 Run、验收和记忆。控制面跟踪到经人工确认发布的 PR 为止，最终合并由仓库维护者确认。[架构方案与故障验收](https://app.notion.com/p/41a9d9f6f60581d08560fa33ed8c4810)
 
 ## 本地计划、验收与交付

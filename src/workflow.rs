@@ -171,6 +171,50 @@ pub struct ExternalSession {
     pub session: String,
     pub workspace: PathBuf,
 }
+/// How much a stage's CLI may touch beyond its workspace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sandbox {
+    /// Codex `read-only`/`workspace-write`; Claude asks before Bash.
+    #[default]
+    Standard,
+    /// Codex workspace sandbox with network (local ports); Claude may run any Bash command.
+    Network,
+    /// No sandbox: Codex `danger-full-access`, Claude `bypassPermissions` (GUI, desktop services).
+    Full,
+}
+impl Sandbox {
+    pub const ALL: [Sandbox; 3] = [Sandbox::Standard, Sandbox::Network, Sandbox::Full];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "默认沙箱",
+            Self::Network => "允许网络",
+            Self::Full => "完全权限",
+        }
+    }
+    /// Tests and acceptance need to run suites that listen on local ports.
+    pub fn for_role(role: Role) -> Self {
+        match role {
+            Role::Test | Role::Accept => Self::Network,
+            _ => Self::Standard,
+        }
+    }
+}
+/// One small piece of the build, planned in `task.json` → `subtasks` by the design stage.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Subtask {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    /// Files or directories the subtask may change.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Acceptance items it covers.
+    #[serde(default)]
+    pub criteria: Vec<String>,
+    /// Command (argv) that verifies it on its own.
+    #[serde(default)]
+    pub check: Vec<String>,
+}
 /// A message that continues an earlier attempt's native CLI conversation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FollowUp {
@@ -180,6 +224,11 @@ pub struct FollowUp {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Request {
+    #[serde(default)]
+    pub sandbox: Sandbox,
+    /// Set when the build runs one planned subtask per session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtask: Option<Subtask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_up: Option<FollowUp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +249,49 @@ pub struct Request {
     pub ticket: Option<String>,
     pub brief: String,
     pub approved: Vec<(String, String)>,
+}
+/// Optional planning stages (not the first) may be passed over; tests and gates may not.
+pub fn skippable(template: Template, stage: usize) -> bool {
+    stage > 0
+        && template
+            .stages()
+            .get(stage)
+            .is_some_and(|s| s.role == Role::Plan)
+}
+/// `AEP-SKIP: <stage>：<reason>` lines naming later optional stages this one found unneeded.
+pub fn skips(template: Template, from: usize, result: &str) -> Vec<(usize, String)> {
+    result
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("AEP-SKIP:"))
+        .filter_map(|line| {
+            let line = line.trim();
+            let (name, reason) = line
+                .split_once('：')
+                .or_else(|| line.split_once(':'))
+                .unwrap_or((line, ""));
+            let name = name.trim().trim_matches(['「', '」', '<', '>']);
+            let stage = template.stages().iter().position(|s| s.name == name)?;
+            (stage > from && skippable(template, stage)).then(|| (stage, reason.trim().to_owned()))
+        })
+        .collect()
+}
+/// The `AEP-BACK: <stage>：<question>` line a stage writes when an earlier stage must act.
+/// Returns the earlier stage's index and the question.
+pub fn route_back(template: Template, from: usize, result: &str) -> Option<(usize, String)> {
+    let line = result
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("AEP-BACK:"))?
+        .trim();
+    let (name, question) = line
+        .split_once('：')
+        .or_else(|| line.split_once(':'))
+        .unwrap_or((line, ""));
+    let name = name.trim().trim_matches(['「', '」', '<', '>']);
+    let stage = template.stages()[..from.min(template.stages().len())]
+        .iter()
+        .rposition(|s| s.name == name)?;
+    Some((stage, question.trim().to_owned()))
 }
 pub fn attempt_dir(catalog: &Path, project: &str, work: &str, attempt: &str) -> PathBuf {
     catalog
@@ -349,3 +441,34 @@ const GAME: &[Stage] = &[
 ];
 
 pub const ZCODE_APP: &str = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+
+/// Models to offer for a CLI. For Codex this is the list the installed CLI last fetched for
+/// this account (`models_cache.json`), so it never suggests a model the CLI cannot use.
+pub fn suggested_models(client: Client) -> Vec<String> {
+    match client {
+        Client::Codex => {
+            let home = std::env::var_os("CODEX_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".codex"))
+                });
+            let listed: Vec<String> = home
+                .and_then(|h| std::fs::read(h.join("models_cache.json")).ok())
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|v| v["models"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter(|m| m["visibility"] == "list")
+                .filter_map(|m| m["slug"].as_str().map(str::to_owned))
+                .take(4)
+                .collect();
+            if listed.is_empty() {
+                vec!["gpt-6.1-sol".into()]
+            } else {
+                listed
+            }
+        }
+        Client::Claude => vec!["sonnet".into(), "opus".into()],
+        _ => vec![],
+    }
+}

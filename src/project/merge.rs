@@ -127,9 +127,82 @@ fn archived(home: &Path, d: &Delivery, index: usize, run: &str) -> Result<serde_
             .join("evidence.json"),
     )
 }
+/// Stages run directly in the item worktree pin their HEAD; the candidate is the commit the
+/// independent acceptance ran on, provided it ran clean and delivery changed nothing after.
+fn stage_candidate(
+    home: &Path,
+    d: &Delivery,
+    history: &super::timeline::Timeline,
+) -> Result<Option<Candidate>> {
+    let find = |run: &str| -> Result<Option<serde_json::Value>> {
+        let found: Vec<_> = history
+            .rounds
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.run == run)
+            .collect();
+        match found.as_slice() {
+            [(i, _)] => Ok(Some(archived(home, d, *i, run)?)),
+            _ => Ok(None),
+        }
+    };
+    let Some(accepted) = find(&d.accepted_run)? else {
+        return Ok(None);
+    };
+    let Some(head) = accepted["head_sha"].as_str().map(str::to_owned) else {
+        return Ok(None);
+    };
+    sha(&head)?;
+    ensure!(
+        accepted["run_id"] == d.accepted_run && accepted["status"] == "succeeded",
+        "独立验收回执不匹配"
+    );
+    ensure!(
+        accepted["clean"] == true,
+        "独立验收时事项工作区还有未提交的改动，验收的不是一个确定的提交；请退回开发实现重新执行"
+    );
+    let delivery = find(&d.run)?.context("缺少交付执行回执")?;
+    ensure!(
+        delivery["head_sha"].as_str() == Some(head.as_str()) && delivery["clean"] == true,
+        "交付阶段在验收之后改动了事项工作区"
+    );
+    let path = accepted["workspace"]
+        .as_str()
+        .context("验收回执缺少工作区")?;
+    let data = Workspace::open(Path::new(path))?.data;
+    let root = data
+        .parent()
+        .and_then(Path::parent)
+        .context("找不到事项所属仓库")?
+        .to_path_buf();
+    let ws = Workspace::open(&root)?;
+    ensure!(ws.data == data, "事项工作区不属于交付仓库");
+    ensure!(
+        commit(&ws.root, &format!("refs/aep/stages/{}", d.accepted_run))
+            .context("已验收提交引用不存在")?
+            == head,
+        "已验收提交引用已改变"
+    );
+    let main_target = worktrees(&ws.root)?
+        .first()
+        .and_then(|(_, b)| b.as_deref())
+        .and_then(|b| b.strip_prefix("refs/heads/"))
+        .map(str::to_owned);
+    Ok(Some(Candidate {
+        repository: ws.root,
+        sha: head,
+        spec_sha: None,
+        transfer_run: d.accepted_run.clone(),
+        default_target: main_target,
+    }))
+}
+
 /// Follow the *sealed* consumer chain, never the mutable current stage selection.
 pub fn candidate(home: &Path, d: &Delivery) -> Result<Candidate> {
     let history = d.snapshot(home)?;
+    if let Some(c) = stage_candidate(home, d, &history)? {
+        return Ok(c);
+    }
     let mut run = d.run.clone();
     let mut seen = BTreeSet::new();
     let mut downstream = Vec::new();
@@ -148,7 +221,7 @@ pub fn candidate(home: &Path, d: &Delivery) -> Result<Candidate> {
         let t = row
             .read_stage_transfer
             .as_ref()
-            .context("归档交接链没有已验收提交")?;
+            .context("没有可合并的已验收提交：这个事项交付时，阶段产出还没有提交到事项分支（早于阶段自动提交）。可以直接归档，或退回「开发实现」提交后重新验收")?;
         ensure!(
             t.project == d.project
                 && t.work == d.work

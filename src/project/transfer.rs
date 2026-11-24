@@ -303,10 +303,23 @@ impl Project {
         let attempt = work.current_attempt.get(&from).cloned();
         if let Some(run) = &attempt {
             let dir = workflow::attempt_dir(home, &pid, wid, run);
-            ensure!(
-                workflow::evidence(&dir)?["status"] == "succeeded",
-                "本阶段执行尚未通过"
-            );
+            let ev = workflow::evidence(&dir)?;
+            ensure!(ev["status"] == "succeeded", "本阶段执行尚未通过");
+            // Later optional stages this stage found unneeded (AEP-SKIP), unless already decided.
+            for s in ev["skip"].as_array().into_iter().flatten() {
+                if let Some(stage) = s["stage"].as_u64().map(|v| v as usize)
+                    && work.skippable(stage)
+                    && stage > from
+                {
+                    work.skipped.entry(stage).or_insert_with(|| {
+                        format!(
+                            "{}：{}",
+                            work.template.stages()[from].name,
+                            s["reason"].as_str().unwrap_or("")
+                        )
+                    });
+                }
+            }
             if note.trim().is_empty() {
                 note = fs::read_to_string(dir.join("result.txt"))?;
             }
@@ -333,6 +346,24 @@ impl Project {
         }
         self.work_by_id_mut(wid)?.notes[from] = note;
         Ok(())
+    }
+
+    /// Pass over an optional stage: no agent runs, and the reason becomes its record.
+    pub fn skip_stage(&mut self, home: &Path, wid: &str, stage: usize, reason: &str) -> Result<()> {
+        let work = self.work_by_id_mut(wid)?;
+        ensure!(work.stage == stage, "阶段已变更");
+        ensure!(work.skippable(stage), "只有可选的规划阶段可以跳过");
+        work.current_attempt.remove(&stage);
+        let reason = if reason.trim().is_empty() {
+            work.skipped
+                .get(&stage)
+                .cloned()
+                .unwrap_or_else(|| "手动跳过".into())
+        } else {
+            reason.trim().to_owned()
+        };
+        work.skipped.insert(stage, reason.clone());
+        self.finish_stage(home, wid, stage, format!("已跳过：{reason}"))
     }
 
     /// Advance past a stage whose agent did not pass, on a person's explicit decision.

@@ -76,6 +76,19 @@ enum Action {
         #[arg(long)]
         request: PathBuf,
     },
+    /// Run a work item's remaining stages unattended (started by Studio).
+    #[command(hide = true)]
+    WorkflowAuto {
+        #[arg(long)]
+        home: PathBuf,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        work: String,
+        /// Last stage (1-based, inclusive) to run.
+        #[arg(long)]
+        until: usize,
+    },
     Control(control::Control),
     /// Review and deliver a pinned task entirely in the local repository.
     Local {
@@ -252,6 +265,21 @@ fn app() -> Result<ExitCode> {
             workflow_stage::execute(&request)?;
             return Ok(ExitCode::SUCCESS);
         }
+        Action::WorkflowAuto {
+            home,
+            project,
+            work,
+            until,
+        } => {
+            aep::autopilot::run(
+                &home,
+                &project,
+                &work,
+                until.saturating_sub(1),
+                &std::env::current_exe()?,
+            )?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Action::Control(request) => {
             control::execute(&cli.repo, request)?;
             return Ok(ExitCode::SUCCESS);
@@ -266,7 +294,8 @@ fn app() -> Result<ExitCode> {
         | Action::ZcodeGroup { .. }
         | Action::ZcodeOpen { .. }
         | Action::ZcodeBridge { .. }
-        | Action::WorkflowStage { .. } => {
+        | Action::WorkflowStage { .. }
+        | Action::WorkflowAuto { .. } => {
             unreachable!()
         }
         Action::Local { action } => return local::execute(&repo, action),

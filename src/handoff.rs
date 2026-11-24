@@ -165,7 +165,65 @@ pub fn packet(
     if stage.role != Role::Build {
         text.push_str("保留已有实现。");
     }
-    text.push_str("不要推送、合并或发布。用 AEP-HANDOFF: 单行写出结论、证据位置和下一步。");
+    text.push_str("不要推送、合并或发布，也不要自己 git commit：");
+    text.push_str(match stage.role {
+        Role::Plan | Role::Build => "本阶段通过后，平台会把工作区改动自动提交到事项分支。",
+        Role::Deliver => "开发产出已由平台提交到事项分支，独立验收针对的就是这个提交；本阶段只核对和汇总，不改文件，合并由人在 Studio「查看 Diff 并合入」完成，不要因为未合并而退回。",
+        _ => "本阶段只核对，不改动工作区文件；验收针对的是平台自动提交的当前 HEAD。",
+    });
+    text.push_str("用 AEP-HANDOFF: 单行写出结论、证据位置和下一步。");
+    text.push_str(if stage.role == Role::Plan {
+        "\n本阶段负责规格文档：只写 specs/<任务名>/ 下的文件（前序已建目录就沿用，否则用简短英文 kebab-case 新建），不改代码。"
+    } else {
+        "\n规格文档（specs/）由需求到技术方案阶段负责，本阶段不要新建或改写；报告、命令和证据写在答复里，Studio 会归档。方案需要调整时用 AEP-BACK 交回技术方案。"
+    });
+    // The last planning stage before the build splits the work into small, checkable subtasks.
+    let stages = req.template.stages();
+    if stage.role == Role::Plan
+        && stages[req.stage + 1..]
+            .iter()
+            .take_while(|s| s.role != Role::Build)
+            .all(|s| s.role != Role::Plan)
+        && stages[req.stage + 1..]
+            .iter()
+            .any(|s| s.role == Role::Build)
+    {
+        text.push_str("\n在 task.json 里用 subtasks 拆分开发：[{\"id\":\"T1\",\"title\":\"…\",\"paths\":[\"可改的文件或目录\"],\"criteria\":[\"覆盖的验收项\"],\"check\":[\"能单独验证它的命令\"]}]，按依赖顺序排列，每个子任务一个会话内能完成并单独验证。");
+    }
+    if let Some(task) = &req.subtask {
+        text.push_str(&format!(
+            "\n本轮只实现子任务 {} {}：可改范围 {}；覆盖 {}；完成后运行 {} 并在答复里给出结果。其它子任务留给后续会话。",
+            task.id,
+            task.title,
+            if task.paths.is_empty() { "按方案".into() } else { task.paths.join("、") },
+            if task.criteria.is_empty() { "—".into() } else { task.criteria.join("、") },
+            if task.check.is_empty() { "相关测试".into() } else { task.check.join(" ") },
+        ));
+    }
+    let optional: Vec<_> = req
+        .template
+        .stages()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i > req.stage && workflow::skippable(req.template, *i))
+        .map(|(_, s)| s.name)
+        .collect();
+    if stage.role == Role::Plan && !optional.is_empty() {
+        text.push_str(&format!(
+            "\n后续可选阶段（{}）如本需求用不到（例如没有界面改动），单独一行写 AEP-SKIP: <阶段名>：<原因>。",
+            optional.join("、")
+        ));
+    }
+    let earlier: Vec<_> = req.template.stages()[..req.stage.min(req.template.stages().len())]
+        .iter()
+        .map(|s| s.name)
+        .collect();
+    if !earlier.is_empty() {
+        text.push_str(&format!(
+            "\n问题必须由前序阶段（{}）先解决时（如需求不明、方案待定、实现缺陷），不要自行假设：最后单独一行写 AEP-BACK: <阶段名>：<需要对方解决的问题>。",
+            earlier.join("、")
+        ));
+    }
     if matches!(stage.role, Role::Test | Role::Accept) {
         text.push_str("最后单独一行写 AEP: PASS 或 AEP: BLOCKED，缺必要证据时标为 BLOCKED。");
     }
@@ -191,6 +249,8 @@ pub struct Assignment {
 impl Work {
     pub fn request(&self, project: &str, stage: usize, assignment: Assignment) -> Request {
         Request {
+            subtask: None,
+            sandbox: self.sandbox(stage),
             follow_up: None,
             stage_transfer: self.incoming(stage).cloned(),
             handoffs: self.handoffs.clone(),
@@ -234,11 +294,25 @@ impl Project {
         assignment: Assignment,
     ) -> Result<PathBuf> {
         let Assignment {
-            profile,
+            mut profile,
             brief,
             repository,
             external,
         } = assignment;
+        // An unset model means the project's saved default for that CLI, not whatever the
+        // CLI's own config happens to name (which may not be available to this account).
+        if external.is_none()
+            && profile.model.trim().is_empty()
+            && matches!(
+                profile.client,
+                workflow::Client::Codex | workflow::Client::Claude
+            )
+            && let Some(preset) = self
+                .preset(profile.client)
+                .filter(|p| !p.model.trim().is_empty())
+        {
+            profile.model = preset.model.clone();
+        }
         if external.is_none() {
             profile.validate()?;
         }
@@ -326,10 +400,18 @@ impl Project {
         ensure!(!message.is_empty(), "请输入要继续发送的消息");
         let pid = self.id.clone();
         let item = self.work_by_id_mut(work_id)?;
+        // After a send-back the stage has no current attempt; its last session still holds context.
         let previous = item
             .current_attempt
             .get(&stage)
             .cloned()
+            .or_else(|| {
+                item.attempts
+                    .iter()
+                    .rev()
+                    .find(|a| a.stage == stage)
+                    .map(|a| a.id.clone())
+            })
             .context("此阶段还没有可以继续的执行")?;
         let attempt = item
             .attempts

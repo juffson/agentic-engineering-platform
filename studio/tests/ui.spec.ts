@@ -1,0 +1,175 @@
+import { expect, test, type Page } from "@playwright/test";
+
+const shot = (page: Page, name: string) => page.screenshot({ path: `tests/screenshots/${name}.png` });
+
+test.describe.configure({ mode: "serial" });
+
+test("primary loop against the mock backend", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+
+  const sidebar = page.getByRole("navigation", { name: "事项" });
+  await expect(sidebar.getByText("自选股分组支持拖拽排序")).toBeVisible();
+  // 已归档 is folded by default.
+  await expect(sidebar.getByText("旧版分时图下线")).toHaveCount(0);
+
+  // --- running item: transcript streams and groups collapse/expand ---
+  await sidebar.getByText("自选股分组支持拖拽排序").click();
+  await expect(page.locator(".work-header h1")).toHaveText("自选股分组支持拖拽排序");
+  await expect(page.locator(".step-running")).toHaveCount(1);
+  const lastTurn = page.locator(".turn").last();
+  await expect(lastTurn.locator(".turn-status.live")).toBeVisible();
+  const group = lastTurn.locator(".activity").first();
+  await expect(group).toBeVisible();
+  await page.waitForTimeout(1500);
+  await shot(page, "01-running-stage");
+
+  await expect(group.locator(".activity-list")).toHaveCount(0);
+  await group.locator(".activity-head").click();
+  await expect(group.locator(".activity-list")).toBeVisible();
+  const cmd = group.locator(".act-cmd:not([disabled])").first();
+  await cmd.click();
+  await expect(group.locator(".act-output").first()).toBeVisible();
+  await shot(page, "02-activity-expanded");
+  await group.locator(".activity-head").click();
+  await expect(group.locator(".activity-list")).toHaveCount(0);
+
+  // --- wait for the run to finish, then decide or keep chatting ---
+  await expect(lastTurn.locator(".turn-status.ok")).toBeVisible({ timeout: 45_000 });
+  await expect(page.getByRole("button", { name: /确认，进入「测试验证」/ })).toBeVisible();
+  await shot(page, "03-stage-succeeded");
+
+  const composer = page.getByRole("textbox", { name: "继续对话" });
+  await composer.fill("T3 的接口字段已确认：groups[].order，请继续完成持久化。");
+  await composer.press("ControlOrMeta+Enter");
+  await expect(page.locator(".turn .bubble").last()).toContainText("T3 的接口字段已确认");
+  await expect(page.locator(".turn").last().locator(".turn-status.live")).toBeVisible();
+  await page.waitForTimeout(2500);
+  await shot(page, "04-follow-up");
+
+  // --- viewing an earlier stage ---
+  await page.locator(".step").filter({ hasText: "技术方案" }).locator("button").click();
+  await expect(page.locator(".view-banner")).toContainText("正在查看已完成的「技术方案」");
+  await expect(page.locator(".composer")).toHaveCount(0);
+  await shot(page, "05-viewing-done-stage");
+  await page.locator(".view-banner").getByRole("button").click();
+  await expect(page.locator(".view-banner")).toHaveCount(0);
+
+  // --- autopilot drawer ---
+  await expect(page.locator(".turn").last().locator(".turn-status.ok")).toBeVisible({ timeout: 20_000 });
+  await page.getByRole("button", { name: "自动运行…" }).click();
+  const drawer = page.getByRole("dialog", { name: "自动运行" });
+  await expect(drawer).toBeVisible();
+  await expect(drawer.getByRole("button", { name: /自动运行到「交付归档」/ })).toBeVisible();
+  await drawer.locator(".ap-row").filter({ hasText: "测试验证" }).locator(".ap-until").click();
+  await expect(drawer.getByRole("button", { name: /自动运行到「测试验证」/ })).toBeVisible();
+  await page.waitForTimeout(300);
+  await shot(page, "06-autopilot-drawer");
+  await page.keyboard.press("Escape");
+  await expect(drawer).toHaveCount(0);
+
+  // --- failed gate: send back ---
+  await sidebar.getByText("K 线图叠加 MACD / KDJ 指标").click();
+  await expect(page.getByRole("button", { name: "退回「开发实现」修复" })).toBeVisible();
+  await expect(page.locator(".turn-routeback")).toContainText("需要「开发实现」先解决");
+  await shot(page, "07-failed-gate");
+
+  // --- a failed non-gate stage with route_back also offers send-back ---
+  await sidebar.getByText("自选股显示港股通标识").click();
+  await expect(page.getByRole("button", { name: "退回「开发实现」修复" })).toBeVisible();
+
+  // --- autopilot running item ---
+  await sidebar.getByText("盘前盘后行情推送").click();
+  await expect(page.getByTestId("autopilot-live")).toBeVisible();
+  await page.waitForTimeout(1200);
+  await shot(page, "08-autopilot-running");
+
+  // --- fresh item ---
+  await sidebar.getByText("港股暗盘报价").click();
+  await expect(page.getByRole("button", { name: "运行「产品需求」" })).toBeVisible();
+  await shot(page, "09-fresh-item");
+
+  // --- delivered item: merge + archive ---
+  await sidebar.getByText("行情快照导出 CSV").click();
+  await expect(page.getByTestId("delivery")).toBeVisible();
+  await expect(page.getByTestId("archive")).toBeVisible();
+  await expect(page.getByRole("button", { name: "合并到 main" })).toBeVisible();
+  await page.getByRole("button", { name: "查看完整差异" }).click();
+  await expect(page.locator(".diff .d-add").first()).toBeVisible();
+  await shot(page, "10-delivered");
+  await page.getByRole("button", { name: "合并到 main" }).click();
+  await expect(page.locator(".merged-line")).toContainText("已合并到 main");
+  await page.getByRole("combobox", { name: "目标分支" }).selectOption("release/2.3");
+  await expect(page.locator(".notice-box")).toContainText("已分叉");
+  await shot(page, "11-merge-diverged");
+
+  // --- new work dialog ---
+  await page.getByRole("button", { name: "新建事项" }).click();
+  const dialog = page.getByRole("dialog", { name: "新建事项" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("textbox", { name: "事项名称" }).fill("分时图支持叠加对比");
+  await page.waitForTimeout(300);
+  await shot(page, "12-new-work");
+  await dialog.getByRole("button", { name: "创建事项" }).click();
+  await expect(page.locator(".work-header h1")).toHaveText("分时图支持叠加对比");
+
+  // --- memory page ---
+  await page.getByRole("button", { name: "项目记忆" }).click();
+  await expect(page.getByRole("heading", { name: "项目记忆" })).toBeVisible();
+  await expect(page.locator(".memory.superseded")).toHaveCount(1);
+  await shot(page, "13-memory");
+
+  // --- repository memory ---
+  await page.locator(".foot-link").filter({ hasText: "仓库" }).click();
+  await expect(page.getByRole("heading", { name: "仓库" })).toBeVisible();
+  const repo = page.locator(".repo").first();
+  await repo.locator(".repo-toggle").click();
+  await expect(repo.locator(".memory.superseded")).toHaveCount(1);
+  await repo.getByRole("textbox", { name: "新增仓库记忆" }).fill("行情快照导出统一使用 src/features/export 下的 toCsv。");
+  await repo.getByRole("button", { name: "添加" }).click();
+  await expect(repo.locator(".memory").first()).toContainText("toCsv");
+  await page.waitForTimeout(200);
+  await shot(page, "17-repo-memory");
+
+  // --- history tab + hand-offs ---
+  await sidebar.getByText("自选股分组支持拖拽排序").click();
+  const historyTab = page.getByRole("tab", { name: /历史/ });
+  await expect(historyTab.locator(".tab-badge")).toHaveText("1");
+  await historyTab.click();
+  const handoffCard = page.getByTestId("handoffs");
+  await expect(handoffCard).toContainText("来自「K 线图叠加 MACD / KDJ 指标」");
+  await expect(page.locator(".tl-item").first()).toBeVisible();
+  await page.locator(".tl-item").nth(2).locator(".tl-head").click();
+  await expect(page.locator(".tl-item").nth(2).locator(".note-card").first()).toBeVisible();
+  await expect(page.locator(".received")).toBeVisible();
+  await page.locator(".history-errors").scrollIntoViewIfNeeded();
+  await page.locator(".history-scroll").evaluate((el) => (el.scrollTop = 0));
+  await shot(page, "15-history");
+  await handoffCard.getByRole("combobox", { name: "交接给" }).selectOption({ label: "K 线图叠加 MACD / KDJ 指标 · 测试验证" });
+  await handoffCard.getByRole("textbox", { name: "交接内容" }).fill("reorderGroups 已稳定，签名保持 (fromIndex, toIndex)。");
+  await handoffCard.getByRole("button", { name: "发送交接" }).click();
+  await expect(page.locator(".toast")).toContainText(["交接已发送"]);
+  await sidebar.getByText("K 线图叠加 MACD / KDJ 指标").click();
+  await expect(page.getByRole("tab", { name: /历史/ }).locator(".tab-badge")).toHaveText("1");
+
+  // --- ZCode models ---
+  await sidebar.getByText("港股暗盘报价").click();
+  await page.getByRole("tab", { name: /阶段/ }).click();
+  await page.getByRole("radio", { name: "ZCode" }).click();
+  await expect(page.getByText("正在读取 ZCode 模型…")).toBeVisible();
+  const glm = page.getByRole("button", { name: "BigModel · GLM-5.3", exact: true });
+  await expect(glm).toBeVisible();
+  await glm.click();
+  await expect(glm).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".step").first()).toContainText("bigmodel/glm-5.3@high");
+  await shot(page, "16-zcode-models");
+
+  // Info toasts dismiss themselves.
+  await expect(page.locator(".toast-info")).toHaveCount(0, { timeout: 8000 });
+
+  // --- light theme ---
+  await page.emulateMedia({ colorScheme: "light" });
+  await sidebar.getByText("K 线图叠加 MACD / KDJ 指标").click();
+  await expect(page.getByRole("button", { name: "退回「开发实现」修复" })).toBeVisible();
+  await shot(page, "14-light-failed-gate");
+});

@@ -2,12 +2,13 @@ use crate::{agent::logged, run::save};
 use aep::{
     cancel::Cancellation,
     memory::{Key, Memory, TEXT_LIMIT},
-    workflow::{Client, Request, Role, Stage, tail},
+    workflow::{Client, Request, Role, Sandbox, Stage, tail},
     workspace::{Workspace, git},
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -191,7 +192,8 @@ fn perform(
 ) -> Result<()> {
     req.profile.validate()?;
     let gate = matches!(stage.role, Role::Test | Role::Accept);
-    let write = stage.role == Role::Build;
+    // Planning stages write the spec documents; the build writes code.
+    let write = matches!(stage.role, Role::Build | Role::Plan);
     let prior = req
         .follow_up
         .as_ref()
@@ -213,8 +215,18 @@ fn perform(
         .and_then(|p| p.session.clone());
     if let (Some(p), Some(f)) = (&prior, &req.follow_up) {
         record["follow_up"] = json!({"attempt":f.attempt,"resumed_session":resume});
+        // A re-check after a send-back continues the session but consumes the new hand-off:
+        // pin the upstream receipt again so delivery can prove which acceptance it read.
+        let mut message = f.message.clone();
+        if let Some(file) = source_receipt(req, stage, dir)? {
+            message.push_str(&format!(
+                "\n\n前序阶段的最新原始执行回执：{}，请核对后再形成结论。",
+                file.display()
+            ));
+            record["source_evidence"] = json!({"run":req.stage_transfer.as_ref().map(|t|&t.run),"file":"inputs/source-evidence.json"});
+        }
         if resume.is_some() {
-            let mut prompt = f.message.clone();
+            let mut prompt = message.clone();
             if gate {
                 prompt.push_str(
                     "\n\n（如果结论有变化，答复最后一行仍按约定：通过时单独输出 AEP: PASS。）",
@@ -250,7 +262,7 @@ fn perform(
             "{}\n\n## 上一轮答复\n{}\n\n## 继续的要求\n{}",
             packet.text,
             p.result.chars().take(8000).collect::<String>(),
-            f.message
+            message
         );
         return invoke(
             req,
@@ -298,6 +310,98 @@ fn perform(
         write,
         (packet.project_ids, packet.repo_ids),
     )
+}
+
+/// Files that differ from HEAD (tracked or untracked), with spec contents kept for restore.
+struct Snapshot {
+    hashes: BTreeMap<String, u64>,
+    specs: BTreeMap<String, Vec<u8>>,
+}
+const SPECS: &str = "specs/";
+
+fn snapshot(cwd: &Path) -> Option<Snapshot> {
+    use std::hash::{Hash, Hasher};
+    let out = git(
+        cwd,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .ok()?;
+    let mut snap = Snapshot {
+        hashes: BTreeMap::new(),
+        specs: BTreeMap::new(),
+    };
+    let mut records = out.split('\0');
+    while let Some(rec) = records.next() {
+        if rec.len() < 4 {
+            continue;
+        }
+        let (status, path) = rec.split_at(3);
+        if status.starts_with('R') || status.starts_with('C') {
+            records.next();
+        }
+        let bytes = fs::read(cwd.join(path)).ok();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        snap.hashes.insert(path.to_owned(), h.finish());
+        if path.starts_with(SPECS)
+            && let Some(b) = bytes
+        {
+            snap.specs.insert(path.to_owned(), b);
+        }
+    }
+    Some(snap)
+}
+
+/// Only planning stages own `specs/`. A planning stage that touched other files fails; any
+/// other stage's spec edits move into this run's archive and `specs/` is put back.
+fn documents(
+    stage: &Stage,
+    dir: &Path,
+    cwd: &Path,
+    before: &Snapshot,
+    record: &mut Value,
+) -> Result<()> {
+    let Some(after) = snapshot(cwd) else {
+        return Ok(());
+    };
+    let changed: Vec<String> = before
+        .hashes
+        .keys()
+        .chain(after.hashes.keys())
+        .filter(|p| before.hashes.get(*p) != after.hashes.get(*p))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let (specs, other): (Vec<_>, Vec<_>) = changed.into_iter().partition(|p| p.starts_with(SPECS));
+    if stage.role == Role::Plan {
+        record["spec_files"] = json!(specs);
+        ensure!(
+            other.is_empty(),
+            "规划阶段只能修改 specs/ 下的文档，本轮还改了：{}",
+            other.iter().take(8).cloned().collect::<Vec<_>>().join("、")
+        );
+        return Ok(());
+    }
+    for path in &specs {
+        let file = cwd.join(path);
+        if let Ok(bytes) = fs::read(&file) {
+            let draft = dir.join("spec-drafts").join(path);
+            fs::create_dir_all(draft.parent().context("draft path")?)?;
+            fs::write(draft, bytes)?;
+        }
+        if let Some(original) = before.specs.get(path) {
+            fs::write(&file, original)?;
+        } else if git(cwd, &["cat-file", "-e", &format!("HEAD:{path}")]).is_ok() {
+            git(cwd, &["checkout", "HEAD", "--", path])?;
+        } else {
+            let _ = fs::remove_file(&file);
+        }
+    }
+    if !specs.is_empty() {
+        record["spec_drafts"] = json!(specs);
+    }
+    Ok(())
 }
 
 struct Prior {
@@ -388,12 +492,13 @@ fn invoke(
 ) -> Result<()> {
     let cwd = cwd.to_path_buf();
     fs::write(dir.join("prompt.txt"), &prompt)?;
-    if req.follow_up.is_none()
-        && let Some(t) = &req.stage_transfer
-    {
+    // Follow-ups carry the stage's current incoming hand-off; a re-check is how a resumed
+    // session reads a new one, so it is recorded the same way as a fresh brief.
+    if let Some(t) = &req.stage_transfer {
         record["read_stage_transfer"] = json!(t);
     }
     record["workspace"] = json!(cwd);
+    record["sandbox"] = json!(req.sandbox.label());
     record["prompt_bytes"] = json!(prompt.len());
     record["read_memory"] = json!(project_ids);
     record["read_repository_memory"] = json!(repo_ids);
@@ -416,10 +521,10 @@ fn invoke(
     let result_path = dir.join("result.txt");
     match profile.client {
         Client::Codex => {
-            let sandbox = if write || gate {
-                "workspace-write"
-            } else {
-                "read-only"
+            let sandbox = match req.sandbox {
+                Sandbox::Full => "danger-full-access",
+                _ if write || gate => "workspace-write",
+                _ => "read-only",
             };
             args.push("exec".into());
             if resume.is_some() {
@@ -431,6 +536,13 @@ fn invoke(
                 ]);
             } else {
                 args.extend(["--sandbox".into(), sandbox.into()]);
+            }
+            if req.sandbox == Sandbox::Network && sandbox == "workspace-write" {
+                // Test suites listen on local ports; the default workspace sandbox has no network.
+                args.extend([
+                    "-c".into(),
+                    "sandbox_workspace_write.network_access=true".into(),
+                ]);
             }
             args.extend(
                 ["--skip-git-repo-check", "--json", "--output-last-message"].map(String::from),
@@ -448,7 +560,11 @@ fn invoke(
                     "stream-json",
                     "--verbose",
                     "--permission-mode",
-                    if write { "acceptEdits" } else { "default" },
+                    match req.sandbox {
+                        Sandbox::Full => "bypassPermissions",
+                        _ if write => "acceptEdits",
+                        _ => "default",
+                    },
                     "--tools",
                     if write {
                         "Read,Grep,Glob,Edit,Write,Bash"
@@ -458,6 +574,10 @@ fn invoke(
                 ]
                 .map(String::from),
             );
+            if req.sandbox == Sandbox::Network {
+                // Print mode cannot ask for approval; let the stage run its test commands.
+                args.extend(["--allowedTools".into(), "Bash".into()]);
+            }
         }
         Client::ZCode if bridge => {
             args = vec![
@@ -512,6 +632,7 @@ fn invoke(
     }
     let stdout = dir.join("stdout.log");
     let stderr = dir.join("stderr.log");
+    let before = snapshot(&cwd);
     let code = logged(
         &args,
         &cwd,
@@ -523,6 +644,9 @@ fn invoke(
         stop,
     )?;
     record["exit_code"] = json!(code);
+    if let Some(before) = &before {
+        documents(stage, dir, &cwd, before, record)?;
+    }
     // Codex and Claude now keep their sessions on disk, so this run can be continued.
     record["resumable"] = json!(matches!(profile.client, Client::Codex | Client::Claude));
     if dir.join("session.json").is_file() {
@@ -547,17 +671,22 @@ fn invoke(
         record["session"] = json!(session);
     }
 
-    ensure!(
-        code == 0,
-        "{} 退出码 {}\n{}",
-        profile.client.label(),
-        code,
-        if stderr.metadata()?.len() > 0 {
-            tail(&stderr, 2400)
-        } else {
-            tail(&stdout, 2400)
-        }
-    );
+    if code != 0 {
+        // The CLI's own account of the failure beats stderr noise (e.g. MCP login warnings).
+        let reported = fs::read_to_string(&stdout)
+            .ok()
+            .and_then(|raw| aep::transcript::failure(&raw));
+        anyhow::bail!(
+            "{} 退出码 {}\n{}",
+            profile.client.label(),
+            code,
+            match reported {
+                Some(message) => message,
+                None if stderr.metadata()?.len() > 0 => tail(&stderr, 2400),
+                None => tail(&stdout, 2400),
+            }
+        );
+    }
     let result = match profile.client {
         Client::Codex => fs::read_to_string(&result_path).context("Codex 未生成最终答复")?,
         Client::Claude => {
@@ -574,6 +703,21 @@ fn invoke(
     };
     ensure!(!result.trim().is_empty(), "CLI 返回空结果");
     fs::write(&result_path, &result)?;
+    let skips = aep::workflow::skips(req.template, req.stage, &result);
+    if !skips.is_empty() {
+        record["skip"] = json!(
+            skips
+                .iter()
+                .map(|(s, r)| json!({"stage":s,"name":req.template.stages()[*s].name,"reason":r}))
+                .collect::<Vec<_>>()
+        );
+    }
+    // An earlier stage must act first: record where to and why, and do not let this pass.
+    if let Some((to, question)) = aep::workflow::route_back(req.template, req.stage, &result) {
+        let target = req.template.stages()[to].name;
+        record["route_back"] = json!({"stage":to,"name":target,"question":question});
+        anyhow::bail!("需要「{target}」先解决：{question}");
+    }
     if gate {
         ensure!(
             result
@@ -595,6 +739,7 @@ fn invoke(
             &profile.model
         }
     );
+    pin_worktree(req, stage, &cwd, id, record)?;
     let mut memory = Memory::open(work.parent().context("missing project directory")?)?;
     let summary = format!(
         "{} · {}\n{}",
@@ -609,6 +754,67 @@ fn invoke(
     record["status"] = json!("succeeded");
     record["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
     save(dir, record)
+}
+
+/// Commit what a planning or build stage wrote onto the item branch, and pin every passing
+/// stage's HEAD, so delivery merges exactly the commit independent acceptance approved.
+fn pin_worktree(
+    req: &Request,
+    stage: &Stage,
+    cwd: &Path,
+    id: &str,
+    record: &mut Value,
+) -> Result<()> {
+    let Some(repo) = &req.repository else {
+        return Ok(());
+    };
+    if record["mode"] == "external" {
+        return Ok(());
+    }
+    let repo = Workspace::open(repo)?;
+    let trees = repo.data.join("workflow-worktrees");
+    if cwd.canonicalize()?.parent() != Some(trees.canonicalize()?.as_path()) {
+        return Ok(());
+    }
+    let status = |cwd: &Path| git(cwd, &["status", "--porcelain", "--untracked-files=all"]);
+    if matches!(stage.role, Role::Plan | Role::Build) && !status(cwd)?.trim().is_empty() {
+        git(cwd, &["add", "-A"])?;
+        let message = format!("{} · {}\n\nAEP-Run: {id}", req.work, stage.name);
+        let named = git(cwd, &["config", "user.email"]).is_ok_and(|e| !e.trim().is_empty());
+        let mut args = vec![];
+        if !named {
+            args.extend([
+                "-c",
+                "user.name=AEP Studio",
+                "-c",
+                "user.email=aep-studio@localhost",
+            ]);
+        }
+        args.extend(["commit", "--no-verify", "-q", "-m", &message]);
+        git(cwd, &args)?;
+        record["committed"] = json!(true);
+    }
+    let head = aep::workspace::commit(cwd, "HEAD")?;
+    git(
+        &repo.root,
+        &["update-ref", &format!("refs/aep/stages/{id}"), &head],
+    )?;
+    record["head_sha"] = json!(head);
+    // Untracked leftovers (reports, caches) are not part of the commit and do no harm; a
+    // changed tracked file would mean the reviewed code is not the committed code.
+    let changed = git(cwd, &["status", "--porcelain", "--untracked-files=no"])?;
+    record["clean"] = json!(changed.trim().is_empty());
+    let untracked = status(cwd)?.lines().filter(|l| l.starts_with("??")).count();
+    if untracked > 0 {
+        record["untracked"] = json!(untracked);
+    }
+    ensure!(
+        changed.trim().is_empty(),
+        "「{}」改动了事项工作区里的已提交文件，验收类阶段不应修改代码；需要修复请用 AEP-BACK 交给开发实现：\n{}",
+        stage.name,
+        changed.lines().take(10).collect::<Vec<_>>().join("\n")
+    );
+    Ok(())
 }
 
 pub fn execute(request: &Path) -> Result<()> {

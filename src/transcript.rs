@@ -76,6 +76,27 @@ fn tool_detail(name: &str, input: &Value) -> String {
     })
 }
 
+/// Codex wraps API failures as a JSON string; keep only the human-readable message.
+fn api_message(raw: &str) -> String {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|v| {
+            v["error"]["message"]
+                .as_str()
+                .or(v["message"].as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| raw.to_owned())
+}
+
+/// The fatal error a failed turn reported, if any.
+pub fn failure(raw: &str) -> Option<String> {
+    parse(raw).entries.into_iter().rev().find_map(|e| match e {
+        Entry::Error(m) if !m.trim().is_empty() => Some(m),
+        _ => None,
+    })
+}
+
 pub fn parse(raw: &str) -> Transcript {
     let mut t = Transcript::default();
     // Codex item ID or Claude tool_use ID → index in `entries`, so completions update in place.
@@ -107,8 +128,17 @@ pub fn parse(raw: &str) -> Transcript {
                 t.input_tokens += v["usage"]["input_tokens"].as_u64().unwrap_or(0);
                 t.output_tokens += v["usage"]["output_tokens"].as_u64().unwrap_or(0);
             }
-            "turn.failed" => t.entries.push(Entry::Error(text(&v["error"]["message"]))),
-            "error" => t.entries.push(Entry::Error(text(&v["message"]))),
+            // Codex reports a fatal error twice (`error`, then `turn.failed`); show it once.
+            "turn.failed" | "error" => {
+                let message = api_message(&text(if v["type"] == "error" {
+                    &v["message"]
+                } else {
+                    &v["error"]["message"]
+                }));
+                if !matches!(t.entries.last(), Some(Entry::Error(last)) if *last == message) {
+                    t.entries.push(Entry::Error(message));
+                }
+            }
             // Claude
             "system" if v["subtype"] == "init" => {
                 t.session = v["session_id"].as_str().map(str::to_owned);
@@ -365,5 +395,17 @@ mod tests {
         assert_eq!(t.entries, vec![Entry::Text("hello\nworld".into())]);
         let t = parse(r#"{"result":"final answer","is_error":false}"#);
         assert_eq!(t.entries, vec![Entry::Message("final answer".into())]);
+    }
+
+    #[test]
+    fn api_failures_read_as_their_message() {
+        let raw = r#"{"type":"error","message":"{\"type\":\"error\",\"status\":400,\"error\":{\"message\":\"model is not supported\"}}"}
+{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"message\":\"model is not supported\"}}"}}"#;
+        assert_eq!(
+            parse(raw).entries,
+            vec![Entry::Error("model is not supported".into())]
+        );
+        assert_eq!(failure(raw).as_deref(), Some("model is not supported"));
+        assert_eq!(failure(r#"{"type":"turn.started"}"#), None);
     }
 }

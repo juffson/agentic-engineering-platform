@@ -1,0 +1,80 @@
+/* One palette for the whole app: graphite surfaces, a single accent, sparse status colors. */
+:root {
+  color-scheme: dark;
+
+  --bg: #0e1013;
+  --panel: #15181c;
+  --raised: #1b1f24;
+  --hover: #22272d;
+  --border: #262b31;
+  --border-strong: #343a42;
+  --code-bg: #0b0d10;
+
+  --text: #e6e8eb;
+  --text-2: #c2c7ce;
+  --muted: #8a919b;
+  --faint: #5f6670;
+
+  --accent: #7c8cff;
+  --accent-hover: #91a0ff;
+  --accent-soft: rgba(124, 140, 255, 0.12);
+  --accent-line: rgba(124, 140, 255, 0.5);
+  --on-accent: #0b0d18;
+
+  --success: #3fb950;
+  --warning: #d29922;
+  --danger: #f85149;
+  --danger-soft: rgba(248, 81, 73, 0.08);
+  --danger-line: rgba(248, 81, 73, 0.35);
+  --success-soft: rgba(63, 185, 80, 0.1);
+
+  --diff-add: rgba(63, 185, 80, 0.12);
+  --diff-del: rgba(248, 81, 73, 0.12);
+
+  --shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent-line);
+
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  --mono: "SF Mono", ui-monospace, Menlo, Monaco, "Cascadia Mono", Consolas, monospace;
+
+  --r-sm: 6px;
+  --r: 8px;
+  --r-lg: 10px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --raised: #f0f2f4;
+    --hover: #e9ecef;
+    --border: #e1e4e8;
+    --border-strong: #cdd2d8;
+    --code-bg: #f6f7f9;
+
+    --text: #1b1f24;
+    --text-2: #3a4049;
+    --muted: #68707b;
+    --faint: #9aa1ab;
+
+    --accent: #5865f2;
+    --accent-hover: #4752d6;
+    --accent-soft: rgba(88, 101, 242, 0.09);
+    --accent-line: rgba(88, 101, 242, 0.45);
+    --on-accent: #ffffff;
+
+    --success: #1a7f37;
+    --warning: #9a6700;
+    --danger: #cf222e;
+    --danger-soft: rgba(207, 34, 46, 0.06);
+    --danger-line: rgba(207, 34, 46, 0.3);
+    --success-soft: rgba(26, 127, 55, 0.08);
+
+    --diff-add: rgba(26, 127, 55, 0.1);
+    --diff-del: rgba(207, 34, 46, 0.09);
+
+    --shadow: 0 16px 48px rgba(20, 24, 32, 0.16);
+  }
+}

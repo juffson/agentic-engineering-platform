@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod directory;
 pub mod merge;
+pub mod shelf;
 pub mod timeline;
 pub mod transfer;
 use anyhow::{Context, Result, ensure};
@@ -12,7 +13,7 @@ use std::{
 };
 use uuid::Uuid;
 
-use crate::workflow::{Client, Profile, Template};
+use crate::workflow::{self, Client, Profile, Template};
 use std::collections::BTreeMap;
 
 pub fn catalog_dir() -> Option<PathBuf> {
@@ -286,9 +287,18 @@ pub struct Work {
     pub records: Vec<WorkRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handoffs: Vec<WorkHandoff>,
+    /// Stages to pass over, with the reason (a person's choice or an earlier stage's AEP-SKIP).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skipped: BTreeMap<usize, String>,
+    /// Per-stage sandbox choice; unset stages use the role default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sandboxes: BTreeMap<usize, workflow::Sandbox>,
     /// Each time a later stage sent the item back for rework.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reworks: Vec<transfer::Rework>,
+    /// Set once a delivered item is put away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shelved: Option<shelf::Shelved>,
     #[serde(default)]
     pub tickets: std::collections::BTreeMap<PathBuf, String>,
     pub id: String,
@@ -319,6 +329,18 @@ impl Work {
         self.records
             .retain(|r| r.repository != repo || r.kind != kind || r.id != id);
         Ok(())
+    }
+    /// Only optional planning stages after the first may be skipped; gates never are.
+    pub fn skippable(&self, stage: usize) -> bool {
+        workflow::skippable(self.template, stage)
+    }
+    pub fn sandbox(&self, stage: usize) -> workflow::Sandbox {
+        self.sandboxes.get(&stage).copied().unwrap_or_else(|| {
+            self.template
+                .stages()
+                .get(stage)
+                .map_or_else(Default::default, |s| workflow::Sandbox::for_role(s.role))
+        })
     }
     pub fn stage_name(&self) -> &'static str {
         self.template
@@ -515,7 +537,10 @@ impl Project {
         let id = Uuid::new_v4().simple().to_string();
         self.selected = Some(id.clone());
         let mut work = Work {
+            skipped: BTreeMap::new(),
+            sandboxes: BTreeMap::new(),
             reworks: vec![],
+            shelved: None,
             deliveries: vec![],
             stage_transfers: vec![],
             active_transfers: BTreeMap::new(),

@@ -1127,3 +1127,83 @@ esac
     );
     Ok(())
 }
+
+#[test]
+fn test_stages_get_network_by_default_and_full_access_on_request() -> Result<()> {
+    use aep::{
+        handoff::Assignment,
+        project::{Kind, Library},
+        workflow::{Client, Profile, Sandbox, Template},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().join("catalog");
+    let codex = temp.path().join("codex");
+    let args = temp.path().join("args");
+    fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\necho \"$*\" >> '{}'\nwhile [ \"$1\" != --output-last-message ]; do shift; done\nprintf 'ok\\nAEP: PASS\\n' > \"$2\"\n",
+            args.display()
+        ),
+    )?;
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700))?;
+    let profile = Profile {
+        client: Client::Codex,
+        executable: codex.display().to_string(),
+        model: String::new(),
+        check_command: String::new(),
+    };
+    let mut lib = Library::open(&home)?;
+    let wid = lib.change(&home, |lib| {
+        lib.create("sandbox", vec![])?;
+        let p = lib.project_mut()?;
+        p.add_work("导出", Kind::Feature, Template::Software)?;
+        let wid = p.selected().unwrap().id.clone();
+        for stage in 0..4 {
+            p.finish_stage(&home, &wid, stage, "结论".into())?;
+        }
+        Ok(wid)
+    })?;
+    let run = |lib: &mut Library| -> Result<String> {
+        let dir = lib.change(&home, |lib| {
+            lib.project_mut()?.reserve(
+                &home,
+                &wid,
+                4,
+                Assignment {
+                    profile: profile.clone(),
+                    brief: "测试".into(),
+                    repository: None,
+                    external: None,
+                },
+            )
+        })?;
+        Command::new(env!("CARGO_BIN_EXE_aep"))
+            .args(["workflow-stage", "--request"])
+            .arg(dir.join("request.json"))
+            .output()?;
+        Ok(fs::read_to_string(&args)?
+            .lines()
+            .last()
+            .unwrap()
+            .to_owned())
+    };
+    let line = run(&mut lib)?;
+    assert!(line.contains("--sandbox workspace-write"), "{line}");
+    assert!(
+        line.contains("sandbox_workspace_write.network_access=true"),
+        "{line}"
+    );
+    lib.change(&home, |lib| {
+        lib.project_mut()?
+            .work_by_id_mut(&wid)?
+            .sandboxes
+            .insert(4, Sandbox::Full);
+        Ok(())
+    })?;
+    let line = run(&mut lib)?;
+    assert!(line.contains("--sandbox danger-full-access"), "{line}");
+    assert!(!line.contains("network_access"), "{line}");
+    Ok(())
+}

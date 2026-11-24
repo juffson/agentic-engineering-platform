@@ -1,5 +1,7 @@
 # HTTPS 私有试点
 
+> 注：GPUI 版 Studio（`desktop/`）已于 2026-11 移除，文中 `ui_debug` 界面演练命令随之失效；控制面、Worker 与 CLI 步骤仍然适用。新版 Studio 见 README「AEP Studio 项目工作台」。
+
 这一部署在 Docker/Linux VM 内运行控制面和一个 Worker。操作端通过宿主机回环端口访问，Worker 从独立的内部网络连入 HTTPS。Nginx 转发 `/v1/control` 和 `/v1/evidence/`，AEP 本身监听共享网络命名空间里的回环地址。证书由专用 CA 签发，客户端使用 `--ca-cert` 验证签名和访问名称。
 
 ## 在 Studio 运行

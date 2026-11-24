@@ -201,7 +201,7 @@ git -C "$operator" config user.email "$git_email"
 baseline=$(git -C "$operator" rev-parse HEAD)
 git -C "$operator" switch -qc "$branch" "$baseline"
 spec_path=specs/$task
-fixture="$repo/desktop/examples/support/handoff"
+fixture="$repo/deploy/pilot/fixture"
 mkdir -p "$operator/$spec_path"
 sed "s/{task}/$task/g" "$script_dir/live-spec.md" > "$operator/$spec_path/spec.md"
 cp "$fixture/normalize.rs" "$fixture/acceptance.rs" "$operator/$spec_path/"

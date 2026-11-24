@@ -1,4 +1,5 @@
 //! Shared workspace, run evidence, and engineering memory for AEP.
+pub mod autopilot;
 pub mod cancel;
 pub mod delivery;
 pub mod deploy_keys;

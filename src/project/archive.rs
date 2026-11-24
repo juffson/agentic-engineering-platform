@@ -136,7 +136,7 @@ pub(super) fn seal(
         ev["run_id"] == delivery
             && ev["status"] == "succeeded"
             && ev["read_stage_transfer"] == serde_json::to_value(accepted)?,
-        "交付执行未消费已确认的验收回执"
+        "这次交付执行没有记录它读取的独立验收交接（旧版本执行器的复核会这样）。请在「交付归档」继续对话一次（例如“请确认交付”），新一轮通过后再确认交付"
     );
 
     if !ev["source_evidence"].is_null() {
