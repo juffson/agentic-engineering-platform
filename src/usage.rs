@@ -65,6 +65,65 @@ pub struct Summary {
     /// Account quota the CLI reported last, e.g. {"five_hour":0.41,"seven_day":0.33}.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<Value>,
+    /// How this summary was counted; caches older than [`REV`] are measured again.
+    #[serde(default)]
+    pub rev: u32,
+    /// Context of the run's first model call (what the stage started with); None when the
+    /// CLI did not report per-call usage.
+    #[serde(default)]
+    pub first_context: Option<u64>,
+    /// Context of the run's last model call, for deciding whether its session is worth
+    /// continuing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_context: Option<u64>,
+    /// A Codex resume counted without its rollout and without the source run's session
+    /// total: the CLI's figure covers the whole thread, so it may be too high.
+    #[serde(default)]
+    pub count_maybe_high: bool,
+}
+
+/// Counting rules of the cached [`Summary`]. 2: Codex resumes count only this run's window.
+pub const REV: u32 = 2;
+
+impl Report {
+    fn finish(mut self) -> Self {
+        self.summary.rev = REV;
+        self.summary.first_context = self.per_call.first().map(|c| c.tokens.context());
+        self.summary.last_context = self.per_call.last().map(|c| c.tokens.context());
+        self
+    }
+}
+
+/// What a Codex run continued, which decides how `turn.completed` is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Thread {
+    /// A new thread: `turn.completed` is this run's usage.
+    Fresh,
+    /// `exec resume` of a thread whose cumulative usage was this when the source run ended.
+    Resumed(Tokens),
+    /// `exec resume` of a thread whose earlier usage is unknown (older records).
+    ResumedUnknown,
+}
+
+fn minus(a: &Tokens, b: &Tokens) -> Tokens {
+    Tokens {
+        input: a.input.saturating_sub(b.input),
+        cache_read: a.cache_read.saturating_sub(b.cache_read),
+        cache_write: a.cache_write.saturating_sub(b.cache_write),
+        output: a.output.saturating_sub(b.output),
+        reasoning: a.reasoning.saturating_sub(b.reasoning),
+    }
+}
+
+/// The last `turn.completed.usage` of a Codex run as reported. After `exec resume` it is
+/// the thread's cumulative usage; kept in evidence as `codex_session_total` so the next
+/// resume can subtract it.
+pub fn codex_session_total(raw: &str) -> Option<Value> {
+    raw.lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["type"] == "turn.completed" && v["usage"].is_object())
+        .map(|v| v["usage"].clone())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -229,6 +288,7 @@ pub fn claude(raw: &str) -> Report {
         summary,
         per_call: calls,
     }
+    .finish()
 }
 
 fn codex_tokens(u: &Value) -> Tokens {
@@ -264,14 +324,27 @@ fn codex_kind(input: &str) -> &'static str {
 
 /// Codex `exec --json` reports usage once per turn; its rollout file has every model call
 /// (`token_count.last_token_usage`) and the tool calls that came before it.
-pub fn codex(raw: &str, rollout: Option<&str>, window: (Option<&str>, Option<&str>)) -> Report {
+///
+/// After `exec resume`, `turn.completed` carries the whole thread's cumulative usage, so the
+/// rollout's calls inside this run's window are the count whenever they exist. Without them a
+/// fresh thread sums `turn.completed`; a resume subtracts the source run's total, or keeps the
+/// cumulative figure and marks it `count_maybe_high` when that total is unknown.
+pub fn codex(
+    raw: &str,
+    rollout: Option<&str>,
+    window: (Option<&str>, Option<&str>),
+    thread: Thread,
+) -> Report {
     let mut summary = Summary::default();
     let mut turns = 0;
+    let mut reported = Tokens::default();
+    let mut last_turn = Tokens::default();
     for line in raw.lines() {
         if let Ok(v) = serde_json::from_str::<Value>(line)
             && v["type"] == "turn.completed"
         {
-            summary.tokens.add(&codex_tokens(&v["usage"]));
+            last_turn = codex_tokens(&v["usage"]);
+            reported.add(&last_turn);
             turns += 1;
         }
     }
@@ -378,15 +451,26 @@ pub fn codex(raw: &str, rollout: Option<&str>, window: (Option<&str>, Option<&st
             _ => {}
         }
     }
-    // A run stopped mid-turn never wrote `turn.completed`: its calls are all there is.
-    if turns == 0 {
+    // The rollout window is exact (runs of one item are serialised by its workflow lock).
+    // A run stopped before any call, or mid-turn, has nothing else to go by either.
+    if !calls.is_empty() || turns == 0 {
         calls.iter().for_each(|c| summary.tokens.add(&c.tokens));
+    } else {
+        match thread {
+            Thread::Fresh => summary.tokens = reported,
+            Thread::Resumed(before) => summary.tokens = minus(&last_turn, &before),
+            Thread::ResumedUnknown => {
+                summary.tokens = reported;
+                summary.count_maybe_high = true;
+            }
+        }
     }
     summary.calls = calls.len();
     Report {
         summary,
         per_call: calls,
     }
+    .finish()
 }
 
 /// ZCode's own accounting: every model request of the session in the run's time window.
@@ -446,7 +530,7 @@ pub fn zcode(db: &Path, session: &str, since_ms: i64, until_ms: Option<i64>) -> 
         });
     }
     report.summary.calls = report.per_call.len();
-    Ok(report)
+    Ok(report.finish())
 }
 
 fn codex_home() -> Option<PathBuf> {
@@ -545,7 +629,12 @@ pub fn measure(dir: &Path) -> Result<Report> {
                     })
             };
             let (a, b) = (utc(&ev["started_at"]), utc(&ev["finished_at"]));
-            codex(&text, rollout.as_deref(), (a.as_deref(), b.as_deref()))
+            codex(
+                &text,
+                rollout.as_deref(),
+                (a.as_deref(), b.as_deref()),
+                codex_thread(dir, &ev),
+            )
         }
         Some(Client::ZCode) => {
             let db = std::env::home_dir()
@@ -555,11 +644,32 @@ pub fn measure(dir: &Path) -> Result<Report> {
                 (Some(db), Some(session), Some(since)) => {
                     zcode(&db, &session, since, millis(&ev["finished_at"]))?
                 }
-                _ => Report::default(),
+                _ => Report::default().finish(),
             }
         }
-        _ => Report::default(),
+        _ => Report::default().finish(),
     })
+}
+
+/// Which run's Codex thread this run resumed: a follow-up that resumed its session, or a
+/// stage that reused the previous stage's session.
+fn codex_thread(dir: &Path, ev: &Value) -> Thread {
+    let source = if ev["follow_up"]["resumed_session"].is_string() {
+        ev["follow_up"]["attempt"].as_str()
+    } else if ev["reused_session"].is_object() {
+        ev["reused_session"]["run"].as_str()
+    } else {
+        return Thread::Fresh;
+    };
+    let total = source
+        .filter(|id| crate::workspace::ident(id, 64).is_ok())
+        .and_then(|id| crate::workflow::evidence(&dir.parent()?.join(id)).ok())
+        .map(|src| src["codex_session_total"].clone())
+        .filter(Value::is_object);
+    match total {
+        Some(u) => Thread::Resumed(codex_tokens(&u)),
+        None => Thread::ResumedUnknown,
+    }
 }
 
 fn finished(ev: &Value) -> bool {
@@ -569,18 +679,31 @@ fn finished(ev: &Value) -> bool {
     )
 }
 
-/// An attempt's usage, cached in `usage.json` once the attempt has finished.
+/// An attempt's usage, cached in `usage.json` once the attempt has finished. A cache counted
+/// by older rules is measured again once (the logs are kept); if that is no longer possible
+/// the old figure stays.
 pub fn summary(dir: &Path) -> Summary {
     let cache = dir.join("usage.json");
-    if let Ok(bytes) = fs::read(&cache)
-        && let Ok(s) = serde_json::from_slice::<Summary>(&bytes)
+    let old = fs::read(&cache)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Summary>(&bytes).ok());
+    if let Some(s) = &old
+        && s.rev >= REV
     {
-        return s;
+        return s.clone();
     }
     let Ok(ev) = crate::workflow::evidence(dir) else {
-        return Summary::default();
+        return old.unwrap_or_default();
     };
-    let s = measure(dir).map(|r| r.summary).unwrap_or_default();
+    let s = match (measure(dir).map(|r| r.summary), old) {
+        // Logs gone (or unreadable): keep what was counted, and stop trying again.
+        (Ok(s), Some(old)) if s.tokens.total() == 0 && old.tokens.total() > 0 => {
+            Summary { rev: REV, ..old }
+        }
+        (Err(_), Some(old)) => Summary { rev: REV, ..old },
+        (Ok(s), _) => s,
+        (Err(_), None) => Summary::default(),
+    };
     if finished(&ev) {
         let _ = crate::project::save_json(dir, "usage.json", &s);
     }
@@ -768,7 +891,9 @@ mod tests {
             stdout,
             Some(rollout),
             (Some("2026-01-02T00:00:00.000Z"), None),
+            Thread::Fresh,
         );
+        // The rollout's calls in the window are the count (the call before it is not).
         assert_eq!(
             r.summary.tokens,
             Tokens {
@@ -776,9 +901,13 @@ mod tests {
                 cache_read: 800,
                 cache_write: 0,
                 output: 50,
-                reasoning: 20
+                reasoning: 0
             }
         );
+        assert_eq!(r.summary.first_context, Some(400));
+        assert_eq!(r.summary.last_context, Some(600));
+        assert_eq!(r.summary.rev, REV);
+        assert!(!r.summary.count_maybe_high);
         assert_eq!(r.per_call.len(), 2);
         assert_eq!(r.per_call[0].kind, "读取");
         assert_eq!(r.per_call[0].detail, "rg foo src");
@@ -791,9 +920,140 @@ mod tests {
             r#"{"type":"thread.started","thread_id":"t"}"#,
             Some(rollout),
             (Some("2026-01-02T00:00:00.000Z"), None),
+            Thread::Fresh,
         );
         assert_eq!(r.summary.tokens.total(), 1050);
         let a = analysis(&r);
         assert_eq!(a["by_kind"][0]["kind"], "编辑");
+    }
+
+    /// AC-9: b578ba7c, an `exec resume` whose `turn.completed` was the thread's 7.3M total.
+    const RESUME_STDOUT: &str = r#"{"type":"thread.started","thread_id":"th"}
+{"type":"turn.completed","usage":{"input_tokens":7337462,"cached_input_tokens":7000000,"output_tokens":90000,"reasoning_output_tokens":40000}}"#;
+
+    #[test]
+    fn codex_resume_counts_only_its_rollout_window() {
+        let rollout = r#"{"timestamp":"2026-11-20T01:00:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7161016,"cached_input_tokens":7000000,"output_tokens":89000},"total_token_usage":{"input_tokens":7161016}}}}
+{"timestamp":"2026-11-21T02:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":176446,"cached_input_tokens":170000,"output_tokens":1000,"reasoning_output_tokens":400},"total_token_usage":{"input_tokens":7337462}}}}"#;
+        let window = (
+            Some("2026-11-21T02:00:00.000Z"),
+            Some("2026-11-21T02:10:00.000Z"),
+        );
+        // Whatever is known about the source, the window decides.
+        for thread in [
+            Thread::Fresh,
+            Thread::ResumedUnknown,
+            Thread::Resumed(Tokens::default()),
+        ] {
+            let r = codex(RESUME_STDOUT, Some(rollout), window, thread);
+            assert_eq!(r.summary.tokens.context(), 176_446, "{thread:?}");
+            assert_eq!(r.summary.tokens.output, 1000);
+            assert_eq!(r.summary.calls, 1);
+            assert_eq!(r.summary.first_context, Some(176_446));
+            assert!(!r.summary.count_maybe_high);
+        }
+    }
+
+    #[test]
+    fn codex_resume_without_rollout_subtracts_the_source_total_or_flags_it() {
+        let before = codex_tokens(
+            &json!({"input_tokens":7161016,"cached_input_tokens":6990000,"output_tokens":89000,"reasoning_output_tokens":39600}),
+        );
+        let r = codex(RESUME_STDOUT, None, (None, None), Thread::Resumed(before));
+        assert_eq!(r.summary.tokens.context(), 176_446);
+        assert_eq!(r.summary.tokens.cache_read, 10_000);
+        assert_eq!(r.summary.tokens.output, 1000);
+        assert_eq!(r.summary.tokens.reasoning, 400);
+        assert!(!r.summary.count_maybe_high);
+        // E12: no per-call data, so no first context.
+        assert_eq!(r.summary.first_context, None);
+        // E11: an older source without `codex_session_total` keeps the figure, flagged.
+        let r = codex(RESUME_STDOUT, None, (None, None), Thread::ResumedUnknown);
+        assert_eq!(r.summary.tokens.context(), 7_337_462);
+        assert!(r.summary.count_maybe_high);
+        // A fresh thread's turns are its own usage.
+        let r = codex(RESUME_STDOUT, None, (None, None), Thread::Fresh);
+        assert_eq!(r.summary.tokens.context(), 7_337_462);
+        assert!(!r.summary.count_maybe_high);
+        assert_eq!(
+            codex_session_total(RESUME_STDOUT).unwrap()["input_tokens"],
+            7337462
+        );
+        assert_eq!(codex_session_total("{}"), None);
+    }
+
+    fn run(root: &Path, id: &str, ev: Value, stdout: &str) -> PathBuf {
+        let dir = root.join("runs").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("evidence.json"), ev.to_string()).unwrap();
+        fs::write(dir.join("stdout.log"), stdout).unwrap();
+        dir
+    }
+
+    #[test]
+    fn old_caches_are_recounted_once_from_the_source_run_total() {
+        let t = tempfile::tempdir().unwrap();
+        let codex = json!({"client":"Codex"});
+        run(
+            t.path(),
+            "src1",
+            json!({"status":"succeeded","profile":codex,"codex_session_total":{"input_tokens":7161016,"cached_input_tokens":6990000,"output_tokens":89000}}),
+            "",
+        );
+        let resumed = |source: &str| {
+            json!({"status":"succeeded","profile":codex,
+                   "follow_up":{"attempt":source,"resumed_session":"th"}})
+        };
+        let dir = run(t.path(), "r1", resumed("src1"), RESUME_STDOUT);
+        // A rev-1 cache holding the inflated figure.
+        let stale = Summary {
+            tokens: codex_tokens(&json!({"input_tokens":7337462,"output_tokens":90000})),
+            ..Summary::default()
+        };
+        fs::write(dir.join("usage.json"), serde_json::to_vec(&stale).unwrap()).unwrap();
+        let s = summary(&dir);
+        assert_eq!(s.rev, REV);
+        assert_eq!(s.tokens.context(), 176_446);
+        assert!(!s.count_maybe_high);
+        let cached: Summary =
+            serde_json::from_slice(&fs::read(dir.join("usage.json")).unwrap()).unwrap();
+        assert_eq!(cached, s);
+
+        // E11: the source predates `codex_session_total`.
+        run(
+            t.path(),
+            "src2",
+            json!({"status":"succeeded","profile":codex}),
+            "",
+        );
+        let dir = run(t.path(), "r2", resumed("src2"), RESUME_STDOUT);
+        let s = summary(&dir);
+        assert!(s.count_maybe_high);
+        assert_eq!(s.tokens.context(), 7_337_462);
+
+        // The rollout, when found, wins over both.
+        let rollout = t.path().join("th.jsonl");
+        fs::write(&rollout, r#"{"timestamp":"2026-11-21T02:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5000,"cached_input_tokens":4000,"output_tokens":10}}}}"#).unwrap();
+        fs::write(dir.join("rollout.path"), rollout.display().to_string()).unwrap();
+        fs::remove_file(dir.join("usage.json")).unwrap();
+        let mut ev = resumed("src2");
+        ev["started_at"] = json!("2026-11-21T10:00:00+08:00");
+        fs::write(dir.join("evidence.json"), ev.to_string()).unwrap();
+        let s = summary(&dir);
+        assert_eq!(s.tokens.context(), 5000);
+        assert!(!s.count_maybe_high);
+        assert_eq!(s.first_context, Some(5000));
+
+        // A current cache is trusted; an old one whose logs are gone keeps its figure.
+        let dir = run(
+            t.path(),
+            "r3",
+            json!({"status":"succeeded","profile":{"client":"Claude"}}),
+            "",
+        );
+        fs::write(dir.join("usage.json"), serde_json::to_vec(&stale).unwrap()).unwrap();
+        let s = summary(&dir);
+        assert_eq!(s.tokens, stale.tokens);
+        assert_eq!(s.rev, REV);
     }
 }

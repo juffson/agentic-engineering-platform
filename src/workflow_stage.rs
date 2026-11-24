@@ -606,6 +606,20 @@ fn claude_launch_stats(client: Client, stdout: &Path, record: &mut Value) {
     record["launch"] = aep::launch::with_stats(record["launch"].take(), stats);
 }
 
+/// Codex's last reported usage, cumulative over the thread after `exec resume`: the next
+/// resume of this session subtracts it when the rollout cannot be read.
+fn codex_session_total(client: Client, stdout: &Path, record: &mut Value) {
+    if client != Client::Codex {
+        return;
+    }
+    if let Some(total) = fs::read_to_string(stdout)
+        .ok()
+        .and_then(|raw| aep::usage::codex_session_total(&raw))
+    {
+        record["codex_session_total"] = total;
+    }
+}
+
 /// Claude's stream-json output ends with one `result` event; older single-object
 /// output (and test doubles) carry the same fields without a `type`.
 fn claude_result(stdout: &Path) -> Result<Value> {
@@ -769,6 +783,7 @@ fn invoke(
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = handle.join();
     }
+    codex_session_total(profile.client, &stdout, record);
     let code = match code {
         Ok(code) => code,
         Err(e) => {
@@ -1125,6 +1140,28 @@ mod tests {
         let mut codex = json!({});
         claude_launch_stats(Client::Codex, &out, &mut codex);
         assert!(codex["launch"].is_null());
+    }
+
+    #[test]
+    fn codex_records_its_last_reported_session_total() {
+        let t = tempfile::tempdir().unwrap();
+        let out = t.path().join("stdout.log");
+        fs::write(
+            &out,
+            concat!(
+                r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":1}}"#,
+                "\n",
+                r#"{"type":"turn.completed","usage":{"input_tokens":30,"output_tokens":2}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let mut record = json!({});
+        codex_session_total(Client::Codex, &out, &mut record);
+        assert_eq!(record["codex_session_total"]["input_tokens"], 30);
+        let mut claude = json!({});
+        codex_session_total(Client::Claude, &out, &mut claude);
+        assert!(claude["codex_session_total"].is_null());
     }
 
     #[test]
