@@ -303,6 +303,7 @@ impl Work {
             sandbox: self.sandbox(stage),
             follow_up: None,
             token_limit: None,
+            resume_limit: None,
             stage_transfer: self.incoming(stage).cloned(),
             handoffs: self.handoffs.clone(),
             project: project.to_owned(),
@@ -369,6 +370,7 @@ impl Project {
         }
         let project = self.name.clone();
         let pid = self.id.clone();
+        let resume_limit = crate::session_reuse::limit(self.resume_limit);
         let budget = self
             .work
             .iter()
@@ -419,6 +421,7 @@ impl Project {
             },
         );
         request.token_limit = budget.and_then(|b| b.remaining());
+        request.resume_limit = Some(resume_limit);
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)

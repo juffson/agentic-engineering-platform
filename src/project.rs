@@ -405,6 +405,9 @@ pub struct Project {
     /// Default token budget for a stage that has none of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_budget: Option<u64>,
+    /// Last-call context above which a stage session is not continued (R2); None = default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_limit: Option<u64>,
 }
 impl Project {
     pub fn configure_site(&mut self, repo: &Path, site: Option<HttpsSite>) -> Result<()> {
@@ -647,6 +650,7 @@ impl Library {
             cli_defaults: vec![],
             dismissed_imports: vec![],
             stage_budget: None,
+            resume_limit: None,
         });
         self.active = Some(id);
         Ok(())

@@ -234,6 +234,9 @@ pub struct Request {
     /// Tokens this attempt may use before it is stopped (what is left of the budgets).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_limit: Option<u64>,
+    /// Context above which a session is not continued (R2); older requests use the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_limit: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_transfer: Option<crate::project::transfer::Transfer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

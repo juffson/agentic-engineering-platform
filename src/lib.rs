@@ -19,5 +19,6 @@ pub mod workflow;
 
 pub mod handoff;
 pub mod project;
+pub mod session_reuse;
 pub mod zcode_catalog;
 pub mod zcode_receipt;

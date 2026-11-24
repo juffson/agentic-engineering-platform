@@ -2,6 +2,7 @@ use crate::{agent::logged, run::save};
 use aep::{
     cancel::Cancellation,
     memory::{Key, Memory, TEXT_LIMIT},
+    session_reuse::{self, Mode, Plan, Reason, Side},
     workflow::{Client, Profile, Request, Role, Sandbox, Stage, tail},
     workspace::{Workspace, git},
     zcode_receipt::ActualModel,
@@ -211,6 +212,34 @@ fn source_receipt(req: &Request, stage: &Stage, dir: &Path) -> Result<Option<Pat
     Ok(Some(file))
 }
 
+/// Record how the session was chosen: why a new one started, and the context that was
+/// compared with the resume limit.
+fn record_plan(record: &mut Value, plan: &Plan, threshold: u64) {
+    let context = match plan {
+        Plan::Resume { context, .. } => *context,
+        Plan::Fresh { reason, context } => {
+            if *reason == Reason::ClientNotReusable {
+                return;
+            }
+            record["fresh_session_reason"] = json!(reason.as_str());
+            *context
+        }
+    };
+    if let Some(c) = context {
+        record["resume_context"] = json!(c);
+        record["resume_threshold"] = json!(threshold);
+    }
+}
+
+/// A resume the CLI could not perform (session pruned or never saved, E4): note it and let
+/// the caller start a new session with the hand-off digest instead.
+fn resume_failed(record: &mut Value, error: &anyhow::Error) {
+    record["fresh_session_reason"] = json!(Reason::SessionUnavailable.as_str());
+    record["resume_error"] = json!(format!("{error:#}"));
+    record["reused_session"] = Value::Null;
+    record["session"] = Value::Null;
+}
+
 fn perform(
     req: &Request,
     stage: &Stage,
@@ -224,26 +253,37 @@ fn perform(
     let gate = matches!(stage.role, Role::Test | Role::Accept);
     // Planning stages write the spec documents; the build writes code.
     let write = matches!(stage.role, Role::Build | Role::Plan);
-    let prior = req
-        .follow_up
-        .as_ref()
-        .map(|f| prior_turn(dir, f))
-        .transpose()?;
-    let cwd = match &prior {
-        Some(p) => p.workspace.clone(),
-        None => workspace(
-            work,
-            req.repository.as_deref(),
-            req.stage_transfer.as_ref(),
-            id,
-        )?,
-    };
-    // A native session already holds the stage context; send only the new message.
-    let resume = prior
-        .as_ref()
-        .filter(|_| matches!(req.profile.client, Client::Codex | Client::Claude))
-        .and_then(|p| p.session.clone());
-    if let (Some(p), Some(f)) = (&prior, &req.follow_up) {
+    let threshold = session_reuse::limit(req.resume_limit);
+    let runs = dir.parent().context("missing runs directory")?;
+    if let Some(f) = &req.follow_up {
+        let p = prior_turn(dir, f)?;
+        let cwd = p.workspace.clone();
+        let current = Side::of(req, Some(&cwd));
+        // A native session already holds the stage context; send only the new message,
+        // unless it has grown past the resume limit (R2).
+        let plan = match &p.session_run {
+            Some(run) => match session_reuse::source(runs, req.stage, stage.name, run) {
+                Ok(src) => session_reuse::decide(Mode::Continue, &current, Some(&src), threshold),
+                Err(_) => session_reuse::decide(Mode::Continue, &current, None, threshold),
+            },
+            None => session_reuse::decide(Mode::Continue, &current, None, threshold),
+        };
+        let plan = match plan {
+            // The round being continued exists; what is missing is a session to resume.
+            Plan::Fresh {
+                reason: Reason::NoPrior,
+                context,
+            } => Plan::Fresh {
+                reason: Reason::SessionUnavailable,
+                context,
+            },
+            other => other,
+        };
+        record_plan(record, &plan, threshold);
+        let resume = match &plan {
+            Plan::Resume { session, .. } => Some(session.clone()),
+            Plan::Fresh { .. } => None,
+        };
         record["follow_up"] = json!({"attempt":f.attempt,"resumed_session":resume});
         // A re-check after a send-back continues the session but consumes the new hand-off:
         // pin the upstream receipt again so delivery can prove which acceptance it read.
@@ -255,7 +295,7 @@ fn perform(
             ));
             record["source_evidence"] = json!({"run":req.stage_transfer.as_ref().map(|t|&t.run),"file":"inputs/source-evidence.json"});
         }
-        if resume.is_some() {
+        if let Some(session) = resume {
             let mut prompt = message.clone();
             if gate {
                 prompt.push_str(
@@ -273,7 +313,7 @@ fn perform(
                 &cwd,
                 prompt,
                 None,
-                resume,
+                Some((session, false)),
                 gate,
                 write,
                 (vec![], vec![]),
@@ -282,17 +322,18 @@ fn perform(
                     // Fall back to sending the context and the previous answer.
                     record["follow_up"]["resume_error"] = json!(format!("{e:#}"));
                     record["follow_up"]["resumed_session"] = Value::Null;
-                    record["session"] = Value::Null;
+                    resume_failed(record, &e);
                 }
                 other => return other,
             }
         }
         let packet = context(req, dir, &cwd, None)?;
-        let prompt = format!(
-            "{}\n\n## 上一轮答复\n{}\n\n## 继续的要求\n{}",
-            packet.text,
-            p.result.chars().take(8000).collect::<String>(),
-            message
+        aep::workspace::ident(&f.attempt, 64)?;
+        let prompt = aep::handoff::with_previous(
+            &packet.text,
+            &p.result,
+            &runs.join(&f.attempt).join("evidence.json"),
+            Some(&message),
         );
         return invoke(
             req,
@@ -311,18 +352,93 @@ fn perform(
             (packet.project_ids, packet.repo_ids),
         );
     }
+    let cwd = workspace(
+        work,
+        req.repository.as_deref(),
+        req.stage_transfer.as_ref(),
+        id,
+    )?;
+    // Reuse the previous stage's session when it ran the same CLI, model, permissions and
+    // workspace (R3); `prior_runs` already leaves out skipped stages (E6).
+    let current = Side::of(req, Some(&cwd));
+    let source = req.prior_runs.last().map(|(s, run)| {
+        let name = req.template.stages().get(*s).map_or("", |st| st.name);
+        session_reuse::source(runs, *s, name, run)
+    });
+    let plan = match &source {
+        Some(Err(_)) if matches!(req.profile.client, Client::Codex | Client::Claude) => {
+            Plan::Fresh {
+                reason: Reason::SessionUnavailable,
+                context: None,
+            }
+        }
+        Some(Ok(src)) => session_reuse::decide(Mode::Adjacent, &current, Some(src), threshold),
+        _ => session_reuse::decide(Mode::Adjacent, &current, None, threshold),
+    };
+    record_plan(record, &plan, threshold);
+    let source = source.and_then(Result::ok);
+    let receipt = source_receipt(req, stage, dir)?;
+    let receipt_text = |prompt: &mut String, record: &mut Value| {
+        if let Some(file) = &receipt {
+            prompt.push_str(&format!(
+                "\n请读取前序阶段的原始执行回执 {}，核对来源会话、结论和决策，再形成自己的结论。",
+                file.display()
+            ));
+            if stage.role == Role::Accept {
+                prompt.push_str("请在独立验收报告中引用你从该回执读到的完整 run_id，并列出决策编号和一项具体测试结果。");
+            }
+            record["source_evidence"] = json!({"run":req.stage_transfer.as_ref().map(|t|&t.run),"file":"inputs/source-evidence.json"});
+        }
+    };
+    let mut carry = matches!(&plan, Plan::Fresh { reason, .. } if reason.carries_previous());
+    if let (
+        Plan::Resume {
+            session,
+            fork,
+            source_stage,
+            source_run,
+            ..
+        },
+        Some(src),
+    ) = (&plan, &source)
+    {
+        record["reused_session"] = json!({"stage":source_stage,"name":src.stage_name,"run":source_run,"session":session,"forked":fork});
+        // The session already holds memory and earlier outputs: send the short prompt.
+        let mut prompt = aep::handoff::adjacent(req, dir)?;
+        receipt_text(&mut prompt, record);
+        match invoke(
+            req,
+            stage,
+            dir,
+            work,
+            id,
+            stop,
+            record,
+            &cwd,
+            prompt,
+            receipt.clone(),
+            Some((session.clone(), *fork)),
+            gate,
+            write,
+            (vec![], vec![]),
+        ) {
+            Err(e) if !stop.requested()? && session_missing(dir) => {
+                resume_failed(record, &e);
+                carry = true;
+            }
+            other => return other,
+        }
+    }
     let packet = context(req, dir, &cwd, None)?;
     let mut prompt = packet.text;
-    let receipt = source_receipt(req, stage, dir)?;
-    if let Some(file) = &receipt {
-        prompt.push_str(&format!(
-            "\n请读取前序阶段的原始执行回执 {}，核对来源会话、结论和决策，再形成自己的结论。",
-            file.display()
-        ));
-        if stage.role == Role::Accept {
-            prompt.push_str("请在独立验收报告中引用你从该回执读到的完整 run_id，并列出决策编号和一项具体测试结果。");
-        }
-        record["source_evidence"] = json!({"run":req.stage_transfer.as_ref().map(|t|&t.run),"file":"inputs/source-evidence.json"});
+    receipt_text(&mut prompt, record);
+    // The source session exists but is too large or cannot be continued: start a new one
+    // that carries its answer and hand-off digest (R2, E4, E5).
+    if carry && let Some(src) = &source {
+        let src_dir = runs.join(&src.run);
+        let previous = fs::read_to_string(src_dir.join("result.txt")).unwrap_or_default();
+        prompt =
+            aep::handoff::with_previous(&prompt, &previous, &src_dir.join("evidence.json"), None);
     }
     invoke(
         req,
@@ -479,7 +595,8 @@ fn documents(
 
 struct Prior {
     workspace: PathBuf,
-    session: Option<String>,
+    /// The newest round whose session was saved; its evidence decides whether to resume.
+    session_run: Option<String>,
     result: String,
 }
 /// Load what a follow-up continues: the latest workspace, the newest session that was
@@ -490,6 +607,7 @@ fn prior_turn(dir: &Path, follow: &aep::workflow::FollowUp) -> Result<Prior> {
     let mut id = follow.attempt.clone();
     let mut workspace = None;
     let mut session = None;
+    let mut session_run = None;
     let mut result = String::new();
     for _ in 0..64 {
         aep::workspace::ident(&id, 64)?;
@@ -501,6 +619,9 @@ fn prior_turn(dir: &Path, follow: &aep::workflow::FollowUp) -> Result<Prior> {
         // Runs from before sessions were persisted (`--ephemeral`) cannot be resumed.
         if session.is_none() && ev["resumable"] == true {
             session = ev["session"].as_str().map(str::to_owned);
+            if session.is_some() {
+                session_run = Some(id.clone());
+            }
         }
         if result.trim().is_empty() {
             result = fs::read_to_string(previous.join("result.txt")).unwrap_or_default();
@@ -517,7 +638,7 @@ fn prior_turn(dir: &Path, follow: &aep::workflow::FollowUp) -> Result<Prior> {
     ensure!(workspace.is_dir(), "上一轮执行的工作区已移除，请重新执行");
     Ok(Prior {
         workspace,
-        session,
+        session_run,
         result,
     })
 }
@@ -606,6 +727,20 @@ fn claude_launch_stats(client: Client, stdout: &Path, record: &mut Value) {
     record["launch"] = aep::launch::with_stats(record["launch"].take(), stats);
 }
 
+/// This run's own calls and the context of its last call, read by the next run deciding
+/// whether to continue the session (R2) and shown as the stage's window usage (AC-8).
+fn usage_window(client: Client, dir: &Path, record: &mut Value) {
+    if !matches!(client, Client::Codex | Client::Claude) {
+        return;
+    }
+    if let Ok(report) = aep::usage::measure(dir) {
+        record["usage_window"] = json!({"calls": report.summary.calls});
+        if let Some(c) = report.summary.last_context {
+            record["last_context"] = json!(c);
+        }
+    }
+}
+
 /// Codex's last reported usage, cumulative over the thread after `exec resume`: the next
 /// resume of this session subtracts it when the rollout cannot be read.
 fn codex_session_total(client: Client, stdout: &Path, record: &mut Value) {
@@ -646,12 +781,16 @@ fn invoke(
     cwd: &Path,
     prompt: String,
     receipt: Option<PathBuf>,
-    resume: Option<String>,
+    resume: Option<(String, bool)>,
     gate: bool,
     write: bool,
     (project_ids, repo_ids): (Vec<i64>, Vec<i64>),
 ) -> Result<()> {
     let cwd = cwd.to_path_buf();
+    let (resume, fork) = match resume {
+        Some((session, fork)) => (Some(session), fork),
+        None => (None, false),
+    };
     fs::write(dir.join("prompt.txt"), &prompt)?;
     // Follow-ups carry the stage's current incoming hand-off; a re-check is how a resumed
     // session reads a new one, so it is recorded the same way as a fresh brief.
@@ -756,6 +895,10 @@ fn invoke(
     if let Some(session) = &resume {
         if profile.client == Client::Claude {
             args.extend(["--resume".into(), session.clone()]);
+            if fork {
+                // A later stage gets its own session ID; the earlier one stays as it was.
+                args.push("--fork-session".into());
+            }
         } else {
             args.push(session.clone());
         }
@@ -783,6 +926,7 @@ fn invoke(
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = handle.join();
     }
+    usage_window(profile.client, dir, record);
     codex_session_total(profile.client, &stdout, record);
     let code = match code {
         Ok(code) => code,
