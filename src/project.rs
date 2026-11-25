@@ -354,11 +354,11 @@ impl Work {
                 .map_or_else(Default::default, |s| workflow::Sandbox::for_role(s.role))
         })
     }
-    pub fn stage_name(&self) -> &'static str {
+    pub fn stage_name(&self) -> &str {
         self.template
             .stages()
             .get(self.stage)
-            .map_or("已交付", |s| s.name)
+            .map_or("已交付", |s| s.name.as_str())
     }
     pub fn profile(&self, stage: usize) -> Profile {
         self.profiles

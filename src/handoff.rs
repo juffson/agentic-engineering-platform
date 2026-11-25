@@ -206,7 +206,7 @@ pub fn rules(req: &Request) -> Result<String> {
         .iter()
         .enumerate()
         .filter(|(i, _)| *i > req.stage && workflow::skippable(req.template, *i))
-        .map(|(_, s)| s.name)
+        .map(|(_, s)| s.name.as_str())
         .collect();
     if stage.role == Role::Plan && !optional.is_empty() {
         text.push_str(&format!(
@@ -216,7 +216,7 @@ pub fn rules(req: &Request) -> Result<String> {
     }
     let earlier: Vec<_> = stages[..req.stage.min(stages.len())]
         .iter()
-        .map(|s| s.name)
+        .map(|s| s.name.as_str())
         .collect();
     if !earlier.is_empty() {
         text.push_str(&format!(

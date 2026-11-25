@@ -286,7 +286,7 @@ fn perform(
         // A native session already holds the stage context; send only the new message,
         // unless it has grown past the resume limit (R2).
         let plan = match &p.session_run {
-            Some(run) => match session_reuse::source(runs, req.stage, stage.name, run) {
+            Some(run) => match session_reuse::source(runs, req.stage, &stage.name, run) {
                 Ok(src) => session_reuse::decide(Mode::Continue, &current, Some(&src), threshold),
                 Err(_) => session_reuse::decide(Mode::Continue, &current, None, threshold),
             },
@@ -405,7 +405,11 @@ fn perform(
             &done.run,
         )),
         _ => req.prior_runs.last().map(|(s, run)| {
-            let name = req.template.stages().get(*s).map_or("", |st| st.name);
+            let name = req
+                .template
+                .stages()
+                .get(*s)
+                .map_or("", |st| st.name.as_str());
             session_reuse::source(runs, *s, name, run)
         }),
     };
@@ -1362,7 +1366,7 @@ fn invoke(
     }
     // An earlier stage must act first: record where to and why, and do not let this pass.
     if let Some((to, question)) = aep::workflow::route_back(req.template, req.stage, &result) {
-        let target = req.template.stages()[to].name;
+        let target = &req.template.stages()[to].name;
         record["route_back"] = json!({"stage":to,"name":target,"question":question});
         anyhow::bail!("需要「{target}」先解决：{question}");
     }

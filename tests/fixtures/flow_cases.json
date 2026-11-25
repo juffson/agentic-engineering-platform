@@ -1,0 +1,388 @@
+[
+  {
+    "name": "E1 too few stages",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": null, "field": "stages", "message": "至少需要 2 个阶段"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E1 too many stages",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "规划1", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划2", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划3", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划4", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划5", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划6", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划7", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划8", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划9", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划10", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划11", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划12", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划13", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划14", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划15", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划16", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划17", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划18", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划19", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划20", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": null, "field": "stages", "message": "最多 20 个阶段"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E1 maximum stage count is valid",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "规划1", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划2", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划3", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划4", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划5", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划6", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划7", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划8", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划9", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划10", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划11", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划12", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划13", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划14", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划15", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划16", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划17", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划18", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "规划19", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [],
+    "warnings": []
+  },
+  {
+    "name": "E2 empty name after trimming",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "　 ", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": 0, "field": "name", "message": "第 1 个阶段：名称不能为空"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E2 name exceeds 20 characters",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "界界界界界界界界界界界界界界界界界界界界界", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": 0, "field": "name", "message": "第 1 个阶段：不超过 20 个字"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E2 20 characters and surrounding whitespace",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "  界界界界界界界界界界界界界界界界界界界界　", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [],
+    "warnings": []
+  },
+  {
+    "name": "E2 duplicate trimmed name",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": " 产品需求 ", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": 1, "field": "name", "message": "第 2 个阶段：与第 1 个阶段重名"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E2 directive delimiters and newline",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "产品：需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交互:设计", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "「技术", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "技术」", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "<前", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "后>", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "测\n试", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "环\r境", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": 0, "field": "name", "message": "第 1 个阶段：不能包含「：」「:」「「」」「<」「>」或换行"},
+      {"stage": 1, "field": "name", "message": "第 2 个阶段：不能包含「：」「:」「「」」「<」「>」或换行"},
+      {"stage": 2, "field": "name", "message": "第 3 个阶段：不能包含「：」「:」「「」」「<」「>」或换行"},
+      {"stage": 3, "field": "name", "message": "第 4 个阶段：不能包含「：」「:」「「」」「<」「>」或换行"},
+      {"stage": 4, "field": "name", "message": "第 5 个阶段：不能包含「：」「:」「「」」「<」「>」或换行"},
+      {"stage": 5, "field": "name", "message": "第 6 个阶段：不能包含「：」「:」「「」」「<」「>」或换行"},
+      {"stage": 6, "field": "name", "message": "第 7 个阶段：不能包含「：」「:」「「」」「<」「>」或换行"},
+      {"stage": 7, "field": "name", "message": "第 8 个阶段：不能包含「：」「:」「「」」「<」「>」或换行"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E3 no delivery stage",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "独立验收", "brief": "", "role": "Accept", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": null, "field": "role", "message": "需要恰好一个「交付」阶段，并放在最后"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E3 delivery is not last",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []},
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": null, "field": "role", "message": "需要恰好一个「交付」阶段，并放在最后"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E3 multiple delivery stages",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "预交付", "brief": "", "role": "Deliver", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": null, "field": "role", "message": "需要恰好一个「交付」阶段，并放在最后"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E4 first stage and non-planning stages cannot be skipped",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": true, "back_to": []},
+        {"name": "开发实现", "brief": "", "role": "Build", "skippable": true, "back_to": []},
+        {"name": "测试验证", "brief": "", "role": "Test", "skippable": true, "back_to": []},
+        {"name": "独立验收", "brief": "", "role": "Accept", "skippable": true, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": true, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": 0, "field": "skippable", "message": "第 1 个阶段「产品需求」：只有非首个的规划阶段可以跳过"},
+      {"stage": 1, "field": "skippable", "message": "第 2 个阶段「开发实现」：只有非首个的规划阶段可以跳过"},
+      {"stage": 2, "field": "skippable", "message": "第 3 个阶段「测试验证」：只有非首个的规划阶段可以跳过"},
+      {"stage": 3, "field": "skippable", "message": "第 4 个阶段「独立验收」：只有非首个的规划阶段可以跳过"},
+      {"stage": 4, "field": "skippable", "message": "第 5 个阶段「交付归档」：只有非首个的规划阶段可以跳过"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E5 later, self, and missing return targets",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "back_to": ["技术方案"], "skippable": false},
+        {"name": "技术方案", "brief": "", "role": "Plan", "back_to": ["产品需求", "技术方案", "旧设计"], "skippable": false},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": 0, "field": "back_to", "message": "第 1 个阶段「产品需求」：只能退回到它之前的阶段（「技术方案」在它之后或已删除）"},
+      {"stage": 1, "field": "back_to", "message": "第 2 个阶段「技术方案」：只能退回到它之前的阶段（「技术方案」在它之后或已删除）"},
+      {"stage": 1, "field": "back_to", "message": "第 2 个阶段「技术方案」：只能退回到它之前的阶段（「旧设计」在它之后或已删除）"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E6 empty label",
+    "flow": {
+      "id": "flow-example",
+      "label": "　 ",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": null, "field": "label", "message": "流程名称不能为空"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E6 label already in use",
+    "flow": {
+      "id": "flow-example",
+      "label": " 后端开发 ",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": ["后端开发"],
+    "errors": [
+      {"stage": null, "field": "label", "message": "与「后端开发」重名"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E6 built-in label",
+    "flow": {
+      "id": "flow-example",
+      "label": "经典开发流程",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": ["软件开发", "游戏开发", "经典开发流程"],
+    "errors": [
+      {"stage": null, "field": "label", "message": "不能与内置流程同名"}
+    ],
+    "warnings": []
+  },
+  {
+    "name": "E7 build without a later accept stage is valid with a warning",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "开发实现", "brief": "", "role": "Build", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [],
+    "warnings": [
+      {"stage": 1, "field": "role", "message": "「开发实现」之后、「交付归档」之前没有验收阶段。合并将直接使用最后一次通过的阶段提交。"}
+    ]
+  },
+  {
+    "name": "E7 accept before the last build does not clear the warning",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "初次实现", "brief": "", "role": "Build", "skippable": false, "back_to": []},
+        {"name": "独立验收", "brief": "", "role": "Accept", "skippable": false, "back_to": []},
+        {"name": "开发实现", "brief": "", "role": "Build", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [],
+    "warnings": [
+      {"stage": 3, "field": "role", "message": "「开发实现」之后、「交付归档」之前没有验收阶段。合并将直接使用最后一次通过的阶段提交。"}
+    ]
+  },
+  {
+    "name": "E7 warning survives an independently rejected label",
+    "flow": {
+      "id": "flow-example",
+      "label": "",
+      "stages": [
+        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "开发实现", "brief": "", "role": "Build", "skippable": false, "back_to": []},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [
+      {"stage": null, "field": "label", "message": "流程名称不能为空"}
+    ],
+    "warnings": [
+      {"stage": 1, "field": "role", "message": "「开发实现」之后、「交付归档」之前没有验收阶段。合并将直接使用最后一次通过的阶段提交。"}
+    ]
+  },
+  {
+    "name": "valid optional planning and accept after build",
+    "flow": {
+      "id": "flow-example",
+      "label": "后端开发",
+      "stages": [
+        {"name": " 产品需求 ", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
+        {"name": "技术方案", "brief": "", "role": "Plan", "skippable": true, "back_to": [" 产品需求 "]},
+        {"name": "开发实现", "brief": "", "role": "Build", "skippable": false, "back_to": []},
+        {"name": "独立验收", "brief": "", "role": "Accept", "back_to": ["产品需求", "开发实现"], "skippable": false},
+        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
+      ]
+    },
+    "taken_labels": [],
+    "errors": [],
+    "warnings": []
+  }
+]

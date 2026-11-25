@@ -277,7 +277,7 @@ rg -n "\.stages\(\)|\bLEGACY\b|\bSOFTWARE\b|\bGAME\b" src studio/src-tauri/src -
 
 为防止两边漂移：
 
-- `tests/fixtures/flow_cases.json` 列出用例 `[{name, flow, taken_labels, errors:[{stage,field,message}], warnings:[…]}]`，覆盖 E1–E7，每条规则至少一个拒绝用例（AC11）。
+- `tests/fixtures/flow_cases.json` 列出用例 `[{name, flow, taken_labels, errors:[{stage,field,message}], warnings:[…]}]`，E1–E6 每条规则至少一个拒绝用例（`errors` 非空，指出具体阶段或字段）；E7 只有警告用例：`errors` 为空、`warnings` 非空，表示可以保存（AC11）。E7 不设拒绝用例。
 - `tests/flow_builtin.rs` 读这个文件，逐条断言 Rust 的 `validate` 结果。
 - `studio/tests/flows.spec.ts` 用 Vite 的 `?raw`/JSON import 读同一个文件，在浏览器里调用 `validateFlow` 逐条断言（Playwright 的 `page.evaluate`，或者让 mock 把它挂到 `window.__aepValidateFlow`，仅 mock 下暴露）。
 
@@ -320,7 +320,7 @@ rg -n "\.stages\(\)|\bLEGACY\b|\bSOFTWARE\b|\bGAME\b" src studio/src-tauri/src -
 ## 9. 子任务顺序（详见 task.json）
 
 1. **T1** 生成基线夹具和测试（不改实现）
-2. **T2** `flow.rs` 和校验
+2. **T2** `flow.rs` 和校验。`name`/`brief` 改为 `String` 后，`src/` 里所有因此编译失败的调用方都在 T2 一并做类型适配，已知有 `autopilot.rs`、`work_draft.rs`、`project/timeline.rs`。这些地方只改类型，不改读取来源。`studio/src-tauri` 的编译适配在 T6 做
 3. **T3** 项目和事项数据：快照、加载隔离、项目流程增删改
 4. **T4** Request 自包含，执行器、交接、门禁改读 flow，E9
 5. **T5** 剩余读取方（autopilot、transfer、timeline 等）和 CLI、草稿，以及端到端测试

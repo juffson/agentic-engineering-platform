@@ -39,8 +39,8 @@
     },
     {
       "id": "T2",
-      "title": "src/flow.rs：Flow/FlowStage（Role 加 serde）、builtin()/builtin_by_id()/template_id()、把 Template::{label,stages} 和 LEGACY/SOFTWARE/GAME 移进来、Flow::{skippable,skips,route_back→Back,back_targets}、validate()+normalized()；workflow.rs 用 `pub use FlowStage as Stage`，旧的 skippable/skips/route_back 暂时保留为委托给 builtin 的薄包装，修好 name/brief 改为 String 引起的编译错误（stage_name 等改返回 &str）；tests/flow_builtin.rs（用新 API 对比 builtin_flows.json）+ tests/fixtures/flow_cases.json（E1–E7 每条至少一个拒绝用例、E7 警告用例）",
-      "paths": ["src/flow.rs", "src/lib.rs", "src/workflow.rs", "src/project.rs", "src/workflow_stage.rs", "src/handoff.rs", "tests/flow_builtin.rs", "tests/fixtures"],
+      "title": "src/flow.rs：Flow/FlowStage（Role 加 serde）、builtin()/builtin_by_id()/template_id()、把 Template::{label,stages} 和 LEGACY/SOFTWARE/GAME 移进来、Flow::{skippable,skips,route_back→Back,back_targets}、validate()+normalized()；workflow.rs 用 `pub use FlowStage as Stage`，旧的 skippable/skips/route_back 暂时保留为委托给 builtin 的薄包装，修好 name/brief 改为 String 引起的编译错误（stage_name 等改返回 &str），包括 autopilot.rs、work_draft.rs、project/timeline.rs 三个调用方，以及编译器指出的其他 src/ 调用方；这些地方只做类型适配（&s.name、.as_str()、返回 &str），不改读取来源，改读来源留给 T4/T5。studio/src-tauri 的编译适配留给 T6；tests/flow_builtin.rs（用新 API 对比 builtin_flows.json）+ tests/fixtures/flow_cases.json（E1–E6 每条至少一个拒绝用例；E7 只验证警告：errors 为空、warnings 非空、可以保存）",
+      "paths": ["src/flow.rs", "src/lib.rs", "src/workflow.rs", "src/project.rs", "src/workflow_stage.rs", "src/handoff.rs", "src/autopilot.rs", "src/work_draft.rs", "src/project/timeline.rs", "src/project", "src/session_reuse.rs", "src/zcode_stage.rs", "src/project_cli.rs", "src/project_cli", "tests/flow_builtin.rs", "tests/fixtures"],
       "criteria": ["AC2", "AC11", "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8"],
       "check": ["cargo", "test", "--locked", "--test", "flow_builtin"]
     },
