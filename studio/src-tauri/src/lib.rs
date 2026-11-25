@@ -39,6 +39,21 @@ fn addRepository(project: String, path: String) -> Result<impl Serialize, String
 }
 
 #[tauri::command(async)]
+fn saveFlow(project: String, flow: serde_json::Value) -> Result<impl Serialize, String> {
+    run(move |h| api::save_flow(&h, &project, flow))
+}
+
+#[tauri::command(async)]
+fn copyFlow(project: String, id: String, label: Option<String>) -> Result<impl Serialize, String> {
+    run(move |h| api::copy_flow(&h, &project, &id, label.as_deref()))
+}
+
+#[tauri::command(async)]
+fn deleteFlow(project: String, id: String) -> Result<impl Serialize, String> {
+    run(move |h| api::delete_flow(&h, &project, &id))
+}
+
+#[tauri::command(async)]
 fn createWork(
     project: String,
     name: String,
@@ -468,6 +483,9 @@ pub fn start() {
             selectWork,
             createProject,
             addRepository,
+            saveFlow,
+            copyFlow,
+            deleteFlow,
             createWork,
             workDetail,
             attemptView,

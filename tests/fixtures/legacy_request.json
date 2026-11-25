@@ -1,0 +1,13 @@
+{
+  "approved": [],
+  "brief": "核对内置流程与阶段交接。",
+  "profile": {
+    "client": "Claude",
+    "executable": "",
+    "model": ""
+  },
+  "project": "流程基线",
+  "stage": 2,
+  "template": "Software",
+  "work": "兼容旧事项"
+}

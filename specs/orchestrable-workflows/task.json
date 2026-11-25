@@ -1,0 +1,90 @@
+{
+  "title": "工作流 · 可编排的阶段流程",
+  "design": "specs/orchestrable-workflows/design.md",
+  "allowed_paths": [
+    "src/flow.rs",
+    "src/lib.rs",
+    "src/workflow.rs",
+    "src/project.rs",
+    "src/project/",
+    "src/handoff.rs",
+    "src/autopilot.rs",
+    "src/session_reuse.rs",
+    "src/workflow_stage.rs",
+    "src/zcode_stage.rs",
+    "src/project_cli.rs",
+    "src/project_cli/",
+    "src/work_draft.rs",
+    "tests/",
+    "studio/src-tauri/src/api.rs",
+    "studio/src-tauri/src/lib.rs",
+    "studio/src-tauri/tests/api.rs",
+    "studio/src/",
+    "studio/tests/"
+  ],
+  "forbidden_paths": [
+    "src/zcode_desktop.rs",
+    "src/zcode_desktop_send.rs",
+    "specs/",
+    "tests/autopilot.rs",
+    "tests/project_handoff.rs"
+  ],
+  "subtasks": [
+    {
+      "id": "T1",
+      "title": "改造前基线：tests/flow_baseline.rs，加 AEP_BLESS=1 时写入、否则比较的夹具 tests/fixtures/{builtin_flows.json, handoff/<template>-<i>.txt, legacy_projects.json, legacy_request.json}。只用改造后仍会保留的 API（Template::stages、s.name/brief/role、Profile::for_stage、Sandbox::for_role、Work::skippable、handoff::header/rules、Library::open、finish_stage），不改任何实现代码（design §8 AC2–AC5）",
+      "paths": ["tests/flow_baseline.rs", "tests/fixtures"],
+      "criteria": ["AC2", "AC3", "AC4", "AC5"],
+      "check": ["cargo", "test", "--locked", "--test", "flow_baseline"]
+    },
+    {
+      "id": "T2",
+      "title": "src/flow.rs：Flow/FlowStage（Role 加 serde）、builtin()/builtin_by_id()/template_id()、把 Template::{label,stages} 和 LEGACY/SOFTWARE/GAME 移进来、Flow::{skippable,skips,route_back→Back,back_targets}、validate()+normalized()；workflow.rs 用 `pub use FlowStage as Stage`，旧的 skippable/skips/route_back 暂时保留为委托给 builtin 的薄包装，修好 name/brief 改为 String 引起的编译错误（stage_name 等改返回 &str），包括 autopilot.rs、work_draft.rs、project/timeline.rs 三个调用方，以及编译器指出的其他 src/ 调用方；这些地方只做类型适配（&s.name、.as_str()、返回 &str），不改读取来源，改读来源留给 T4/T5。studio/src-tauri 的编译适配留给 T6；tests/flow_builtin.rs（用新 API 对比 builtin_flows.json）+ tests/fixtures/flow_cases.json（E1–E6 每条至少一个拒绝用例；E7 只验证警告：errors 为空、warnings 非空、可以保存）",
+      "paths": ["src/flow.rs", "src/lib.rs", "src/workflow.rs", "src/project.rs", "src/workflow_stage.rs", "src/handoff.rs", "src/autopilot.rs", "src/work_draft.rs", "src/project/timeline.rs", "src/project", "src/session_reuse.rs", "src/zcode_stage.rs", "src/project_cli.rs", "src/project_cli", "tests/flow_builtin.rs", "tests/fixtures"],
+      "criteria": ["AC2", "AC11", "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8"],
+      "check": ["cargo", "test", "--locked", "--test", "flow_builtin"]
+    },
+    {
+      "id": "T3",
+      "title": "项目与事项数据：Project.flows/broken_flows、ProjectFlow(revision)、save_flow/copy_flow/delete_flow/flow_in_use/flow_choices；Work.flow(WorkFlow 快照)/flow_error 和访问器 flow()/stages()/flow_id()/stage_name()/delivered()/skippable()/profile()；add_work 委托给 add_work_flow；Library::open 预处理隔离坏快照、坏模板和坏的项目流程（E11）；shelf.rs 改用访问器；tests/custom_flow.rs 加 save_and_reload、snapshot_frozen（数据层）、broken_snapshot 测试",
+      "paths": ["src/project.rs", "src/project/shelf.rs", "src/flow.rs", "tests/custom_flow.rs", "tests/fixtures"],
+      "criteria": ["AC4", "AC6", "AC12", "E10", "E11", "E12", "E13"],
+      "check": ["cargo", "test", "--locked", "--test", "custom_flow"]
+    },
+    {
+      "id": "T4",
+      "title": "执行请求自包含：Request.flow + Request::flow()，Work::request 总是写入 flow；handoff.rs（header label、rules 里的可选阶段和 back_targets 列表、approved、续聊）、workflow_stage.rs（408/612/1344–1366/1472/1627，Back::Rejected 写 evidence.route_back_rejected 后不让阶段失败）、zcode_stage.rs、project_cli/submission.rs 改读 req.flow()；删除 workflow.rs 里的薄包装；flow_baseline 的 handoff 快照逐字不变；custom_flow 加 request_self_contained、back_rules（E9）、legacy_request 的 flow() 断言",
+      "paths": ["src/workflow.rs", "src/handoff.rs", "src/workflow_stage.rs", "src/zcode_stage.rs", "src/project_cli/submission.rs", "src/flow.rs", "tests/custom_flow.rs", "tests/flow_baseline.rs"],
+      "criteria": ["AC3", "AC5", "AC9", "AC13", "E9"],
+      "check": ["cargo", "test", "--locked"]
+    },
+    {
+      "id": "T5",
+      "title": "其余读取方和 CLI：autopilot.rs、session_reuse.rs、project/{transfer,timeline,archive,import}.rs 改用 work.stages()/flow()?（推进类操作在流程出错时拒绝）；project_cli.rs 加 flows/flow-show/flow-save/flow-copy/flow-delete、add-work --flow，project show 加 flow；work_draft.rs 加 flows 参数和 fallback_from；端到端测试 custom_flow::{runs_to_delivery, skip_rules, autopilot_gate_failure, snapshot_frozen 推进部分}，用 tests/autopilot.rs 的假执行器写法，不修改 tests/autopilot.rs",
+      "paths": ["src/autopilot.rs", "src/session_reuse.rs", "src/project/transfer.rs", "src/project/timeline.rs", "src/project/archive.rs", "src/project/import.rs", "src/project_cli.rs", "src/work_draft.rs", "src/project.rs", "tests/custom_flow.rs", "tests/support"],
+      "criteria": ["AC1", "AC6", "AC7", "AC8", "AC10", "AC12", "E14", "S7"],
+      "check": ["cargo", "test", "--locked"]
+    },
+    {
+      "id": "T6",
+      "title": "Studio 后端：api.rs 的 snapshot 加 projects[].flows/broken_flows 和 work[].flow_error；新命令 save_flow/copy_flow/delete_flow 并在 lib.rs 注册；create_work 接受任意流程 id，未知 id 报错；work_detail 加 flow{source_state}/flow_error，出错时 stages=[]；attempt summary 加 route_back_rejected；draft_start 写 flows；把其余 template.stages() 调用全部换掉；studio/src-tauri/tests/api.rs 追加往返测试（先在仓库根目录 cargo build --bin aep）",
+      "paths": ["studio/src-tauri/src/api.rs", "studio/src-tauri/src/lib.rs", "studio/src-tauri/tests/api.rs"],
+      "criteria": ["AC6", "AC12", "AC14", "AC16", "E10", "E11"],
+      "check": ["cargo", "test", "--locked", "--manifest-path", "studio/src-tauri/Cargo.toml"]
+    },
+    {
+      "id": "T7",
+      "title": "前端契约与现有界面：types.ts（FlowId/FlowDef/FlowStage、WorkDetail.flow/flow_error、AttemptSummary.route_back_rejected、DraftItem.fallback_from、Api.saveFlow/copyFlow/deleteFlow）、client.ts、lib/flow.ts（validateFlow 与 Rust 同文案、ROLE_LABEL/ROLE_HINT、copyLabel、defaultNewFlow）、mock.ts（项目流程、快照、种子数据「后端开发」和一个 flow_error 事项）；Dialogs.tsx 改为「流程」分组下拉、带角色的预览、定制流程…链接、草稿 fallback 提示；WorkPage.tsx 的流程名悬停和 flow_error 错误卡；DecisionPanel/History 显示退回被拒；Sidebar 的错误点；跑 design §4 的 rg 核对 AC14",
+      "paths": ["studio/src/api", "studio/src/lib", "studio/src/components/Dialogs.tsx", "studio/src/components/WorkPage.tsx", "studio/src/components/DecisionPanel.tsx", "studio/src/components/History.tsx", "studio/src/components/Sidebar.tsx", "studio/src/styles/app.css"],
+      "criteria": ["AC14", "AC16", "AC17", "E9", "E11"],
+      "check": ["npm", "--prefix", "studio", "run", "build"]
+    },
+    {
+      "id": "T8",
+      "title": "流程页与编辑器：components/Flows.tsx（FlowsPage 列表和状态、FlowEditor 抽屉：行展开、上移下移、添加插在交付之前、删除可撤销、back_to 跟随改名和删除、即时校验、E7 警告、未保存离开确认、保存冲突时另存为新流程、删除确认）；store.tsx 加 Page \"flows\"、App.tsx 路由、Sidebar 底部「流程」链接；studio/tests/flows.spec.ts（P2–P5 路径、内置只读、用 flow_cases.json 做同源校验断言）",
+      "paths": ["studio/src/components/Flows.tsx", "studio/src/components/Sidebar.tsx", "studio/src/state/store.tsx", "studio/src/App.tsx", "studio/src/styles/app.css", "studio/src/api/mock.ts", "studio/tests/flows.spec.ts"],
+      "criteria": ["AC11", "AC15", "AC16", "AC17"],
+      "check": ["npm", "--prefix", "studio", "run", "test:ui", "--", "flows.spec.ts"]
+    }
+  ]
+}

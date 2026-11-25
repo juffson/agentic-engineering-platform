@@ -23,15 +23,19 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::Url;
+use uuid::Uuid;
 
 const SETTINGS_FILE: &str = "plugins.json";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 pub struct Ctx {
     pub home: PathBuf,
     pub secrets: Arc<dyn Secrets>,
     pub api_base: Option<String>,
+    #[doc(hidden)]
+    pub curl_program: Option<PathBuf>,
 }
 
 impl Ctx {
@@ -52,6 +56,7 @@ impl Ctx {
             home,
             secrets,
             api_base,
+            curl_program: None,
         }
     }
 
@@ -60,10 +65,14 @@ impl Ctx {
     }
 
     fn forge(&self, provider: Provider, host: &str) -> Result<Forge> {
-        match &self.api_base {
-            Some(base) => Forge::with_base(provider.kind(), host, base),
-            None => Ok(Forge::new(provider.kind(), host)),
-        }
+        let forge = match &self.api_base {
+            Some(base) => Forge::with_base(provider.kind(), host, base)?,
+            None => Forge::new(provider.kind(), host),
+        };
+        Ok(match &self.curl_program {
+            Some(program) => forge.with_curl_program(program.clone()),
+            None => forge,
+        })
     }
 }
 
@@ -133,8 +142,17 @@ struct Switch {
 struct Connection {
     enabled: bool,
     host: String,
+    #[serde(default)]
+    token_id: Option<Uuid>,
     token_hint: Option<String>,
     error: Option<SavedError>,
+}
+
+impl Connection {
+    fn token_account(&self, provider: Provider) -> Option<String> {
+        self.token_id
+            .map(|id| format!("{}:{}:{id}", provider.id(), self.host))
+    }
 }
 
 impl Default for Settings {
@@ -142,6 +160,7 @@ impl Default for Settings {
         let connection = |provider: Provider| Connection {
             enabled: false,
             host: provider.default_host().to_owned(),
+            token_id: None,
             token_hint: None,
             error: None,
         };
@@ -239,13 +258,18 @@ struct RemoteError {
 
 impl RemoteError {
     fn new(host: &str, error: ApiError) -> Self {
+        let at = now();
+        let reset_at = error.reset_at.or_else(|| {
+            (error.kind == ErrorKind::RateLimited)
+                .then(|| (at + RATE_LIMIT_BACKOFF.as_secs()) as i64)
+        });
         Self {
             kind: error.kind,
             message: error.message,
             host: host_name(host),
             status: error.status,
-            reset_at: error.reset_at,
-            at: now(),
+            reset_at,
+            at,
         }
     }
 
@@ -263,7 +287,7 @@ impl RemoteError {
 
     fn is_active_limit(&self) -> bool {
         self.kind == ErrorKind::RateLimited
-            && self.reset_at.is_none_or(|reset| reset > now() as i64)
+            && self.reset_at.is_some_and(|reset| reset > now() as i64)
     }
 }
 
@@ -295,8 +319,16 @@ fn read_settings(ctx: &Ctx) -> Result<SettingsFile> {
         Err(err) => return Err(err).context("无法读取插件配置"),
     };
     match serde_json::from_slice::<Settings>(&bytes) {
-        Ok(settings) => {
+        Ok(mut settings) => {
             ensure!(settings.version == 1, "不支持此插件配置版本");
+            // Legacy Keychain entries carry no evidence of the host they were saved for.
+            for provider in Provider::ALL {
+                let connection = settings.connection_mut(provider);
+                if connection.token_id.is_none() {
+                    connection.token_hint = None;
+                    connection.error = None;
+                }
+            }
             Ok(SettingsFile::Ready(settings, true))
         }
         Err(_) => Ok(SettingsFile::Corrupt(bytes)),
@@ -406,18 +438,17 @@ pub fn save(ctx: &Ctx, plugin: &str, host: &str, token: Option<&str>) -> Result<
     connection.host = host;
     connection.error = None;
     if let Some(token) = token {
+        connection.token_id = Some(Uuid::new_v4());
         connection.token_hint = Some(token[token.len() - 4..].to_owned());
-        write_credentials(ctx, &previous, existed, &next, || {
-            ctx.secrets
-                .set(provider.id(), token)
-                .map_err(|_| anyhow!("无法保存访问令牌"))
-        })?;
+    } else if changed_host {
+        connection.token_id = None;
+        connection.token_hint = None;
     } else {
         write_settings(ctx, &next)?;
+        return Ok(next.view());
     }
-    if changed_host || token.is_some() {
-        changed(&mut revisions, ctx, provider);
-    }
+    replace_token(ctx, provider, &previous, existed, &next, token)?;
+    changed(&mut revisions, ctx, provider);
     Ok(next.view())
 }
 
@@ -427,20 +458,50 @@ pub fn clear_token(ctx: &Ctx, plugin: &str) -> Result<Vec<Value>> {
     let (previous, existed) = settings(ctx)?;
     let mut next = previous.clone();
     let connection = next.connection_mut(provider);
+    connection.token_id = None;
     connection.token_hint = None;
     connection.error = None;
-    write_credentials(ctx, &previous, existed, &next, || {
-        ctx.secrets
-            .delete(provider.id())
-            .map_err(|_| anyhow!("无法清除访问令牌"))
-    })?;
+    replace_token(ctx, provider, &previous, existed, &next, None)?;
     changed(&mut revisions, ctx, provider);
     Ok(next.view())
 }
 
-fn read_token(ctx: &Ctx, provider: Provider) -> Result<Option<String>> {
+fn replace_token(
+    ctx: &Ctx,
+    provider: Provider,
+    previous: &Settings,
+    existed: bool,
+    next: &Settings,
+    token: Option<&str>,
+) -> Result<()> {
+    let old_account = previous.connection(provider).token_account(provider);
+    let new_account = next.connection(provider).token_account(provider);
+    write_credentials(ctx, previous, existed, next, || {
+        if let Some((account, token)) = new_account.as_deref().zip(token) {
+            ctx.secrets
+                .set(account, token)
+                .map_err(|_| anyhow!("无法保存访问令牌"))?;
+        }
+        if ctx
+            .secrets
+            .delete(old_account.as_deref().unwrap_or(provider.id()))
+            .is_err()
+        {
+            if let Some(account) = new_account {
+                let _ = ctx.secrets.delete(&account);
+            }
+            bail!("无法清除访问令牌");
+        }
+        Ok(())
+    })
+}
+
+fn read_token(ctx: &Ctx, provider: Provider, connection: &Connection) -> Result<Option<String>> {
+    let Some(account) = connection.token_account(provider) else {
+        return Ok(None);
+    };
     ctx.secrets
-        .get(provider.id())
+        .get(&account)
         .map_err(|_| anyhow!("无法读取访问令牌"))
 }
 
@@ -486,8 +547,10 @@ pub fn test(ctx: &Ctx, plugin: &str, host: &str, token: Option<&str>) -> Result<
         None => {
             let revisions = settings_lock()?;
             let revision = credential_revision(&revisions, ctx, provider);
-            let token = if settings(ctx)?.0.connection(provider).token_hint.is_some() {
-                read_token(ctx, provider)?
+            let (settings, _) = settings(ctx)?;
+            let connection = settings.connection(provider);
+            let token = if connection.host == host {
+                read_token(ctx, provider, connection)?
             } else {
                 None
             };
@@ -526,6 +589,8 @@ struct Cache {
     pulls: BTreeMap<String, PullInfo>,
     fetch_error: Option<FetchError>,
     api_error: Option<RemoteError>,
+    #[serde(default)]
+    api_error_token: Option<Uuid>,
 }
 
 #[derive(PartialEq, Eq, Deserialize, Serialize)]
@@ -752,14 +817,21 @@ fn load_cache(
         Err(err) => return Err(err).context("无法读取远端缓存"),
     };
     let cached: Option<Cache> = serde_json::from_slice(&bytes).ok();
-    Ok(cached
+    let mut cache = cached
         .filter(|entry| {
             entry.repository == empty.repository
                 && entry.remote == empty.remote
                 && entry.plugin == empty.plugin
                 && entry.source == empty.source
         })
-        .unwrap_or(empty))
+        .unwrap_or(empty);
+    let token_id = selected
+        .plugin
+        .and_then(|id| settings.connection(id).token_id);
+    if cache.api_error_token != token_id {
+        cache.api_error = None;
+    }
+    Ok(cache)
 }
 
 static REFRESHING: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -911,7 +983,7 @@ fn refresh_pulls(
         if credential_revision(&revisions, ctx, provider) != revision {
             return Ok(None);
         }
-        read_token(ctx, provider)
+        read_token(ctx, provider, connection)
     })();
     let host = &connection.host;
     let result = match token {
@@ -941,6 +1013,7 @@ fn refresh_pulls(
         }
         Err(error) => cache.api_error = Some(error),
     }
+    cache.api_error_token = connection.token_id;
     Some(())
 }
 

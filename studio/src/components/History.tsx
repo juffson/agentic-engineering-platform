@@ -45,6 +45,8 @@ export function HistoryView({
   const [history, setHistory] = useState<WorkHistory | null>(null);
   const [error, setError] = useState<string | null>(null);
   const key = historyKey(detail);
+  const stages = detail.stages.map((s) => s.name);
+  const rejectedByRun = new Map(detail.stages.flatMap((s) => s.attempts.map((a) => [a.id, a.route_back_rejected] as const)));
 
   useEffect(() => {
     let alive = true;
@@ -73,7 +75,7 @@ export function HistoryView({
         {history && history.rounds.length > 0 && (
           <ol className="timeline">
             {history.rounds.map((r, i) => (
-              <RoundItem key={`${r.run}-${i}`} round={r} stages={detail.stages.map((s) => s.name)} />
+              <RoundItem key={`${r.run}-${i}`} round={r} stages={stages} rejected={rejectedByRun.get(r.run)?.name} />
             ))}
           </ol>
         )}
@@ -114,7 +116,7 @@ export function HistoryView({
   );
 }
 
-function RoundItem({ round, stages }: { round: HistoryRound; stages: string[] }) {
+function RoundItem({ round, stages, rejected }: { round: HistoryRound; stages: string[]; rejected?: string }) {
   const [open, setOpen] = useState(false);
   const live = isLive(round.status);
   const tone = live ? "running" : round.status === "succeeded" ? "ok" : round.status === "failed" ? "fail" : "muted";
@@ -138,6 +140,7 @@ function RoundItem({ round, stages }: { round: HistoryRound; stages: string[] })
           {live && <Spinner size={10} />}
           {STATUS[round.status] ?? round.status}
         </span>
+        {rejected && <span className="tag tag-warn">退回被拒：{rejected}</span>}
       </button>
       {open && (
         <div className="tl-body">

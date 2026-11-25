@@ -126,7 +126,7 @@ fn drive(
         let mut lib = Library::open(catalog)?;
         let p = project(&lib, pid)?;
         let work = p.work.iter().find(|w| w.id == wid).context("事项不存在")?;
-        let stages = work.template.stages();
+        let stages = &work.flow()?.stages;
         let i = work.stage;
         if i >= stages.len() {
             return Ok(("done".into(), "全部阶段已完成".into()));
@@ -140,7 +140,7 @@ fn drive(
                 ),
             ));
         }
-        let name = stages[i].name;
+        let name = stages[i].name.as_str();
         state.stage = Some(i);
         let budget = crate::usage::budget(catalog, p, work, i);
         if let Some(reason) = budget.exhausted() {
@@ -362,7 +362,7 @@ fn drive(
 
 /// The build plan the latest planning stage wrote: `task.json` → `subtasks`.
 pub fn subtasks(catalog: &Path, pid: &str, work: &crate::project::Work) -> Vec<workflow::Subtask> {
-    let stages = work.template.stages();
+    let stages = work.stages();
     for (i, _) in stages
         .iter()
         .enumerate()
@@ -462,22 +462,22 @@ pub fn revisiting(work: &crate::project::Work, stage: usize) -> bool {
 /// What a re-entered stage is told: why the item went back and what the upstream fix says.
 /// Resumed sessions only receive this message, so it carries the hand-off itself.
 pub fn recheck_message(work: &crate::project::Work, stage: usize) -> String {
-    let stages = work.template.stages();
+    let stages = work.stages();
     let mut text = String::from(
         "前序阶段已按反馈修改。请在事项分支当前的最新提交上复核你上次指出的问题，确认是否已解决、有没有引入新问题，再照常给出本阶段结论。",
     );
     if let Some(r) = work.reworks.iter().rev().find(|r| r.to < stage) {
         text.push_str(&format!(
             "\n\n最近一次退回：「{}」→「{}」\n原因：{}",
-            stages.get(r.from).map_or("", |s| s.name),
-            stages.get(r.to).map_or("", |s| s.name),
+            stages.get(r.from).map_or("", |s| s.name.as_str()),
+            stages.get(r.to).map_or("", |s| s.name.as_str()),
             handoff::clip(r.reason.trim(), 1500)
         ));
     }
     if let Some(t) = work.incoming(stage) {
         text.push_str(&format!(
             "\n\n「{}」修改后的交接：\n{}",
-            stages.get(t.from).map_or("", |s| s.name),
+            stages.get(t.from).map_or("", |s| s.name.as_str()),
             handoff::clip(t.decision.trim(), 2000)
         ));
     }
@@ -508,7 +508,7 @@ fn start(p: &mut Project, catalog: &Path, wid: &str, stage: usize) -> Result<Pat
     let w = p.work_by_id_mut(wid)?;
     let assignment = Assignment {
         profile: w.profile(stage),
-        brief: w.notes[stage].clone(),
+        brief: w.notes.get(stage).context("阶段说明缺失")?.clone(),
         repository: w.target(stage),
         external: None,
     };

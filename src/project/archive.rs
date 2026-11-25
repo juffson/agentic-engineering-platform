@@ -112,7 +112,6 @@ pub(super) fn seal(
     ensure!(
         accepted.from.checked_add(1) == Some(stage)
             && work
-                .template
                 .stages()
                 .get(accepted.from)
                 .is_some_and(|s| s.role == workflow::Role::Accept),

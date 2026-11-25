@@ -51,6 +51,10 @@ function Decision({ detail, current }: { detail: WorkDetail; current: StageDetai
 
   const base = { project: detail.project, work: detail.id };
   const latest = latestAttempt(current);
+  const rejected = detail.running ? null : latest?.route_back_rejected;
+  const rejectedTarget = rejected && latest?.status === "succeeded"
+    ? detail.stages.slice(0, current.index).find((stage) => stage.name === rejected.name)
+    : undefined;
   const next = detail.stages.slice(current.index + 1).find((s) => s.state !== "skipped");
   const run = async (key: string, fn: () => Promise<unknown>) => {
     setBusy(key);
@@ -217,6 +221,23 @@ function Decision({ detail, current }: { detail: WorkDetail; current: StageDetai
         </span>
       </div>
       {body}
+      {rejected && (
+        <p className="routeback-note">
+          <CornerUpLeft size={13} />
+          <span>Agent 要求退回「{rejected.name}」，但这一阶段只能退回到{rejected.allowed.map((name) => `「${name}」`).join("")}，已按普通结果处理。</span>
+        </p>
+      )}
+      {rejected && rejectedTarget && (
+        <Button
+          variant="ghost"
+          className="block"
+          icon={<CornerUpLeft size={14} />}
+          busy={busy === "back"}
+          onClick={() => run("back", () => api.sendBack({ ...base, from: current.index, to: rejectedTarget.index, reason: rejected.question }))}
+        >
+          手动退回「{rejectedTarget.name}」
+        </Button>
+      )}
     </section>
   );
 }

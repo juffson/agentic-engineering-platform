@@ -451,7 +451,7 @@ function RemoteBar({ status, error, busy, onRead, onRefresh, onConfigure }: {
   const otherRemotes = status.remotes.filter((entry) => entry.name !== remote.name);
   const updated = status.refreshed_at === null ? null : new Date(status.refreshed_at * 1000);
   const requiresConfig = apiError && ["auth", "forbidden", "not_found"].includes(apiError.kind);
-  const limited = apiError?.kind === "rate_limited" && (resetAt === null || resetAt * 1000 > Math.max(now, Date.now()));
+  const limited = apiError?.kind === "rate_limited" && resetAt !== null && resetAt * 1000 > Math.max(now, Date.now());
   const retryTitle = limited && resetAt !== null ? `恢复时间：${new Date(resetAt * 1000).toLocaleString()}` : undefined;
   const fetchError = busy ? null : status.fetch_error;
 

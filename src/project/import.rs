@@ -3,6 +3,7 @@
 //! that continue from 开发实现 on their own `aep-stage/<id>` branch.
 use super::{Kind, Project, Work};
 use crate::{
+    flow,
     memory::{Key, Memory, TEXT_LIMIT},
     workflow::{Role, Template},
     workspace::{Workspace, git},
@@ -393,8 +394,8 @@ impl Project {
             return Ok(w.id.clone());
         }
         let template = Template::Software;
-        let build = template
-            .stages()
+        let build = flow::builtin(template)
+            .stages
             .iter()
             .position(|s| s.role == Role::Build)
             .context("模板没有开发阶段")?;

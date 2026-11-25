@@ -7,10 +7,11 @@ use std::{
     sync::Mutex,
 };
 
+/// Stores tokens by Keychain account. Callers choose the account scope.
 pub trait Secrets: Send + Sync {
-    fn get(&self, plugin: &str) -> Result<Option<String>>;
-    fn set(&self, plugin: &str, token: &str) -> Result<()>;
-    fn delete(&self, plugin: &str) -> Result<()>;
+    fn get(&self, account: &str) -> Result<Option<String>>;
+    fn set(&self, account: &str, token: &str) -> Result<()>;
+    fn delete(&self, account: &str) -> Result<()>;
 }
 
 pub fn valid_token(token: &str) -> bool {
@@ -24,21 +25,21 @@ pub fn valid_token(token: &str) -> bool {
 pub struct Memory(Mutex<HashMap<String, String>>);
 
 impl Secrets for Memory {
-    fn get(&self, plugin: &str) -> Result<Option<String>> {
+    fn get(&self, account: &str) -> Result<Option<String>> {
         let tokens = self.0.lock().map_err(|_| anyhow!("lock plugin tokens"))?;
-        Ok(tokens.get(plugin).cloned())
+        Ok(tokens.get(account).cloned())
     }
 
-    fn set(&self, plugin: &str, token: &str) -> Result<()> {
+    fn set(&self, account: &str, token: &str) -> Result<()> {
         ensure!(valid_token(token), "invalid plugin token");
         let mut tokens = self.0.lock().map_err(|_| anyhow!("lock plugin tokens"))?;
-        tokens.insert(plugin.to_owned(), token.to_owned());
+        tokens.insert(account.to_owned(), token.to_owned());
         Ok(())
     }
 
-    fn delete(&self, plugin: &str) -> Result<()> {
+    fn delete(&self, account: &str) -> Result<()> {
         let mut tokens = self.0.lock().map_err(|_| anyhow!("lock plugin tokens"))?;
-        tokens.remove(plugin);
+        tokens.remove(account);
         Ok(())
     }
 }
@@ -56,8 +57,8 @@ impl Default for Keychain {
 }
 
 impl Secrets for Keychain {
-    fn get(&self, plugin: &str) -> Result<Option<String>> {
-        let output = self.run(Operation::Get, plugin)?;
+    fn get(&self, account: &str) -> Result<Option<String>> {
+        let output = self.run(Operation::Get, account)?;
         if output.status.code() == Some(44) {
             return Ok(None);
         }
@@ -67,12 +68,12 @@ impl Secrets for Keychain {
         Ok(Some(token.trim_end_matches(['\r', '\n']).to_owned()))
     }
 
-    fn set(&self, plugin: &str, token: &str) -> Result<()> {
-        check_status(&self.run(Operation::Set(token), plugin)?, "write")
+    fn set(&self, account: &str, token: &str) -> Result<()> {
+        check_status(&self.run(Operation::Set(token), account)?, "write")
     }
 
-    fn delete(&self, plugin: &str) -> Result<()> {
-        let output = self.run(Operation::Delete, plugin)?;
+    fn delete(&self, account: &str) -> Result<()> {
+        let output = self.run(Operation::Delete, account)?;
         if output.status.code() == Some(44) {
             return Ok(());
         }
@@ -81,8 +82,8 @@ impl Secrets for Keychain {
 }
 
 impl Keychain {
-    fn run(&self, op: Operation<'_>, plugin: &str) -> Result<Output> {
-        let (argv, input) = keychain_argv(op, &self.service, plugin)?;
+    fn run(&self, op: Operation<'_>, account: &str) -> Result<Output> {
+        let (argv, input) = keychain_argv(op, &self.service, account)?;
         let mut command = Command::new("/usr/bin/security");
         command.args(argv).env("LC_ALL", "C").stderr(Stdio::null());
         let Some(input) = input else {
@@ -122,14 +123,14 @@ enum Operation<'a> {
 fn keychain_argv(
     op: Operation<'_>,
     service: &str,
-    plugin: &str,
+    account: &str,
 ) -> Result<(Vec<String>, Option<String>)> {
     let command = match op {
         Operation::Get => "find-generic-password",
         Operation::Delete => "delete-generic-password",
         Operation::Set(token) => {
             ensure!(valid_token(token), "invalid plugin token");
-            for name in [service, plugin] {
+            for name in [service, account] {
                 ensure!(
                     !name.is_empty()
                         && !name.contains(['"', '\\'])
@@ -140,12 +141,12 @@ fn keychain_argv(
             return Ok((
                 vec!["-i".to_owned()],
                 Some(format!(
-                    "add-generic-password -U -s \"{service}\" -a \"{plugin}\" -w \"{token}\"\n"
+                    "add-generic-password -U -s \"{service}\" -a \"{account}\" -w \"{token}\"\n"
                 )),
             ));
         }
     };
-    let mut argv: Vec<_> = [command, "-s", service, "-a", plugin]
+    let mut argv: Vec<_> = [command, "-s", service, "-a", account]
         .into_iter()
         .map(str::to_owned)
         .collect();

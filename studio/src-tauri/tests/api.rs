@@ -1,7 +1,7 @@
 //! End to end over the command layer: a real repository, a scripted Claude, the real runner.
 use aep_studio_app::api;
 use anyhow::{Result, ensure};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -56,6 +56,229 @@ fn wait_idle(home: &Path, pid: &str, wid: &str) -> Result<Value> {
         ensure!(Instant::now() < deadline, "timed out: {d}");
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+#[test]
+fn custom_flow_survives_edit_and_delete_in_work_snapshot() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let home = t.path();
+    let pid = api::create_project(home, "flows", &[])?;
+    let id = api::copy_flow(home, &pid, "Software", Some("后端开发"))?;
+    let snapshot = api::snapshot(home)?;
+    let project = &snapshot["projects"][0];
+    assert_eq!(project["flows"][0]["id"], "Software");
+    assert_eq!(project["flows"][0]["builtin"], true);
+    assert_eq!(project["flows"][0]["revision"], 0);
+    assert_eq!(project["flows"][1]["id"], "Game");
+    assert_eq!(project["broken_flows"], json!([]));
+    assert_eq!(snapshot["templates"][0]["stages"][0], "产品需求");
+
+    let mut flow = project["flows"][2].clone();
+    assert_eq!(flow["id"], id);
+    assert_eq!(flow["revision"], 1);
+    let stages = flow["stages"].as_array_mut().unwrap();
+    stages.remove(1);
+    stages.insert(
+        4,
+        json!({
+            "name": "安全审查", "brief": "检查权限边界", "role": "Test",
+            "skippable": false, "back_to": ["产品需求"],
+        }),
+    );
+    let saved = api::save_flow(home, &pid, flow.clone())?;
+    assert_eq!(saved, json!({"id": id, "warnings": []}));
+
+    let snap = api::snapshot(home)?;
+    let preview = &snap["projects"][0]["flows"][2];
+    assert_eq!(preview["label"], "后端开发");
+    assert_eq!(preview["builtin"], false);
+    assert_eq!(preview["revision"], 2);
+    assert_eq!(preview["stages"], flow["stages"]);
+    assert_eq!(preview["stages"][0]["back_to"], json!([]));
+    let stage_names = |definition: &Value| {
+        definition["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].clone())
+            .collect::<Vec<_>>()
+    };
+    let names = stage_names(preview);
+    assert_eq!(
+        names,
+        [
+            "产品需求",
+            "技术方案",
+            "开发实现",
+            "测试验证",
+            "安全审查",
+            "独立验收",
+            "交付归档"
+        ]
+    );
+
+    let wid = api::create_work(home, &pid, "导出 API", &id, false, &[])?;
+    let detail = api::work_detail(home, &pid, &wid)?;
+    assert_eq!(
+        detail["flow"],
+        json!({"id": id, "label": "后端开发", "builtin": false, "source_state": "same"})
+    );
+    assert_eq!(detail["template"], "Software");
+    assert_eq!(detail["template_label"], "后端开发");
+    assert!(detail["flow_error"].is_null());
+    assert_eq!(stage_names(&detail), names);
+    let snap = api::snapshot(home)?;
+    assert_eq!(snap["projects"][0]["flows"][2]["in_use"], 1);
+    assert_eq!(snap["projects"][0]["work"][0]["stage_count"], 7);
+    assert_eq!(snap["projects"][0]["work"][0]["flow_error"], false);
+
+    flow["label"] = json!("后端开发新版");
+    let edited = flow["stages"].as_array_mut().unwrap();
+    edited[1]["name"] = json!("新版技术方案");
+    edited.remove(4);
+    api::save_flow(home, &pid, flow)?;
+    let detail = api::work_detail(home, &pid, &wid)?;
+    assert_eq!(detail["flow"]["source_state"], "changed");
+    assert_eq!(detail["template_label"], "后端开发");
+    assert_eq!(stage_names(&detail), names);
+
+    api::update_stage(home, &pid, &wid, 0, Some("需求已确认".into()), None, None)?;
+    api::advance(home, &pid, &wid, 0)?;
+    assert_eq!(
+        api::snapshot(home)?["projects"][0]["work"][0]["stage_name"],
+        "技术方案"
+    );
+    assert_eq!(api::delete_flow(home, &pid, &id)?, 1);
+    let snap = api::snapshot(home)?;
+    assert_eq!(snap["projects"][0]["flows"].as_array().unwrap().len(), 2);
+    let err = api::create_work(home, &pid, "新事项", &id, false, &[]).unwrap_err();
+    assert_eq!(err.to_string(), format!("流程「{id}」已被删除，请重新选择"));
+    assert_eq!(api::snapshot(home)?, snap);
+
+    api::update_stage(home, &pid, &wid, 1, Some("方案已确认".into()), None, None)?;
+    api::advance(home, &pid, &wid, 1)?;
+    let rejected = json!({"name": "开发实现", "question": "请核对", "allowed": ["产品需求"]});
+    record_run(
+        home,
+        &pid,
+        &wid,
+        "review",
+        4,
+        json!({"client": "Claude", "executable": "claude", "model": "", "check_command": ""}),
+        json!({"status": "succeeded", "route_back_rejected": rejected}),
+        Value::Null,
+    )?;
+    let detail = api::work_detail(home, &pid, &wid)?;
+    assert_eq!(detail["flow"]["source_state"], "deleted");
+    assert_eq!(stage_names(&detail), names);
+    assert_eq!(detail["stages"][2]["state"], "current");
+    assert_eq!(
+        detail["stages"][4]["attempts"][0]["route_back_rejected"],
+        rejected
+    );
+    Ok(())
+}
+
+#[test]
+fn save_flow_returns_validation_errors_and_persists_warnings() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let home = t.path();
+    let pid = api::create_project(home, "flows", &[])?;
+    let mut flow = json!({
+        "label": "",
+        "stages": [
+            {"name": "开发实现", "brief": "", "role": "Build"},
+            {"name": "交付归档", "brief": "", "role": "Deliver"},
+        ],
+    });
+    let err = api::save_flow(home, &pid, flow.clone()).unwrap_err();
+    assert_eq!(err.to_string(), "流程名称不能为空");
+    flow["label"] = json!("精简开发");
+    let saved = api::save_flow(home, &pid, flow)?;
+    let snap = api::snapshot(home)?;
+    let entry = &snap["projects"][0]["flows"][2];
+    assert_eq!(entry["id"], saved["id"]);
+    assert_eq!(entry["revision"], 1);
+    assert_eq!(entry["warnings"], saved["warnings"]);
+    assert_eq!(saved["warnings"].as_array().unwrap().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_broken_flow_keeps_its_item_and_attempts_readable() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let home = t.path();
+    let pid = api::create_project(home, "flows", &[])?;
+    let healthy = api::create_work(home, &pid, "游戏事项", "Game", false, &[])?;
+    let broken = api::create_work(home, &pid, "旧事项", "Software", false, &[])?;
+    let damaged = api::create_work(home, &pid, "损坏快照", "Software", false, &[])?;
+    record_run(
+        home,
+        &pid,
+        &broken,
+        "prior",
+        0,
+        json!({"client": "Claude", "executable": "claude", "model": "", "check_command": ""}),
+        json!({"status": "succeeded"}),
+        Value::Null,
+    )?;
+    let path = home.join("projects.json");
+    let mut raw: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let project = &mut raw["projects"][0];
+    project["flows"] = json!([{"id": "flow-broken", "label": "损坏流程", "stages": false}]);
+    project["work"][1]["template"] = json!("Unknown");
+    project["work"][2]["flow"] = json!({"id": "flow-broken", "stages": false});
+    fs::write(&path, serde_json::to_vec(&raw)?)?;
+
+    let snap = api::snapshot(home)?;
+    let project = &snap["projects"][0];
+    assert_eq!(project["flows"].as_array().unwrap().len(), 2);
+    assert_eq!(project["broken_flows"][0]["id"], "flow-broken");
+    assert_eq!(project["broken_flows"][0]["label"], "损坏流程");
+    assert!(project["broken_flows"][0]["error"].is_string());
+    for (index, (id, error)) in [(&damaged, "事项流程快照无法读取"), (&broken, "Unknown")]
+        .into_iter()
+        .enumerate()
+    {
+        let summary = &project["work"][index];
+        assert_eq!(summary["id"], id.as_str());
+        assert_eq!(summary["flow_error"], true);
+        assert_eq!(summary["stage_count"], 0);
+        assert_eq!(summary["group"], "active");
+        let detail = api::work_detail(home, &pid, id)?;
+        assert!(detail["flow"].is_null());
+        assert!(detail["flow_error"].as_str().unwrap().contains(error));
+        assert_eq!(detail["stages"], json!([]));
+    }
+    assert_eq!(
+        api::history(home, &pid, &broken)?["rounds"][0]["run"],
+        "prior"
+    );
+    assert_eq!(
+        api::attempt_view(home, &pid, &broken, "prior")?["status"],
+        "succeeded"
+    );
+    assert!(
+        api::run_stage(home, &pid, &broken, 0, None)
+            .unwrap_err()
+            .to_string()
+            .contains("流程数据无法读取")
+    );
+
+    let detail = api::work_detail(home, &pid, &healthy)?;
+    assert_eq!(detail["flow"]["id"], "Game");
+    assert_eq!(detail["flow"]["builtin"], true);
+    assert!(detail["flow"]["source_state"].is_null());
+    assert!(detail["flow_error"].is_null());
+    assert_eq!(detail["stages"].as_array().unwrap().len(), 7);
+
+    assert_eq!(api::delete_flow(home, &pid, "flow-broken")?, 0);
+    assert_eq!(
+        api::snapshot(home)?["projects"][0]["broken_flows"],
+        json!([])
+    );
+    assert!(api::work_detail(home, &pid, &broken)?["flow_error"].is_string());
+    Ok(())
 }
 
 #[test]
@@ -726,6 +949,7 @@ fn memory_is_tidied_by_a_cli_and_applied_by_choice() -> Result<()> {
     let a = api::add_memory(&home, &pid, "金额用分")?;
     let b = api::add_memory(&home, &pid, "金额统一用分存储")?;
     let c = api::add_memory(&home, &pid, "旧部署流程：手动 scp")?;
+    let flow = api::copy_flow(&home, &pid, "Software", Some("后端开发"))?;
     // A scripted Claude that proposes merging the two money notes and retiring the old one.
     let bin = t.path().join("bin");
     fs::create_dir_all(&bin)?;
@@ -737,7 +961,7 @@ input=$(cat)
 pwd > "{dir}/cwd-seen"
 if printf '%s' "$input" | grep -q '整理成开发事项'; then
   printf '%s' "$input" > "{dir}/draft-seen"
-  answer='{{"summary":"拆成两件","items":[{{"name":"导出 · CSV","template":"Software","brief":"导出对账单为 CSV"}},{{"name":"导出 · 表头","brief":"空账户也导出表头"}}]}}'
+  answer='{{"summary":"拆成两件","items":[{{"name":"导出 · CSV","template":"{flow}","brief":"导出对账单为 CSV"}},{{"name":"导出 · 表头","brief":"空账户也导出表头"}}]}}'
 else
   printf '%s' "$input" > "{dir}/prompt-seen"
   answer='{{"summary":"合并重复","ops":[{{"op":"merge","ids":[{a},{b}],"text":"金额统一用整数分存储","why":"重复"}},{{"op":"retire","id":{c},"why":"已改为自动部署"}}]}}'
@@ -811,13 +1035,25 @@ printf '%s' "$answer" | python3 -c 'import json,sys; print(json.dumps({{"type":"
     };
     assert_eq!(status["status"], "succeeded", "{status}");
     assert_eq!(status["id"], draft.as_str());
+    assert_eq!(status["draft"]["items"][0]["template"], flow);
     assert_eq!(status["draft"]["items"][1]["name"], "导出 · 表头");
     assert_eq!(status["draft"]["items"][1]["template"], "Software");
+    let job: Value = serde_json::from_slice(&fs::read(
+        home.join("workflows")
+            .join(&pid)
+            .join("work-drafts")
+            .join(&draft)
+            .join("job.json"),
+    )?)?;
+    assert_eq!(job["flows"][2]["id"], flow);
+    assert_eq!(job["flows"][2]["label"], "后端开发");
+    assert_eq!(job["flows"][2]["stages"][0], "产品需求");
     let seen = fs::read_to_string(t.path().join("draft-seen"))?;
     assert!(
         seen.contains("支持导出对账单")
             && seen.contains("金额统一用整数分存储")
-            && seen.contains("- 已有的事"),
+            && seen.contains("- 已有的事")
+            && seen.contains(&format!("{flow}（后端开发）：产品需求")),
         "{seen}"
     );
     assert_eq!(
@@ -917,7 +1153,10 @@ done
     assert_eq!(a["status"], "budget_exhausted", "{d}");
     assert!(a["error"].as_str().unwrap().contains("Token 预算已用完"));
     let tree = std::path::PathBuf::from(d["worktrees"][0].as_str().unwrap());
-    assert!(tree.starts_with(home.canonicalize()?.join("worktrees")), "{tree:?}");
+    assert!(
+        tree.starts_with(home.canonicalize()?.join("worktrees")),
+        "{tree:?}"
+    );
     assert!(!old.exists());
     assert_eq!(fs::read_to_string(tree.join("draft.md"))?, "unsaved\n");
     let used = d["stages"][0]["budget"]["used"].as_u64().unwrap();
@@ -973,7 +1212,7 @@ fn record_run(
                 repository: None,
                 external: None,
             },
-        );
+        )?;
         let dir = aep::workflow::attempt_dir(home, pid, wid, id);
         fs::create_dir_all(&dir)?;
         fs::write(dir.join("request.json"), serde_json::to_vec(&req)?)?;

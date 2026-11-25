@@ -121,8 +121,7 @@ pub struct Forge {
     kind: Kind,
     api_base: Option<Url>,
     timeout: Duration,
-    #[cfg(test)]
-    curl_program: Option<std::path::PathBuf>,
+    curl_program: std::path::PathBuf,
 }
 
 impl Forge {
@@ -170,9 +169,14 @@ impl Forge {
             kind,
             api_base,
             timeout: Duration::from_secs(15),
-            #[cfg(test)]
-            curl_program: None,
+            curl_program: "/usr/bin/curl".into(),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_curl_program(mut self, program: std::path::PathBuf) -> Self {
+        self.curl_program = program;
+        self
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -215,6 +219,12 @@ impl Forge {
                     encode_segment(repo)
                 );
                 self.list(token, &endpoint, |row: GitHubPull| row.into_pull(path))
+                    .map_err(|mut error| {
+                        if error.status == Some(301) {
+                            error.message = "仓库已改名，请更新远端地址".into();
+                        }
+                        error
+                    })
             }
             Kind::GitLab => {
                 let endpoint = format!(
@@ -303,14 +313,7 @@ impl Forge {
 
     fn get(&self, token: &str, path: &str) -> Result<Vec<u8>, ApiError> {
         let (args, config) = self.request(token, path)?;
-        #[cfg(test)]
-        let program = self
-            .curl_program
-            .as_deref()
-            .unwrap_or(std::path::Path::new("/usr/bin/curl"));
-        #[cfg(not(test))]
-        let program = "/usr/bin/curl";
-        let output = run_curl(Command::new(program), &args, &config)?;
+        let output = run_curl(Command::new(&self.curl_program), &args, &config)?;
         Ok(response_body(&output, token)?.to_vec())
     }
 }
@@ -400,12 +403,22 @@ fn parse_http(output: &[u8]) -> Option<(u16, Headers, &[u8])> {
 }
 
 fn http_error(status: u16, headers: &Headers, body: &[u8], token: &str) -> ApiError {
+    let json = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let api_message = json
+        .as_ref()
+        .and_then(|value| value.get("message")?.as_str());
     let exhausted = headers
         .get("x-ratelimit-remaining")
         .is_some_and(|value| value == "0");
+    let secondary = status == 403
+        && String::from_utf8_lossy(body)
+            .to_ascii_lowercase()
+            .contains("secondary rate limit");
     let kind = match status {
         401 => ErrorKind::Auth,
-        403 if exhausted => ErrorKind::RateLimited,
+        403 if exhausted || secondary || headers.contains_key("retry-after") => {
+            ErrorKind::RateLimited
+        }
         403 => ErrorKind::Forbidden,
         404 => ErrorKind::NotFound,
         429 => ErrorKind::RateLimited,
@@ -414,20 +427,27 @@ fn http_error(status: u16, headers: &Headers, body: &[u8], token: &str) -> ApiEr
     let reset_at = (kind == ErrorKind::RateLimited)
         .then(|| {
             let timestamp = |key| headers.get(key)?.parse::<i64>().ok().filter(|&n| n >= 0);
-            timestamp("x-ratelimit-reset")
-                .or_else(|| timestamp("ratelimit-reset"))
-                .or_else(|| {
-                    timestamp("retry-after").map(|secs| Utc::now().timestamp().saturating_add(secs))
-                })
+            let retry_after = || {
+                timestamp("retry-after")
+                    .map(|secs| Utc::now().timestamp().saturating_add(secs))
+                    .or_else(|| {
+                        DateTime::parse_from_rfc2822(headers.get("retry-after")?)
+                            .ok()
+                            .map(|date| date.timestamp())
+                    })
+            };
+            if status == 403 && !exhausted {
+                // The primary quota reset does not govern a secondary limit.
+                retry_after()
+            } else {
+                timestamp("x-ratelimit-reset")
+                    .or_else(|| timestamp("ratelimit-reset"))
+                    .or_else(retry_after)
+            }
         })
         .flatten();
-    let message = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|json| {
-            json.get("message")?
-                .as_str()
-                .map(|msg| safe_message(msg, token))
-        })
+    let message = api_message
+        .map(|msg| safe_message(msg, token))
         .unwrap_or_else(|| format!("HTTP {status}"));
     ApiError {
         kind,
@@ -497,7 +517,11 @@ struct GitHubRepo {
 
 impl GitHubPull {
     fn into_pull(self, path: &str) -> Result<Option<Pull>, ApiError> {
-        if !self.head.repo.is_some_and(|repo| repo.full_name == path) {
+        if !self
+            .head
+            .repo
+            .is_some_and(|repo| repo.full_name.eq_ignore_ascii_case(path))
+        {
             return Ok(None);
         }
         let state = match (self.state.as_str(), self.merged_at.is_some(), self.draft) {
@@ -608,6 +632,7 @@ token=studio_Fixture_Token
 case "$*" in *"$token"*) exit 10 ;; esac
 case " $* " in *" --request GET "*) ;; *) exit 11 ;; esac
 case " $* " in *" --config - "*) ;; *) exit 12 ;; esac
+case " $* " in *" --location "*|*" --location-trusted "*) exit 15 ;; esac
 IFS= read -r url
 IFS= read -r authorization
 IFS= read -r header < "$root/authorization"
@@ -629,8 +654,7 @@ exit 14
                 Kind::GitLab => "PRIVATE-TOKEN:",
             };
             fs::write(dir.path().join("authorization"), format!("{header}\n"))?;
-            let mut forge = Forge::with_base(kind, "example.invalid", BASE)?;
-            forge.curl_program = Some(program);
+            let forge = Forge::with_base(kind, "example.invalid", BASE)?.with_curl_program(program);
             Ok(Self { dir, forge })
         }
 
@@ -829,6 +853,26 @@ exit 14
     }
 
     #[test]
+    fn forge_classifies_secondary_limits_without_exhausting_the_primary_quota() {
+        let remaining = "X-RateLimit-Remaining: 10\r\nX-RateLimit-Reset: 1764000000\r\n";
+        let out = response(
+            403,
+            remaining,
+            r#"{"message":"Secondary rate limit exceeded"}"#,
+        );
+        let error = response_body(&out, TOKEN).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::RateLimited);
+        assert_eq!(error.reset_at, None);
+
+        let before = Utc::now().timestamp();
+        let headers = format!("{remaining}Retry-After: 90\r\n");
+        let out = response(403, &headers, r#"{"message":"Try later"}"#);
+        let error = response_body(&out, TOKEN).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::RateLimited);
+        assert!((before + 90..=Utc::now().timestamp() + 90).contains(&error.reset_at.unwrap()));
+    }
+
+    #[test]
     fn forge_classifies_curl_transport_errors_and_reads_final_response() {
         for (code, kind) in [
             (6, ErrorKind::Unreachable),
@@ -879,7 +923,8 @@ exit 14
     fn forge_github_filters_forks_and_returns_latest_pull_per_branch() -> Result<()> {
         let stub = Stub::new(Kind::GitHub)?;
         let branch = "feature/中文+fix";
-        let open = github_pull(2, "open", false, None, branch);
+        let mut open = github_pull(2, "open", false, None, branch);
+        open["head"]["repo"]["full_name"] = json!("O/R");
         let mut newer = github_pull(1, "open", true, None, branch);
         newer["created_at"] = json!("2026-05-16T12:00:00Z");
         let draft = github_pull(3, "open", true, None, "draft");
@@ -914,6 +959,23 @@ exit 14
             (pull.number, pull.url.as_str(), *others),
             (1, "https://github.com/o/r/pull/1", 1)
         );
+        assert_eq!(stub.calls()?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn forge_github_reports_a_renamed_repo_without_following_the_redirect() -> Result<()> {
+        let stub = Stub::new(Kind::GitHub)?;
+        stub.respond(
+            1,
+            &format!("{GITHUB_LIST}&page=1"),
+            301,
+            "Location: https://other.example/repos/o/renamed/pulls\r\n",
+            json!({"message":"Moved Permanently"}),
+        )?;
+        let error = stub.forge.pulls(TOKEN, "o/r").unwrap_err();
+        assert_eq!(error.status, Some(301));
+        assert_eq!(error.message, "仓库已改名，请更新远端地址");
         assert_eq!(stub.calls()?, 1);
         Ok(())
     }

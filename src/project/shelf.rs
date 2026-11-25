@@ -23,7 +23,7 @@ pub struct Shelved {
 
 impl Work {
     pub fn delivered(&self) -> bool {
-        self.stage >= self.template.stages().len()
+        self.flow_error.is_none() && self.stage >= self.stages().len()
     }
 
     /// The item's own worktrees (one per repository; a pinned restart may add `<id>-<run>`).
@@ -45,7 +45,7 @@ impl Work {
 
     /// A memory note drafted from each stage's latest handoff, within the note size limit.
     pub fn memory_draft(&self, home: &Path, project: &str) -> Result<String> {
-        let stages = self.template.stages();
+        let stages = self.stages();
         let notes = Memory::browse(&home.join("workflows").join(project))?;
         let mut by_run: HashMap<&str, &str> = HashMap::new();
         for note in &notes {

@@ -51,8 +51,8 @@ pub struct Side {
 impl Side {
     pub fn of(req: &Request, workspace: Option<&Path>) -> Self {
         let role = req
-            .template
-            .stages()
+            .flow()
+            .stages
             .get(req.stage)
             .map(|s| s.role)
             .unwrap_or(Role::Build);

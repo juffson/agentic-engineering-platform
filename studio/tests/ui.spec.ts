@@ -673,6 +673,35 @@ test.describe("Studio plugins", () => {
     await shot(page, "31-plugin-config");
   });
 
+  test("requests a new token for a changed forge host and clears the old mask on save", async ({ page }) => {
+    await page.getByRole("button", { name: "插件", exact: true }).click();
+    const github = page.getByRole("region", { name: "GitHub" });
+    await github.getByRole("button", { name: "配置", exact: true }).click();
+    const host = github.getByLabel("主机地址");
+    const token = github.getByLabel("访问令牌", { exact: true });
+    const testConnection = github.getByRole("button", { name: "测试连接" });
+    const mask = github.getByText("已设置 · ••••a1b2", { exact: true });
+    await expect(mask).toBeVisible();
+
+    await host.fill("GitHub.COM:443/");
+    await expect(testConnection).toBeEnabled();
+    await expect(mask).toBeVisible();
+    await host.fill("ghe.example.com");
+    await expect(github.getByText("主机已更改，请为新主机重新输入访问令牌。", { exact: false })).toBeVisible();
+    await expect(token).toHaveValue("");
+    await expect(mask).toHaveCount(0);
+    await expect(testConnection).toBeDisabled();
+
+    await github.getByRole("button", { name: "保存", exact: true }).click();
+    await expect(github.getByText("需要配置", { exact: true })).toBeVisible();
+    await expect(host).toHaveValue("https://ghe.example.com");
+    await expect(mask).toHaveCount(0);
+    await expect(testConnection).toBeDisabled();
+    await token.fill("ghe-test-token");
+    await testConnection.click();
+    await expect(github.getByRole("status")).toContainText("已连接为 octocat");
+  });
+
   test("shows upstream comparisons, remote-only branches and pull requests alongside work items", async ({ page }) => {
     await page.getByRole("button", { name: "分支", exact: true }).click();
     const list = page.getByRole("complementary", { name: "分支列表" });
@@ -783,13 +812,16 @@ test.describe("Studio plugins", () => {
     await expect(refreshing).toBeDisabled();
     await expect(remoteError).toContainText("github.com 15 秒内没有响应");
 
-    // The mock respects the rate-limit window even when the token changes.
     await refreshWithToken("limit-token");
     await expect(remoteError).toContainText(/请求过多已被限流，约 \d{2}:\d{2} 后恢复/);
     await expect(remoteError.getByRole("button", { name: "重试", exact: true })).toBeDisabled();
     await localBranch.click();
     await expect(page.locator(".graph-row.on")).toContainText("导出对账单：补齐表头");
     await shot(page, "33-branches-refresh-error");
+
+    await refreshWithToken("demo-valid-token");
+    await expect(refresh).toBeEnabled();
+    await expect(remoteError).toHaveCount(0);
   });
 
   test("preserves the local branch graph and external tools with both forge plugins off", async ({ page }) => {

@@ -143,10 +143,11 @@ function ForgeConfig({ plugin, id, focusToken }: { plugin: PluginInfo; id: Forge
 
   const normalized = normalizeHost(host, id);
   const tokenSet = plugin.token?.set ?? false;
-  const showToken = !tokenSet || replacing || token.length > 0;
+  const hostChanged = !!normalized.url && normalized.url !== savedHost;
+  const showToken = !tokenSet || hostChanged || replacing || token.length > 0;
   const draftToken = token.trim() || null;
-  const canTest = !!draftToken || tokenSet;
-  const changed = normalized.url !== savedHost || !!draftToken;
+  const canTest = !!draftToken || (tokenSet && !hostChanged);
+  const changed = hostChanged || !!draftToken;
   const hostHint = hostChecked && normalized.error
     ? normalized.error
     : !host.trim() ? `留空将使用 ${defaultHost[id]}`
@@ -270,7 +271,7 @@ function ForgeConfig({ plugin, id, focusToken }: { plugin: PluginInfo; id: Forge
               disabled={!!writing}
               onChange={(e) => editToken(e.target.value)}
             />
-            {tokenSet && <Button size="sm" disabled={!!writing} onClick={() => { setReplacing(false); editToken(""); }}>取消</Button>}
+            {tokenSet && !hostChanged && <Button size="sm" disabled={!!writing} onClick={() => { setReplacing(false); editToken(""); }}>取消</Button>}
           </div>
         ) : (
           <div className="plugin-token-row">
@@ -280,6 +281,7 @@ function ForgeConfig({ plugin, id, focusToken }: { plugin: PluginInfo; id: Forge
           </div>
         )}
         <span className="field-hint" id={`${id}-token-hint`}>
+          {hostChanged && <>主机已更改，请为新主机重新输入访问令牌。保存时留空将清除旧令牌。<br /></>}
           {id === "github" ? <>需要仓库读取和 Pull requests 读取权限，classic 令牌使用 <code>repo</code>。</> : <>需要 <code>read_api</code> 权限。</>}
           令牌存放在系统钥匙串，不写入任何文件。
         </span>

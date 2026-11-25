@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { BookOpen, Check, ChevronDown, ChevronRight, FolderGit2, Gauge, GitBranch, Plus, Puzzle, Trash2 } from "lucide-react";
+import { BookOpen, Check, ChevronDown, ChevronRight, FolderGit2, Gauge, GitBranch, ListOrdered, Plus, Puzzle, Trash2 } from "lucide-react";
 import { api } from "../api/client";
 import type { Group, WorkSummary } from "../api/types";
 import { useStudio } from "../state/store";
@@ -15,6 +15,7 @@ export function Sidebar({ onNewWork, onNewProject }: { onNewWork(): void; onNewP
   const { snapshot, project, selected, selectWork, page, setPage, branchesOn, plugins } = useStudio();
   const [folded, setFolded] = useState<Record<Group, boolean>>({ active: false, delivered: false, shelved: true });
   const work = project?.work ?? [];
+  const customFlowCount = project?.flows.filter((flow) => !flow.builtin).length ?? 0;
 
   return (
     <nav className="sidebar" aria-label="事项">
@@ -66,6 +67,11 @@ export function Sidebar({ onNewWork, onNewProject }: { onNewWork(): void; onNewP
           仓库
           {project && <span className="foot-count">{project.repositories.length}</span>}
         </button>
+        <button type="button" className={`foot-link${page === "flows" ? " on" : ""}`} onClick={() => setPage("flows")} disabled={!project} aria-current={page === "flows" ? "page" : undefined}>
+          <ListOrdered size={14} />
+          流程
+          {customFlowCount > 0 && <span className="foot-count" aria-hidden="true">{customFlowCount}</span>}
+        </button>
         {branchesOn && (
           <button type="button" className={`foot-link${page === "branches" ? " on" : ""}`} onClick={() => setPage("branches")} disabled={!project}>
             <GitBranch size={14} />
@@ -91,7 +97,8 @@ function WorkRow({ item, active, onSelect }: { item: WorkSummary; active: boolea
   const failed = item.status === "failed";
   const delivered = item.group !== "active";
   const done = Math.min(item.stage, item.stage_count);
-  const dot = item.running || isLive(item.status) ? "running" : failed ? "failed" : null;
+  const dot = item.flow_error ? "failed" : item.running || isLive(item.status) ? "running" : failed ? "failed" : null;
+  const dotLabel = item.flow_error ? "流程无法读取" : dot === "running" ? "运行中" : "失败";
   return (
     <button type="button" className={`work-row${active ? " on" : ""}`} onClick={onSelect} aria-current={active ? "true" : undefined} data-work={item.id}>
       <span className="work-row-top">
@@ -99,19 +106,19 @@ function WorkRow({ item, active, onSelect }: { item: WorkSummary; active: boolea
           {item.name}
         </span>
         {item.autopilot && <span className="tag tag-auto">自动</span>}
-        {dot && <span className={`dot dot-${dot}`} aria-label={dot === "running" ? "运行中" : "失败"} />}
+        {dot && <span className={`dot dot-${dot}`} aria-label={dotLabel} title={dotLabel} />}
       </span>
       <span className="work-row-bottom">
-        <span className="seg-bar" aria-hidden>
+        {!item.flow_error && <span className="seg-bar" aria-hidden>
           {Array.from({ length: item.stage_count }, (_, i) => (
             <span
               key={i}
               className={i < done ? "seg done" : i === done && !delivered ? `seg cur${failed ? " fail" : ""}` : "seg"}
             />
           ))}
-        </span>
+        </span>}
         <span className="work-stage">
-          {delivered ? item.stage_name : `${done + 1}/${item.stage_count} · ${item.stage_name}`}
+          {delivered || item.flow_error ? item.stage_name : `${done + 1}/${item.stage_count} · ${item.stage_name}`}
         </span>
       </span>
     </button>
@@ -119,7 +126,7 @@ function WorkRow({ item, active, onSelect }: { item: WorkSummary; active: boolea
 }
 
 function ProjectSwitcher({ onNewProject }: { onNewProject(): void }) {
-  const { snapshot, project, openProject, act } = useStudio();
+  const { snapshot, project, openProject, act, requestNavigation } = useStudio();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -182,8 +189,10 @@ function ProjectSwitcher({ onNewProject }: { onNewProject(): void }) {
               className="menu-item danger"
               onClick={() => {
                 setOpen(false);
-                if (!window.confirm(`把项目「${project.name}」从 Studio 移除？\n仓库里的文件和分支不受影响；Studio 的记录会移到 workflows/.removed 下。`)) return;
-                void act(() => api.removeProject({ project: project.id }), "项目已移除");
+                requestNavigation(() => {
+                  if (!window.confirm(`把项目「${project.name}」从 Studio 移除？\n仓库里的文件和分支不受影响；Studio 的记录会移到 workflows/.removed 下。`)) return;
+                  void act(() => api.removeProject({ project: project.id }), "项目已移除");
+                });
               }}
             >
               <Trash2 size={14} />

@@ -3,6 +3,7 @@ use crate::workflow_stage;
 use aep::project::directory::Binding;
 use aep::{
     cancel::Cancellation,
+    flow::{self, Flow},
     handoff,
     memory::{Key, Kind as MemoryKind, Memory},
     project::{self, HttpsSite, Kind, Library, Project, RecordKind, Work, save_json},
@@ -82,11 +83,34 @@ enum Action {
         repository: PathBuf,
         ticket: String,
     },
-    /// Create a feature or release using a built-in template.
+    /// List the project's available and unreadable workflows.
+    Flows,
+    /// Inspect a workflow by ID or label.
+    FlowShow {
+        flow: String,
+    },
+    /// Save a workflow definition from a JSON file.
+    FlowSave {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Copy a workflow by ID or label.
+    FlowCopy {
+        flow: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Delete a project workflow by ID or label.
+    FlowDelete {
+        flow: String,
+    },
+    /// Create a feature or release. Defaults to the Software workflow.
     AddWork {
         name: String,
-        #[arg(long, value_enum, default_value = "software")]
-        template: Template,
+        #[arg(long, value_enum, conflicts_with = "flow")]
+        template: Option<Template>,
+        #[arg(long)]
+        flow: Option<String>,
         #[arg(long)]
         release: bool,
     },
@@ -265,15 +289,15 @@ enum Action {
         #[arg(long)]
         stage: usize,
     },
-    /// Read an attempt's receipt or a full artifact on demand.
+    /// Show the work item, or read an attempt's receipt or artifact.
     Show {
         /// Stream a submitted evidence file by its workspace-relative name.
-        #[arg(long)]
+        #[arg(long, requires = "attempt")]
         artifact: Option<PathBuf>,
         #[arg(long)]
-        attempt: String,
-        #[arg(long,default_value="receipt",value_parser=["receipt","result","request","prompt","stdout","stderr","files"])]
-        part: String,
+        attempt: Option<String>,
+        #[arg(long, requires = "attempt", value_parser = ["receipt","result","request","prompt","stdout","stderr","files"])]
+        part: Option<String>,
     },
     /// Report AEP input bytes, elapsed time and available provider counters per attempt.
     Metrics,
@@ -339,8 +363,33 @@ fn project_mut<'a>(lib: &'a mut Library, id: &str) -> Result<&'a mut Project> {
         .find(|p| p.id == id)
         .context("项目已改变")
 }
+fn flow_options(project: &Project) -> Vec<&Flow> {
+    std::iter::once(flow::builtin(Template::Legacy))
+        .chain(project.flow_choices())
+        .collect()
+}
+fn resolve_flow<'a>(project: &'a Project, key: &str) -> Result<&'a Flow> {
+    find(&flow_options(project), key, |f| (&f.id, &f.label)).copied()
+}
+fn flow_view(project: &Project, flow: &Flow) -> Value {
+    let revision = project
+        .flows
+        .iter()
+        .find(|entry| entry.flow.id == flow.id)
+        .map_or(0, |entry| entry.revision);
+    let warnings: Vec<_> = flow::validate(flow, &[])
+        .warnings
+        .into_iter()
+        .map(|issue| issue.message)
+        .collect();
+    json!({
+        "id":flow.id,"label":flow.label,"stages":flow.stages,
+        "builtin":flow::builtin_by_id(&flow.id).is_some(),
+        "in_use":project.flow_in_use(&flow.id),"revision":revision,"warnings":warnings
+    })
+}
 fn index(stage: usize, w: &Work) -> Result<usize> {
-    ensure!((1..=w.template.stages().len()).contains(&stage), "无效阶段");
+    ensure!((1..=w.flow()?.stages.len()).contains(&stage), "无效阶段");
     Ok(stage - 1)
 }
 fn profile(w: &Work, i: usize, r: &Routing) -> workflow::Profile {
@@ -472,9 +521,21 @@ fn view(work: &Work, project: &Project, dir: &Path) -> Result<Value> {
         let actual = aep::zcode_receipt::read(&d).ok().flatten();
         attempts.push(json!({"id":a.id,"stage":a.stage+1,"status":e["status"],"session":e["session"],"client":a.profile.client,"model":a.profile.model,"actual_model":actual,"error":e["error"]}));
     }
-    Ok(
-        json!({"project":project.id,"work":work.id,"name":work.name,"template":work.template,"stage_name":work.stage_name(),"stage":(work.stage<work.notes.len()).then_some(work.stage+1),"repositories":work.repositories,"records":work.records,"https":https,"handoffs":work.handoffs,"stage_transfers":work.stage_transfers,"deliveries":work.deliveries,"stages":work.template.stages().iter().enumerate().map(|(i,s)|json!({"stage":i+1,"name":s.name,"profile":work.profile(i),"attempt":work.current_attempt.get(&i)})).collect::<Vec<_>>(),"attempts":attempts}),
-    )
+    let stages: Vec<_> = work
+        .stages()
+        .iter()
+        .enumerate()
+        .map(|(i,s)| json!({"stage":i+1,"name":s.name,"profile":work.profile(i),"attempt":work.current_attempt.get(&i)}))
+        .collect();
+    let flow = work.flow().ok().map(|f| json!({"id":f.id,"label":f.label}));
+    Ok(json!({
+        "project":project.id,"work":work.id,"name":work.name,"template":work.template,
+        "flow":flow,"flow_error":work.flow_error.as_ref().map(|broken| &broken.error),
+        "stage_name":work.stage_name(),"stage":(work.stage < stages.len()).then(|| work.stage+1),
+        "repositories":work.repositories,"records":work.records,"https":https,
+        "handoffs":work.handoffs,"stage_transfers":work.stage_transfers,
+        "deliveries":work.deliveries,"stages":stages,"attempts":attempts
+    }))
 }
 struct Catalog {
     dir: PathBuf,
@@ -524,7 +585,7 @@ impl Catalog {
         let work = self.work()?;
         let wid = work.id.clone();
         let i = work.stage;
-        ensure!(i < work.template.stages().len(), "事项已完成");
+        ensure!(i < work.flow()?.stages.len(), "事项已完成");
         if !retry
             && let Some(ext) = &external
             && let Some(id) = work.current_attempt.get(&i)
@@ -548,7 +609,8 @@ impl Catalog {
             let w = p.work_by_id_mut(&wid)?;
             let profile = profile(w, i, routing);
             let repository = target(w, i, routing, external.as_ref())?;
-            let text = brief.unwrap_or_else(|| w.notes[i].clone());
+            let note = w.notes.get(i).context("阶段说明缺失")?;
+            let text = brief.unwrap_or_else(|| note.clone());
             p.reserve(
                 &dir,
                 &wid,
@@ -566,7 +628,7 @@ impl Catalog {
         let w = self.work()?;
         let i = index(stage, w)?;
         let wid = w.id.clone();
-        let text = note.unwrap_or_else(|| w.notes[i].clone());
+        let text = note.unwrap_or_else(|| w.notes.get(i).cloned().unwrap_or_default());
         let home = self.dir.clone();
         self.edit_project(|p| p.finish_stage(&home, &wid, i, text))?;
         print(&json!({"confirmed_stage":stage}))
@@ -771,9 +833,70 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             })?;
             print(&json!({"ticket":ticket}))
         }
+        Action::Flows => {
+            let p = c.project()?;
+            let flows: Vec<_> = flow_options(p)
+                .into_iter()
+                .map(|f| flow_view(p, f))
+                .collect();
+            let broken: Vec<_> = p.broken_flows.iter().map(|entry| json!({
+                "error":entry.error,"id":entry.raw["id"].as_str(),"label":entry.raw["label"].as_str()
+            })).collect();
+            print(&json!({"flows":flows,"broken":broken}))
+        }
+        Action::FlowShow { flow } => {
+            let p = c.project()?;
+            print(&flow_view(p, resolve_flow(p, &flow)?))
+        }
+        Action::FlowSave { file } => {
+            let mut value = aep::workspace::read(&file)?;
+            value
+                .as_object_mut()
+                .context("流程文件必须是 JSON 对象")?
+                .entry("id")
+                .or_insert_with(|| json!(""));
+            let flow: Flow = serde_json::from_value(value)?;
+            let (id, revision, warnings) = c.edit_project(|p| {
+                let (id, warnings) = p.save_flow(flow)?;
+                let revision = p
+                    .flows
+                    .iter()
+                    .find(|entry| entry.flow.id == id)
+                    .context("找不到已保存的流程")?
+                    .revision;
+                let warnings: Vec<_> = warnings.into_iter().map(|issue| issue.message).collect();
+                Ok((id, revision, warnings))
+            })?;
+            print(&json!({"id":id,"revision":revision,"warnings":warnings}))
+        }
+        Action::FlowCopy { flow, label } => {
+            let id = c.edit_project(|p| {
+                let source = resolve_flow(p, &flow)?.id.clone();
+                p.copy_flow(&source, label.as_deref())
+            })?;
+            print(&json!({"id":id}))
+        }
+        Action::FlowDelete { flow } => {
+            let (id, in_use) = c.edit_project(|p| {
+                let choices: Vec<_> = flow_options(p)
+                    .into_iter()
+                    .map(|f| (f.id.as_str(), f.label.as_str()))
+                    .chain(p.broken_flows.iter().filter_map(|entry| {
+                        let id = entry.raw["id"].as_str()?;
+                        Some((id, entry.raw["label"].as_str().unwrap_or(id)))
+                    }))
+                    .collect();
+                let id = find(&choices, &flow, |&(id, label)| (id, label))?
+                    .0
+                    .to_owned();
+                Ok((id.clone(), p.delete_flow(&id)?))
+            })?;
+            print(&json!({"deleted":id,"in_use":in_use}))
+        }
         Action::AddWork {
             name,
             template,
+            flow,
             release,
         } => {
             let kind = if release {
@@ -781,7 +904,14 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             } else {
                 Kind::Feature
             };
-            c.edit_project(|p| p.add_work(&name, kind, template))?;
+            c.edit_project(|p| {
+                if let Some(key) = &flow {
+                    let id = resolve_flow(p, key)?.id.clone();
+                    p.add_work_flow(&name, kind, &id)
+                } else {
+                    p.add_work(&name, kind, template.unwrap_or(Template::Software))
+                }
+            })?;
             print(&json!({"project":c.project()?.id,"work":c.project()?.selected}))
         }
         Action::ImportScan { path } => print(&project::import::scan(&path)?),
@@ -1018,7 +1148,10 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
         } => {
             let w = c.work()?;
             let i = w.stage;
-            ensure!(i < w.notes.len(), "事项已完成，可按执行 ID 查看归档");
+            ensure!(
+                i < w.flow()?.stages.len(),
+                "事项已完成，可按执行 ID 查看归档"
+            );
             let p = c.project()?;
             let wd = c.dir.join("workflows").join(&p.id).join(&w.id);
             let req = w.request(
@@ -1026,7 +1159,7 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
                 i,
                 handoff::Assignment {
                     profile: w.profile(i),
-                    brief: w.notes[i].clone(),
+                    brief: w.notes.get(i).cloned().unwrap_or_default(),
                     repository: w.target(i),
                     external: None,
                 },
@@ -1057,10 +1190,11 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             print(&workflow::evidence(&dir)?)
         }
         Action::Show {
-            attempt,
+            attempt: Some(attempt),
             part,
             artifact,
-        } => c.show(&attempt, &part, artifact),
+        } => c.show(&attempt, part.as_deref().unwrap_or("receipt"), artifact),
+        Action::Show { attempt: None, .. } => print(&view(c.work()?, c.project()?, &c.dir)?),
         Action::Memory { operation } => {
             let dir = c.dir.join("workflows").join(&c.project()?.id);
             let mut db = Memory::open(&dir)?;

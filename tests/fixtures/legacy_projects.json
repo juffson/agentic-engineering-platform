@@ -1,0 +1,66 @@
+{
+  "active": "baseline",
+  "projects": [
+    {
+      "id": "baseline",
+      "name": "流程基线",
+      "repositories": [],
+      "selected": "in-progress",
+      "work": [
+        {
+          "id": "in-progress",
+          "kind": "Feature",
+          "name": "in-progress",
+          "notes": [
+            "需求",
+            "方案",
+            "",
+            "",
+            ""
+          ],
+          "repositories": [],
+          "stage": 2,
+          "template": "Legacy"
+        },
+        {
+          "id": "delivered",
+          "kind": "Feature",
+          "name": "delivered",
+          "notes": [
+            "通过",
+            "通过",
+            "通过",
+            "通过",
+            "通过",
+            "通过",
+            "通过"
+          ],
+          "repositories": [],
+          "stage": 7,
+          "template": "Software"
+        },
+        {
+          "id": "shelved",
+          "kind": "Feature",
+          "name": "shelved",
+          "notes": [
+            "通过",
+            "通过",
+            "通过",
+            "通过",
+            "通过",
+            "通过",
+            "通过"
+          ],
+          "repositories": [],
+          "shelved": {
+            "at": "2026-01-01T00:00:00Z"
+          },
+          "stage": 7,
+          "template": "Game"
+        }
+      ]
+    }
+  ],
+  "revision": 1
+}

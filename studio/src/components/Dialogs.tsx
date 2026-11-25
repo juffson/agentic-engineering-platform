@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Download, FolderOpen, Plus, RefreshCw, Sparkles } from "lucide-react";
-import type { DraftItem, DraftStatus, ImportFound, SyncPlan, Template } from "../api/types";
+import type { DraftItem, DraftStatus, FlowDef, FlowId, ImportFound, SyncPlan } from "../api/types";
 import { api, errorMessage } from "../api/client";
+import { ROLE_HINT, ROLE_LABEL } from "../lib/flow";
 import { useStudio } from "../state/store";
 import { Button, Field, Modal, Segmented, Spinner } from "./ui";
 
-export function NewWorkDialog({ onClose }: { onClose(): void }) {
+const DEFAULT_FLOW: FlowId = "Software";
+
+export function NewWorkDialog({ onClose, onCustomizeFlow }: { onClose(): void; onCustomizeFlow?(): void }) {
   const { project } = useStudio();
   const [mode, setMode] = useState<"manual" | "draft">("manual");
   const [repos, setRepos] = useState<string[]>(project?.repositories ?? []);
@@ -33,28 +36,72 @@ export function NewWorkDialog({ onClose }: { onClose(): void }) {
           { value: "draft", label: "用 CLI 起草" },
         ]}
       />
-      {mode === "manual" ? <ManualWork repos={repos} picker={picker} onClose={onClose} /> : <DraftWork repos={repos} picker={picker} onClose={onClose} />}
+      {mode === "manual" ? <ManualWork repos={repos} picker={picker} onClose={onClose} onCustomizeFlow={onCustomizeFlow} /> : <DraftWork repos={repos} picker={picker} onClose={onClose} />}
     </Modal>
   );
 }
 
-function ManualWork({ repos, picker, onClose }: { repos: string[]; picker: ReactNode; onClose(): void }) {
-  const { snapshot, project, act, selectWork } = useStudio();
-  const templates = snapshot?.templates ?? [];
+function FlowSelect({ flows, value, onChange, disabled }: {
+  flows: FlowDef[];
+  value: FlowId;
+  onChange(id: FlowId): void;
+  disabled?: boolean;
+}) {
+  const builtin = flows.filter((flow) => flow.builtin);
+  const custom = flows.filter((flow) => !flow.builtin);
+  const options = (choices: FlowDef[]) => choices.map((flow) => <option key={flow.id} value={flow.id}>{flow.label}</option>);
+  return (
+    <select className="input select" value={value} onChange={(e) => onChange(e.target.value)} disabled={disabled} aria-label="流程">
+      <optgroup label="内置">{options(builtin)}</optgroup>
+      {custom.length > 0 && <optgroup label="本项目">{options(custom)}</optgroup>}
+    </select>
+  );
+}
+
+function deletedFlowMessage(id: FlowId): string {
+  return `流程「${id}」已被删除，请重新选择`;
+}
+
+function ManualWork({ repos, picker, onClose, onCustomizeFlow }: {
+  repos: string[];
+  picker: ReactNode;
+  onClose(): void;
+  onCustomizeFlow?(): void;
+}) {
+  const { project, notify, refresh, selectWork } = useStudio();
+  const flows = project?.flows ?? [];
   const [name, setName] = useState("");
-  const [template, setTemplate] = useState<Template>(templates.find((t) => t.id === "Software")?.id ?? templates[0]?.id ?? "Software");
+  const [flowId, setFlowId] = useState<FlowId>(DEFAULT_FLOW);
   const [release, setRelease] = useState(false);
   const [busy, setBusy] = useState(false);
-  const stages = templates.find((t) => t.id === template)?.stages ?? [];
+  const [error, setError] = useState<string | null>(null);
+  const selectedFlow = flows.find((flow) => flow.id === flowId);
+  const stages = selectedFlow?.stages ?? flows.find((flow) => flow.id === DEFAULT_FLOW)?.stages ?? [];
+  const canCreate = !!selectedFlow && !!name.trim() && repos.length > 0 && !busy;
+
+  useEffect(() => {
+    if (project && !selectedFlow && flowId !== DEFAULT_FLOW) {
+      setError(deletedFlowMessage(flowId));
+      setFlowId(DEFAULT_FLOW);
+    }
+  }, [project, selectedFlow, flowId]);
 
   const create = async () => {
-    if (!project) return;
+    if (!project || !canCreate) return;
     setBusy(true);
-    const id = await act(() => api.createWork({ project: project.id, name: name.trim(), template, release, repositories: repos }), "事项已创建");
-    setBusy(false);
-    if (id) {
+    setError(null);
+    try {
+      const id = await api.createWork({ project: project.id, name: name.trim(), template: flowId, release, repositories: repos });
+      notify("事项已创建", "info");
       selectWork(id);
       onClose();
+    } catch (e) {
+      const message = errorMessage(e);
+      setError(message);
+      if (message === deletedFlowMessage(flowId)) setFlowId(DEFAULT_FLOW);
+    } finally {
+      setBusy(false);
+      refresh();
     }
   };
 
@@ -66,7 +113,7 @@ function ManualWork({ repos, picker, onClose }: { repos: string[]; picker: React
           autoFocus
           value={name}
           onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && name.trim() && repos.length > 0 && void create()}
+          onKeyDown={(e) => e.key === "Enter" && void create()}
           placeholder="例如：自选股分组支持拖拽排序"
           aria-label="事项名称"
         />
@@ -83,24 +130,36 @@ function ManualWork({ repos, picker, onClose }: { repos: string[]; picker: React
             onChange={(v) => setRelease(v === "release")}
           />
         </Field>
-        <Field label="模板">
-          <Segmented<Template> label="模板" value={template} options={templates.map((t) => ({ value: t.id, label: t.label }))} onChange={setTemplate} />
+        <Field label="流程">
+          <FlowSelect flows={flows} value={selectedFlow?.id ?? DEFAULT_FLOW} disabled={busy} onChange={(id) => { setFlowId(id); setError(null); }} />
         </Field>
       </div>
       <ol className="template-preview" aria-label="阶段预览">
         {stages.map((s, i) => (
-          <li key={s}>
+          <li key={s.name}>
             <span className="tp-num">{i + 1}</span>
-            {s}
+            {s.name}
+            <span className="tag" title={ROLE_HINT[s.role]}>{ROLE_LABEL[s.role]}</span>
+            {s.skippable && <span className="tag">可跳过</span>}
           </li>
         ))}
       </ol>
+      <div className="flow-customize">
+        <button type="button" className="link-btn" disabled={!onCustomizeFlow || busy} onClick={() => {
+          if (!onCustomizeFlow) return;
+          onClose();
+          onCustomizeFlow();
+        }}>
+          定制流程…
+        </button>
+      </div>
       {picker}
+      {error && <p className="inline-error" role="alert">{error}</p>}
       <div className="modal-actions">
         <Button variant="ghost" onClick={onClose}>
           取消
         </Button>
-        <Button variant="primary" onClick={create} busy={busy} disabled={!name.trim() || repos.length === 0}>
+        <Button variant="primary" onClick={create} busy={busy} disabled={!canCreate}>
           创建事项
         </Button>
       </div>
@@ -110,8 +169,8 @@ function ManualWork({ repos, picker, onClose }: { repos: string[]; picker: React
 
 /** Describe what to do; a CLI reads the repository and memory and drafts items to review. */
 function DraftWork({ repos, picker, onClose }: { repos: string[]; picker: ReactNode; onClose(): void }) {
-  const { snapshot, project, act, notify, selectWork } = useStudio();
-  const templates = snapshot?.templates ?? [];
+  const { project, act, notify, selectWork } = useStudio();
+  const flows = project?.flows ?? [];
   const [request, setRequest] = useState("");
   const [client, setClient] = useState<"Claude" | "Codex">("Claude");
   const [model, setModel] = useState("");
@@ -120,6 +179,7 @@ function DraftWork({ repos, picker, onClose }: { repos: string[]; picker: ReactN
   const [shown, setShown] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const pid = project?.id ?? "";
+  const draftFlowId = (item: DraftItem) => flows.some((flow) => flow.id === item.template) ? item.template : DEFAULT_FLOW;
 
   const poll = useCallback(async () => {
     if (!pid) return null;
@@ -159,7 +219,7 @@ function DraftWork({ repos, picker, onClose }: { repos: string[]; picker: ReactN
     let first: string | null = null;
     let made = 0;
     for (const item of items.filter((i) => i.on)) {
-      const id = await act(() => api.createWork({ project: pid, name: item.name.trim(), template: item.template, release: item.release, repositories: repos }));
+      const id = await act(() => api.createWork({ project: pid, name: item.name.trim(), template: draftFlowId(item), release: item.release, repositories: repos }));
       if (!id) break;
       await act(() => api.updateStage({ project: pid, work: id, stage: 0, note: item.brief.trim() }));
       first ??= id;
@@ -167,7 +227,7 @@ function DraftWork({ repos, picker, onClose }: { repos: string[]; picker: ReactN
     }
     setBusy(false);
     if (first) {
-      notify(`已创建 ${made} 个事项，「产品需求」已写好说明`, "info");
+      notify(`已创建 ${made} 个事项，已写好第一阶段说明`, "info");
       selectWork(first);
       onClose();
     }
@@ -176,7 +236,7 @@ function DraftWork({ repos, picker, onClose }: { repos: string[]; picker: ReactN
 
   return (
     <div className="draft" data-testid="draft">
-      <Field label="想做什么" hint="可以写得很随意，也可以贴 issue 内容；CLI 会只读地看仓库代码和项目记忆，拆成合适的事项并写好「产品需求」说明。">
+      <Field label="想做什么" hint="可以写得很随意，也可以贴 issue 内容；CLI 会只读地看仓库代码和项目记忆，拆成合适的事项并写好第一阶段说明。">
         <textarea className="input" rows={4} value={request} onChange={(e) => setRequest(e.target.value)} placeholder="例如：对账单要能导出 CSV，空账户也要有表头" aria-label="需求描述" />
       </Field>
       <div className="draft-cli">
@@ -204,26 +264,26 @@ function DraftWork({ repos, picker, onClose }: { repos: string[]; picker: ReactN
         <>
           {status?.draft?.summary && <p className="tidy-summary">{status.draft.summary}</p>}
           <ul className="draft-items">
-            {items.map((item, i) => (
-              <li key={i} className={item.on ? undefined : "off"}>
-                <div className="draft-head">
-                  <input type="checkbox" checked={item.on} onChange={(e) => set(i, { on: e.target.checked })} aria-label={`创建 ${item.name}`} />
-                  <input className="input" value={item.name} onChange={(e) => set(i, { name: e.target.value })} aria-label="事项名称" />
-                  <select className="input select" value={item.template} onChange={(e) => set(i, { template: e.target.value as Template })} aria-label="模板">
-                    {templates.map((t) => (
-                      <option key={t.id} value={t.id}>
-                        {t.label}
-                      </option>
-                    ))}
-                  </select>
-                  <label className="check">
-                    <input type="checkbox" checked={item.release} onChange={(e) => set(i, { release: e.target.checked })} />
-                    <span>发布</span>
-                  </label>
-                </div>
-                <textarea className="input" rows={4} value={item.brief} onChange={(e) => set(i, { brief: e.target.value })} aria-label="产品需求说明" />
-              </li>
-            ))}
+            {items.map((item, i) => {
+              const flowId = draftFlowId(item);
+              const fallback = item.fallback_from ?? (flowId !== item.template ? item.template : null);
+              const stageName = flows.find((flow) => flow.id === flowId)?.stages[0]?.name ?? "第一阶段";
+              return (
+                <li key={i} className={item.on ? undefined : "off"}>
+                  <div className="draft-head">
+                    <input type="checkbox" checked={item.on} onChange={(e) => set(i, { on: e.target.checked })} aria-label={`创建 ${item.name}`} />
+                    <input className="input" value={item.name} onChange={(e) => set(i, { name: e.target.value })} aria-label="事项名称" />
+                    <FlowSelect flows={flows} value={flowId} disabled={busy} onChange={(id) => set(i, { template: id, fallback_from: null })} />
+                    <label className="check">
+                      <input type="checkbox" checked={item.release} onChange={(e) => set(i, { release: e.target.checked })} />
+                      <span>发布</span>
+                    </label>
+                  </div>
+                  {fallback !== null && <p className="field-hint draft-flow-hint">起草结果选的流程「{fallback}」不存在，已改为软件开发</p>}
+                  <textarea className="input" rows={4} value={item.brief} onChange={(e) => set(i, { brief: e.target.value })} aria-label={`${stageName}说明`} />
+                </li>
+              );
+            })}
           </ul>
         </>
       )}

@@ -3,7 +3,8 @@ import { api, errorMessage } from "../api/client";
 import type { PluginId, PluginInfo, ProjectSummary, Snapshot, ZCodeModel } from "../api/types";
 import { pluginBadge } from "../lib/remote";
 
-export type Page = "work" | "memory" | "repos" | "branches" | "usage" | "plugins";
+export type Page = "work" | "memory" | "repos" | "branches" | "usage" | "flows" | "plugins";
+type NavigationGuard = (navigate: () => void) => void;
 
 export interface ZCodeState {
   models: ZCodeModel[] | null;
@@ -19,12 +20,16 @@ export interface Toast {
 
 interface StudioState {
   snapshot: Snapshot | null;
+  snapshotError: string | null;
+  reloadSnapshot(): Promise<void>;
   project: ProjectSummary | null;
   selected: string | null;
   page: Page;
   setPage(page: Page): void;
   selectWork(id: string): void;
   openProject(id: string): void;
+  requestNavigation(navigate: () => void): void;
+  registerNavigationGuard(guard: NavigationGuard): () => void;
   /** Bumped after every mutation so pollers refetch immediately. */
   revision: number;
   refresh(): void;
@@ -85,6 +90,7 @@ export function usePoll(fn: () => Promise<void> | void, ms: number, deps: unknow
 
 export function StudioProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [page, setCurrentPage] = useState<Page>("work");
   const [pluginFocus, setPluginFocus] = useState<PluginId | null>(null);
@@ -96,7 +102,9 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const [revision, setRevision] = useState(0);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastSeq = useRef(0);
-  const snapshotError = useRef<string | null>(null);
+  const lastSnapshotError = useRef<string | null>(null);
+  const snapshotRequest = useRef(0);
+  const navigationGuard = useRef<NavigationGuard | null>(null);
   const [zcode, setZcode] = useState<ZCodeState>({ models: null, loading: false, error: null });
   const zcodeBusy = useRef(false);
   const zcodeTried = useRef(false);
@@ -124,15 +132,31 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [dismiss],
   );
 
-  const setPage = useCallback((next: Page) => {
+  const changePage = useCallback((next: Page) => {
     if (next !== "plugins") setPluginFocus(null);
     setCurrentPage(next);
   }, []);
 
-  const openPlugin = useCallback((id: PluginId | null) => {
+  const registerNavigationGuard = useCallback((guard: NavigationGuard) => {
+    navigationGuard.current = guard;
+    return () => {
+      if (navigationGuard.current === guard) navigationGuard.current = null;
+    };
+  }, []);
+
+  const requestNavigation = useCallback((navigate: () => void) => {
+    if (navigationGuard.current) navigationGuard.current(navigate);
+    else navigate();
+  }, []);
+
+  const setPage = (next: Page) => {
+    if (next !== page) requestNavigation(() => changePage(next));
+  };
+
+  const openPlugin = useCallback((id: PluginId | null) => requestNavigation(() => {
     setPluginFocus(id);
     setCurrentPage("plugins");
-  }, []);
+  }), [requestNavigation]);
 
   const setPlugins = useCallback((list: PluginInfo[]) => {
     ++pluginReadVersion.current;
@@ -193,13 +217,16 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const remoteOn = branchesOn && (plugins?.some((plugin) => plugin.id !== "branches" && plugin.enabled) ?? false);
 
   useEffect(() => {
-    if (page === "branches" && !branchesOn) setPage("work");
-  }, [branchesOn, page, setPage]);
+    if (page === "branches" && !branchesOn) changePage("work");
+  }, [branchesOn, page, changePage]);
 
   const loadSnapshot = useCallback(async () => {
+    const request = ++snapshotRequest.current;
     try {
       const s = await api.snapshot();
-      snapshotError.current = null;
+      if (request !== snapshotRequest.current) return;
+      lastSnapshotError.current = null;
+      setSnapshotError(null);
       setSnapshot(s);
       setSelected((cur) => {
         const project = s.projects.find((p) => p.id === s.active);
@@ -207,9 +234,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         return s.selected ?? project?.work[0]?.id ?? null;
       });
     } catch (e) {
+      if (request !== snapshotRequest.current) return;
       const text = errorMessage(e);
-      if (snapshotError.current !== text) notify(`无法读取工作台状态：${text}`);
-      snapshotError.current = text;
+      if (lastSnapshotError.current !== text) notify(`无法读取工作台状态：${text}`);
+      lastSnapshotError.current = text;
+      setSnapshotError(text);
     }
   }, [notify]);
 
@@ -239,31 +268,35 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   );
 
   const selectWork = useCallback(
-    (id: string) => {
+    (id: string) => requestNavigation(() => {
       setSelected(id);
-      setPage("work");
+      changePage("work");
       if (project) void api.selectWork({ project: project.id, work: id }).catch((e) => notify(errorMessage(e)));
-    },
-    [project, notify, setPage],
+    }),
+    [project, notify, requestNavigation, changePage],
   );
 
   const openProject = useCallback(
-    (id: string) => {
+    (id: string) => requestNavigation(() => {
       setSelected(null);
-      setPage("work");
+      changePage("work");
       void act(() => api.openProject({ project: id }));
-    },
-    [act, setPage],
+    }),
+    [act, requestNavigation, changePage],
   );
 
   const value: StudioState = {
     snapshot,
+    snapshotError,
+    reloadSnapshot: loadSnapshot,
     project,
     selected,
     page,
     setPage,
     selectWork,
     openProject,
+    requestNavigation,
+    registerNavigationGuard,
     revision,
     refresh,
     act,

@@ -7,6 +7,7 @@ import { MemoryPage, ReposPage } from "./components/SecondaryPages";
 import { BranchesPage } from "./components/Branches";
 import { PluginsPage } from "./components/Plugins";
 import { UsagePage } from "./components/Usage";
+import { FlowsPage } from "./components/Flows";
 import { NewProjectDialog, NewWorkDialog } from "./components/Dialogs";
 import { Toasts } from "./components/Toasts";
 import { Button, Spinner } from "./components/ui";
@@ -20,7 +21,7 @@ export function App() {
 }
 
 function Shell() {
-  const { snapshot, project, selected, page, branchesOn } = useStudio();
+  const { snapshot, project, selected, page, branchesOn, setPage, requestNavigation } = useStudio();
   const [dialog, setDialog] = useState<"work" | "project" | null>(null);
 
   let main;
@@ -44,6 +45,8 @@ function Shell() {
     main = <BranchesPage project={project} />;
   } else if (page === "usage") {
     main = <UsagePage project={project} />;
+  } else if (page === "flows") {
+    main = <FlowsPage key={project.id} project={project} />;
   } else if (selected && project.work.some((w) => w.id === selected)) {
     main = <WorkPage key={`${project.id}/${selected}`} project={project.id} work={selected} />;
   } else {
@@ -54,9 +57,9 @@ function Shell() {
 
   return (
     <div className="app">
-      <Sidebar onNewWork={() => setDialog("work")} onNewProject={() => setDialog("project")} />
+      <Sidebar onNewWork={() => requestNavigation(() => setDialog("work"))} onNewProject={() => requestNavigation(() => setDialog("project"))} />
       <main className="main">{main}</main>
-      {dialog === "work" && <NewWorkDialog onClose={() => setDialog(null)} />}
+      {dialog === "work" && <NewWorkDialog onClose={() => setDialog(null)} onCustomizeFlow={() => setPage("flows")} />}
       {dialog === "project" && <NewProjectDialog onClose={() => setDialog(null)} />}
       <Toasts />
     </div>
