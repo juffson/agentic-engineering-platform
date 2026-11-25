@@ -2,6 +2,7 @@ pub mod archive;
 pub mod branches;
 pub mod directory;
 pub mod forge;
+pub mod folder;
 pub mod import;
 pub mod merge;
 pub mod remote;
@@ -482,6 +483,10 @@ pub struct Project {
     /// Remote branch items start from and follow, and how deliveries reach it, per repository.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub upstreams: BTreeMap<PathBuf, upstream::Upstream>,
+    /// Folder holding several of this project's repositories (not itself a repository).
+    /// Its top-level AGENTS.md / CLAUDE.md are pointed out to every stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
 }
 impl Project {
     pub fn flow_choices(&self) -> Vec<&Flow> {
@@ -981,6 +986,7 @@ impl Library {
             stage_budget: None,
             resume_limit: None,
             upstreams: BTreeMap::new(),
+            workspace_root: None,
         });
         self.active = Some(id);
         Ok(())
@@ -1053,6 +1059,29 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(dir.join("projects.json"))?, b"damaged");
+        Ok(())
+    }
+    #[test]
+    fn old_project_json_round_trips_without_workspace_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        // The field did not exist when this projects.json was written (AC-11).
+        fs::write(
+            dir.join("projects.json"),
+            r#"{"revision":1,"active":"legacy","projects":[{"id":"legacy","name":"旧项目","repositories":[],"work":[],"selected":null}]}"#,
+        )?;
+        let mut library = Library::open(dir)?;
+        assert_eq!(
+            library.project().context("legacy project missing")?.workspace_root,
+            None
+        );
+        library.change(dir, |lib| lib.create("新项目", vec![]))?;
+        let saved = fs::read_to_string(dir.join("projects.json"))?;
+        assert!(
+            !saved.contains("workspace_root"),
+            "old projects must not grow the field: {saved}"
+        );
+        assert!(saved.contains("旧项目"));
         Ok(())
     }
 }
