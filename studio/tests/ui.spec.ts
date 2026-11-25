@@ -309,12 +309,12 @@ test("the branch page draws branches, their worktrees and items, and opens git t
   await expect(list).toContainText("事项：自选股分组支持拖拽排序");
   await expect(list).toContainText("Claude 工作区 · 0 改动 · 74 未跟踪");
   await expect(page.locator(".graph-svg circle")).toHaveCount(10);
-  await list.getByText("feat/export-statement").click();
+  await list.getByRole("button", { name: /^feat\/export-statement/ }).click();
   await expect(page.locator(".graph-row.on")).toContainText("导出对账单：补齐表头");
   await shot(page, "23-branches");
   await page.getByRole("button", { name: "Fork" }).click();
   await expect(page.locator(".toast-error")).toHaveCount(0);
-  await list.getByText("fix/snapshot-paging").click();
+  await list.getByRole("button", { name: /^fix\/snapshot-paging/ }).click();
   await expect(page.getByText("这个分支没有检出到工作区")).toBeVisible();
 });
 
@@ -545,4 +545,292 @@ test("a ZCode stage stopped by its budget re-runs instead of continuing", async 
   await expect(page.locator(".toast", { hasText: "已追加预算，重新运行" })).toBeVisible();
   await expect(page.locator(".turn")).toHaveCount(2);
   await expect(page.locator(".turn").last().locator(".turn-meta")).not.toContainText("继续对话");
+});
+
+test.describe("Studio plugins", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.emulateMedia({ colorScheme: "dark" });
+    await page.goto("/");
+  });
+
+  test("lists plugins without a project and hides branches when branch management is disabled", async ({ page }) => {
+    const sidebar = page.getByRole("navigation", { name: "事项" });
+    const plugins = sidebar.getByRole("button", { name: "插件", exact: true });
+    const branches = sidebar.getByRole("button", { name: "分支", exact: true });
+    const branchCard = page.getByRole("region", { name: "分支管理" });
+    const github = page.getByRole("region", { name: "GitHub" });
+    const gitlab = page.getByRole("region", { name: "GitLab" });
+    const branchSwitch = branchCard.getByRole("switch");
+    const workHeading = page.getByRole("heading", { name: "自选股分组支持拖拽排序", exact: true });
+
+    await expect(workHeading).toBeVisible();
+    await expect(sidebar.getByRole("separator").locator("+ button")).toHaveText("插件");
+    await expect(sidebar.locator(".sidebar-foot > :last-child")).toHaveText("插件");
+    await plugins.click();
+    await expect(branchCard.getByText("已启用", { exact: true })).toBeVisible();
+    await expect(github.getByText("已启用", { exact: true })).toBeVisible();
+    await expect(gitlab.getByText("已停用", { exact: true })).toBeVisible();
+    await branchSwitch.click();
+    await expect(branchCard.getByText("已停用", { exact: true })).toBeVisible();
+    await expect(branches).toHaveCount(0);
+    for (const forge of [github, gitlab]) {
+      await expect(forge.getByText("不可用", { exact: true })).toBeVisible();
+      await expect(forge.getByRole("switch")).toBeDisabled();
+    }
+    await branchSwitch.click();
+    await expect(branches).toBeEnabled();
+    await branches.click();
+    await expect(page.getByRole("heading", { name: "分支", exact: true })).toBeVisible();
+
+    // Change the mock settings outside this page's UI, as another window would.
+    await page.evaluate(async (clientPath) => {
+      const { api } = await import(clientPath);
+      await api.setPluginEnabled({ plugin: "branches", enabled: false });
+    }, "/src/api/client.ts");
+    await expect(branches).toHaveCount(0);
+    await expect(workHeading).toBeVisible();
+    await plugins.click();
+    await branchSwitch.click();
+    await expect(branches).toBeEnabled();
+
+    await sidebar.getByRole("button", { name: /^仓库/ }).click();
+    await expect(page.getByRole("heading", { name: "仓库", exact: true })).toBeVisible();
+    const projectSwitcher = page.locator(".project-btn");
+    const projectName = projectSwitcher.locator(".project-name");
+    for (const [current, next] of [["行情终端", "内部工具"], ["内部工具", "选择项目"]]) {
+      await expect(projectName).toHaveText(current);
+      await projectSwitcher.click();
+      page.once("dialog", (dialog) => dialog.accept());
+      await page.getByRole("menuitem", { name: `移除项目「${current}」` }).click();
+      await expect(projectName).toHaveText(next);
+    }
+    await expect(page.getByRole("heading", { name: "开始一个项目" })).toBeVisible();
+    await expect(plugins).toBeEnabled();
+    await plugins.click();
+    await expect(page.getByRole("heading", { name: "插件", exact: true })).toBeVisible();
+    await expect(branchCard).toContainText("查看本地分支、工作区和提交图");
+    await expect(github).toContainText("在分支页显示 GitHub 远端分支、领先落后和 PR");
+    await expect(gitlab).toContainText("在分支页显示 GitLab 远端分支、领先落后和 MR");
+    await expect(page.getByRole("button", { name: "关闭提示" })).toHaveCount(0);
+    await shot(page, "30-plugins");
+  });
+
+  test("validates forge settings, tests connections and masks the saved token", async ({ page }) => {
+    await page.getByRole("button", { name: "插件", exact: true }).click();
+    const github = page.getByRole("region", { name: "GitHub" });
+    const gitlab = page.getByRole("region", { name: "GitLab" });
+    await github.getByRole("button", { name: "配置", exact: true }).click();
+    await github.getByRole("button", { name: "更换", exact: true }).click();
+    const githubHost = github.getByLabel("主机地址");
+    const githubToken = github.getByLabel("访问令牌", { exact: true });
+    const githubTest = github.getByRole("button", { name: "测试连接" });
+    await githubToken.fill("bad");
+    await githubTest.click();
+    await expect(github.getByRole("status")).toContainText("令牌无效或过期");
+    await githubToken.fill("demo-test-1234");
+    await githubHost.fill("github.invalid");
+    await githubHost.press("Tab");
+    await githubTest.click();
+    await expect(github.getByRole("status")).toContainText("无法连接 github.invalid");
+    await githubHost.fill("github.com");
+    await githubHost.press("Tab");
+    await githubTest.click();
+    await expect(github.getByRole("status")).toContainText("已连接为 octocat");
+
+    await gitlab.getByRole("switch").click();
+    await expect(gitlab.getByText("需要配置", { exact: true })).toBeVisible();
+    const host = gitlab.getByLabel("主机地址");
+    const token = gitlab.getByLabel("访问令牌", { exact: true });
+    const save = gitlab.getByRole("button", { name: "保存", exact: true });
+    const testConnection = gitlab.getByRole("button", { name: "测试连接" });
+    await token.fill("bad");
+    await host.fill("http://x");
+    await host.press("Tab");
+    await expect(gitlab.getByText("只支持 https 地址")).toBeVisible();
+    await expect(save).toBeDisabled();
+    await host.fill("gitlab.invalid");
+    await host.press("Tab");
+    await testConnection.click();
+    await expect(gitlab.getByRole("status")).toContainText("无法连接 gitlab.invalid");
+    await host.fill("gitlab.example.com/");
+    await host.press("Tab");
+    await expect(gitlab.getByText("将保存为 https://gitlab.example.com", { exact: true })).toBeVisible();
+    await testConnection.click();
+    await expect(gitlab.getByRole("status")).toContainText("令牌无效或过期");
+    await token.fill("demo-test-7890");
+    await testConnection.click();
+    await expect(gitlab.getByRole("status")).toContainText("已连接为 octocat");
+    await save.click();
+    const masked = gitlab.getByText("已设置 · ••••7890", { exact: true });
+    await expect(masked).toBeVisible();
+    await expect(gitlab.getByText("已启用", { exact: true })).toBeVisible();
+    await expect(host).toHaveValue("https://gitlab.example.com");
+    await expect(token).toHaveCount(0);
+    await gitlab.getByRole("button", { name: "更换", exact: true }).click();
+    await expect(token).toHaveValue("");
+    await gitlab.getByRole("button", { name: "取消", exact: true }).click();
+    await expect(masked).toBeVisible();
+    await shot(page, "31-plugin-config");
+  });
+
+  test("shows upstream comparisons, remote-only branches and pull requests alongside work items", async ({ page }) => {
+    await page.getByRole("button", { name: "分支", exact: true }).click();
+    const list = page.getByRole("complementary", { name: "分支列表" });
+    const workBranch = list.getByRole("button", { name: /^aep-stage\/7f3a9c21/ });
+    const workRow = list.getByRole("listitem").filter({ has: page.getByRole("button", { name: /^aep-stage\/7f3a9c21/ }) });
+    await expect(page.getByText("origin · github.com/demo/quote-terminal", { exact: true })).toBeVisible();
+    await expect(page.getByText("另有 1 个远端", { exact: true })).toBeVisible();
+    await expect(workBranch).toContainText("相对 HEAD 领先 2 · 落后 1");
+    await expect(workBranch).toContainText("↑2 ↓1（相对 origin/aep-stage/7f3a9c21）");
+    await expect(workBranch).toContainText("事项：自选股分组支持拖拽排序");
+    await expect(list.getByRole("button", { name: /^feat\/export-statement/ })).toContainText("相对 origin/feat/export-statement 未知");
+    await expect(list.getByRole("button", { name: /^fix\/snapshot-paging/ })).toContainText("未跟踪 · 远端有同名分支 origin/fix/snapshot-paging");
+    const pull = workRow.getByRole("button", { name: /^#123 打开/ });
+    await expect(pull).toContainText("+2");
+    await expect(pull.getByText("+2", { exact: true })).toHaveAttribute("title", "另有 2 个 PR");
+    await expect(list.getByRole("button", { name: "#124 草稿", exact: true })).toBeVisible();
+    await expect(list.getByRole("button", { name: "#120 已合并", exact: true })).toBeVisible();
+    await expect(list.getByRole("button", { name: "#119 已关闭", exact: true })).toBeVisible();
+
+    const group = list.getByRole("button", { name: "仅远端 3", exact: true });
+    const remoteBranches = list.getByRole("list", { name: "仅远端分支" });
+    await expect(group).toHaveAttribute("aria-expanded", "false");
+    await expect(remoteBranches).toHaveCount(0);
+    await group.click();
+    await expect(group).toHaveAttribute("aria-expanded", "true");
+    await expect(remoteBranches.getByRole("listitem")).toHaveCount(3);
+    await expect(remoteBranches.getByRole("button", { name: /^origin\/feat\/盘口优化/ })).toBeVisible();
+
+    const filter = list.getByRole("textbox", { name: "筛选分支" });
+    await filter.fill("#124");
+    await expect(list.getByRole("listitem")).toHaveCount(1);
+    await expect(list.getByRole("button", { name: "#124 草稿", exact: true })).toBeVisible();
+    await filter.fill("盘口数据推送优化");
+    await expect(remoteBranches.getByRole("listitem")).toHaveCount(1);
+    await expect(remoteBranches.getByRole("button", { name: "#125 打开", exact: true })).toBeVisible();
+    await filter.clear();
+
+    await workBranch.click();
+    const detail = page.locator(".graph-remote");
+    await expect(detail).toContainText("#123 自选股分组支持拖拽排序");
+    await expect(detail).toContainText("打开 · 另有 2 个");
+    const opened = page.waitForEvent("console", (message) => (
+      message.type() === "info" && message.text() === "在浏览器打开 https://github.com/demo/quote-terminal/pull/123"
+    ));
+    await pull.click();
+    await opened;
+    await shot(page, "32-branches-remote");
+
+    await page.getByRole("combobox", { name: "仓库" }).selectOption({ label: "quote-gateway" });
+    await expect(page.getByText("origin · gitlab.example.com/g/sub/r", { exact: true })).toBeVisible();
+    await expect(page.getByText("未配置与 gitlab.example.com 对应的插件")).toBeVisible();
+    await page.locator(".project-btn").click();
+    await page.getByRole("menuitem", { name: /^内部工具/ }).click();
+    await page.getByRole("button", { name: "分支", exact: true }).click();
+    await expect(page.getByText("此仓库没有配置远端", { exact: true })).toBeVisible();
+  });
+
+  test("refreshes once at a time and keeps local branches usable through remote errors", async ({ page }) => {
+    const sidebar = page.getByRole("navigation", { name: "事项" });
+    const plugins = sidebar.getByRole("button", { name: /^插件/ });
+    const branches = sidebar.getByRole("button", { name: "分支", exact: true });
+    const github = page.getByRole("region", { name: "GitHub" });
+    const refresh = page.getByRole("button", { name: "刷新远端", exact: true });
+    const refreshing = page.getByRole("button", { name: "正在刷新…", exact: true });
+    const lastRefresh = page.locator(".branch-remote-bar time");
+    const remoteError = page.getByRole("status").and(page.locator(".branch-remote-error"));
+    const localBranch = page.getByRole("complementary", { name: "分支列表" }).getByRole("button", { name: /^feat\/export-statement/ });
+
+    await branches.click();
+    await expect(lastRefresh).toHaveText(/^上次刷新/);
+    const previous = await lastRefresh.evaluate((time: HTMLTimeElement) => time.dateTime);
+    await refresh.click();
+    await expect(refreshing).toBeDisabled();
+    await expect(refresh).toHaveCount(0);
+    await expect(lastRefresh).toHaveText("上次刷新 刚刚");
+    await expect(lastRefresh).not.toHaveAttribute("datetime", previous);
+    await expect(refresh).toBeEnabled();
+
+    async function refreshWithToken(token: string) {
+      if (!(await github.isVisible())) await plugins.click();
+      const configure = github.getByRole("button", { name: "配置", exact: true });
+      if (await configure.getAttribute("aria-expanded") === "false") await configure.click();
+      await github.getByRole("button", { name: "更换", exact: true }).click();
+      await github.getByLabel("访问令牌", { exact: true }).fill(token);
+      await github.getByRole("button", { name: "保存", exact: true }).click();
+      await expect(github.getByRole("button", { name: "更换", exact: true })).toBeVisible();
+      await branches.click();
+      await refresh.click();
+    }
+
+    await refreshWithToken("bad-token");
+    await expect(remoteError).toContainText("令牌无效或过期");
+    await expect(plugins.getByLabel("有插件出错")).toBeVisible();
+    await localBranch.click();
+    await expect(page.locator(".graph-row.on")).toContainText("导出对账单：补齐表头");
+    await expect(page.getByRole("button", { name: "#124 草稿", exact: true })).toBeVisible();
+    await remoteError.getByRole("button", { name: "去配置", exact: true }).click();
+    await expect(github.getByText("出错", { exact: true })).toBeVisible();
+    await expect(github.getByRole("button", { name: "配置", exact: true })).toHaveAttribute("aria-expanded", "true");
+
+    await refreshWithToken("slow-token");
+    await expect(remoteError).toContainText("github.com 15 秒内没有响应");
+    await localBranch.click();
+    await expect(page.locator(".graph-row.on")).toContainText("导出对账单：补齐表头");
+    const retry = remoteError.getByRole("button", { name: "重试", exact: true });
+    await expect(retry).toBeEnabled();
+    await retry.click();
+    await expect(refreshing).toBeDisabled();
+    await expect(remoteError).toContainText("github.com 15 秒内没有响应");
+
+    // The mock respects the rate-limit window even when the token changes.
+    await refreshWithToken("limit-token");
+    await expect(remoteError).toContainText(/请求过多已被限流，约 \d{2}:\d{2} 后恢复/);
+    await expect(remoteError.getByRole("button", { name: "重试", exact: true })).toBeDisabled();
+    await localBranch.click();
+    await expect(page.locator(".graph-row.on")).toContainText("导出对账单：补齐表头");
+    await shot(page, "33-branches-refresh-error");
+  });
+
+  test("preserves the local branch graph and external tools with both forge plugins off", async ({ page }) => {
+    await page.getByRole("button", { name: "插件", exact: true }).click();
+    const github = page.getByRole("region", { name: "GitHub" });
+    const gitlab = page.getByRole("region", { name: "GitLab" });
+    await gitlab.getByRole("switch").click();
+    await expect(gitlab.getByText("需要配置", { exact: true })).toBeVisible();
+    await gitlab.getByRole("switch").click();
+    await github.getByRole("switch").click();
+    await expect(github.getByText("已停用", { exact: true })).toBeVisible();
+    await expect(gitlab.getByText("已停用", { exact: true })).toBeVisible();
+
+    await page.getByRole("button", { name: "分支", exact: true }).click();
+    const list = page.getByRole("complementary", { name: "分支列表" });
+    await expect(list).toContainText("事项：自选股分组支持拖拽排序");
+    await expect(list).toContainText("Claude 工作区 · 0 改动 · 74 未跟踪");
+    await expect(list).toContainText("领先 3 · 落后 1");
+    await expect(list).not.toContainText("相对 HEAD");
+    await expect(page.locator(".branch-remote-bar, .branch-pull, .graph-remote, .branch-remote-only")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "刷新远端" })).toHaveCount(0);
+    await expect(page.locator(".graph-svg circle")).toHaveCount(10);
+    await list.getByRole("button", { name: /^feat\/export-statement/ }).click();
+    await expect(page.locator(".graph-row.on")).toContainText("导出对账单：补齐表头");
+    await expect(page.getByRole("button", { name: "VS Code（Git Graph 扩展）", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "lazygit", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Fork", exact: true }).click();
+    await expect(page.locator(".toast-error")).toHaveCount(0);
+    await shot(page, "34-branches-local");
+    await list.getByRole("button", { name: /^fix\/snapshot-paging/ }).click();
+    await expect(page.getByText(/这个分支没有检出到工作区/)).toBeVisible();
+    await expect(page.getByRole("button", { name: "Fork", exact: true })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "插件 › 分支管理", exact: true }).click();
+    const tools = page.getByRole("region", { name: "分支管理" });
+    await expect(tools.getByRole("heading", { name: "外部 git 工具" })).toBeVisible();
+    await expect(tools.getByText("/Users/demo/.aep/plugins/git-tools.json", { exact: true })).toBeVisible();
+    const revealed = page.waitForEvent("console", (message) => (
+      message.type() === "info" && message.text() === "在访达中选中 git-tools.json /Users/demo/.aep/plugins/git-tools.json"
+    ));
+    await tools.getByRole("button", { name: "在访达中显示", exact: true }).click();
+    await revealed;
+  });
 });
