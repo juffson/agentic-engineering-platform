@@ -1,0 +1,159 @@
+{
+  "title": "项目 · 从多仓库文件夹创建项目",
+  "spec": "specs/multi-repo-folder-project/spec.md",
+  "interaction": "specs/multi-repo-folder-project/interaction.md",
+  "design": "specs/multi-repo-folder-project/design.md",
+  "allowed_paths": [
+    "src/project.rs",
+    "src/project",
+    "src/workflow.rs",
+    "src/handoff.rs",
+    "src/workflow_stage.rs",
+    "src/project_cli.rs",
+    "tests",
+    "studio/src-tauri/src/api.rs",
+    "studio/src-tauri/src/lib.rs",
+    "studio/src-tauri/tests/api.rs",
+    "studio/src",
+    "studio/tests"
+  ],
+  "forbidden_paths": [
+    "desktop",
+    "specs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "studio/package.json",
+    "studio/package-lock.json"
+  ],
+  "subtasks": [
+    {
+      "id": "T1",
+      "title": "仓库发现：新建 src/project/folder.rs（resolve/notes/message/unreadable，Resolved 五种结果，BFS 深度 1–4、跳过 node_modules/target/点目录、命中仓库不再深入、符号链接去重防环、无权限跳过、MAX_DIRS=5000 截断），src/project.rs 加 pub mod folder 和 Project.workspace_root（serde default + skip none），Library::create 字面量补字段；单测覆盖 design §10 第一行和旧 JSON 往返",
+      "paths": [
+        "src/project",
+        "src/project.rs"
+      ],
+      "criteria": [
+        "AC-6",
+        "AC-11",
+        "R1",
+        "R2",
+        "R3",
+        "R4",
+        "R9"
+      ],
+      "check": [
+        "cargo test --locked --lib project::folder",
+        "cargo test --locked --lib project::tests"
+      ]
+    },
+    {
+      "id": "T2",
+      "title": "阶段 prompt 与读取授权：Request.workspace_root（src/workflow.rs，serde default）；Project::start 和 CLI context 预览赋值；handoff::workspace_line 在 packet 的 since=None 路径、memory_body 之后 rules 之前追加；claude_stage_args 增加 notes 参数，按文件输出 --allowedTools Read(/<file>)，不加 --add-dir；补 handoff 与 claude 参数单测",
+      "paths": [
+        "src/workflow.rs",
+        "src/handoff.rs",
+        "src/workflow_stage.rs",
+        "src/project_cli.rs"
+      ],
+      "criteria": [
+        "AC-7",
+        "R12",
+        "R13",
+        "R14",
+        "E11",
+        "E12"
+      ],
+      "check": [
+        "cargo test --locked --lib handoff",
+        "cargo test --locked --bin aep claude_allowed_tools",
+        "cargo test --locked --test stage_token_diet"
+      ]
+    },
+    {
+      "id": "T3",
+      "title": "CLI：project create / add-repo 增加 --all 和 --depth（1–4，clap 校验）；expand() 按 design §6 处理五种结果；不带 --all 时把列表和提示作为错误输出（stderr，退出码 1）；add-repo 工作区情况输出 added/existing/workspace_root/note，选中事项时 include；root() 失败改用 folder::unreadable；新建 tests/workspace_folder.rs 集成测试",
+      "paths": [
+        "src/project_cli.rs",
+        "tests"
+      ],
+      "criteria": [
+        "AC-9",
+        "AC-3",
+        "R15",
+        "R16",
+        "R17",
+        "R10"
+      ],
+      "check": [
+        "cargo test --locked --test workspace_folder",
+        "cargo test --locked --test project_handoff"
+      ]
+    },
+    {
+      "id": "T4",
+      "title": "Studio 后端：api.rs 新增 resolve_folder、add_repositories，create_project 增加可选 workspace_root（先全部校验、一次 change 写入，错误点名仓库），repository() 失败改用 folder::unreadable，snapshot 项目增加 workspace{root,exists,notes}；lib.rs 新增 resolveFolder、addRepositories 命令，createProject 加 workspaceRoot 可选参数并注册；tests/api.rs 补 design §10 的 Studio 后端用例和 AC-10 多仓库事项回归",
+      "paths": [
+        "studio/src-tauri/src/api.rs",
+        "studio/src-tauri/src/lib.rs",
+        "studio/src-tauri/tests/api.rs"
+      ],
+      "criteria": [
+        "AC-1",
+        "AC-2",
+        "AC-3",
+        "AC-5",
+        "AC-10",
+        "E14",
+        "R18"
+      ],
+      "check": [
+        "cd studio/src-tauri && cargo test --test api"
+      ]
+    },
+    {
+      "id": "T5",
+      "title": "Studio 前端：types.ts、client.ts 增加 FolderResolved、resolveFolder、addRepositories、createProject.workspaceRoot、ProjectSummary.workspace；mock.ts 按 interaction §8 提供样例；新建 components/FolderScan.tsx；NewProjectDialog 实现清单区、错误行、导入区（并发 3、折叠、汇总）、按钮状态；ReposPage 实现添加清单、工作区卡片、重新扫描；两处 pickFolder 提示语改写；app.css 增加清单样式",
+      "paths": [
+        "studio/src/api/types.ts",
+        "studio/src/api/client.ts",
+        "studio/src/api/mock.ts",
+        "studio/src/components",
+        "studio/src/components/Dialogs.tsx",
+        "studio/src/components/SecondaryPages.tsx",
+        "studio/src/styles/app.css"
+      ],
+      "criteria": [
+        "AC-1",
+        "AC-2",
+        "AC-3",
+        "AC-4",
+        "AC-5",
+        "E15"
+      ],
+      "check": [
+        "cd studio && npm run build"
+      ]
+    },
+    {
+      "id": "T6",
+      "title": "UI 测试与整体验证：新建 studio/tests/workspace-folder.spec.ts 覆盖 AC-1–AC-5 和「再查一层」并截图（截图写到执行档案 evidence/）；跑全部 cargo 测试、Studio cargo 测试、npm run build、Playwright 全量，结果写在答复里",
+      "paths": [
+        "studio/tests"
+      ],
+      "criteria": [
+        "AC-1",
+        "AC-2",
+        "AC-3",
+        "AC-4",
+        "AC-5",
+        "AC-12"
+      ],
+      "check": [
+        "cargo test --locked",
+        "cd studio/src-tauri && cargo test",
+        "cd studio && npm run build && npx playwright test"
+      ]
+    }
+  ]
+}
