@@ -1,9 +1,11 @@
 pub mod archive;
 pub mod branches;
 pub mod directory;
+pub mod forge;
 pub mod import;
 pub mod merge;
 pub mod remote;
+pub mod secret;
 pub mod shelf;
 pub mod timeline;
 pub mod transfer;
