@@ -1044,6 +1044,88 @@ fn claude_result(stdout: &Path) -> Result<Value> {
     last.context("Claude 未生成最终答复")
 }
 
+/// Returns the refused file writes and the evidence for every permission denial.
+fn denials(v: &Value) -> (Vec<String>, Vec<Value>) {
+    let mut refused = Vec::new();
+    let mut all = Vec::new();
+    for denial in v["permission_denials"].as_array().into_iter().flatten() {
+        let tool = denial["tool_name"].as_str();
+        let input = &denial["tool_input"];
+        let path = input["file_path"]
+            .as_str()
+            .or_else(|| input["notebook_path"].as_str());
+        if let Some(tool @ ("Edit" | "Write" | "MultiEdit" | "NotebookEdit")) = tool {
+            refused.push(
+                path.map(str::to_owned)
+                    .unwrap_or_else(|| format!("{tool}（无路径）")),
+            );
+        }
+        let target = path
+            .or_else(|| input["command"].as_str())
+            .or_else(|| input["path"].as_str());
+        all.push(json!({"tool": tool, "target": target}));
+    }
+    (refused, all)
+}
+
+fn record_claude_denials(v: &Value, write: bool, record: &mut Value) -> Result<()> {
+    let (refused, all) = denials(v);
+    record["denied_bash"] = json!(all.iter().filter(|d| d["tool"] == "Bash").count());
+    record["permission_denials"] = json!(all);
+    ensure!(
+        !write || refused.is_empty(),
+        "Claude 的文件写入被拒绝 {} 次，本阶段没有完成：{}",
+        refused.len(),
+        refused.join("，")
+    );
+    Ok(())
+}
+
+fn claude_stage_args(
+    args: &mut Vec<String>,
+    dir: &Path,
+    receipt: Option<&Path>,
+    sandbox: Sandbox,
+    write: bool,
+) {
+    if let Some(parent) = receipt.and_then(Path::parent) {
+        args.extend(["--add-dir".into(), parent.display().to_string()]);
+    }
+    args.extend(["--add-dir".into(), dir.display().to_string()]);
+    // The hand-off points at earlier runs. Claude's absolute Read rules start with "//".
+    if let Some(runs) = dir.parent() {
+        args.extend([
+            "--allowedTools".into(),
+            format!("Read(/{}/**)", runs.display()),
+        ]);
+    }
+    args.extend(
+        [
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            match sandbox {
+                Sandbox::Full => "bypassPermissions",
+                _ if write => "acceptEdits",
+                _ => "default",
+            },
+            "--tools",
+            if write {
+                "Read,Grep,Glob,Edit,Write,Bash"
+            } else {
+                "Read,Grep,Glob,Bash"
+            },
+        ]
+        .map(String::from),
+    );
+    if sandbox == Sandbox::Network {
+        // Print mode cannot ask for approval; let the stage run its test commands.
+        args.extend(["--allowedTools".into(), "Bash".into()]);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn invoke(
     req: &Request,
@@ -1118,36 +1200,7 @@ fn invoke(
             args.push(result_path.display().to_string());
         }
         Client::Claude => {
-            if let Some(parent) = receipt.as_ref().and_then(|p| p.parent()) {
-                args.extend(["--add-dir".into(), parent.display().to_string()]);
-            }
-            // The prompt points at request.json and earlier runs in the attempt folder.
-            args.extend(["--add-dir".into(), dir.display().to_string()]);
-            args.extend(
-                [
-                    "-p",
-                    "--output-format",
-                    "stream-json",
-                    "--verbose",
-                    "--permission-mode",
-                    match req.sandbox {
-                        Sandbox::Full => "bypassPermissions",
-                        _ if write => "acceptEdits",
-                        _ => "default",
-                    },
-                    "--tools",
-                    if write {
-                        "Read,Grep,Glob,Edit,Write,Bash"
-                    } else {
-                        "Read,Grep,Glob,Bash"
-                    },
-                ]
-                .map(String::from),
-            );
-            if req.sandbox == Sandbox::Network {
-                // Print mode cannot ask for approval; let the stage run its test commands.
-                args.extend(["--allowedTools".into(), "Bash".into()]);
-            }
+            claude_stage_args(&mut args, dir, receipt.as_deref(), req.sandbox, write);
             // No user MCP, settings, skills or auto memory: the stage starts from the project.
             let launch = aep::launch::claude_minimal(&bin, &profile.model);
             args.extend(launch.args.iter().cloned());
@@ -1288,6 +1341,17 @@ fn invoke(
         record["session"] = json!(session);
     }
 
+    // A result event can carry denials even when Claude exits with an error.
+    let claude = (profile.client == Client::Claude).then(|| claude_result(&stdout));
+    if let Some(Ok(v)) = &claude {
+        if !v["session_id"].is_null() {
+            record["session"] = v["session_id"].clone();
+        }
+        if let Some(usage) = v["modelUsage"].as_object() {
+            record["reported_models"] = json!(usage.keys().collect::<Vec<_>>());
+        }
+        record_claude_denials(v, write, record)?;
+    }
     if code != 0 {
         // The CLI's own account of the failure beats stderr noise (e.g. MCP login warnings).
         let reported = fs::read_to_string(&stdout)
@@ -1304,40 +1368,17 @@ fn invoke(
             }
         );
     }
-    let result = match profile.client {
-        Client::Codex => fs::read_to_string(&result_path).context("Codex 未生成最终答复")?,
-        Client::Claude => {
-            let v = claude_result(&stdout)?;
-            record["session"] = v["session_id"].clone();
-            if let Some(usage) = v["modelUsage"].as_object() {
-                record["reported_models"] = json!(usage.keys().collect::<Vec<_>>());
-            }
+    let result = match claude {
+        Some(result) => {
+            let v = result?;
             let s = v["result"].as_str().context("Claude 未生成最终答复")?;
             ensure!(v["is_error"] != true, "Claude: {s}");
-            // A stage whose file writes were refused did not do its job, whatever it says.
-            if write {
-                let refused: Vec<String> = v["permission_denials"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|d| {
-                        matches!(
-                            d["tool_name"].as_str(),
-                            Some("Edit" | "Write" | "MultiEdit" | "NotebookEdit")
-                        )
-                    })
-                    .filter_map(|d| d["tool_input"]["file_path"].as_str().map(str::to_owned))
-                    .collect();
-                ensure!(
-                    refused.is_empty(),
-                    "Claude 的文件写入被拒绝 {} 次，本阶段没有完成：{}",
-                    refused.len(),
-                    refused.join("，")
-                );
-            }
             s.into()
         }
-        _ => fs::read_to_string(stdout)?,
+        None if profile.client == Client::Codex => {
+            fs::read_to_string(&result_path).context("Codex 未生成最终答复")?
+        }
+        None => fs::read_to_string(stdout)?,
     };
     ensure!(!result.trim().is_empty(), "CLI 返回空结果");
     fs::write(&result_path, &result)?;
@@ -1797,6 +1838,125 @@ mod tests {
         resume_failed(&mut record, &anyhow::anyhow!("resume failed"));
         assert_eq!(record["fresh_session_reason"], "session_unavailable");
         assert!(record["session"].is_null());
+    }
+
+    #[test]
+    fn claude_denials_fail_write_stages_and_keep_evidence() {
+        let result = json!({"permission_denials": [
+            {"tool_name": "Write", "tool_input": {"file_path": "/tmp/probe/x.md"}},
+            {"tool_name": "Bash", "tool_input": {"command": "mkdir /tmp/probe"}},
+        ]});
+        let mut record = json!({});
+        let error = record_claude_denials(&result, true, &mut record).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Claude 的文件写入被拒绝 1 次，本阶段没有完成：/tmp/probe/x.md"
+        );
+        let expected = json!({
+            "permission_denials": [
+                {"tool": "Write", "target": "/tmp/probe/x.md"},
+                {"tool": "Bash", "target": "mkdir /tmp/probe"},
+            ],
+            "denied_bash": 1,
+        });
+        assert_eq!(record, expected);
+
+        let mut read_only = json!({});
+        record_claude_denials(&result, false, &mut read_only).unwrap();
+        assert_eq!(read_only, expected);
+    }
+
+    #[test]
+    fn claude_denials_include_notebooks_and_writes_without_paths() {
+        let result = json!({"permission_denials": [
+            {"tool_name": "NotebookEdit", "tool_input": {"notebook_path": "/tmp/probe.ipynb"}},
+            {"tool_name": "Edit", "tool_input": {"file_path": "/tmp/edit", "notebook_path": "/tmp/other"}},
+            {"tool_name": "MultiEdit", "tool_input": {"file_path": null}},
+            {"tool_name": "Write"},
+        ]});
+        let (refused, all) = denials(&result);
+        assert_eq!(
+            refused,
+            [
+                "/tmp/probe.ipynb",
+                "/tmp/edit",
+                "MultiEdit（无路径）",
+                "Write（无路径）"
+            ]
+        );
+        assert_eq!(
+            all,
+            [
+                json!({"tool": "NotebookEdit", "target": "/tmp/probe.ipynb"}),
+                json!({"tool": "Edit", "target": "/tmp/edit"}),
+                json!({"tool": "MultiEdit", "target": null}),
+                json!({"tool": "Write", "target": null}),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_denials_record_bash_and_other_tools_without_failing() {
+        let result = json!({"permission_denials": [
+            {"tool_name": "Bash", "tool_input": {"command": "ls /tmp", "path": "/other"}},
+            {"tool_name": "Read", "tool_input": {"path": "/tmp/probe"}},
+            {"tool_name": "Bash"},
+        ]});
+        let mut record = json!({});
+        record_claude_denials(&result, true, &mut record).unwrap();
+        assert_eq!(record["denied_bash"], 2);
+        assert_eq!(
+            record["permission_denials"],
+            json!([
+                {"tool": "Bash", "target": "ls /tmp"},
+                {"tool": "Read", "target": "/tmp/probe"},
+                {"tool": "Bash", "target": null},
+            ])
+        );
+    }
+
+    #[test]
+    fn claude_denials_allow_missing_or_null_denials() {
+        for result in [json!({}), json!({"permission_denials": null})] {
+            let mut record = json!({});
+            record_claude_denials(&result, true, &mut record).unwrap();
+            assert_eq!(record, json!({"permission_denials": [], "denied_bash": 0}));
+        }
+    }
+
+    #[test]
+    fn claude_allowed_tools_scopes_read_to_runs_with_spaces() {
+        let dir = Path::new("/home/user/Application Support/AEP Studio/runs/current");
+        let receipt = dir.join("inputs/source-evidence.json");
+        let mut args = Vec::new();
+        claude_stage_args(&mut args, dir, Some(&receipt), Sandbox::Standard, true);
+
+        assert_eq!(
+            &args[..6],
+            [
+                "--add-dir",
+                "/home/user/Application Support/AEP Studio/runs/current/inputs",
+                "--add-dir",
+                "/home/user/Application Support/AEP Studio/runs/current",
+                "--allowedTools",
+                "Read(//home/user/Application Support/AEP Studio/runs/**)",
+            ]
+        );
+        assert!(!args[6..].iter().any(|arg| arg == "--add-dir"));
+    }
+
+    #[test]
+    fn claude_allowed_tools_keeps_network_bash_authorization() {
+        let dir = Path::new("/work/runs/current");
+        let mut args = Vec::new();
+        claude_stage_args(&mut args, dir, None, Sandbox::Network, false);
+
+        let allowed: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--allowedTools")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(allowed, ["Read(//work/runs/**)", "Bash"]);
     }
 
     #[test]
