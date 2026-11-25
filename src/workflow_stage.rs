@@ -1081,6 +1081,51 @@ fn record_claude_denials(v: &Value, write: bool, record: &mut Value) -> Result<(
     Ok(())
 }
 
+fn claude_stage_args(
+    args: &mut Vec<String>,
+    dir: &Path,
+    receipt: Option<&Path>,
+    sandbox: Sandbox,
+    write: bool,
+) {
+    if let Some(parent) = receipt.and_then(Path::parent) {
+        args.extend(["--add-dir".into(), parent.display().to_string()]);
+    }
+    args.extend(["--add-dir".into(), dir.display().to_string()]);
+    // The hand-off points at earlier runs. Claude's absolute Read rules start with "//".
+    if let Some(runs) = dir.parent() {
+        args.extend([
+            "--allowedTools".into(),
+            format!("Read(/{}/**)", runs.display()),
+        ]);
+    }
+    args.extend(
+        [
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            match sandbox {
+                Sandbox::Full => "bypassPermissions",
+                _ if write => "acceptEdits",
+                _ => "default",
+            },
+            "--tools",
+            if write {
+                "Read,Grep,Glob,Edit,Write,Bash"
+            } else {
+                "Read,Grep,Glob,Bash"
+            },
+        ]
+        .map(String::from),
+    );
+    if sandbox == Sandbox::Network {
+        // Print mode cannot ask for approval; let the stage run its test commands.
+        args.extend(["--allowedTools".into(), "Bash".into()]);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn invoke(
     req: &Request,
@@ -1155,36 +1200,7 @@ fn invoke(
             args.push(result_path.display().to_string());
         }
         Client::Claude => {
-            if let Some(parent) = receipt.as_ref().and_then(|p| p.parent()) {
-                args.extend(["--add-dir".into(), parent.display().to_string()]);
-            }
-            // The prompt points at request.json and earlier runs in the attempt folder.
-            args.extend(["--add-dir".into(), dir.display().to_string()]);
-            args.extend(
-                [
-                    "-p",
-                    "--output-format",
-                    "stream-json",
-                    "--verbose",
-                    "--permission-mode",
-                    match req.sandbox {
-                        Sandbox::Full => "bypassPermissions",
-                        _ if write => "acceptEdits",
-                        _ => "default",
-                    },
-                    "--tools",
-                    if write {
-                        "Read,Grep,Glob,Edit,Write,Bash"
-                    } else {
-                        "Read,Grep,Glob,Bash"
-                    },
-                ]
-                .map(String::from),
-            );
-            if req.sandbox == Sandbox::Network {
-                // Print mode cannot ask for approval; let the stage run its test commands.
-                args.extend(["--allowedTools".into(), "Bash".into()]);
-            }
+            claude_stage_args(&mut args, dir, receipt.as_deref(), req.sandbox, write);
             // No user MCP, settings, skills or auto memory: the stage starts from the project.
             let launch = aep::launch::claude_minimal(&bin, &profile.model);
             args.extend(launch.args.iter().cloned());
@@ -1906,6 +1922,41 @@ mod tests {
             record_claude_denials(&result, true, &mut record).unwrap();
             assert_eq!(record, json!({"permission_denials": [], "denied_bash": 0}));
         }
+    }
+
+    #[test]
+    fn claude_allowed_tools_scopes_read_to_runs_with_spaces() {
+        let dir = Path::new("/home/user/Application Support/AEP Studio/runs/current");
+        let receipt = dir.join("inputs/source-evidence.json");
+        let mut args = Vec::new();
+        claude_stage_args(&mut args, dir, Some(&receipt), Sandbox::Standard, true);
+
+        assert_eq!(
+            &args[..6],
+            [
+                "--add-dir",
+                "/home/user/Application Support/AEP Studio/runs/current/inputs",
+                "--add-dir",
+                "/home/user/Application Support/AEP Studio/runs/current",
+                "--allowedTools",
+                "Read(//home/user/Application Support/AEP Studio/runs/**)",
+            ]
+        );
+        assert!(!args[6..].iter().any(|arg| arg == "--add-dir"));
+    }
+
+    #[test]
+    fn claude_allowed_tools_keeps_network_bash_authorization() {
+        let dir = Path::new("/work/runs/current");
+        let mut args = Vec::new();
+        claude_stage_args(&mut args, dir, None, Sandbox::Network, false);
+
+        let allowed: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--allowedTools")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(allowed, ["Read(//work/runs/**)", "Bash"]);
     }
 
     #[test]
