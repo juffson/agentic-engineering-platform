@@ -1,0 +1,160 @@
+{
+  "Game": [
+    {
+      "brief": "冻结玩家行为、目标平台和地区，给正常路径、异常路径及验收标准编号。",
+      "default_cli": "Claude",
+      "default_sandbox": "Standard",
+      "name": "玩法需求",
+      "role": "Plan",
+      "skippable": false
+    },
+    {
+      "brief": "按数值表、场景与 LFS 资源、客户端、协议、服务端及打包拆分受影响的工作包。",
+      "default_cli": "Claude",
+      "default_sandbox": "Standard",
+      "name": "影响分析",
+      "role": "Plan",
+      "skippable": true
+    },
+    {
+      "brief": "实际检查引擎和导出模板、LFS、数据及设备可用性，列出缺失能力及所需人工证据。",
+      "default_cli": "Codex",
+      "default_sandbox": "Network",
+      "name": "环境预检",
+      "role": "Test",
+      "skippable": false
+    },
+    {
+      "brief": "在事项工作区完成涉及的玩法、资源或服务端工作包，保留可复核的变更。",
+      "default_cli": "Codex",
+      "default_sandbox": "Standard",
+      "name": "游戏实现",
+      "role": "Build",
+      "skippable": false
+    },
+    {
+      "brief": "运行静态检查，再验证适用的场景、玩法、设备或构建，记录命令和运行证据。",
+      "default_cli": "Codex",
+      "default_sandbox": "Network",
+      "name": "运行验证",
+      "role": "Test",
+      "skippable": false
+    },
+    {
+      "brief": "逐条核对冻结的 AC，将结果标为通过、失败、阻塞或不适用，注明证据和不适用原因。",
+      "default_cli": "Claude",
+      "default_sandbox": "Network",
+      "name": "玩家验收",
+      "role": "Accept",
+      "skippable": false
+    },
+    {
+      "brief": "核对版本、平台、构建回执与设备证据，汇总人工交付步骤及剩余风险。",
+      "default_cli": "Codex",
+      "default_sandbox": "Standard",
+      "name": "交付归档",
+      "role": "Deliver",
+      "skippable": false
+    }
+  ],
+  "Legacy": [
+    {
+      "brief": "记录用户目标、范围和验收标准",
+      "default_cli": "Claude",
+      "default_sandbox": "Standard",
+      "name": "需求定义",
+      "role": "Plan",
+      "skippable": false
+    },
+    {
+      "brief": "记录技术方案、涉及仓库和接口约定",
+      "default_cli": "Claude",
+      "default_sandbox": "Standard",
+      "name": "方案设计",
+      "role": "Plan",
+      "skippable": true
+    },
+    {
+      "brief": "跟进各仓库的实现任务和代码变更",
+      "default_cli": "Codex",
+      "default_sandbox": "Standard",
+      "name": "开发实现",
+      "role": "Build",
+      "skippable": false
+    },
+    {
+      "brief": "核对验收结果、审查意见和遗留问题",
+      "default_cli": "Codex",
+      "default_sandbox": "Network",
+      "name": "测试审查",
+      "role": "Test",
+      "skippable": false
+    },
+    {
+      "brief": "记录发布版本、交付范围和证据位置",
+      "default_cli": "Codex",
+      "default_sandbox": "Standard",
+      "name": "发布归档",
+      "role": "Deliver",
+      "skippable": false
+    }
+  ],
+  "Software": [
+    {
+      "brief": "整理 PRD，给用户场景、范围、边界情况和可验证的验收标准编号。",
+      "default_cli": "Claude",
+      "default_sandbox": "Standard",
+      "name": "产品需求",
+      "role": "Plan",
+      "skippable": false
+    },
+    {
+      "brief": "依据 PRD 描述用户路径、界面布局和交互状态，覆盖空数据、加载和失败。无界面改动时记录原因。",
+      "default_cli": "Claude",
+      "default_sandbox": "Standard",
+      "name": "交互设计",
+      "role": "Plan",
+      "skippable": true
+    },
+    {
+      "brief": "明确仓库边界、接口、数据、变更文件、兼容性与可执行的测试计划。",
+      "default_cli": "Claude",
+      "default_sandbox": "Standard",
+      "name": "技术方案",
+      "role": "Plan",
+      "skippable": true
+    },
+    {
+      "brief": "在事项工作区实现已确认的方案，记录变更文件和验证命令。",
+      "default_cli": "Codex",
+      "default_sandbox": "Standard",
+      "name": "开发实现",
+      "role": "Build",
+      "skippable": false
+    },
+    {
+      "brief": "运行相关测试，逐项核对验收标准，提供实际命令、结果及失败原因。",
+      "default_cli": "Codex",
+      "default_sandbox": "Network",
+      "name": "测试验证",
+      "role": "Test",
+      "skippable": false
+    },
+    {
+      "brief": "独立检查实际变更及测试证据，逐项标注通过、失败或阻塞；缺少必要证据时给出阻塞。",
+      "default_cli": "Claude",
+      "default_sandbox": "Network",
+      "name": "独立验收",
+      "role": "Accept",
+      "skippable": false
+    },
+    {
+      "brief": "汇总版本、变更范围、验收证据、遗留问题和人工交付步骤。",
+      "default_cli": "Codex",
+      "default_sandbox": "Standard",
+      "name": "交付归档",
+      "role": "Deliver",
+      "skippable": false
+    }
+  ]
+}
