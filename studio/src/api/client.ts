@@ -28,24 +28,24 @@ function loadMock(): Promise<Api> {
   return mockApi;
 }
 
-async function call(name: keyof Api, args: unknown): Promise<unknown> {
+async function call<K extends keyof Api>(name: K, args: Args<K>): Promise<Result<K>> {
   try {
     if (inTauri) {
-      return await invoke(name, (args ?? {}) as Record<string, unknown>);
+      return await invoke<Result<K>>(name, (args[0] ?? {}) as Record<string, unknown>);
     }
     const mock = await loadMock();
     // A small delay keeps loading states honest in the browser preview.
     await new Promise((resolve) => setTimeout(resolve, name === "zcodeModels" ? 900 : 40));
-    const fn = mock[name] as (a: unknown) => unknown;
-    return fn.call(mock, args);
+    const fn = mock[name] as (...params: Args<K>) => Result<K>;
+    return fn.apply(mock, args);
   } catch (error) {
     throw message(error);
   }
 }
 
 export const api = new Proxy({} as AsyncApi, {
-  get(_target, name: string) {
-    return (args?: unknown) => call(name as keyof Api, args);
+  get(_target, name: keyof Api) {
+    return (...args: Args<typeof name>) => call(name, args);
   },
 });
 

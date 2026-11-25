@@ -4,8 +4,37 @@
 export type Client = "Codex" | "Claude" | "ZCode" | "Custom";
 export type Sandbox = "Standard" | "Network" | "Full";
 export type Role = "Plan" | "Build" | "Test" | "Accept" | "Deliver";
-export type Template = "Software" | "Game" | "Legacy";
+export type FlowId = string;
+export type Template = FlowId;
 export type Group = "active" | "delivered" | "shelved";
+
+export interface FlowStage {
+  name: string;
+  brief: string;
+  role: Role;
+  skippable: boolean;
+  back_to: string[];
+}
+
+export interface FlowInput {
+  id?: FlowId;
+  label: string;
+  stages: FlowStage[];
+}
+
+export interface FlowDef extends FlowInput {
+  id: FlowId;
+  builtin: boolean;
+  in_use: number;
+  revision: number;
+  warnings: string[];
+}
+
+export interface RouteBackRejected {
+  name: string;
+  question: string;
+  allowed: string[];
+}
 /** Evidence status of an attempt as written by the runner. */
 export type RunStatus =
   | "initializing"
@@ -192,6 +221,7 @@ export interface WorkSummary {
   status: RunStatus;
   running: boolean; // an agent is running for this item
   autopilot: boolean; // autopilot is running for this item
+  flow_error: boolean;
 }
 
 export interface ProjectSummary {
@@ -199,6 +229,8 @@ export interface ProjectSummary {
   name: string;
   repositories: string[];
   work: WorkSummary[]; // newest first
+  flows: FlowDef[];
+  broken_flows: { id: FlowId | null; label: string | null; error: string }[];
 }
 
 export interface Snapshot {
@@ -224,6 +256,7 @@ export interface AttemptSummary {
   subtask: string | null; // e.g. "T2 表头"
   error: string | null;
   route_back: { stage: number; name: string; question: string } | null;
+  route_back_rejected: RouteBackRejected | null;
   committed: boolean; // platform committed worktree changes after this run
   head_sha: string | null;
   tokens: number; // total tokens this attempt used
@@ -289,6 +322,13 @@ export interface WorkDetail {
   kind: "Feature" | "Release";
   template: Template;
   template_label: string;
+  flow: {
+    id: FlowId;
+    label: string;
+    builtin: boolean;
+    source_state: "same" | "changed" | "deleted" | null;
+  } | null;
+  flow_error: string | null;
   stage: number;
   delivered: boolean;
   shelved: { at: string; memory: number | null } | null;
@@ -485,7 +525,8 @@ export interface DraftItem {
   name: string;
   release: boolean;
   template: Template;
-  brief: string; // 产品需求 note
+  fallback_from?: FlowId | null;
+  brief: string; // first stage's note
 }
 
 /** The latest work-item draft job of a project. */
@@ -505,6 +546,9 @@ export interface Api {
   selectWork(a: { project: string; work: string }): void;
   createProject(a: { name: string; repositories: string[] }): string; // new project id
   addRepository(a: { project: string; path: string }): void;
+  saveFlow(a: { project: string; flow: FlowInput }): { id: FlowId; warnings: string[] };
+  copyFlow(a: { project: string; id: FlowId; label?: string }): FlowId;
+  deleteFlow(a: { project: string; id: FlowId }): number; // number of unarchived items using the flow
   createWork(a: {
     project: string;
     name: string;

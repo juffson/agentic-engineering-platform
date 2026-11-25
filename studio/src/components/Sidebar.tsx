@@ -83,7 +83,8 @@ function WorkRow({ item, active, onSelect }: { item: WorkSummary; active: boolea
   const failed = item.status === "failed";
   const delivered = item.group !== "active";
   const done = Math.min(item.stage, item.stage_count);
-  const dot = item.running || isLive(item.status) ? "running" : failed ? "failed" : null;
+  const dot = item.flow_error ? "failed" : item.running || isLive(item.status) ? "running" : failed ? "failed" : null;
+  const dotLabel = item.flow_error ? "流程无法读取" : dot === "running" ? "运行中" : "失败";
   return (
     <button type="button" className={`work-row${active ? " on" : ""}`} onClick={onSelect} aria-current={active ? "true" : undefined} data-work={item.id}>
       <span className="work-row-top">
@@ -91,19 +92,19 @@ function WorkRow({ item, active, onSelect }: { item: WorkSummary; active: boolea
           {item.name}
         </span>
         {item.autopilot && <span className="tag tag-auto">自动</span>}
-        {dot && <span className={`dot dot-${dot}`} aria-label={dot === "running" ? "运行中" : "失败"} />}
+        {dot && <span className={`dot dot-${dot}`} aria-label={dotLabel} title={dotLabel} />}
       </span>
       <span className="work-row-bottom">
-        <span className="seg-bar" aria-hidden>
+        {!item.flow_error && <span className="seg-bar" aria-hidden>
           {Array.from({ length: item.stage_count }, (_, i) => (
             <span
               key={i}
               className={i < done ? "seg done" : i === done && !delivered ? `seg cur${failed ? " fail" : ""}` : "seg"}
             />
           ))}
-        </span>
+        </span>}
         <span className="work-stage">
-          {delivered ? item.stage_name : `${done + 1}/${item.stage_count} · ${item.stage_name}`}
+          {delivered || item.flow_error ? item.stage_name : `${done + 1}/${item.stage_count} · ${item.stage_name}`}
         </span>
       </span>
     </button>

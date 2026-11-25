@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, CornerUpLeft, GitBranch, Square, X, Zap } from "lucide-react";
+import { AlertTriangle, Check, CornerUpLeft, GitBranch, Square, X, Zap } from "lucide-react";
 import type { AttemptView, ItemHandoff, WorkDetail } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio, usePoll } from "../state/store";
@@ -127,37 +127,59 @@ export function WorkPage({ project, work }: { project: string; work: string }) {
   return (
     <div className="work-page">
       <WorkHeader detail={detail} onAutopilot={() => setDrawer(true)} tab={tab} onTab={setTab} received={handoffs?.length ?? 0} />
-      <Pipeline
-        detail={detail}
-        viewIndex={tab === "stages" ? viewIndex : -1}
-        onView={(i) => {
-          setTab("stages");
-          setViewed(i === detail.stage ? null : i);
-        }}
-      />
+      {!detail.flow_error && (
+        <Pipeline
+          detail={detail}
+          viewIndex={tab === "stages" ? viewIndex : -1}
+          onView={(i) => {
+            setTab("stages");
+            setViewed(i === detail.stage ? null : i);
+          }}
+        />
+      )}
       {tab === "history" ? (
         <HistoryView detail={detail} handoffs={handoffs} onHandoffSent={() => setHandoffRev((r) => r + 1)} />
+      ) : detail.flow_error ? (
+        <section className="card work-flow-error" role="alert">
+          <AlertTriangle size={16} />
+          <div>
+            <p className="card-title">这个事项的流程数据无法读取：{detail.flow_error}</p>
+            <p className="muted">事项的执行记录和工作区不受影响。</p>
+          </div>
+        </section>
       ) : (
         <>
-      {!isCurrent && current && !detail.delivered && (
-        <div className="view-banner">
-          <span>
-            正在查看{stage.state === "done" ? "已完成的" : stage.state === "skipped" ? "已跳过的" : "后续的"}「{stage.name}」
-          </span>
-          <button type="button" className="link-btn" onClick={() => setViewed(null)}>
-            回到当前阶段「{current.name}」
-          </button>
-        </div>
-      )}
-      <div className={`work-body${detail.delivered && !detail.shelved ? " wide" : ""}`}>
-        {stage ? <Session detail={detail} stage={stage} views={views} isCurrent={isCurrent} /> : <div />}
-        <DecisionPanel detail={detail} viewed={stage} />
-      </div>
+          {!isCurrent && current && stage && !detail.delivered && (
+            <div className="view-banner">
+              <span>
+                正在查看{stage.state === "done" ? "已完成的" : stage.state === "skipped" ? "已跳过的" : "后续的"}「{stage.name}」
+              </span>
+              <button type="button" className="link-btn" onClick={() => setViewed(null)}>
+                回到当前阶段「{current.name}」
+              </button>
+            </div>
+          )}
+          <div className={`work-body${detail.delivered && !detail.shelved ? " wide" : ""}`}>
+            {stage ? <Session detail={detail} stage={stage} views={views} isCurrent={isCurrent} /> : <div />}
+            <DecisionPanel detail={detail} viewed={stage} />
+          </div>
         </>
       )}
-      {drawer && <AutopilotDrawer detail={detail} onClose={() => setDrawer(false)} />}
+      {drawer && !detail.flow_error && <AutopilotDrawer detail={detail} onClose={() => setDrawer(false)} />}
     </div>
   );
+}
+
+function flowTitle(detail: WorkDetail): string | undefined {
+  const { flow } = detail;
+  if (!flow) return undefined;
+  const count = `${detail.stages.length} 个阶段`;
+  if (flow.builtin) return `内置流程 · ${count}`;
+  if (flow.source_state === "changed" || flow.source_state === "deleted") {
+    const change = flow.source_state === "changed" ? "之后已修改" : "已删除";
+    return `按创建时的流程推进（${count}）；项目里的「${flow.label}」${change}`;
+  }
+  return `本项目流程 · ${count}`;
 }
 
 function WorkHeader({
@@ -185,7 +207,7 @@ function WorkHeader({
         <h1 title={detail.name}>{detail.name}</h1>
         <div className="work-meta">
           <span className="tag">{detail.kind === "Release" ? "发布" : "功能"}</span>
-          <span className="meta-text">{detail.template_label}</span>
+          <span className="meta-text" title={flowTitle(detail)}>{detail.flow?.label ?? detail.template_label}</span>
           {detail.branch && (
             <button
               type="button"
@@ -228,7 +250,7 @@ function WorkHeader({
               </Button>
             </div>
           ) : (
-            <Button variant="secondary" icon={<Zap size={14} />} onClick={onAutopilot}>
+            <Button variant="secondary" icon={<Zap size={14} />} onClick={onAutopilot} disabled={!!detail.flow_error}>
               自动运行…
             </Button>
           ))}

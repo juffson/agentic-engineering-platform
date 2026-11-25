@@ -13,6 +13,9 @@ import type {
   AttemptView,
   Client,
   Entry,
+  FlowDef,
+  FlowId,
+  FlowStage,
   MemoryNote,
   MergePreview,
   Profile,
@@ -21,7 +24,6 @@ import type {
   Sandbox,
   Snapshot,
   StageDetail,
-  Template,
   WorkDetail,
   WorkHistory,
   HistoryNote,
@@ -38,43 +40,44 @@ import type {
   SessionPreview,
 } from "./types";
 import { parseTokens } from "../lib/format";
+import { BUILTIN_FLOW_LABELS, copyLabel, trimFlowText, validateFlow } from "../lib/flow";
 
-type StageDef = { name: string; role: Role; brief: string; skippable: boolean };
+function builtinFlow(id: keyof typeof BUILTIN_FLOW_LABELS, rows: [string, Role, string][]): FlowDef {
+  const stages: FlowStage[] = rows.map(([name, role, brief], i) => ({
+    name, role, brief, skippable: i > 0 && role === "Plan", back_to: [],
+  }));
+  const flow = { id, label: BUILTIN_FLOW_LABELS[id], stages };
+  return { ...flow, builtin: true, revision: 0, in_use: 0, warnings: validateFlow(flow, []).warnings.map((w) => w.message) };
+}
 
-const TEMPLATES: Record<Template, { label: string; stages: StageDef[] }> = {
-  Software: {
-    label: "软件开发",
-    stages: [
-      { name: "产品需求", role: "Plan", brief: "澄清目标用户、使用场景与验收标准，产出需求说明。", skippable: false },
-      { name: "交互设计", role: "Plan", brief: "给出界面结构、交互流程以及空态、错误态等边界状态。", skippable: true },
-      { name: "技术方案", role: "Plan", brief: "确定实现路径、数据结构、接口变更与主要风险。", skippable: false },
-      { name: "开发实现", role: "Build", brief: "按技术方案在事项工作区实现功能，并补充单元测试。", skippable: false },
-      { name: "测试验证", role: "Test", brief: "运行测试与检查命令；发现问题时退回负责的阶段。", skippable: false },
-      { name: "独立验收", role: "Accept", brief: "以使用者视角独立验收，逐条核对验收标准。", skippable: true },
-      { name: "交付归档", role: "Deliver", brief: "整理变更说明，提交改动并准备合并。", skippable: false },
-    ],
-  },
-  Game: {
-    label: "游戏开发",
-    stages: [
-      { name: "玩法设计", role: "Plan", brief: "明确核心玩法循环、数值框架与目标体验。", skippable: false },
-      { name: "技术方案", role: "Plan", brief: "确定引擎模块、资源管线与性能预算。", skippable: false },
-      { name: "开发实现", role: "Build", brief: "实现玩法与配套系统。", skippable: false },
-      { name: "试玩测试", role: "Test", brief: "自动化冒烟与试玩检查。", skippable: false },
-      { name: "交付归档", role: "Deliver", brief: "整理构建与变更说明。", skippable: false },
-    ],
-  },
-  Legacy: {
-    label: "存量改造",
-    stages: [
-      { name: "现状调研", role: "Plan", brief: "梳理现有代码路径、依赖与已知问题。", skippable: false },
-      { name: "改造方案", role: "Plan", brief: "给出渐进式改造步骤与回滚方案。", skippable: false },
-      { name: "开发实现", role: "Build", brief: "按步骤改造并保持行为一致。", skippable: false },
-      { name: "回归测试", role: "Test", brief: "全量回归，确认无行为变化。", skippable: false },
-      { name: "交付归档", role: "Deliver", brief: "整理变更说明，提交并准备合并。", skippable: false },
-    ],
-  },
+const BUILTIN_FLOWS = {
+  Software: builtinFlow("Software", [
+    ["产品需求", "Plan", "整理 PRD，给用户场景、范围、边界情况和可验证的验收标准编号。"],
+    ["交互设计", "Plan", "依据 PRD 描述用户路径、界面布局和交互状态，覆盖空数据、加载和失败。无界面改动时记录原因。"],
+    ["技术方案", "Plan", "明确仓库边界、接口、数据、变更文件、兼容性与可执行的测试计划。"],
+    ["开发实现", "Build", "在事项工作区实现已确认的方案，记录变更文件和验证命令。"],
+    ["测试验证", "Test", "运行相关测试，逐项核对验收标准，提供实际命令、结果及失败原因。"],
+    ["独立验收", "Accept", "独立检查实际变更及测试证据，逐项标注通过、失败或阻塞；缺少必要证据时给出阻塞。"],
+    ["交付归档", "Deliver", "汇总版本、变更范围、验收证据、遗留问题和人工交付步骤。"],
+  ]),
+  Game: builtinFlow("Game", [
+    ["玩法需求", "Plan", "冻结玩家行为、目标平台和地区，给正常路径、异常路径及验收标准编号。"],
+    ["影响分析", "Plan", "按数值表、场景与 LFS 资源、客户端、协议、服务端及打包拆分受影响的工作包。"],
+    ["环境预检", "Test", "实际检查引擎和导出模板、LFS、数据及设备可用性，列出缺失能力及所需人工证据。"],
+    ["游戏实现", "Build", "在事项工作区完成涉及的玩法、资源或服务端工作包，保留可复核的变更。"],
+    ["运行验证", "Test", "运行静态检查，再验证适用的场景、玩法、设备或构建，记录命令和运行证据。"],
+    ["玩家验收", "Accept", "逐条核对冻结的 AC，将结果标为通过、失败、阻塞或不适用，注明证据和不适用原因。"],
+    ["交付归档", "Deliver", "核对版本、平台、构建回执与设备证据，汇总人工交付步骤及剩余风险。"],
+  ]),
+  Legacy: builtinFlow("Legacy", [
+    ["需求定义", "Plan", "记录用户目标、范围和验收标准"],
+    ["方案设计", "Plan", "记录技术方案、涉及仓库和接口约定"],
+    ["开发实现", "Build", "跟进各仓库的实现任务和代码变更"],
+    ["测试审查", "Test", "核对验收结果、审查意见和遗留问题"],
+    ["发布归档", "Deliver", "记录发布版本、交付范围和证据位置"],
+  ]),
 };
+const BUILTIN_CHOICES = [BUILTIN_FLOWS.Software, BUILTIN_FLOWS.Game];
 
 const CLIENTS: Snapshot["clients"] = [
   { id: "Codex", label: "Codex", models: ["gpt-5-codex", "gpt-5", "o4-mini"] },
@@ -103,7 +106,7 @@ interface MockAttempt {
   script: Entry[];
   startMs: number;
   stepMs: number;
-  outcome: Pick<AttemptSummary, "status" | "error" | "route_back">;
+  outcome: Pick<AttemptSummary, "status" | "error" | "route_back"> & Partial<Pick<AttemptSummary, "route_back_rejected">>;
   tokens: [number, number];
   result: string | null;
   /** Tokens the run may use before it is stopped (what was left of the budgets). */
@@ -142,6 +145,8 @@ interface MockWork {
   createdMs: number;
   autopilotRan: Set<number>;
   autopilotLoops: number;
+  flowRevision: number;
+  historyStages?: StageDetail[];
   budgets?: Record<number, number>;
   budgetTotal?: number | null;
 }
@@ -178,7 +183,7 @@ function clone<T>(value: T): T {
 }
 
 class MockStore implements Api {
-  projects: { id: string; name: string; repositories: string[] }[] = [];
+  projects: Omit<ProjectSummary, "work">[] = [];
   works = new Map<string, MockWork>();
   order: string[] = []; // newest first
   attempts = new Map<string, MockAttempt>();
@@ -196,6 +201,16 @@ class MockStore implements Api {
 
   // ---------- helpers ----------
 
+  project(id: string) {
+    const project = this.projects.find((p) => p.id === id);
+    if (!project) throw new Error("项目不存在");
+    return project;
+  }
+
+  flowInUse(project: string, id: FlowId): number {
+    return [...this.works.values()].filter((w) => w.project === project && !w.detail.shelved && w.detail.flow?.id === id).length;
+  }
+
   work(project: string, work: string): MockWork {
     const w = this.works.get(work);
     if (!w || w.project !== project) throw new Error(`找不到事项 ${work}`);
@@ -203,6 +218,7 @@ class MockStore implements Api {
   }
 
   stage(w: MockWork, index: number): StageDetail {
+    if (w.detail.flow_error) throw new Error(`这个事项的流程数据无法读取：${w.detail.flow_error}`);
     const s = w.detail.stages[index];
     if (!s) throw new Error(`阶段 ${index + 1} 不存在`);
     return s;
@@ -280,6 +296,7 @@ class MockStore implements Api {
       subtask: opts.subtask ?? null,
       error: null,
       route_back: null,
+      route_back_rejected: null,
       committed: false,
       head_sha: null,
       tokens: 0,
@@ -329,6 +346,7 @@ class MockStore implements Api {
     s.status = attempt.outcome.status;
     s.error = attempt.outcome.error;
     s.route_back = attempt.outcome.route_back;
+    s.route_back_rejected = attempt.outcome.route_back_rejected ?? null;
     s.finished_at = iso(at);
     s.tokens = sumTokens(mockTokens(attempt));
     if (s.status === "succeeded") {
@@ -469,10 +487,11 @@ class MockStore implements Api {
       group,
       stage: d.stage,
       stage_count: d.stages.length,
-      stage_name: d.delivered ? "已交付" : stage?.name ?? "",
+      stage_name: d.flow_error ? "流程无法读取" : d.delivered ? "已交付" : stage?.name ?? "",
       status: latest?.status ?? "",
       running: d.running !== null,
       autopilot: d.autopilot.running,
+      flow_error: d.flow_error !== null,
     } as const;
   }
 
@@ -483,6 +502,9 @@ class MockStore implements Api {
     const projects: ProjectSummary[] = this.projects.map((p) => ({
       ...p,
       repositories: [...p.repositories],
+      flows: clone([...BUILTIN_CHOICES, ...[...p.flows].sort((a, b) => a.label.localeCompare(b.label, "zh-CN"))]
+        .map((flow) => ({ ...flow, in_use: this.flowInUse(p.id, flow.id) }))),
+      broken_flows: clone(p.broken_flows),
       work: this.order
         .map((id) => this.works.get(id)!)
         .filter((w) => w.project === p.id)
@@ -495,10 +517,10 @@ class MockStore implements Api {
       projects,
       clients: clone(CLIENTS),
       sandboxes: clone(SANDBOXES),
-      templates: (Object.keys(TEMPLATES) as Template[]).map((id) => ({
+      templates: BUILTIN_CHOICES.map(({ id, label, stages }) => ({
         id,
-        label: TEMPLATES[id].label,
-        stages: TEMPLATES[id].stages.map((s) => s.name),
+        label,
+        stages: stages.map((s) => s.name),
       })),
     };
   }
@@ -516,7 +538,7 @@ class MockStore implements Api {
   createProject({ name, repositories }: { name: string; repositories: string[] }) {
     if (!name.trim()) throw new Error("项目名称不能为空");
     const id = nextId("p");
-    this.projects.push({ id, name: name.trim(), repositories: repositories.filter(Boolean) });
+    this.projects.push({ id, name: name.trim(), repositories: repositories.filter(Boolean), flows: [], broken_flows: [] });
     this.memoryNotes.set(id, []);
     this.active = id;
     return id;
@@ -531,13 +553,58 @@ class MockStore implements Api {
     p.repositories.push(clean);
   }
 
-  createWork(a: { project: string; name: string; template: Template; release: boolean; repositories: string[] }): string {
-    if (!a.name.trim()) throw new Error("事项名称不能为空");
-    if (a.repositories.length === 0) throw new Error("至少选择一个仓库");
-    const w = newWork(a.project, a.name.trim(), a.template, a.release ? "Release" : "Feature", a.repositories, Date.now());
+  saveFlow({ project, flow }: Parameters<Api["saveFlow"]>[0]) {
+    const p = this.project(project);
+    if (Object.values(BUILTIN_FLOWS).some((f) => f.id === flow.id)) throw new Error("内置流程不能修改");
+    const existing = p.flows.findIndex((entry) => entry.id === flow.id);
+    if (flow.id && existing < 0) throw new Error("这套流程已被删除");
+    const label = trimFlowText(flow.label);
+    const stages = flow.stages.map((s) => ({
+      ...s,
+      name: trimFlowText(s.name),
+      skippable: s.skippable ?? false,
+      back_to: (s.back_to ?? []).map(trimFlowText),
+    }));
+    const taken = [...Object.values(BUILTIN_FLOW_LABELS), ...p.flows.filter((f) => f.id !== flow.id).map((f) => f.label)];
+    const issues = validateFlow({ label, stages }, taken);
+    if (issues.errors.length) throw new Error(issues.errors.map((e) => e.message).join("\n"));
+    const warnings = issues.warnings.map((w) => w.message);
+    const id = flow.id || `flow-${(seq++).toString(16).padStart(12, "0")}`;
+    const saved = { id, label, stages, builtin: false, in_use: 0, revision: (p.flows[existing]?.revision ?? 0) + 1, warnings };
+    if (existing < 0) p.flows.push(saved);
+    else p.flows[existing] = saved;
+    return { id, warnings: [...warnings] };
+  }
+
+  copyFlow({ project, id, label }: Parameters<Api["copyFlow"]>[0]): FlowId {
+    const p = this.project(project);
+    const source = [...Object.values(BUILTIN_FLOWS), ...p.flows].find((f) => f.id === id);
+    if (!source) throw new Error("这套流程已被删除");
+    const taken = [...Object.values(BUILTIN_FLOW_LABELS), ...p.flows.map((f) => f.label)];
+    return this.saveFlow({ project, flow: { label: label ?? copyLabel(source.label, taken), stages: source.stages } }).id;
+  }
+
+  deleteFlow({ project, id }: Parameters<Api["deleteFlow"]>[0]): number {
+    const p = this.project(project);
+    if (Object.values(BUILTIN_FLOWS).some((f) => f.id === id)) throw new Error("内置流程不能删除");
+    const remaining = p.flows.filter((f) => f.id !== id);
+    const broken = p.broken_flows.filter((f) => f.id !== id);
+    if (remaining.length === p.flows.length && broken.length === p.broken_flows.length) throw new Error("这套流程已被删除");
+    p.flows = remaining;
+    p.broken_flows = broken;
+    return this.flowInUse(project, id);
+  }
+
+  createWork(a: Parameters<Api["createWork"]>[0]): string {
+    const project = this.project(a.project);
+    if (!a.name.trim()) throw new Error("请填写事项名称");
+    const flow = [...Object.values(BUILTIN_FLOWS), ...project.flows].find((f) => f.id === a.template);
+    if (!flow) throw new Error(`流程「${a.template}」已被删除，请重新选择`);
+    const w = newWork(a.project, a.name.trim(), flow, a.release ? "Release" : "Feature", a.repositories, Date.now());
     this.works.set(w.detail.id, w);
     this.order.unshift(w.detail.id);
     this.selected.set(a.project, w.detail.id);
+    this.active = a.project;
     return w.detail.id;
   }
 
@@ -555,7 +622,11 @@ class MockStore implements Api {
       total_used: d.stages.reduce((n, st) => n + st.budget.used, 0),
       stage_default: fallback,
     };
-    return clone(d);
+    const flow = d.flow;
+    if (!flow || flow.builtin) return clone(d);
+    const source = this.project(project).flows.find((f) => f.id === flow.id);
+    const source_state = source ? (source.revision === w.flowRevision ? "same" : "changed") : "deleted";
+    return clone({ ...d, flow: { ...flow, source_state } });
   }
 
   projectBudget = new Map<string, number | null>();
@@ -960,13 +1031,14 @@ class MockStore implements Api {
     if (!id) throw new Error("找不到这个 git 工具");
   }
 
-  drafts = new Map<string, DraftStatus & { polls: number }>();
+  drafts = new Map<string, DraftStatus & { polls: number; flowId: FlowId }>();
 
   draftStart({ project, client, request }: { project: string; client: "Codex" | "Claude"; model: string; request: string; repository?: string }) {
     if (!request.trim()) throw new Error("请描述要做的事");
     if (this.drafts.get(project)?.status === "running") throw new Error("已有一次起草在进行");
+    const flowId = this.project(project).flows[0]?.id ?? "Software";
     const id = String(Date.now());
-    this.drafts.set(project, { id, status: "running", error: null, client, request, draft: null, polls: 0 });
+    this.drafts.set(project, { id, status: "running", error: null, client, request, draft: null, polls: 0, flowId });
     return id;
   }
 
@@ -978,12 +1050,12 @@ class MockStore implements Api {
       d.draft = {
         summary: "导出和表头是两件可以分开交付的事，拆成两个事项。",
         items: [
-          { name: "对账单 · 导出 CSV", release: false, template: "Software", brief: "目标：用户可把对账单导出为 CSV。范围：src/features/statement 下新增导出按钮与服务端接口；不做 Excel。验收：金额按分转元、UTF-8 BOM。" },
-          { name: "对账单 · 空账户表头", release: false, template: "Software", brief: "目标：空账户导出时也带表头。待确认：是否需要提示「无数据」。" },
+          { name: "对账单 · 导出 CSV", release: false, template: d.flowId, brief: "目标：用户可把对账单导出为 CSV。范围：src/features/statement 下新增导出按钮与服务端接口；不做 Excel。验收：金额按分转元、UTF-8 BOM。" },
+          { name: "对账单 · 空账户表头", release: false, template: "Software", fallback_from: "statement-export", brief: "目标：空账户导出时也带表头。待确认：是否需要提示「无数据」。" },
         ],
       };
     }
-    const { polls: _polls, ...status } = d;
+    const { polls: _polls, flowId: _flowId, ...status } = d;
     return clone(status);
   }
 
@@ -1267,13 +1339,15 @@ class MockStore implements Api {
 
   history({ project, work }: { project: string; work: string }): WorkHistory {
     this.tick();
-    const d = this.work(project, work).detail;
+    const w = this.work(project, work);
+    const d = w.detail;
+    const stages = w.historyStages ?? d.stages;
     const notes = this.memoryNotes.get(project) ?? [];
     const projectReads: HistoryNote[] = notes
       .filter((n) => !n.superseded)
       .slice(-2)
       .map((n) => ({ id: n.id, kind: n.kind === "convention" || n.kind === "delivery" ? "decision" : n.kind, body: n.body }));
-    const flat = d.stages
+    const flat = stages
       .flatMap((s) => s.attempts.map((a, i) => ({ s, a, i })))
       .sort((x, y) => Date.parse(x.a.started_at ?? "") - Date.parse(y.a.started_at ?? ""));
     let noteId = 100;
@@ -1292,9 +1366,9 @@ class MockStore implements Api {
       written.set(s.index, [...(written.get(s.index) ?? []), ...writes]);
       const first = !seen.has(s.index);
       seen.add(s.index);
-      const prev = [...d.stages.slice(0, s.index)].reverse().find((x) => x.state !== "skipped");
+      const prev = [...stages.slice(0, s.index)].reverse().find((x) => x.state !== "skipped");
       return {
-        run: `r-${a.id.slice(-6)}`,
+        run: a.id,
         stage: s.index,
         stage_name: s.name,
         status: a.status,
@@ -1517,9 +1591,8 @@ index 81c2d0e..b7a9e44 100644
 
 // ---------- seed ----------
 
-function newWork(project: string, name: string, template: Template, kind: "Feature" | "Release", repositories: string[], createdMs: number): MockWork {
+function newWork(project: string, name: string, flow: FlowDef, kind: "Feature" | "Release", repositories: string[], createdMs: number): MockWork {
   const id = nextId("w").padEnd(10, "0").slice(0, 10);
-  const def = TEMPLATES[template];
   const defaults: [Client, string][] = [
     ["Claude", "claude-opus-4-1"],
     ["Claude", "claude-sonnet-4-5"],
@@ -1529,7 +1602,7 @@ function newWork(project: string, name: string, template: Template, kind: "Featu
     ["Claude", "claude-sonnet-4-5"],
     ["Codex", ""],
   ];
-  const stages: StageDetail[] = def.stages.map((s, index) => {
+  const stages: StageDetail[] = flow.stages.map((s, index) => {
     const [client, model] = s.role === "Build" ? defaults[3] : s.role === "Test" ? defaults[4] : defaults[Math.min(index, defaults.length - 1)];
     return {
       index,
@@ -1554,13 +1627,16 @@ function newWork(project: string, name: string, template: Template, kind: "Featu
     createdMs,
     autopilotRan: new Set(),
     autopilotLoops: 0,
+    flowRevision: flow.revision,
     detail: {
       project,
       id,
       name,
       kind,
-      template,
-      template_label: def.label,
+      template: flow.builtin ? flow.id : "Software",
+      template_label: flow.label,
+      flow: { id: flow.id, label: flow.label, builtin: flow.builtin, source_state: flow.builtin ? null : "same" },
+      flow_error: null,
       stage: 0,
       delivered: false,
       shelved: null,
@@ -1599,8 +1675,8 @@ function seed(store: MockStore) {
   const now = Date.now();
   const min = 60_000;
   store.projects = [
-    { id: "quote", name: "行情终端", repositories: [...REPOS] },
-    { id: "tools", name: "内部工具", repositories: ["/Users/demo/code/devtools"] },
+    { id: "quote", name: "行情终端", repositories: [...REPOS], flows: [], broken_flows: [] },
+    { id: "tools", name: "内部工具", repositories: ["/Users/demo/code/devtools"], flows: [], broken_flows: [] },
   ];
   store.active = "quote";
   store.memoryNotes.set("quote", [
@@ -1630,7 +1706,7 @@ function seed(store: MockStore) {
   };
 
   // 1. Running build stage with a streaming transcript.
-  const w1 = newWork("quote", "自选股分组支持拖拽排序", "Software", "Feature", REPOS, now - 3 * 60 * min);
+  const w1 = newWork("quote", "自选股分组支持拖拽排序", BUILTIN_FLOWS.Software, "Feature", REPOS, now - 3 * 60 * min);
   w1.detail.branch = "aep-stage/7f3a9c21";
   w1.detail.stages[0].note = "参考竞品的分组拖拽，重点是跨设备同步。";
   // Same CLI, model and sandbox as 产品需求: 交互设计 and 技术方案 continue its session.
@@ -1666,7 +1742,7 @@ function seed(store: MockStore) {
   add(w1);
 
   // 2. Failed test stage with route_back to 开发实现.
-  const w2 = newWork("quote", "K 线图叠加 MACD / KDJ 指标", "Software", "Feature", [REPOS[0]], now - 26 * 60 * min);
+  const w2 = newWork("quote", "K 线图叠加 MACD / KDJ 指标", BUILTIN_FLOWS.Software, "Feature", [REPOS[0]], now - 26 * 60 * min);
   w2.detail.branch = "aep-stage/2b81e0d4";
   w2.detail.stages[1].state = "skipped";
   w2.detail.stages[1].skipped_reason = "复用现有指标面板，无新交互";
@@ -1711,7 +1787,7 @@ function seed(store: MockStore) {
   add(w2);
 
   // 2b. Deliver stage failed and routed back to 开发实现.
-  const w8 = newWork("quote", "自选股显示港股通标识", "Software", "Feature", [REPOS[0]], now - 4 * 24 * 60 * min);
+  const w8 = newWork("quote", "自选股显示港股通标识", BUILTIN_FLOWS.Software, "Feature", [REPOS[0]], now - 4 * 24 * 60 * min);
   w8.detail.branch = "aep-stage/4c5d6e7f";
   w8.detail.stages.forEach((s, i) => {
     if (i >= 6) return;
@@ -1741,7 +1817,7 @@ function seed(store: MockStore) {
   add(w8);
 
   // 3. Autopilot running.
-  const w3 = newWork("quote", "盘前盘后行情推送", "Software", "Feature", REPOS, now - 2 * 24 * 60 * min);
+  const w3 = newWork("quote", "盘前盘后行情推送", BUILTIN_FLOWS.Software, "Feature", REPOS, now - 2 * 24 * 60 * min);
   w3.detail.branch = "aep-stage/c09d55e1";
   done(w3, 0, now - 90 * min);
   w3.detail.stages[1].state = "skipped";
@@ -1759,14 +1835,14 @@ function seed(store: MockStore) {
   add(w3);
 
   // 4. Fresh item, nothing run yet.
-  const w4 = newWork("quote", "港股暗盘报价", "Software", "Feature", REPOS, now - 30 * min);
+  const w4 = newWork("quote", "港股暗盘报价", BUILTIN_FLOWS.Software, "Feature", REPOS, now - 30 * min);
   w4.detail.branch = null;
   w4.detail.worktrees = [];
   w4.detail.branches = [];
   add(w4);
 
   // 5. Delivered, not merged yet.
-  const w5 = newWork("quote", "行情快照导出 CSV", "Software", "Feature", [REPOS[0]], now - 5 * 24 * 60 * min);
+  const w5 = newWork("quote", "行情快照导出 CSV", BUILTIN_FLOWS.Software, "Feature", [REPOS[0]], now - 5 * 24 * 60 * min);
   w5.detail.branch = "aep-stage/5e6f7a8b";
   w5.detail.stages.forEach((s, i) => {
     if (i === 1) {
@@ -1781,7 +1857,7 @@ function seed(store: MockStore) {
   add(w5);
 
   // 6. Release, delivered and merged.
-  const w6 = newWork("quote", "v2.3 发布", "Software", "Release", REPOS, now - 7 * 24 * 60 * min);
+  const w6 = newWork("quote", "v2.3 发布", BUILTIN_FLOWS.Software, "Release", REPOS, now - 7 * 24 * 60 * min);
   w6.detail.branch = "aep-stage/91ab3c7d";
   w6.detail.branches = [{ name: "aep-stage/91ab3c7d", merged: true }];
   w6.detail.stages.forEach((s, i) => {
@@ -1797,12 +1873,12 @@ function seed(store: MockStore) {
   add(w6);
 
   // 7. Archived.
-  const w7 = newWork("quote", "旧版分时图下线", "Legacy", "Feature", [REPOS[0]], now - 10 * 24 * 60 * min);
+  const w7 = newWork("quote", "旧版分时图下线", BUILTIN_FLOWS.Legacy, "Feature", [REPOS[0]], now - 10 * 24 * 60 * min);
   w7.detail.branch = "aep-stage/0d1e2f3a";
   w7.detail.stages.forEach((_, i) => done(w7, i, now - (9 * 24 * 60 - i * 90) * min, legacyRun(i + 5)));
 
   // 8. Another project whose runs all predate the minimal launch.
-  const w9 = newWork("tools", "构建缓存清理脚本", "Software", "Feature", ["/Users/demo/code/devtools"], now - 12 * 24 * 60 * min);
+  const w9 = newWork("tools", "构建缓存清理脚本", BUILTIN_FLOWS.Software, "Feature", ["/Users/demo/code/devtools"], now - 12 * 24 * 60 * min);
   w9.detail.branch = "aep-stage/6a7b8c9d";
   [0, 2].forEach((i) => done(w9, i, now - (11 * 24 * 60 - i * 60) * min, legacyRun(i)));
   w9.detail.stages[1].state = "skipped";
@@ -1817,6 +1893,35 @@ function seed(store: MockStore) {
   w7.detail.worktrees = [];
   w7.detail.branches = [{ name: "aep-stage/0d1e2f3a", merged: true }];
   add(w7);
+
+  const backendStages = BUILTIN_FLOWS.Software.stages.filter((s) => s.name !== "交互设计");
+  backendStages.splice(4, 0, {
+    name: "安全审查", brief: "核对权限边界和门禁结果。", role: "Test", skippable: false, back_to: ["产品需求"],
+  });
+  const { id: backendId } = store.saveFlow({ project: "quote", flow: { label: "后端开发", stages: backendStages } });
+  const backendFlow = store.project("quote").flows.find((f) => f.id === backendId)!;
+  const backend = newWork("quote", "行情接口权限审查", backendFlow, "Feature", [REPOS[1]], now - 11 * 24 * 60 * min);
+  backend.detail.stage = 4;
+  [0, 1, 2, 3].forEach((i) => { backend.detail.stages[i].state = "done"; });
+  backend.detail.stages[4].state = "current";
+  store.addAttempt(backend, 4, {
+    prompt: "检查行情接口的权限边界。",
+    script: [{ kind: "message", text: "门禁已通过。\n\nAEP-BACK: 开发实现：请复核权限缓存。\nAEP: PASS" }],
+    startMs: now - 60 * min,
+    done: true,
+    outcome: { status: "succeeded", error: null, route_back: null, route_back_rejected: { name: "开发实现", question: "请复核权限缓存。", allowed: ["产品需求"] } },
+  });
+  add(backend);
+
+  const broken = newWork("quote", "旧版订阅接口迁移", BUILTIN_FLOWS.Software, "Feature", [REPOS[1]], now - 12 * 24 * 60 * min);
+  done(broken, 0, now - 11 * 24 * 60 * min);
+  broken.historyStages = broken.detail.stages;
+  broken.detail.stages = [];
+  broken.detail.flow = null;
+  broken.detail.template = "Legacy";
+  broken.detail.template_label = "流程无法读取";
+  broken.detail.flow_error = "事项流程快照无法读取";
+  add(broken);
 
   store.handoffInbox.set(w1.detail.id, [
     {
