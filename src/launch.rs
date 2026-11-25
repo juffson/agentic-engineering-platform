@@ -187,8 +187,8 @@ fn run_help(bin: &Path) -> Probe {
     Ok(text)
 }
 
-/// What a stream-json run actually loaded (AC-1): counts from the `init` event and the
-/// first API call's context from the first assistant event.
+/// What a stream-json run actually loaded: counts and plugin sources from the `init`
+/// event and the first API call's context from the first assistant event.
 pub fn claude_init_stats(stdout: &str) -> Option<Value> {
     let mut init = None;
     let mut first_context = None;
@@ -230,6 +230,28 @@ pub fn claude_init_stats(stdout: &str) -> Option<Value> {
         })
         .filter_map(|p| p["name"].as_str().map(str::to_owned))
         .collect();
+    let plugin_sources: Vec<_> = plugins
+        .iter()
+        .map(|plugin| {
+            let name = plugin["name"]
+                .as_str()
+                .or_else(|| plugin.as_str())
+                .filter(|s| !s.is_empty());
+            let origin = ["source", "path"]
+                .into_iter()
+                .filter_map(|key| plugin[key].as_str())
+                .find(|s| !s.is_empty());
+            // Claude can report the complete name@source, or only the origin.
+            if let (Some(name), Some(origin)) = (name, origin)
+                && !origin
+                    .strip_prefix(name)
+                    .is_some_and(|suffix| suffix.starts_with('@'))
+            {
+                return format!("{name}@{}", origin.strip_prefix('@').unwrap_or(origin));
+            }
+            origin.or(name).unwrap_or("未知插件").to_owned()
+        })
+        .collect();
     Some(json!({
         "mcp_servers": list("mcp_servers").len(),
         "mcp_tools": tools.iter().filter(|t| t.as_str().is_some_and(|t| t.starts_with("mcp__"))).count(),
@@ -237,6 +259,7 @@ pub fn claude_init_stats(stdout: &str) -> Option<Value> {
         "skills": list("skills").len(),
         "plugins": plugins.len(),
         "builtin_plugins": builtin,
+        "plugin_sources": plugin_sources,
         "first_context": first_context,
         "version": init["claude_code_version"],
     }))
@@ -395,11 +418,42 @@ mod tests {
         assert_eq!(
             s,
             json!({"mcp_servers":1,"mcp_tools":1,"tools":5,"skills":0,"plugins":2,
-                   "builtin_plugins":["agents-md"],"first_context":9800,"version":"2.1.331"})
+                   "builtin_plugins":["agents-md"],"plugin_sources":["agents-md@builtin","lsp@official"],
+                   "first_context":9800,"version":"2.1.331"})
         );
         assert!(claude_init_stats(r#"{"type":"result","result":"x"}"#).is_none());
         let merged = with_stats(compose(Ok(HELP), "m", None).evidence(), Some(s));
         assert_eq!(merged["diet"], DIET);
         assert_eq!(merged["first_context"], 9800);
+        assert_eq!(
+            merged["plugin_sources"],
+            json!(["agents-md@builtin", "lsp@official"])
+        );
+    }
+
+    #[test]
+    fn launch_plugin_sources_prefer_source_then_path_then_name() {
+        let init = json!({"type": "system", "subtype": "init", "plugins": [
+            {"name": "market", "source": "official", "path": "/ignored"},
+            {"name": "local", "path": "/plugins/Local Tools"},
+            {"name": "agents-md", "path": "@builtin"},
+            {"name": "standalone"},
+            "legacy",
+            {},
+        ]});
+        let stats = claude_init_stats(&init.to_string()).unwrap();
+        assert_eq!(
+            stats["plugin_sources"],
+            json!([
+                "market@official",
+                "local@/plugins/Local Tools",
+                "agents-md@builtin",
+                "standalone",
+                "legacy",
+                "未知插件",
+            ])
+        );
+        assert_eq!(stats["plugins"], 6);
+        assert_eq!(stats["builtin_plugins"], json!([]));
     }
 }
