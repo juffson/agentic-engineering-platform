@@ -180,6 +180,16 @@ lib.rs 里每个命令都用 `run(|h| plugins::xxx(&Ctx::real(h), …))`。测�
 | `remoteStatus({project, path})` | `remote_status` | `RemoteStatus` |
 | `remoteRefresh({project, path})` | `refresh`：已在刷新时直接返回当前状态，否则起后台线程 | `RemoteStatus`（`refreshing: true`） |
 | `openUrl({url})` | `open_url`：只接受 `https://`，并能被 `url::Url` 解析；`/usr/bin/open <url>` | `null` |
+| `revealGitToolsConfig()` | `reveal_git_tools_config`（见下，开发实现退回后补充） | `"file" \| "dir" \| "missing"` |
+
+**「在访达中显示」git-tools 配置**（interaction §3.4；开发实现退回后补充）：结论是**要精确选中文件**，现有 `reveal` 只能打开目录，所以新增这个专用命令，不扩展通用 `reveal`。
+- 不接收路径参数，固定处理 `<home>/plugins/git-tools.json`，避免变成任意路径的打开入口。
+- 文件存在：`/usr/bin/open -R <file>`，在访达中选中它，返回 `"file"`。
+- 文件不存在但 `plugins/` 目录存在：`/usr/bin/open <dir>`，返回 `"dir"`；界面在按钮旁提示「文件还不存在，按上面格式新建即可」。
+- 目录也不存在：不创建目录，也不调用 `open`，返回 `"missing"`；界面显示同样的提示。
+- `open` 失败时返回错误「无法在访达中显示」，界面用配置区里现有的 `revealError` 显示。
+- 测试：把 `open` 前的判断抽成纯函数 `git_tools_target(home) -> (Target, PathBuf)`，在 `tests/plugins.rs` 里覆盖三种情况，测试中不真的调用 `open`。
+- 前端：`BranchToolsConfig` 改为调用 `api.revealGitToolsConfig()`，不再用 `api.reveal` 打开父目录；按钮的 `title` 改为「在访达中选中 git-tools.json」。mock 返回 `"file"`，并在 `console.info` 中记录。
 
 - `plugin` 不在 `branches|github|gitlab` 里时返回错误「未知插件」。对 `branches` 调用 save/clear/test 时返回错误「这个插件没有可配置的令牌」。
 - 徽标 `badge`（interaction §2.1，后端统一计算）：`unavailable`（远端插件，且分支管理停用）→ `disabled` → `needs_config`（远端插件、启用、无令牌）→ `error`（有 `error`）→ `enabled`。是否有令牌以 `token_hint` 为准，列表不读钥匙串。
@@ -226,7 +236,7 @@ export interface RemoteStatus {
 }
 ```
 
-`Api` 接口加上 §3.3 的 8 个方法。`client.ts` 是 Proxy，不用改。
+`Api` 接口加上 §3.3 的 9 个方法（含 `revealGitToolsConfig(): "file" | "dir" | "missing"`）。`client.ts` 是 Proxy，不用改。
 
 ### 3.5 前端结构
 
@@ -261,7 +271,7 @@ export interface RemoteStatus {
 | `src/project/secret.rs`（新） | §2.2 及单元测试（argv 不含令牌、`valid_token`、`Memory`） |
 | `tests/studio_plugins_remote.rs`（新） | 用真实临时仓库测 `upstreams` / `remote_only` / `fetch`（AC-9、AC-10、AC-11） |
 | `studio/src-tauri/src/plugins.rs`（新） | §3.3 |
-| `studio/src-tauri/src/lib.rs` | `pub mod plugins;`，加 8 个 `#[tauri::command(async)]` 并注册到 `generate_handler!` |
+| `studio/src-tauri/src/lib.rs` | `pub mod plugins;`，加 9 个 `#[tauri::command(async)]` 并注册到 `generate_handler!`（`revealGitToolsConfig` 在 T4 补上） |
 | `studio/src-tauri/tests/plugins.rs`（新） | 命令层端到端（§7.2） |
 | `studio/src/api/types.ts`、`studio/src/api/mock.ts` | §3.4、§3.5 |
 | `studio/src/state/store.tsx`、`studio/src/App.tsx`、`studio/src/components/Sidebar.tsx` | §3.5 |

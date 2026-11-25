@@ -450,6 +450,66 @@ export interface BranchGraph {
   truncated: boolean;
 }
 
+export type ForgePluginId = "github" | "gitlab";
+export type PluginId = "branches" | ForgePluginId;
+export type PluginBadge = "enabled" | "disabled" | "needs_config" | "error" | "unavailable";
+export type RemoteErrorKind = "unreachable" | "auth" | "forbidden" | "cert" | "rate_limited" | "timeout" | "not_found" | "other";
+
+export interface RemoteError {
+  kind: RemoteErrorKind;
+  message: string;
+  host: string;
+  status: number | null;
+  reset_at: number | null;
+  at: number;
+}
+
+export interface PluginInfo {
+  id: PluginId;
+  enabled: boolean;
+  badge: PluginBadge;
+  host: string | null;
+  /** The saved credential is represented only by its final four characters. */
+  token: { set: boolean; hint: string | null } | null;
+  error: RemoteError | null;
+}
+
+export type TestResult = { ok: true; account: string } | { ok: false; error: RemoteError };
+export type PullState = "open" | "draft" | "merged" | "closed";
+
+export interface Pull {
+  number: number;
+  title: string;
+  state: PullState;
+  url: string;
+  created_at: number;
+  others: number;
+}
+
+export interface RemoteBranchComparison {
+  name: string;
+  upstream: string | null;
+  present: boolean;
+  ahead: number | null;
+  behind: number | null;
+  same_name: string | null;
+}
+
+export type RemoteStatus = { active: false } | {
+  active: true;
+  repository: string;
+  remotes: { name: string; url: string; host: string | null; path: string | null }[];
+  remote: { name: string; host: string | null; path: string | null; plugin: ForgePluginId | null; badge: PluginBadge | null } | null;
+  refreshing: boolean;
+  refreshed_at: number | null;
+  branches: RemoteBranchComparison[];
+  remote_only: { name: string; sha: string }[];
+  pulls: Record<string, Pull>;
+  pulls_checked: boolean;
+  fetch_error: { message: string; auth: boolean } | null;
+  api_error: RemoteError | null;
+};
+
 /** What a sync changes so the project matches Claude Code memory and the repo's worktrees. */
 export interface SyncPlan {
   memories_add: string[]; // file names
@@ -547,6 +607,14 @@ export interface Api {
   /** Installed git tools (Fork, VS Code, lazygit…) plus plugins from `config`. */
   gitTools(): { tools: { id: string; label: string }[]; config: string };
   openGitTool(a: { id: string; path: string }): void;
+  plugins(): PluginInfo[];
+  setPluginEnabled(a: { plugin: PluginId; enabled: boolean }): PluginInfo[];
+  savePlugin(a: { plugin: ForgePluginId; host: string; token: string | null }): PluginInfo[];
+  clearPluginToken(a: { plugin: ForgePluginId }): PluginInfo[];
+  testPlugin(a: { plugin: ForgePluginId; host: string; token: string | null }): TestResult;
+  remoteStatus(a: { project: string; path: string }): RemoteStatus;
+  remoteRefresh(a: { project: string; path: string }): RemoteStatus;
+  openUrl(a: { url: string }): null;
   /** Ask Codex or Claude to read the repository and memory and draft items from a description. */
   draftStart(a: { project: string; client: "Codex" | "Claude"; model: string; request: string; repository?: string }): string;
   draftStatus(a: { project: string }): DraftStatus;

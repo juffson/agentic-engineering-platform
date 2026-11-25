@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { BookOpen, Check, ChevronDown, ChevronRight, FolderGit2, Gauge, GitBranch, Plus, Trash2 } from "lucide-react";
+import { BookOpen, Check, ChevronDown, ChevronRight, FolderGit2, Gauge, GitBranch, Plus, Puzzle, Trash2 } from "lucide-react";
 import { api } from "../api/client";
 import type { Group, WorkSummary } from "../api/types";
 import { useStudio } from "../state/store";
@@ -12,7 +12,7 @@ const GROUPS: { id: Group; label: string }[] = [
 ];
 
 export function Sidebar({ onNewWork, onNewProject }: { onNewWork(): void; onNewProject(): void }) {
-  const { snapshot, project, selected, selectWork, page, setPage } = useStudio();
+  const { snapshot, project, selected, selectWork, page, setPage, branchesOn, plugins } = useStudio();
   const [folded, setFolded] = useState<Record<Group, boolean>>({ active: false, delivered: false, shelved: true });
   const work = project?.work ?? [];
 
@@ -66,13 +66,21 @@ export function Sidebar({ onNewWork, onNewProject }: { onNewWork(): void; onNewP
           仓库
           {project && <span className="foot-count">{project.repositories.length}</span>}
         </button>
-        <button type="button" className={`foot-link${page === "branches" ? " on" : ""}`} onClick={() => setPage("branches")} disabled={!project}>
-          <GitBranch size={14} />
-          分支
-        </button>
+        {branchesOn && (
+          <button type="button" className={`foot-link${page === "branches" ? " on" : ""}`} onClick={() => setPage("branches")} disabled={!project}>
+            <GitBranch size={14} />
+            分支
+          </button>
+        )}
         <button type="button" className={`foot-link${page === "usage" ? " on" : ""}`} onClick={() => setPage("usage")} disabled={!project}>
           <Gauge size={14} />
           Token 消耗
+        </button>
+        <div className="foot-separator" role="separator" />
+        <button type="button" className={`foot-link${page === "plugins" ? " on" : ""}`} onClick={() => setPage("plugins")} aria-current={page === "plugins" ? "page" : undefined}>
+          <Puzzle size={14} />
+          插件
+          {plugins?.some((plugin) => plugin.badge === "error") && <span className="dot dot-failed foot-status" aria-label="有插件出错" />}
         </button>
       </div>
     </nav>

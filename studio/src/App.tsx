@@ -5,6 +5,7 @@ import { Sidebar } from "./components/Sidebar";
 import { WorkPage } from "./components/WorkPage";
 import { MemoryPage, ReposPage } from "./components/SecondaryPages";
 import { BranchesPage } from "./components/Branches";
+import { PluginsPage } from "./components/Plugins";
 import { UsagePage } from "./components/Usage";
 import { NewProjectDialog, NewWorkDialog } from "./components/Dialogs";
 import { Toasts } from "./components/Toasts";
@@ -19,11 +20,13 @@ export function App() {
 }
 
 function Shell() {
-  const { snapshot, project, selected, page } = useStudio();
+  const { snapshot, project, selected, page, branchesOn } = useStudio();
   const [dialog, setDialog] = useState<"work" | "project" | null>(null);
 
   let main;
-  if (!snapshot) {
+  if (page === "plugins") {
+    main = <PluginsPage />;
+  } else if (!snapshot) {
     main = (
       <div className="page-loading">
         <Spinner size={16} />
@@ -37,7 +40,7 @@ function Shell() {
     main = <MemoryPage project={project} />;
   } else if (page === "repos") {
     main = <ReposPage project={project} />;
-  } else if (page === "branches") {
+  } else if (page === "branches" && branchesOn) {
     main = <BranchesPage project={project} />;
   } else if (page === "usage") {
     main = <UsagePage project={project} />;

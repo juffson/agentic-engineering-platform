@@ -58,8 +58,11 @@
     },
     {
       "id": "T4",
-      "title": "前端契约与插件页：types.ts（PluginInfo/RemoteStatus/TestResult）、mock.ts 插件状态与测试结果、store（plugins、branchesOn/remoteOn、openPlugin、停用回到事项页）、App 路由在无项目判断之前、Sidebar「插件」入口与红点和「分支」显隐、Plugins.tsx 与 lib/remote.ts 文本函数、样式",
+      "title": "前端契约与插件页：types.ts（PluginInfo/RemoteStatus/TestResult）、mock.ts 插件状态与测试结果、store（plugins、branchesOn/remoteOn、openPlugin、停用回到事项页）、App 路由在无项目判断之前、Sidebar「插件」入口与红点和「分支」显隐、Plugins.tsx 与 lib/remote.ts 文本函数、样式；补充后端命令 revealGitToolsConfig（design §3.3：文件存在时在访达中选中 git-tools.json，否则打开 plugins/ 目录或返回 missing），分支管理配置区改用它",
       "paths": [
+        "studio/src-tauri/src/plugins.rs",
+        "studio/src-tauri/src/lib.rs",
+        "studio/src-tauri/tests/plugins.rs",
         "studio/src/api/types.ts",
         "studio/src/api/mock.ts",
         "studio/src/state/store.tsx",
@@ -68,8 +71,8 @@
         "studio/src/lib/",
         "studio/src/styles/app.css"
       ],
-      "criteria": ["AC-1", "AC-2", "AC-3", "AC-4", "AC-6", "AC-16", "E12", "E14"],
-      "check": ["sh", "-c", "cd studio && npm run build"]
+      "criteria": ["AC-1", "AC-2", "AC-3", "AC-4", "AC-6", "AC-15", "AC-16", "E12", "E14"],
+      "check": ["sh", "-c", "cargo build --locked --bin aep && cargo test --locked --manifest-path studio/src-tauri/Cargo.toml --test plugins && cd studio && npm run build"]
     },
     {
       "id": "T5",

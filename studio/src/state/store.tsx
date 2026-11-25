@@ -1,8 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, errorMessage } from "../api/client";
-import type { ProjectSummary, Snapshot, ZCodeModel } from "../api/types";
+import type { PluginId, PluginInfo, ProjectSummary, Snapshot, ZCodeModel } from "../api/types";
+import { pluginBadge } from "../lib/remote";
 
-export type Page = "work" | "memory" | "repos" | "branches" | "usage";
+export type Page = "work" | "memory" | "repos" | "branches" | "usage" | "plugins";
 
 export interface ZCodeState {
   models: ZCodeModel[] | null;
@@ -35,6 +36,17 @@ interface StudioState {
   /** ZCode's model list, loaded lazily the first time a ZCode stage is shown. */
   zcode: ZCodeState;
   loadZcode(refresh?: boolean): void;
+  plugins: PluginInfo[] | null;
+  pluginsError: string | null;
+  reloadPlugins(): Promise<void>;
+  setPlugins(list: PluginInfo[]): void;
+  mutatePlugins(fn: () => Promise<PluginInfo[]>, optimistic?: PluginInfo[]): Promise<PluginInfo[] | undefined>;
+  pluginMutation: boolean;
+  branchesOn: boolean;
+  remoteOn: boolean;
+  pluginFocus: PluginId | null;
+  openPlugin(id: PluginId | null): void;
+  setPluginEnabled(id: PluginId, enabled: boolean): Promise<PluginInfo[] | undefined>;
 }
 
 const Ctx = createContext<StudioState | null>(null);
@@ -74,7 +86,13 @@ export function usePoll(fn: () => Promise<void> | void, ms: number, deps: unknow
 export function StudioProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [page, setPage] = useState<Page>("work");
+  const [page, setCurrentPage] = useState<Page>("work");
+  const [pluginFocus, setPluginFocus] = useState<PluginId | null>(null);
+  const [plugins, setPluginList] = useState<PluginInfo[] | null>(null);
+  const [pluginsError, setPluginsError] = useState<string | null>(null);
+  const [pluginMutation, setPluginMutation] = useState(false);
+  const pluginWrite = useRef(false);
+  const pluginReadVersion = useRef(0);
   const [revision, setRevision] = useState(0);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastSeq = useRef(0);
@@ -105,6 +123,78 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     },
     [dismiss],
   );
+
+  const setPage = useCallback((next: Page) => {
+    if (next !== "plugins") setPluginFocus(null);
+    setCurrentPage(next);
+  }, []);
+
+  const openPlugin = useCallback((id: PluginId | null) => {
+    setPluginFocus(id);
+    setCurrentPage("plugins");
+  }, []);
+
+  const setPlugins = useCallback((list: PluginInfo[]) => {
+    ++pluginReadVersion.current;
+    setPluginList(list);
+    setPluginsError(null);
+  }, []);
+
+  const reloadPlugins = useCallback(async () => {
+    if (pluginWrite.current) return;
+    const version = ++pluginReadVersion.current;
+    try {
+      const list = await api.plugins();
+      if (version === pluginReadVersion.current) setPlugins(list);
+    } catch (e) {
+      if (version !== pluginReadVersion.current) return;
+      setPluginList(null);
+      setPluginsError(errorMessage(e));
+    }
+  }, [setPlugins]);
+
+  usePoll(reloadPlugins, 2000, []);
+
+  const mutatePlugins: StudioState["mutatePlugins"] = useCallback(async (fn, optimistic) => {
+    if (pluginWrite.current) return undefined;
+    pluginWrite.current = true;
+    ++pluginReadVersion.current;
+    setPluginMutation(true);
+    if (optimistic) setPluginList(optimistic);
+    try {
+      const list = await fn();
+      setPlugins(list);
+      return list;
+    } catch (e) {
+      if (optimistic) setPluginList(plugins);
+      throw e;
+    } finally {
+      pluginWrite.current = false;
+      setPluginMutation(false);
+    }
+  }, [plugins, setPlugins]);
+
+  const setPluginEnabled = useCallback(async (id: PluginId, enabled: boolean) => {
+    if (!plugins) return undefined;
+    const next = plugins.map((plugin) => plugin.id === id ? { ...plugin, enabled } : plugin);
+    const branches = next.find((plugin) => plugin.id === "branches")?.enabled ?? true;
+    try {
+      return await mutatePlugins(
+        () => api.setPluginEnabled({ plugin: id, enabled }),
+        next.map((plugin) => ({ ...plugin, badge: pluginBadge(plugin, branches) })),
+      );
+    } catch (e) {
+      notify(`更新插件状态失败：${errorMessage(e)}`);
+      return undefined;
+    }
+  }, [mutatePlugins, notify, plugins]);
+
+  const branchesOn = plugins?.find((plugin) => plugin.id === "branches")?.enabled ?? true;
+  const remoteOn = branchesOn && (plugins?.some((plugin) => plugin.id !== "branches" && plugin.enabled) ?? false);
+
+  useEffect(() => {
+    if (page === "branches" && !branchesOn) setPage("work");
+  }, [branchesOn, page, setPage]);
 
   const loadSnapshot = useCallback(async () => {
     try {
@@ -154,7 +244,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setPage("work");
       if (project) void api.selectWork({ project: project.id, work: id }).catch((e) => notify(errorMessage(e)));
     },
-    [project, notify],
+    [project, notify, setPage],
   );
 
   const openProject = useCallback(
@@ -163,7 +253,7 @@ export function StudioProvider({ children }: { children: ReactNode }) {
       setPage("work");
       void act(() => api.openProject({ project: id }));
     },
-    [act],
+    [act, setPage],
   );
 
   const value: StudioState = {
@@ -182,6 +272,17 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     dismiss,
     zcode,
     loadZcode,
+    plugins,
+    pluginsError,
+    reloadPlugins,
+    setPlugins,
+    mutatePlugins,
+    pluginMutation,
+    branchesOn,
+    remoteOn,
+    pluginFocus,
+    openPlugin,
+    setPluginEnabled,
   };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
