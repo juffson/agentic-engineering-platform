@@ -3,6 +3,7 @@ pub mod branches;
 pub mod directory;
 pub mod import;
 pub mod merge;
+pub mod remote;
 pub mod shelf;
 pub mod timeline;
 pub mod transfer;
