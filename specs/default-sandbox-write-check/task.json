@@ -1,0 +1,80 @@
+{
+  "title": "验证 · 默认沙箱下 Claude 阶段能写文件",
+  "design": "specs/default-sandbox-write-check/design.md",
+  "allowed_paths": [
+    "src/workflow_stage.rs",
+    "src/launch.rs",
+    "tests/"
+  ],
+  "forbidden_paths": [
+    "desktop/",
+    "studio/",
+    "specs/"
+  ],
+  "subtasks": [
+    {
+      "id": "T1",
+      "title": "写入拒绝判定：抽出 denials()，NotebookEdit 认 notebook_path、缺路径不再丢弃；全部拒绝项和 denied_bash 写进 evidence；补单测",
+      "paths": [
+        "src/workflow_stage.rs"
+      ],
+      "criteria": [
+        "AC-2",
+        "AC-4",
+        "AC-5"
+      ],
+      "check": [
+        "cargo test --bin aep denials"
+      ]
+    },
+    {
+      "id": "T2",
+      "title": "同级执行目录可读：Claude 启动追加 --allowedTools Read(//<runs 目录>/**)（不 add-dir），补参数单测（含空格路径、与 Bash 授权并存）",
+      "paths": [
+        "src/workflow_stage.rs"
+      ],
+      "criteria": [
+        "R6（design F3：同级执行目录在默认沙箱下不可读）"
+      ],
+      "check": [
+        "cargo test --bin aep allowed_tools",
+        "cargo test --test stage_token_diet"
+      ]
+    },
+    {
+      "id": "T3",
+      "title": "插件来源进 evidence：launch init 统计新增 plugin_sources（name@source / path / name），保持 plugins 与 builtin_plugins 不变",
+      "paths": [
+        "src/launch.rs"
+      ],
+      "criteria": [
+        "AC-6"
+      ],
+      "check": [
+        "cargo test --lib launch"
+      ]
+    },
+    {
+      "id": "T4",
+      "title": "端到端验证：新建 tests/default_sandbox_write.rs，伪造 claude 覆盖写入被拒失败、无提交、Bash 拒绝不失败；#[ignore] 真实层（AEP_REAL_CLAUDE）覆盖 Standard 写入成功并提交、越界失败、同级执行目录可读、打印插件来源；据实测决定是否在 MINIMAL_FLAGS 关插件，并在 handoff 里给出记忆条目正文（run_id、结论、插件清单与处置）",
+      "paths": [
+        "tests/",
+        "src/launch.rs"
+      ],
+      "criteria": [
+        "AC-1",
+        "AC-2",
+        "AC-3",
+        "AC-4",
+        "AC-6",
+        "AC-7",
+        "AC-8"
+      ],
+      "check": [
+        "cargo test --test default_sandbox_write",
+        "cargo test --test stage_token_diet",
+        "cargo test --lib launch"
+      ]
+    }
+  ]
+}
