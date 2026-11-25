@@ -367,7 +367,7 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
             let receipt = receipt(&dir)?;
             let stage = work.template.stages().get(a.stage).context("阶段不存在")?;
             let agent = Agent {
-                role: stage.name.into(),
+                role: stage.name.clone(),
                 client: a.profile.client.label().into(),
                 model: (!a.profile.model.is_empty()).then(|| a.profile.model.clone()),
                 actual_model: receipt.actual_model,

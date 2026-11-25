@@ -140,7 +140,7 @@ fn drive(
                 ),
             ));
         }
-        let name = stages[i].name;
+        let name = stages[i].name.as_str();
         state.stage = Some(i);
         let budget = crate::usage::budget(catalog, p, work, i);
         if let Some(reason) = budget.exhausted() {
@@ -469,15 +469,15 @@ pub fn recheck_message(work: &crate::project::Work, stage: usize) -> String {
     if let Some(r) = work.reworks.iter().rev().find(|r| r.to < stage) {
         text.push_str(&format!(
             "\n\n最近一次退回：「{}」→「{}」\n原因：{}",
-            stages.get(r.from).map_or("", |s| s.name),
-            stages.get(r.to).map_or("", |s| s.name),
+            stages.get(r.from).map_or("", |s| s.name.as_str()),
+            stages.get(r.to).map_or("", |s| s.name.as_str()),
             handoff::clip(r.reason.trim(), 1500)
         ));
     }
     if let Some(t) = work.incoming(stage) {
         text.push_str(&format!(
             "\n\n「{}」修改后的交接：\n{}",
-            stages.get(t.from).map_or("", |s| s.name),
+            stages.get(t.from).map_or("", |s| s.name.as_str()),
             handoff::clip(t.decision.trim(), 2000)
         ));
     }

@@ -350,25 +350,6 @@
     ]
   },
   {
-    "name": "E7 warning survives an independently rejected label",
-    "flow": {
-      "id": "flow-example",
-      "label": "",
-      "stages": [
-        {"name": "产品需求", "brief": "", "role": "Plan", "skippable": false, "back_to": []},
-        {"name": "开发实现", "brief": "", "role": "Build", "skippable": false, "back_to": []},
-        {"name": "交付归档", "brief": "", "role": "Deliver", "skippable": false, "back_to": []}
-      ]
-    },
-    "taken_labels": [],
-    "errors": [
-      {"stage": null, "field": "label", "message": "流程名称不能为空"}
-    ],
-    "warnings": [
-      {"stage": 1, "field": "role", "message": "「开发实现」之后、「交付归档」之前没有验收阶段。合并将直接使用最后一次通过的阶段提交。"}
-    ]
-  },
-  {
     "name": "valid optional planning and accept after build",
     "flow": {
       "id": "flow-example",

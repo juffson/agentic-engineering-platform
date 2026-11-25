@@ -55,7 +55,7 @@ pub fn prompt(request: &str, notes: &[Value], existing: &[String]) -> String {
     );
     text.push_str("## 模板\n");
     for t in TEMPLATES {
-        let stages: Vec<&str> = t.stages().iter().map(|s| s.name).collect();
+        let stages: Vec<&str> = t.stages().iter().map(|s| s.name.as_str()).collect();
         text.push_str(&format!(
             "- {}（{}）：{}\n",
             template_id(t),
