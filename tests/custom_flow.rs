@@ -1,17 +1,21 @@
 use aep::{
     flow::{Flow, FlowStage, builtin},
     handoff::{self, Assignment},
-    project::{Kind, Library, Project, ProjectFlow},
+    project::{self, Kind, Library, Project, ProjectFlow, Work, save_json},
     workflow::{Client, Profile, Request, Role, Sandbox, Template},
+    workspace::{git, read},
 };
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
+
+#[path = "support/custom_workflow.rs"]
+mod automatic;
 
 fn project_flow<'a>(project: &'a Project, id: &str) -> &'a ProjectFlow {
     project
@@ -36,6 +40,205 @@ fn security_review() -> FlowStage {
         skippable: false,
         back_to: vec!["开发实现".into()],
     }
+}
+
+fn backend_flow() -> Flow {
+    let mut flow = builtin(Template::Software).clone();
+    flow.id.clear();
+    flow.label = "后端开发".into();
+    flow.stages.remove(1);
+    flow.stages.insert(4, security_review());
+    flow
+}
+
+fn project_cli(home: &Path, args: &[&str]) -> Result<Output> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_aep"))
+        .current_dir(home)
+        .env_remove("AEP_PROJECT")
+        .env_remove("AEP_WORK")
+        .env_remove("AEP_PROJECT_HOME")
+        .args(["project", "--home"])
+        .arg(home)
+        .args(args)
+        .output()?)
+}
+
+fn cli_json(home: &Path, args: &[&str]) -> Result<Value> {
+    let out = project_cli(home, args)?;
+    ensure!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(serde_json::from_slice(&out.stdout)?)
+}
+
+fn setup_automatic(
+    root: &Path,
+    flow: Flow,
+    repo: Option<PathBuf>,
+) -> Result<(PathBuf, String, String)> {
+    let home = root.join("catalog");
+    let profile = automatic::fake(root)?;
+    let mut lib = Library::open(&home)?;
+    let (pid, wid) = lib.change(&home, |lib| {
+        lib.create("自动运行", repo.clone().into_iter().collect())?;
+        let p = lib.project_mut()?;
+        let pid = p.id.clone();
+        let (id, _) = p.save_flow(flow)?;
+        p.add_work_flow("接口改动", Kind::Feature, &id)?;
+        let work = p.selected_mut()?;
+        if let Some(repo) = &repo {
+            work.include(repo);
+        }
+        for i in 0..work.stages().len() {
+            work.profiles.insert(i, profile.clone());
+        }
+        Ok((pid, work.id.clone()))
+    })?;
+    Ok((home, pid, wid))
+}
+
+fn selected_work(home: &Path) -> Result<Work> {
+    Ok(Library::open(home)?
+        .project()
+        .unwrap()
+        .selected()
+        .unwrap()
+        .clone())
+}
+
+#[test]
+fn runs_to_delivery() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo)?;
+    let repo = repo.canonicalize()?;
+    git(&repo, &["init", "-q", "-b", "main"])?;
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+    )?;
+    let flow = backend_flow();
+    let (home, pid, wid) = setup_automatic(dir.path(), flow.clone(), Some(repo.clone()))?;
+    let state = automatic::run(&home, &pid, &wid, 7)?;
+    assert_eq!(state.status, "done", "{state:?}");
+    let work = selected_work(&home)?;
+    assert!(work.delivered());
+    assert_eq!(work.stage, 7);
+    assert_eq!(
+        work.attempts.iter().map(|a| a.stage).collect::<Vec<_>>(),
+        (0..7).collect::<Vec<_>>()
+    );
+
+    let review_run = aep::workflow::attempt_dir(&home, &pid, &wid, &work.current_attempt[&4]);
+    let req: Request = serde_json::from_value(read(&review_run.join("request.json"))?)?;
+    assert_eq!(req.flow().stages[req.stage], security_review());
+    assert_eq!(req.sandbox, Sandbox::Network);
+    let args = fs::read_to_string(dir.path().join("安全审查.1.args"))?;
+    assert!(args.contains("--tools\nRead,Grep,Glob,Bash\n"));
+    assert!(args.contains("--allowedTools\nBash\n"));
+    let review = aep::workflow::evidence(&review_run)?;
+    assert_eq!(review["clean"], true);
+    let test = aep::workflow::evidence(&aep::workflow::attempt_dir(
+        &home,
+        &pid,
+        &wid,
+        &work.current_attempt[&3],
+    ))?;
+    assert_eq!(review["head_sha"], test["head_sha"]);
+    assert!(
+        work.incoming(5)
+            .unwrap()
+            .acceptance
+            .starts_with("AEP: PASS")
+    );
+
+    let mut lib = Library::open(&home)?;
+    let delivery = &work.deliveries[0];
+    let names: Vec<_> = flow.stages.iter().map(|s| &s.name).collect();
+    let timeline = delivery.snapshot(&home)?;
+    assert_eq!(timeline.stages.iter().collect::<Vec<_>>(), names);
+    assert_eq!(timeline.rounds[4].agents[0].role, "安全审查");
+    let preview = project::merge::preview(&home, delivery, "main")?;
+    assert!(preview.branch.writable());
+    assert_eq!(preview.candidate.transfer_run, work.current_attempt[&5]);
+    assert_eq!(preview.candidate.sha, review["head_sha"].as_str().unwrap());
+    assert!(preview.diff.contains("+backend ready"));
+    let receipt = project::merge::merge(
+        &home,
+        &mut lib,
+        &pid,
+        &wid,
+        &delivery.run,
+        "main",
+        &preview.diff_sha256,
+    )?;
+    assert_eq!(receipt.status, project::merge::MergeStatus::Merged);
+    assert_eq!(
+        fs::read_to_string(repo.join("backend.txt"))?,
+        "backend ready\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn skip_rules() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (home, pid, wid) = setup_automatic(dir.path(), backend_flow(), None)?;
+    fs::write(
+        dir.path().join("产品需求.1"),
+        "AEP-SKIP: 技术方案：已有方案\nAEP-SKIP: 安全审查：声称无需审查",
+    )?;
+    let state = automatic::run(&home, &pid, &wid, 7)?;
+    assert_eq!(state.status, "done", "{state:?}");
+    let work = selected_work(&home)?;
+    assert_eq!(work.skipped.len(), 1);
+    assert_eq!(work.skipped[&1], "产品需求：已有方案");
+    assert!(!work.attempts.iter().any(|a| a.stage == 1));
+    assert!(work.attempts.iter().any(|a| a.stage == 4));
+    Ok(())
+}
+
+#[test]
+fn autopilot_gate_failure() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut flow = backend_flow();
+    flow.stages[4].back_to = vec!["产品需求".into()];
+    let (home, pid, wid) = setup_automatic(dir.path(), flow.clone(), None)?;
+    fs::write(dir.path().join("安全审查.1"), "权限核验失败\nAEP: FAIL")?;
+    let state = automatic::run(&home, &pid, &wid, 7)?;
+    assert_eq!(state.status, "done", "{state:?}");
+    let work = selected_work(&home)?;
+    assert_eq!(work.reworks_between(4, 2), 1);
+    let rework = &work.reworks[0];
+    let failed = aep::workflow::attempt_dir(&home, &pid, &wid, rework.run.as_deref().unwrap());
+    assert_eq!(aep::workflow::evidence(&failed)?["status"], "failed");
+    let prompt = fs::read_to_string(dir.path().join("开发实现.2.prompt"))?;
+    assert!(prompt.contains("权限核验失败"));
+    let prompt = fs::read_to_string(dir.path().join("安全审查.2.prompt"))?;
+    assert!(prompt.contains("最近一次退回：「安全审查」→「开发实现」"));
+
+    let dir = tempfile::tempdir()?;
+    flow.stages.remove(2);
+    let (home, pid, wid) = setup_automatic(dir.path(), flow, None)?;
+    fs::write(dir.path().join("安全审查.1"), "权限核验失败\nAEP: FAIL")?;
+    let state = automatic::run(&home, &pid, &wid, 6)?;
+    assert_eq!(state.status, "stopped", "{state:?}");
+    assert!(state.message.contains("「安全审查」未通过"));
+    let work = selected_work(&home)?;
+    assert_eq!(work.stage_name(), "安全审查");
+    assert!(work.reworks.is_empty());
+    Ok(())
 }
 
 fn reserve_request(
@@ -288,6 +491,137 @@ fn save_and_reload() -> Result<()> {
 }
 
 #[test]
+fn cli_flow_round_trip() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    cli_json(home, &["create", "CLI 流程"])?;
+    let copied = cli_json(home, &["flow-copy", "Software"])?;
+    let id = copied["id"].as_str().unwrap();
+    let old = cli_json(home, &["flow-show", "软件开发 副本"])?;
+    assert_eq!(old["id"], id);
+    assert_eq!(old["revision"], 1);
+    assert_eq!(old["builtin"], false);
+    assert_eq!(
+        cli_json(home, &["flow-show", "经典开发流程"])?["id"],
+        "Legacy"
+    );
+
+    let mut flow = backend_flow();
+    flow.id = id.into();
+    save_json(home, "flow.json", &flow)?;
+    let saved = cli_json(home, &["flow-save", "--file", "flow.json"])?;
+    assert_eq!(saved, json!({"id":id,"revision":2,"warnings":[]}));
+    let library = Library::open(home)?;
+    assert_eq!(&project_flow(library.project().unwrap(), id).flow, &flow);
+
+    let conflict = project_cli(
+        home,
+        &["add-work", "冲突", "--template", "game", "--flow", id],
+    )?;
+    assert!(!conflict.status.success());
+    assert!(
+        !project_cli(home, &["flow-delete", "软件开发"])?
+            .status
+            .success()
+    );
+    cli_json(home, &["add-work", "我的事项", "--flow", "后端开发"])?;
+    let view = cli_json(home, &["show"])?;
+    assert_eq!(view["flow"], json!({"id":id,"label":"后端开发"}));
+    assert_eq!(view["stages"][4]["name"], "安全审查");
+    let choices = cli_json(home, &["flows"])?;
+    let entries = choices["flows"].as_array().unwrap();
+    assert_eq!(entries.iter().filter(|f| f["builtin"] == true).count(), 3);
+    assert_eq!(entries.iter().find(|f| f["id"] == id).unwrap()["in_use"], 1);
+    assert_eq!(choices["broken"], json!([]));
+    assert_eq!(
+        cli_json(home, &["flow-delete", "后端开发"])?,
+        json!({"deleted":id,"in_use":1})
+    );
+    assert!(
+        !project_cli(home, &["add-work", "不可选", "--flow", id])?
+            .status
+            .success()
+    );
+    assert_eq!(cli_json(home, &["show"])?["flow"]["id"], id);
+
+    let mut draft = serde_json::to_value(custom_legacy("兼容发布"))?;
+    draft.as_object_mut().unwrap().remove("id");
+    save_json(home, "flow.json", &draft)?;
+    let created = cli_json(home, &["flow-save", "--file", "flow.json"])?;
+    assert_eq!(created["revision"], 1);
+    assert!(
+        created["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("没有验收阶段")
+    );
+
+    draft["stages"] = json!([]);
+    draft["label"] = json!(" ");
+    save_json(home, "flow.json", &draft)?;
+    let invalid = project_cli(home, &["flow-save", "--file", "flow.json"])?;
+    assert!(!invalid.status.success());
+    let error = String::from_utf8(invalid.stderr)?;
+    assert!(
+        error.lines().any(|line| line.contains("至少需要 2 个阶段")),
+        "{error}"
+    );
+    assert!(
+        error.lines().any(|line| line.contains("流程名称不能为空")),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn draft_chooses_project_flow() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let profile = automatic::fake(root)?;
+    let answer = json!({"summary":"检查接口","items":[
+        {"name":"接口","template":"flow-backend","brief":"添加接口"},
+        {"name":"旧配置","template":"flow-missing","brief":"整理配置"}
+    ]});
+    save_json(
+        root,
+        "draft-result.json",
+        &json!({"result":answer.to_string(),"is_error":false}),
+    )?;
+
+    let mut flow = backend_flow();
+    flow.id = "flow-backend".into();
+    for custom in [true, false] {
+        let job = root.join(if custom { "custom" } else { "legacy" });
+        fs::create_dir(&job)?;
+        let mut spec = json!({"profile":profile,"request":"新增接口"});
+        if custom {
+            spec["flows"] = json!([
+                aep::work_draft::DraftFlow::from(builtin(Template::Software)),
+                aep::work_draft::DraftFlow::from(&flow),
+            ]);
+        }
+        save_json(&job, "job.json", &spec)?;
+        aep::work_draft::run(&job)?;
+        assert_eq!(read(&job.join("status.json"))?["status"], "succeeded");
+        let text = fs::read_to_string(job.join("prompt.txt"))?;
+        let draft = read(&job.join("draft.json"))?;
+        if custom {
+            assert!(text.contains("flow-backend（后端开发）"));
+            assert!(text.contains("测试验证 → 安全审查 → 独立验收"));
+            assert_eq!(draft["items"][0]["template"], "flow-backend");
+            assert!(draft["items"][0].get("fallback_from").is_none());
+        } else {
+            assert!(text.contains("Software（软件开发）") && text.contains("Game（游戏开发）"));
+            assert_eq!(draft["items"][0]["template"], "Software");
+            assert_eq!(draft["items"][0]["fallback_from"], "flow-backend");
+        }
+        assert_eq!(draft["items"][1]["template"], "Software");
+        assert_eq!(draft["items"][1]["fallback_from"], "flow-missing");
+    }
+    Ok(())
+}
+
+#[test]
 fn snapshot_frozen() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let home = dir.path();
@@ -374,6 +708,31 @@ fn snapshot_frozen() -> Result<()> {
     assert!(archived.delivered());
     assert!(archived.shelved.is_some());
     assert_eq!(archived.stage_name(), "已交付");
+    let pid = project.id.clone();
+    let profile = automatic::fake(home)?;
+    library.change(home, |library| {
+        let work = library.project_mut()?.work_by_id_mut(&work_id)?;
+        work.current_attempt.remove(&2);
+        for i in 2..work.stages().len() {
+            work.profiles.insert(i, profile.clone());
+        }
+        Ok(())
+    })?;
+    let state = automatic::run(home, &pid, &work_id, original.stages.len())?;
+    assert_eq!(state.status, "done", "{state:?}");
+    let work = Library::open(home)?
+        .project_mut()?
+        .work_by_id_mut(&work_id)?
+        .clone();
+    assert!(work.delivered());
+    assert_eq!(work.stage, original.stages.len());
+    assert!(
+        work.incoming(3)
+            .unwrap()
+            .acceptance
+            .starts_with("AEP: PASS")
+    );
+    assert!(home.join("后端检查.1.prompt").is_file());
     Ok(())
 }
 
@@ -465,6 +824,22 @@ fn broken_snapshot() -> Result<()> {
         assert!(!item.skippable(1));
         assert_eq!(item.profile(1).client, Client::Codex);
     }
+    let view = cli_json(home, &["--work", "unknown-template", "show"])?;
+    assert_eq!(view["stages"], json!([]));
+    assert!(view["flow_error"].is_string());
+    for args in [
+        &["advance", "--stage", "1", "--note", "已完成"][..],
+        &["reopen", "--stage", "1"][..],
+        &["run"][..],
+    ] {
+        let mut command = vec!["--work", "unknown-template"];
+        command.extend_from_slice(args);
+        let out = project_cli(home, &command)?;
+        assert!(!out.status.success(), "{command:?}");
+        assert!(String::from_utf8(out.stderr)?.contains("这个事项的流程数据无法读取"));
+    }
+    let flows = cli_json(home, &["flows"])?;
+    assert_eq!(flows["broken"][0]["id"], "flow-unreadable");
 
     library.change(home, |library| {
         library

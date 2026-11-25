@@ -1,7 +1,7 @@
 //! Draft new work items with a model CLI: from a plain description it reads the repository
-//! (read-only) and the project memory, and proposes one or more items with a name, template
-//! and 产品需求 brief. A person reviews, edits and creates them; nothing is created here.
+//! (read-only) and the project memory, and proposes items with a name, workflow and first-stage brief.
 use crate::{
+    flow::{Flow, builtin},
     memory::TEXT_LIMIT,
     workflow::{Profile, Template},
 };
@@ -15,10 +15,12 @@ pub struct DraftItem {
     pub name: String,
     #[serde(default)]
     pub release: bool,
-    /// "Software", "Game" or "Legacy".
+    /// ID of the workflow to use.
     #[serde(default = "software")]
     pub template: String,
-    /// The 产品需求 stage brief.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_from: Option<String>,
+    /// The first stage's brief.
     pub brief: String,
 }
 
@@ -32,35 +34,48 @@ pub struct Draft {
     pub items: Vec<DraftItem>,
 }
 
-const TEMPLATES: [Template; 3] = [Template::Software, Template::Game, Template::Legacy];
+#[derive(Serialize, Deserialize)]
+pub struct DraftFlow {
+    pub id: String,
+    pub label: String,
+    pub stages: Vec<String>,
+}
 
-fn template_id(t: Template) -> &'static str {
-    match t {
-        Template::Software => "Software",
-        Template::Game => "Game",
-        Template::Legacy => "Legacy",
+impl From<&Flow> for DraftFlow {
+    fn from(flow: &Flow) -> Self {
+        Self {
+            id: flow.id.clone(),
+            label: flow.label.clone(),
+            stages: flow.stages.iter().map(|stage| stage.name.clone()).collect(),
+        }
     }
 }
 
-pub fn prompt(request: &str, notes: &[Value], existing: &[String]) -> String {
+fn default_flows() -> Vec<DraftFlow> {
+    [Template::Software, Template::Game]
+        .into_iter()
+        .map(|template| DraftFlow::from(builtin(template)))
+        .collect()
+}
+
+pub fn prompt(request: &str, notes: &[Value], existing: &[String], flows: &[DraftFlow]) -> String {
     let mut text = String::from(
-        "你在帮一个软件项目把一段需求描述整理成开发事项。事项会按模板的阶段（产品需求 → … → 交付归档）由不同的 Agent 依次推进，\
-         第一阶段「产品需求」读你写的 brief。\n\n\
+        "你在帮一个项目把一段需求描述整理成开发事项。事项会按流程由不同的 Agent 依次推进，\
+         第一阶段读你写的 brief。\n\n\
          请先在当前仓库里看看相关代码和文档（只读，不要修改任何文件），再给出事项：\n\
          - 一件事一个事项；描述里有几件相互独立、可以分开交付的事，就拆成几个，否则只给一个。\n\
          - name：简短的事项名，形如「模块 · 要做的事」，不超过 30 字。\n\
-         - template：从下面的模板里选最合适的 id。\n\
+         - template：从下面的流程里选最合适的 id。\n\
          - release：只有发版、上线类事项为 true。\n\
-         - brief：给产品需求阶段的说明，写清目标、范围（做什么 / 不做什么）、相关代码位置和验收要点；只写你从描述和仓库里确认过的，不确定的写成待确认问题。不超过 900 字。\n\n",
+         - brief：给第一阶段的说明，写清目标、范围（做什么 / 不做什么）、相关代码位置和验收要点；只写你从描述和仓库里确认过的，不确定的写成待确认问题。不超过 900 字。\n\n",
     );
-    text.push_str("## 模板\n");
-    for t in TEMPLATES {
-        let stages: Vec<&str> = t.stages().iter().map(|s| s.name.as_str()).collect();
+    text.push_str("## 流程\n");
+    for flow in flows {
         text.push_str(&format!(
             "- {}（{}）：{}\n",
-            template_id(t),
-            t.label(),
-            stages.join(" → ")
+            flow.id,
+            flow.label,
+            flow.stages.join(" → ")
         ));
     }
     if !existing.is_empty() {
@@ -87,7 +102,7 @@ pub fn prompt(request: &str, notes: &[Value], existing: &[String]) -> String {
     text
 }
 
-pub fn parse(answer: &str) -> Result<Draft> {
+pub fn parse(answer: &str, known: &[&str]) -> Result<Draft> {
     let start = answer.find('{').context("答复里没有 JSON")?;
     let end = answer.rfind('}').context("答复里没有 JSON")?;
     let mut draft: Draft =
@@ -98,15 +113,14 @@ pub fn parse(answer: &str) -> Result<Draft> {
     for item in &mut draft.items {
         item.name = item.name.trim().chars().take(60).collect();
         item.brief = item.brief.trim().chars().take(TEXT_LIMIT).collect();
-        if !TEMPLATES.iter().any(|t| template_id(*t) == item.template) {
-            item.template = software();
-        }
+        item.fallback_from = (!known.contains(&item.template.as_str()))
+            .then(|| std::mem::replace(&mut item.template, software()));
     }
     ensure!(!draft.items.is_empty(), "Agent 没有给出事项");
     Ok(draft)
 }
 
-/// A draft job: `job.json` (profile, request, repository, existing, notes) in, `status.json`
+/// A draft job: `job.json` (profile, request, repository, existing, notes, flows) in, `status.json`
 /// and `draft.json` out.
 pub fn run(job: &Path) -> Result<()> {
     let spec = crate::workspace::read(&job.join("job.json"))?;
@@ -123,7 +137,17 @@ pub fn run(job: &Path) -> Result<()> {
         let notes: Vec<Value> = spec["notes"].as_array().cloned().unwrap_or_default();
         let existing: Vec<String> =
             serde_json::from_value(spec["existing"].clone()).unwrap_or_default();
-        let text = prompt(spec["request"].as_str().unwrap_or(""), &notes, &existing);
+        let flows = match spec.get("flows") {
+            Some(flows) => serde_json::from_value(flows.clone()).context("无法读取草稿流程")?,
+            None => default_flows(),
+        };
+        let known: Vec<_> = flows.iter().map(|flow| flow.id.as_str()).collect();
+        let text = prompt(
+            spec["request"].as_str().unwrap_or(""),
+            &notes,
+            &existing,
+            &flows,
+        );
         fs::write(job.join("prompt.txt"), &text)?;
         // Work in the repository so the agent can read the code; without one, in the job folder.
         let cwd = spec["repository"]
@@ -133,7 +157,7 @@ pub fn run(job: &Path) -> Result<()> {
             .unwrap_or_else(|| job.to_owned());
         let answer = crate::memory_tidy::ask(&profile, &text, job, &cwd)?;
         fs::write(job.join("result.txt"), &answer)?;
-        parse(&answer)
+        parse(&answer, &known)
     })();
     match result {
         Ok(d) => {
@@ -154,19 +178,25 @@ mod tests {
             r#"好的 {"summary":"拆成两件","items":[
               {"name":" 导出 · CSV ","brief":"导出对账单"},
               {"name":"发版 2.3","template":"Nope","release":true,"brief":"上线"},
+              {"name":"后端改动","template":"flow-backend","brief":"验证接口"},
               {"name":"","brief":"没有名字"}]}"#,
+            &["Software", "Game", "flow-backend"],
         )
         .unwrap();
-        assert_eq!(d.items.len(), 2);
+        assert_eq!(d.items.len(), 3);
         assert_eq!(d.items[0].name, "导出 · CSV");
         assert_eq!(d.items[0].template, "Software");
         assert!(d.items[1].release);
         assert_eq!(d.items[1].template, "Software");
-        assert!(parse(r#"{"summary":"","items":[]}"#).is_err());
+        assert_eq!(d.items[1].fallback_from.as_deref(), Some("Nope"));
+        assert_eq!(d.items[2].template, "flow-backend");
+        assert!(d.items[2].fallback_from.is_none());
+        assert!(parse(r#"{"summary":"","items":[]}"#, &["Software"]).is_err());
         let p = prompt(
             "支持导出",
             &[json!({"id":1,"body":"金额用分"})],
             &["已有事项".into()],
+            &default_flows(),
         );
         assert!(
             p.contains("Game（游戏开发）") && p.contains("#1 金额用分") && p.contains("- 已有事项")

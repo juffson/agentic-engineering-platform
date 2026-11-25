@@ -101,7 +101,7 @@ impl Transfer {
             self.decision = upstream.decision.clone();
         }
         self.acceptance = if matches!(
-            work.template.stages()[from].role,
+            work.stages()[from].role,
             workflow::Role::Test | workflow::Role::Accept
         ) {
             ensure!(
@@ -261,8 +261,9 @@ impl Work {
     /// with the failure report instead of starting over.
     pub fn send_back(&mut self, to: usize, reason: &str) -> Result<()> {
         let from = self.stage;
+        let stage_count = self.flow()?.stages.len();
         ensure!(
-            to < from && from < self.template.stages().len(),
+            to < from && from < stage_count,
             "只能退回到当前阶段之前的阶段"
         );
         let run = self.current_attempt.get(&from).cloned();
@@ -299,9 +300,14 @@ impl Project {
     ) -> Result<()> {
         let pid = self.id.clone();
         let work = self.work_by_id_mut(wid)?;
-        ensure!(work.stage == from && from < work.notes.len(), "阶段已变更");
-        let has_next = from + 1 < work.template.stages().len();
+        let stages = &work.flow()?.stages;
+        ensure!(
+            work.stage == from && from < stages.len() && from < work.notes.len(),
+            "阶段已变更"
+        );
+        let has_next = from + 1 < stages.len();
         let attempt = work.current_attempt.get(&from).cloned();
+        let mut skips = Vec::new();
         if let Some(run) = &attempt {
             let dir = workflow::attempt_dir(home, &pid, wid, run);
             let ev = workflow::evidence(&dir)?;
@@ -312,13 +318,14 @@ impl Project {
                     && work.skippable(stage)
                     && stage > from
                 {
-                    work.skipped.entry(stage).or_insert_with(|| {
+                    skips.push((
+                        stage,
                         format!(
                             "{}：{}",
-                            work.template.stages()[from].name,
+                            stages[from].name,
                             s["reason"].as_str().unwrap_or("")
-                        )
-                    });
+                        ),
+                    ));
                 }
             }
             if note.trim().is_empty() {
@@ -328,9 +335,7 @@ impl Project {
         ensure!(!note.trim().is_empty(), "请先填写阶段结论");
         if !has_next
             && let Some(t) = work.incoming(from)
-            && work
-                .template
-                .stages()
+            && stages
                 .get(t.from)
                 .is_some_and(|s| s.role == workflow::Role::Accept)
             && let Some(run) = attempt.as_deref()
@@ -345,15 +350,23 @@ impl Project {
         } else {
             work.stage += 1;
         }
-        self.work_by_id_mut(wid)?.notes[from] = note;
+        let work = self.work_by_id_mut(wid)?;
+        for (stage, reason) in skips {
+            work.skipped.entry(stage).or_insert(reason);
+        }
+        work.notes[from] = note;
         Ok(())
     }
 
     /// Pass over an optional stage: no agent runs, and the reason becomes its record.
     pub fn skip_stage(&mut self, home: &Path, wid: &str, stage: usize, reason: &str) -> Result<()> {
         let work = self.work_by_id_mut(wid)?;
-        ensure!(work.stage == stage, "阶段已变更");
-        ensure!(work.skippable(stage), "只有可选的规划阶段可以跳过");
+        let flow = work.flow()?;
+        ensure!(
+            work.stage == stage && stage < work.notes.len(),
+            "阶段已变更"
+        );
+        ensure!(flow.skippable(stage), "只有可选的规划阶段可以跳过");
         work.current_attempt.remove(&stage);
         let reason = if reason.trim().is_empty() {
             work.skipped
@@ -373,7 +386,11 @@ impl Project {
         ensure!(!reason.trim().is_empty(), "请写明人工放行的理由");
         let pid = self.id.clone();
         let work = self.work_by_id_mut(wid)?;
-        ensure!(work.stage == from, "阶段已变更");
+        let stage_count = work.flow()?.stages.len();
+        ensure!(
+            work.stage == from && from < stage_count && from < work.notes.len(),
+            "阶段已变更"
+        );
         let report = work
             .current_attempt
             .remove(&from)
@@ -401,7 +418,7 @@ impl Project {
         let project = self.id.clone();
         let work = self.work_by_id_mut(wid)?;
         ensure!(
-            from < work.template.stages().len().saturating_sub(1),
+            from < work.flow()?.stages.len().saturating_sub(1),
             "没有后续阶段"
         );
         let to = from + 1;

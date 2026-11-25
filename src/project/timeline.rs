@@ -298,17 +298,13 @@ impl Timeline {
 pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
     ident(project, 64)?;
     ident(&work.id, 64)?;
+    let stages = work.stages();
     let mut result = Timeline {
         deliveries: work.deliveries.clone(),
         work_id: work.id.clone(),
         stage_transfers: work.stage_transfers.clone(),
         work_name: work.name.clone(),
-        stages: work
-            .template
-            .stages()
-            .iter()
-            .map(|s| s.name.to_owned())
-            .collect(),
+        stages: stages.iter().map(|s| s.name.clone()).collect(),
         ..Default::default()
     };
     for delivery in &mut result.deliveries {
@@ -365,7 +361,7 @@ pub fn load(home: &Path, project: &str, work: &Work) -> Result<Timeline> {
                 });
             }
             let receipt = receipt(&dir)?;
-            let stage = work.template.stages().get(a.stage).context("阶段不存在")?;
+            let stage = stages.get(a.stage).context("阶段不存在")?;
             let agent = Agent {
                 role: stage.name.clone(),
                 client: a.profile.client.label().into(),
