@@ -1,0 +1,97 @@
+{
+  "title": "Studio · 插件菜单与分支管理插件化",
+  "design": "specs/studio-plugins-branch-remote/design.md",
+  "allowed_paths": [
+    "src/project.rs",
+    "src/project/",
+    "tests/",
+    "studio/src-tauri/src/",
+    "studio/src-tauri/tests/",
+    "studio/src/api/types.ts",
+    "studio/src/api/mock.ts",
+    "studio/src/state/store.tsx",
+    "studio/src/App.tsx",
+    "studio/src/components/",
+    "studio/src/lib/",
+    "studio/src/styles/app.css",
+    "studio/tests/ui.spec.ts",
+    "specs/studio-plugins-branch-remote/"
+  ],
+  "forbidden_paths": [
+    "desktop/",
+    "src/project/branches.rs",
+    "src/project/merge.rs",
+    "Cargo.toml",
+    "studio/src-tauri/Cargo.toml"
+  ],
+  "subtasks": [
+    {
+      "id": "T1",
+      "title": "git 层 src/project/remote.rs：parse_url（HTTPS/SSH/scp/多级 group）、remotes 读原始 remote.*.url、upstreams（%(upstream:track,nobracket)，gone→未知）、remote_only、只改 refs/remotes 的 fetch（60 秒超时、GIT_TERMINAL_PROMPT=0）；先核实 track 输出格式",
+      "paths": [
+        "src/project.rs",
+        "src/project/",
+        "tests/"
+      ],
+      "criteria": ["AC-7", "AC-9", "AC-10", "AC-11", "E1", "E2", "E3", "E9", "E10", "E11"],
+      "check": ["sh", "-c", "cargo test --locked remote && cargo test --locked --test studio_plugins_remote"]
+    },
+    {
+      "id": "T2",
+      "title": "只读 API 与令牌：src/project/forge.rs（系统 curl，令牌只走 stdin，GET /user 与 PR/MR 列表，错误分类、限流 reset、latest_by_branch、normalize_host）和 src/project/secret.rs（security -i 写钥匙串、Memory、valid_token、argv 不含令牌）；先核实 security -i",
+      "paths": [
+        "src/project.rs",
+        "src/project/"
+      ],
+      "criteria": ["AC-4", "AC-5", "AC-6", "AC-12", "AC-13", "AC-17", "E4", "E5", "E6", "E7", "E8", "E12"],
+      "check": ["sh", "-c", "cargo test --locked forge && cargo test --locked secret"]
+    },
+    {
+      "id": "T3",
+      "title": "Studio 后端 studio/src-tauri/src/plugins.rs：plugins.json 持久化与徽标、save/clear/test、remote_status、后台 refresh（互斥、缓存、限流不重试、出错写回插件）、open_url；lib.rs 注册 8 个命令；tests/plugins.rs 端到端（insteadOf 指向本地 bare 仓库 + HTTP 替身）",
+      "paths": [
+        "studio/src-tauri/src/",
+        "studio/src-tauri/tests/"
+      ],
+      "criteria": ["AC-2", "AC-3", "AC-4", "AC-5", "AC-6", "AC-8", "AC-11", "AC-12", "AC-13", "AC-14", "AC-17", "FR-16"],
+      "check": ["sh", "-c", "cargo build --locked --bin aep && cargo test --locked --manifest-path studio/src-tauri/Cargo.toml --test plugins && cargo check --locked --manifest-path studio/src-tauri/Cargo.toml"]
+    },
+    {
+      "id": "T4",
+      "title": "前端契约与插件页：types.ts（PluginInfo/RemoteStatus/TestResult）、mock.ts 插件状态与测试结果、store（plugins、branchesOn/remoteOn、openPlugin、停用回到事项页）、App 路由在无项目判断之前、Sidebar「插件」入口与红点和「分支」显隐、Plugins.tsx 与 lib/remote.ts 文本函数、样式",
+      "paths": [
+        "studio/src/api/types.ts",
+        "studio/src/api/mock.ts",
+        "studio/src/state/store.tsx",
+        "studio/src/App.tsx",
+        "studio/src/components/",
+        "studio/src/lib/",
+        "studio/src/styles/app.css"
+      ],
+      "criteria": ["AC-1", "AC-2", "AC-3", "AC-4", "AC-6", "AC-16", "E12", "E14"],
+      "check": ["sh", "-c", "cd studio && npm run build"]
+    },
+    {
+      "id": "T5",
+      "title": "分支页远端：remoteStatus 加载与刷新轮询、远端状态栏与错误行、分支行双比较与 PR 标签、选中详情 graph-remote、默认折叠的「仅远端」分组、筛选匹配 PR、页底说明改链接；remoteOn 为假时与改动前一致；mock 三仓库样例",
+      "paths": [
+        "studio/src/components/Branches.tsx",
+        "studio/src/lib/",
+        "studio/src/api/mock.ts",
+        "studio/src/styles/app.css"
+      ],
+      "criteria": ["AC-8", "AC-9", "AC-10", "AC-11", "AC-12", "AC-13", "AC-14", "AC-15", "AC-16"],
+      "check": ["sh", "-c", "cd studio && npm run build"]
+    },
+    {
+      "id": "T6",
+      "title": "UI 测试与整体验证：ui.spec.ts 新增插件页、配置、分支页远端、刷新与错误、AC-15 回归五个用例并截图；跑全部 cargo / studio 测试与 AC-17 只读 grep，结果写 specs/studio-plugins-branch-remote/validation.md",
+      "paths": [
+        "studio/tests/ui.spec.ts",
+        "specs/studio-plugins-branch-remote/"
+      ],
+      "criteria": ["AC-1", "AC-3", "AC-4", "AC-9", "AC-10", "AC-11", "AC-12", "AC-13", "AC-14", "AC-15", "AC-16", "AC-17"],
+      "check": ["sh", "-c", "cargo test --locked && cargo build --locked --bin aep && cargo test --locked --manifest-path studio/src-tauri/Cargo.toml && cd studio && npm run build && npx playwright test"]
+    }
+  ]
+}
