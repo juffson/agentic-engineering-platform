@@ -1899,6 +1899,10 @@ function seed(store: MockStore) {
     name: "安全审查", brief: "核对权限边界和门禁结果。", role: "Test", skippable: false, back_to: ["产品需求"],
   });
   const { id: backendId } = store.saveFlow({ project: "quote", flow: { label: "后端开发", stages: backendStages } });
+  store.project("quote").broken_flows.push(
+    { id: "flow-broken-demo", label: "旧版发布流程", error: "需要恰好一个「交付」阶段，并放在最后" },
+    { id: backendId, label: "重复标识的后端流程", error: `流程标识「${backendId}」重复` },
+  );
   const backendFlow = store.project("quote").flows.find((f) => f.id === backendId)!;
   const backend = newWork("quote", "行情接口权限审查", backendFlow, "Feature", [REPOS[1]], now - 11 * 24 * 60 * min);
   backend.detail.stage = 4;

@@ -2,7 +2,8 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { api, errorMessage } from "../api/client";
 import type { ProjectSummary, Snapshot, ZCodeModel } from "../api/types";
 
-export type Page = "work" | "memory" | "repos" | "branches" | "usage";
+export type Page = "work" | "memory" | "repos" | "branches" | "usage" | "flows";
+type NavigationGuard = (navigate: () => void) => void;
 
 export interface ZCodeState {
   models: ZCodeModel[] | null;
@@ -18,12 +19,16 @@ export interface Toast {
 
 interface StudioState {
   snapshot: Snapshot | null;
+  snapshotError: string | null;
+  reloadSnapshot(): Promise<void>;
   project: ProjectSummary | null;
   selected: string | null;
   page: Page;
   setPage(page: Page): void;
   selectWork(id: string): void;
   openProject(id: string): void;
+  requestNavigation(navigate: () => void): void;
+  registerNavigationGuard(guard: NavigationGuard): () => void;
   /** Bumped after every mutation so pollers refetch immediately. */
   revision: number;
   refresh(): void;
@@ -73,12 +78,15 @@ export function usePoll(fn: () => Promise<void> | void, ms: number, deps: unknow
 
 export function StudioProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-  const [page, setPage] = useState<Page>("work");
+  const [page, setCurrentPage] = useState<Page>("work");
   const [revision, setRevision] = useState(0);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastSeq = useRef(0);
-  const snapshotError = useRef<string | null>(null);
+  const lastSnapshotError = useRef<string | null>(null);
+  const snapshotRequest = useRef(0);
+  const navigationGuard = useRef<NavigationGuard | null>(null);
   const [zcode, setZcode] = useState<ZCodeState>({ models: null, loading: false, error: null });
   const zcodeBusy = useRef(false);
   const zcodeTried = useRef(false);
@@ -107,9 +115,12 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   );
 
   const loadSnapshot = useCallback(async () => {
+    const request = ++snapshotRequest.current;
     try {
       const s = await api.snapshot();
-      snapshotError.current = null;
+      if (request !== snapshotRequest.current) return;
+      lastSnapshotError.current = null;
+      setSnapshotError(null);
       setSnapshot(s);
       setSelected((cur) => {
         const project = s.projects.find((p) => p.id === s.active);
@@ -117,9 +128,11 @@ export function StudioProvider({ children }: { children: ReactNode }) {
         return s.selected ?? project?.work[0]?.id ?? null;
       });
     } catch (e) {
+      if (request !== snapshotRequest.current) return;
       const text = errorMessage(e);
-      if (snapshotError.current !== text) notify(`无法读取工作台状态：${text}`);
-      snapshotError.current = text;
+      if (lastSnapshotError.current !== text) notify(`无法读取工作台状态：${text}`);
+      lastSnapshotError.current = text;
+      setSnapshotError(text);
     }
   }, [notify]);
 
@@ -148,32 +161,52 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     [snapshot],
   );
 
+  const registerNavigationGuard = useCallback((guard: NavigationGuard) => {
+    navigationGuard.current = guard;
+    return () => {
+      if (navigationGuard.current === guard) navigationGuard.current = null;
+    };
+  }, []);
+
+  const requestNavigation = useCallback((navigate: () => void) => {
+    if (navigationGuard.current) navigationGuard.current(navigate);
+    else navigate();
+  }, []);
+
+  const setPage = (next: Page) => {
+    if (next !== page) requestNavigation(() => setCurrentPage(next));
+  };
+
   const selectWork = useCallback(
-    (id: string) => {
+    (id: string) => requestNavigation(() => {
       setSelected(id);
-      setPage("work");
+      setCurrentPage("work");
       if (project) void api.selectWork({ project: project.id, work: id }).catch((e) => notify(errorMessage(e)));
-    },
-    [project, notify],
+    }),
+    [project, notify, requestNavigation],
   );
 
   const openProject = useCallback(
-    (id: string) => {
+    (id: string) => requestNavigation(() => {
       setSelected(null);
-      setPage("work");
+      setCurrentPage("work");
       void act(() => api.openProject({ project: id }));
-    },
-    [act],
+    }),
+    [act, requestNavigation],
   );
 
   const value: StudioState = {
     snapshot,
+    snapshotError,
+    reloadSnapshot: loadSnapshot,
     project,
     selected,
     page,
     setPage,
     selectWork,
     openProject,
+    requestNavigation,
+    registerNavigationGuard,
     revision,
     refresh,
     act,
