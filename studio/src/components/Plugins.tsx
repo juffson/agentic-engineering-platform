@@ -309,6 +309,7 @@ function BranchToolsConfig() {
   const [data, setData] = useState<ReturnType<Api["gitTools"]> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [revealError, setRevealError] = useState<string | null>(null);
+  const [configMissing, setConfigMissing] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -320,13 +321,14 @@ function BranchToolsConfig() {
     return () => { active = false; };
   }, []);
 
-  async function revealConfig(config: string) {
+  async function revealConfig() {
     setRevealError(null);
+    setConfigMissing(false);
     try {
-      await api.reveal({ path: config.slice(0, config.lastIndexOf("/")) });
+      const target = await api.revealGitToolsConfig();
+      setConfigMissing(target !== "file");
     } catch (e) {
-      const message = errorMessage(e);
-      setRevealError(message.startsWith("路径不存在") ? "文件还不存在，按上面格式新建即可" : message);
+      setRevealError(errorMessage(e));
     }
   }
 
@@ -352,7 +354,8 @@ function BranchToolsConfig() {
         <>
           <div className="plugin-token-row">
             <span>自定义工具：<code>{data.config}</code></span>
-            <Button size="sm" title="在访达中打开配置目录" onClick={() => void revealConfig(data.config)}>在访达中显示</Button>
+            <Button size="sm" title="在访达中选中 git-tools.json" onClick={() => void revealConfig()}>在访达中显示</Button>
+            {configMissing && <span className="field-hint" role="status">文件还不存在，按上面格式新建即可</span>}
           </div>
           <p className="field-hint">格式：<code>{`[{"label":"Fork","command":["open","-a","Fork","{path}"]}]`}</code></p>
           {revealError && <p className="inline-error" role="alert">{revealError}</p>}

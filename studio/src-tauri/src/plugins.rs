@@ -963,3 +963,44 @@ pub fn open_url(_ctx: &Ctx, input: &str) -> Result<()> {
     ensure!(status.success(), "无法打开链接");
     Ok(())
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitToolsTarget {
+    File,
+    Dir,
+    Missing,
+}
+
+pub fn git_tools_target(home: &Path) -> (GitToolsTarget, PathBuf) {
+    let dir = home.join("plugins");
+    let file = dir.join("git-tools.json");
+    if file.is_file() {
+        (GitToolsTarget::File, file)
+    } else if dir.is_dir() {
+        (GitToolsTarget::Dir, dir)
+    } else {
+        (GitToolsTarget::Missing, dir)
+    }
+}
+
+pub fn reveal_git_tools_config(ctx: &Ctx) -> Result<GitToolsTarget> {
+    let (target, path) = git_tools_target(&ctx.home);
+    if target == GitToolsTarget::Missing {
+        return Ok(target);
+    }
+
+    let mut open = Command::new("/usr/bin/open");
+    if target == GitToolsTarget::File {
+        open.arg("-R");
+    }
+    let status = open
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| anyhow!("无法在访达中显示"))?;
+    ensure!(status.success(), "无法在访达中显示");
+    Ok(target)
+}

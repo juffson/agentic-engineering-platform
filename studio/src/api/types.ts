@@ -606,6 +606,7 @@ export interface Api {
   branchGraph(a: { project: string; path: string; limit: number }): BranchGraph;
   /** Installed git tools (Fork, VS Code, lazygit…) plus plugins from `config`. */
   gitTools(): { tools: { id: string; label: string }[]; config: string };
+  revealGitToolsConfig(): "file" | "dir" | "missing";
   openGitTool(a: { id: string; path: string }): void;
   plugins(): PluginInfo[];
   setPluginEnabled(a: { plugin: PluginId; enabled: boolean }): PluginInfo[];

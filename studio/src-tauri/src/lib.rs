@@ -216,6 +216,11 @@ fn gitTools() -> Result<impl Serialize, String> {
 }
 
 #[tauri::command(async)]
+fn revealGitToolsConfig() -> Result<impl Serialize, String> {
+    run(move |h| plugins::reveal_git_tools_config(&plugins::Ctx::real(h)))
+}
+
+#[tauri::command(async)]
 fn openGitTool(id: String, path: String) -> Result<impl Serialize, String> {
     run(move |h| api::open_git_tool(&h, &id, &path))
 }
@@ -489,6 +494,7 @@ pub fn start() {
             importSync,
             branchGraph,
             gitTools,
+            revealGitToolsConfig,
             openGitTool,
             plugins,
             setPluginEnabled,

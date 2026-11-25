@@ -998,6 +998,11 @@ class MockStore implements Api {
     return { tools: [{ id: "app:Fork", label: "Fork" }, { id: "app:Visual Studio Code", label: "VS Code（Git Graph 扩展）" }, { id: "tui:lazygit", label: "lazygit" }], config: `${HOME}/plugins/git-tools.json` };
   }
 
+  revealGitToolsConfig(): "file" {
+    console.info("在访达中选中 git-tools.json", this.gitTools().config);
+    return "file";
+  }
+
   openGitTool({ id }: { id: string; path: string }) {
     if (!id) throw new Error("找不到这个 git 工具");
   }

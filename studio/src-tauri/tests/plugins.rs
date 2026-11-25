@@ -5,7 +5,7 @@ use aep::{
 };
 use aep_studio_app::{
     api,
-    plugins::{self, Ctx},
+    plugins::{self, Ctx, GitToolsTarget},
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -462,6 +462,34 @@ fn open_url_validation_requires_https() -> Result<()> {
     }
     let url = "https://github.com/acme/demo/pull/12?source=studio";
     assert_eq!(plugins::check_url(url)?.as_str(), url);
+    Ok(())
+}
+
+#[test]
+fn reveal_git_tools_config_uses_the_fixed_file_or_directory() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let home = temp.path().join("AEP Catalog");
+    let dir = home.join("plugins");
+    let file = dir.join("git-tools.json");
+
+    assert_eq!(
+        plugins::git_tools_target(&home),
+        (GitToolsTarget::Missing, dir.clone())
+    );
+    let ctx = context(home.clone(), None);
+    let result = plugins::reveal_git_tools_config(&ctx)?;
+    assert_eq!(serde_json::to_value(result)?, "missing");
+    assert!(!home.exists());
+
+    fs::create_dir_all(&dir)?;
+    let (target, path) = plugins::git_tools_target(&home);
+    assert_eq!(path, dir);
+    assert_eq!(serde_json::to_value(target)?, "dir");
+
+    fs::write(&file, "[]")?;
+    let (target, path) = plugins::git_tools_target(&home);
+    assert_eq!(path, file);
+    assert_eq!(serde_json::to_value(target)?, "file");
     Ok(())
 }
 
