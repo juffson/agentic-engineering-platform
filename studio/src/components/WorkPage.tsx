@@ -4,6 +4,8 @@ import type { AttemptView, ItemHandoff, WorkDetail } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio, usePoll } from "../state/store";
 import { clientLabel, isLive, modelLabel, stageVisual } from "../lib/work";
+import { sessionLabel, stageSession } from "../lib/format";
+import { VIEW_ATTEMPT } from "./Transcript";
 import { Session } from "./Session";
 import { DecisionPanel } from "./DecisionPanel";
 import { AutopilotDrawer } from "./AutopilotDrawer";
@@ -71,6 +73,34 @@ export function WorkPage({ project, work }: { project: string; work: string }) {
   }, [project, work, notify]);
 
   usePoll(poll, 1000, [poll, revision, viewed]);
+
+  // "复用自「…」" on a turn: show that stage and bring the reused turn into view.
+  const detailRef = useRef(detail);
+  detailRef.current = detail;
+  useEffect(() => {
+    let timer = 0;
+    const onView = (e: Event) => {
+      const { stage, attempt } = (e as CustomEvent<{ stage: number; attempt?: string }>).detail;
+      setTab("stages");
+      setViewed(stage === detailRef.current?.stage ? null : stage);
+      if (!attempt) return;
+      let tries = 0;
+      window.clearInterval(timer);
+      timer = window.setInterval(() => {
+        const el = document.querySelector<HTMLElement>(`.turn[data-attempt="${CSS.escape(attempt)}"]`);
+        if (el || ++tries > 40) window.clearInterval(timer);
+        if (!el) return;
+        el.scrollIntoView({ block: "start", behavior: "smooth" });
+        el.classList.add("turn-flash");
+        window.setTimeout(() => el.classList.remove("turn-flash"), 1600);
+      }, 100);
+    };
+    window.addEventListener(VIEW_ATTEMPT, onView);
+    return () => {
+      window.removeEventListener(VIEW_ATTEMPT, onView);
+      window.clearInterval(timer);
+    };
+  }, []);
 
   // Follow the current stage when it moves (advance / send back) unless the user pinned another stage.
   const lastStage = useRef<number | null>(null);
@@ -214,10 +244,14 @@ function Pipeline({ detail, viewIndex, onView }: { detail: WorkDetail; viewIndex
       <ol>
         {detail.stages.map((s, i) => {
           const v = stageVisual(detail, s);
-          const caption = v === "skipped" ? "已跳过" : `${clientLabel(snapshot, s.profile.client)} · ${modelLabel(s.profile.model)}`;
+          // Session of the latest passed run: "↻ 复用" in the caption, the full label on hover.
+          const passed = v === "skipped" ? null : stageSession(s);
+          const session = sessionLabel(passed);
+          const reused = passed?.kind === "reused";
+          const caption = v === "skipped" ? "已跳过" : `${clientLabel(snapshot, s.profile.client)} · ${modelLabel(s.profile.model)}${reused ? " · ↻ 复用" : ""}`;
           return (
             <li key={s.index} className={`step step-${v}${i === viewIndex ? " viewed" : ""}`}>
-              <button type="button" onClick={() => onView(i)} aria-current={i === viewIndex ? "step" : undefined} title={`${s.name} · ${caption}`}>
+              <button type="button" onClick={() => onView(i)} aria-current={i === viewIndex ? "step" : undefined} title={`${s.name} · ${caption}${session ? `\n${session.text}` : ""}`}>
                 <span className="step-marker">
                   {v === "done" ? (
                     <Check size={12} strokeWidth={2.5} />
@@ -234,7 +268,17 @@ function Pipeline({ detail, viewIndex, onView }: { detail: WorkDetail; viewIndex
                     {s.name}
                     {detail.reworks.some((r) => r.to === i) && v !== "upcoming" && <CornerUpLeft size={11} className="step-rework" aria-label="有退回" />}
                   </span>
-                  <span className="step-caption">{caption}</span>
+                  {reused ? (
+                    // The model name may be cut off; "↻ 复用" stays visible.
+                    <span className="step-caption">
+                      <span className="step-caption-text">
+                        {clientLabel(snapshot, s.profile.client)} · {modelLabel(s.profile.model)}
+                      </span>
+                      <span className="step-reuse"> · ↻ 复用</span>
+                    </span>
+                  ) : (
+                    <span className="step-caption">{caption}</span>
+                  )}
                 </span>
               </button>
             </li>

@@ -6,7 +6,7 @@ import { useStudio } from "../state/store";
 import { clientLabel, modelLabel, sandboxLabel } from "../lib/work";
 import { Chip, Segmented } from "./ui";
 import { StageBudget } from "./Budget";
-import { tokens } from "../lib/format";
+import { sessionPreviewText, tokens } from "../lib/format";
 
 /** CLI / model / sandbox pickers for one stage; shared by the decision panel and the autopilot drawer. */
 export function StagePickers({
@@ -140,6 +140,19 @@ export function StageConfigCard({ detail, stage, collapsed: initiallyCollapsed }
           <StageBudget detail={detail} stage={stage} />
         </>
       )}
+      <SessionPreviewLine stage={stage} detail={detail} />
     </section>
+  );
+}
+
+/** What the next run does with its session (interaction §4.1); a prediction, the turn's own
+ *  label is what actually happened. Refreshes with every CLI / model / sandbox change. */
+export function SessionPreviewLine({ detail, stage }: { detail: WorkDetail; stage: StageDetail }) {
+  const text = stage.index === detail.stage && !detail.running ? sessionPreviewText(stage.session_preview) : null;
+  if (!text) return null;
+  return (
+    <p className={`session-preview${stage.session_preview?.kind === "reused" ? " reuse" : ""}`} data-testid="session-preview">
+      {text}
+    </p>
   );
 }

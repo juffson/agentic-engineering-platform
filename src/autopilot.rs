@@ -175,10 +175,10 @@ fn drive(
             .transpose()?;
         // A planned build runs one subtask per session until every subtask has passed.
         if stages[i].role == Role::Build && ev.as_ref().is_none_or(|e| e["status"] == "succeeded") {
-            let done = done_subtasks(catalog, pid, work, i);
+            let done = finished_subtasks(catalog, pid, work, i);
             if let Some(task) = subtasks(catalog, pid, work)
                 .into_iter()
-                .find(|t| !done.contains(&t.id))
+                .find(|t| done.iter().all(|d| d.id != t.id))
             {
                 state.message = format!("「{name}」子任务 {} {}", task.id, task.title);
                 save(dir, state)?;
@@ -188,6 +188,7 @@ fn drive(
                 let mut request: workflow::Request =
                     serde_json::from_slice(&fs::read(attempt.join("request.json"))?)?;
                 request.subtask = Some(task);
+                request.subtasks_done = done;
                 crate::project::save_json(&attempt, "request.json", &request)?;
                 if !execute(exe, &attempt, dir, &mut ours)? {
                     return Ok(("stopped".into(), "已手动停止自动运行".into()));
@@ -406,17 +407,48 @@ pub fn done_subtasks(
     work: &crate::project::Work,
     stage: usize,
 ) -> HashSet<String> {
-    work.attempts
-        .iter()
-        .filter(|a| a.stage == stage)
-        .filter_map(|a| {
-            let dir = workflow::attempt_dir(catalog, pid, &work.id, &a.id);
-            (workflow::evidence(&dir).ok()?["status"] == "succeeded").then_some(())?;
-            let req: workflow::Request =
-                serde_json::from_slice(&fs::read(dir.join("request.json")).ok()?).ok()?;
-            req.subtask.map(|t| t.id)
-        })
+    finished_subtasks(catalog, pid, work, stage)
+        .into_iter()
+        .map(|t| t.id)
         .collect()
+}
+
+/// Build subtasks that passed, in the order they ran, with their runs and hand-off lines.
+pub fn finished_subtasks(
+    catalog: &Path,
+    pid: &str,
+    work: &crate::project::Work,
+    stage: usize,
+) -> Vec<workflow::DoneSubtask> {
+    let mut done: Vec<workflow::DoneSubtask> = vec![];
+    for a in work.attempts.iter().filter(|a| a.stage == stage) {
+        let dir = workflow::attempt_dir(catalog, pid, &work.id, &a.id);
+        let Ok(ev) = workflow::evidence(&dir) else {
+            continue;
+        };
+        if ev["status"] != "succeeded" {
+            continue;
+        }
+        let Some(req) = fs::read(dir.join("request.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<workflow::Request>(&b).ok())
+        else {
+            continue;
+        };
+        let Some(task) = req.subtask else {
+            continue;
+        };
+        let report = fs::read_to_string(dir.join("result.txt")).unwrap_or_default();
+        // A subtask passed twice keeps its latest run.
+        done.retain(|d| d.id != task.id);
+        done.push(workflow::DoneSubtask {
+            id: task.id,
+            title: task.title,
+            run: a.id.clone(),
+            summary: handoff::clip(handoff::summary(&report).trim(), 600),
+        });
+    }
+    done
 }
 
 /// A stage entered again after a later stage sent the item back: it has run before but its

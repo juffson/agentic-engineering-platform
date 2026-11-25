@@ -389,3 +389,160 @@ test("a stage stops at its token budget, continues after more budget, and the pr
   await expect(page.getByTestId("usage-breakdown")).toBeVisible();
   await shot(page, "28-project-usage");
 });
+
+test("Token 消耗 compares runs before and after the minimal launch and sets the resume limit", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Token 消耗" }).click();
+  const card = page.getByTestId("usage-compare");
+  await expect(card).toContainText("以执行记录里是否带「最小启动」标记分界");
+  const table = card.getByRole("table", { name: "优化前后对比" });
+  // Before → after per stage; the much smaller base context shows as a large drop.
+  const plan = table.locator(".cmp-row").filter({ hasText: "产品需求" });
+  await expect(plan).toContainText("→");
+  await expect(plan.locator(".cmp-change")).toHaveClass(/down/);
+  await expect(plan.locator(".cmp-change")).toContainText("−");
+  await expect(plan.locator(".cmp-num").first()).toHaveAttribute("title", /优化前 \d+ 次 · 优化后 \d+ 次/);
+  await expect(table).toContainText("样本少");
+  await plan.click();
+  await expect(card.locator(".cmp-detail .usage-run").first()).toBeVisible();
+  await card.getByRole("radio", { name: "按 CLI · 模型" }).click();
+  await expect(table).toContainText("Claude · claude-opus-4-1");
+  await expect(table.locator("th").first()).toHaveText("CLI · 模型");
+  await shot(page, "29-usage-compare");
+
+  // E11: a Codex run that could not be recounted keeps its number with a warning.
+  await expect(page.locator(".usage-run .tag-warn", { hasText: "计数可能偏高" })).toBeVisible();
+  await expect(page.locator(".card-title", { hasText: "按阶段" })).toHaveAttribute("title", "含 1 次计数可能偏高的 Codex 执行");
+  await expect(page.locator(".usage-run .tag", { hasText: "优化前" }).first()).toBeVisible();
+
+  // R2: the resume limit has a floor and a default.
+  const limit = page.getByRole("textbox", { name: "续接上限" });
+  await expect(limit).toHaveAttribute("placeholder", "默认 150K");
+  await limit.fill("10k");
+  await expect(limit).toHaveAttribute("aria-invalid", "true");
+  await expect(limit).toHaveAttribute("title", "至少 20K，否则几乎每次都会开新会话");
+  await limit.fill("120k");
+  await limit.press("Enter");
+  await expect(page.locator(".toast", { hasText: "续接上限 120K" })).toBeVisible();
+  await expect(limit).toHaveValue("120k");
+  await limit.fill("");
+  await limit.press("Enter");
+  await expect(page.locator(".toast", { hasText: "续接上限恢复默认 150K" })).toBeVisible();
+});
+
+test("the comparison waits for the first run after the upgrade, and a project without runs has none", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.goto("/");
+  await page.locator(".project-btn").click();
+  await page.getByRole("menuitem", { name: /内部工具/ }).click();
+  await expect(page.locator(".project-name")).toHaveText("内部工具");
+  await page.getByRole("button", { name: "Token 消耗" }).click();
+  const card = page.getByTestId("usage-compare");
+  await expect(card).toContainText("升级后的第一次执行完成后开始对比。");
+  await expect(card.locator(".cmp-change").first()).toHaveText("暂无优化后");
+  await expect(card.locator(".cmp-num").first()).toContainText("→ —");
+  await shot(page, "30-usage-compare-before-only");
+
+  await page.locator(".project-btn").click();
+  await page.getByText("新建项目").click();
+  await page.getByRole("button", { name: "选择文件夹…" }).click();
+  await expect(page.getByLabel("项目名称")).toHaveValue("picked-1");
+  await page.getByRole("button", { name: "创建项目" }).click();
+  await expect(page.locator(".project-name")).toHaveText("picked-1");
+  await page.getByRole("button", { name: "Token 消耗" }).click();
+  await expect(page.getByRole("heading", { name: "Token 消耗" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "续接上限" })).toBeVisible();
+  await expect(page.getByTestId("usage-compare")).toHaveCount(0);
+});
+
+test("turns and the stage bar say which session a run reused or why it started a new one", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  const sidebar = page.getByRole("navigation", { name: "事项" });
+  await sidebar.getByText("自选股分组支持拖拽排序").click();
+  // AC-6: adjacent stages with the same CLI, model and sandbox continue the earlier session.
+  await expect(page.locator(".step").filter({ hasText: "交互设计" }).locator(".step-caption")).toContainText("↻ 复用");
+  await expect(page.locator(".step").filter({ hasText: "技术方案" }).locator(".step-caption")).toContainText("↻ 复用");
+  await expect(page.locator(".step").filter({ hasText: "产品需求" }).locator(".step-caption")).not.toContainText("复用");
+
+  // The running build uses another CLI; Codex without a session log counts only at the end (R8).
+  const running = page.locator(".turn").last();
+  await expect(running.getByTestId("session-tag")).toHaveText("新会话 · CLI 不同（前序 Claude）");
+  await expect(running.getByTestId("count-at-end")).toHaveText("只在结束时计数，预算无法中途生效");
+  await shot(page, "31-session-new-client");
+
+  await page.locator(".step").filter({ hasText: "交互设计" }).locator("button").click();
+  const reused = page.locator(".turn").first();
+  await expect(reused.getByTestId("session-tag")).toHaveText("复用自「产品需求」的会话");
+  await reused.getByRole("button", { name: "消耗分析" }).click();
+  await expect(reused.getByTestId("usage-launch")).toContainText("复用会话");
+  await expect(reused.getByTestId("usage-launch")).toContainText("本轮只计本阶段窗口内的 12 次调用");
+  await shot(page, "32-session-reused");
+  // The link opens the stage whose session was reused.
+  await reused.getByTestId("session-tag").getByRole("button", { name: "「产品需求」" }).click();
+  await expect(page.locator(".view-banner")).toContainText("正在查看已完成的「产品需求」");
+  const first = page.locator(".turn").first();
+  await first.getByRole("button", { name: "消耗分析" }).click();
+  await expect(first.getByTestId("usage-launch")).toContainText("最小启动 · MCP 0 · skills 0 · 插件 5 · 首轮");
+  await expect(first.getByTestId("usage-launch")).toHaveAttribute("title", /cc-plugin-sec-default/);
+
+  // AC-4: a session over the resume limit is not continued; the new one carries a summary.
+  await sidebar.getByText("K 线图叠加 MACD / KDJ 指标").click();
+  await page.locator(".step").filter({ hasText: "技术方案" }).locator("button").click();
+  const over = page.locator(".turn").first().getByTestId("session-tag");
+  await expect(over).toContainText("新会话 · 上下文超过阈值（182K > 150K）");
+  await expect(over).toContainText("已带上一轮结果和交接摘要");
+  await expect(page.locator(".step").filter({ hasText: "技术方案" }).locator("button")).toHaveAttribute("title", /上下文超过阈值/);
+  await page.locator(".view-banner").getByRole("button").click();
+  await expect(page.locator(".turn").last().getByTestId("session-tag")).toHaveText("新会话 · 模型不同（前序 gpt-5-codex）");
+  await shot(page, "33-session-over-limit");
+});
+
+test("the current stage previews its session, and its budget suggests a value from runs after the diet", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  await page.getByRole("navigation", { name: "事项" }).getByText("K 线图叠加 MACD / KDJ 指标").click();
+  const preview = page.getByTestId("session-preview");
+  await expect(preview).toHaveText("将开新会话 · 模型不同（前序 gpt-5-codex）");
+  // Changing the model to the earlier stage's makes the next run reuse its session.
+  await page.locator(".pickers").getByRole("button", { name: "gpt-5-codex", exact: true }).click();
+  await expect(preview).toHaveText("↻ 将复用「开发实现」的会话 · 只发本阶段职责和说明");
+
+  // R9: a suggested budget, filled only when adopted.
+  const budget = page.getByRole("textbox", { name: "「测试验证」Token 预算" });
+  await expect(budget).toHaveAttribute("placeholder", /^建议 /);
+  await expect(budget).toHaveValue("");
+  const hint = page.locator(".budget-suggest");
+  await expect(hint).toContainText("优化后 1 次执行中位数");
+  await shot(page, "34-session-preview-budget");
+  await hint.getByRole("button", { name: "采用" }).click();
+  await expect(page.locator(".toast", { hasText: "已设为建议值" })).toBeVisible();
+  await expect(budget).not.toHaveValue("");
+  await expect(page.locator(".budget-suggest")).toHaveCount(0);
+
+  // The autopilot drawer shows the same phrase in its compact row, without the hint.
+  await page.getByRole("button", { name: "自动运行…" }).click();
+  await expect(page.locator(".ap-row").first().locator(".ap-session")).toHaveText("↻ 复用");
+});
+
+test("a ZCode stage stopped by its budget re-runs instead of continuing", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  await page.getByRole("navigation", { name: "事项" }).getByText("港股暗盘报价").click();
+  await page.getByRole("radio", { name: "ZCode" }).click();
+  const budget = page.getByRole("textbox", { name: /Token 预算$/ }).first();
+  await budget.fill("10k");
+  await budget.press("Enter");
+  await page.getByRole("button", { name: /^运行「/ }).click();
+  const decision = page.getByTestId("decision");
+  await expect(decision).toContainText("Token 预算已用完", { timeout: 30_000 });
+  // AC-13: no "what to say when continuing" box; the button says it re-runs.
+  await expect(decision).toContainText("ZCode 不支持在原任务上继续，会按原说明重新运行这一阶段");
+  await expect(decision.getByRole("textbox", { name: "继续说明" })).toHaveCount(0);
+  await shot(page, "35-zcode-budget-rerun");
+  await decision.getByRole("button", { name: "追加预算并重跑" }).click();
+  await expect(page.locator(".toast", { hasText: "已追加预算，重新运行" })).toBeVisible();
+  await expect(page.locator(".turn")).toHaveCount(2);
+  await expect(page.locator(".turn").last().locator(".turn-meta")).not.toContainText("继续对话");
+});

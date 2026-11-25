@@ -3,6 +3,7 @@ pub mod autopilot;
 pub mod cancel;
 pub mod delivery;
 pub mod deploy_keys;
+pub mod launch;
 pub mod memory;
 pub mod memory_tidy;
 pub mod studio;
@@ -18,5 +19,6 @@ pub mod workflow;
 
 pub mod handoff;
 pub mod project;
+pub mod session_reuse;
 pub mod zcode_catalog;
 pub mod zcode_receipt;

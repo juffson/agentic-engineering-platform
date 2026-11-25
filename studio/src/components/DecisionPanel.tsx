@@ -120,7 +120,7 @@ function Decision({ detail, current }: { detail: WorkDetail; current: StageDetai
             {latest.error && <p className="decision-text">{latest.error}</p>}
           </div>
         </div>
-        {outOfBudget && <ExtendBudget detail={detail} stage={current} />}
+        {outOfBudget && <ExtendBudget detail={detail} stage={current} attempt={latest} />}
         {latest.route_back && (
           <p className="routeback-note">
             <CornerUpLeft size={13} />

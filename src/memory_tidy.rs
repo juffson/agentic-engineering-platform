@@ -204,6 +204,7 @@ pub fn ask(profile: &Profile, prompt: &str, dir: &Path, cwd: &Path) -> Result<St
         }
         Client::Claude => {
             cmd.args(["-p", "--output-format", "json", "--tools", "Read,Grep,Glob"]);
+            cmd.args(crate::launch::claude_minimal(&bin, &profile.model).args);
         }
         _ => bail!("目前支持 Codex 和 Claude"),
     }
@@ -253,6 +254,51 @@ pub fn ask(profile: &Profile, prompt: &str, dir: &Path, cwd: &Path) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_ask_runs_claude_with_the_minimal_flags() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("argv");
+        let bin = t.path().join("claude");
+        fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+case "$1" in --help)
+  printf 'Usage: claude\n  --strict-mcp-config\n  --setting-sources <s>\n  --disable-slash-commands\n  --settings <f>\n'
+  exit 0 ;;
+esac
+cat >/dev/null
+printf '%s\n' "$@" > '{}'
+printf '%s\n' '{{"type":"result","result":"好","is_error":false}}'
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = Profile {
+            client: Client::Claude,
+            executable: bin.display().to_string(),
+            model: "sonnet".into(),
+            check_command: String::new(),
+        };
+        assert_eq!(ask(&profile, "整理", t.path(), t.path()).unwrap(), "好");
+        let argv = fs::read_to_string(&log).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        for flag in [
+            "--strict-mcp-config",
+            "--disable-slash-commands",
+            "project,local",
+            r#"{"autoMemoryEnabled":false}"#,
+        ] {
+            assert!(argv.contains(&flag), "{flag} missing in {argv:?}");
+        }
+        assert_eq!(argv.iter().filter(|a| **a == "--model").count(), 1);
+        assert!(!argv.contains(&"--mcp-config"));
+    }
 
     #[test]
     fn keeps_only_valid_operations_on_current_notes() {

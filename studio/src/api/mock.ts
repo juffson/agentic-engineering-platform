@@ -31,7 +31,13 @@ import type {
   Tokens,
   UsageAnalysis,
   ProjectUsage,
+  CompareRow,
+  CompareSide,
+  Launch,
+  SessionLabel,
+  SessionPreview,
 } from "./types";
+import { parseTokens } from "../lib/format";
 
 type StageDef = { name: string; role: Role; brief: string; skippable: boolean };
 
@@ -102,7 +108,33 @@ interface MockAttempt {
   result: string | null;
   /** Tokens the run may use before it is stopped (what was left of the budgets). */
   limit: number | null;
+  /** Context of the first and the last model call; null first = interrupted before one (E12). */
+  firstContext: number | null;
+  lastContext: number;
+  calls: number;
+  /** Codex without a rollout: usage only when the run ends (R8). */
+  noRollout: boolean;
 }
+
+const BUILTIN_PLUGINS = ["cc-plugin-sec-default", "agents-md", "telemetry", "privacy", "plugin-authoring"];
+const DEFAULT_RESUME_LIMIT = 150_000;
+
+/** The launch record a run gets: Claude reports its init, Codex only the first call; old runs none. */
+function mockLaunch(client: Client, legacy: boolean, firstContext: number | null): Launch | null {
+  if (legacy) return null;
+  if (client === "Claude")
+    return { diet: 1, minimal: true, not_minimized: [], model_source: null, version: "2.1.331", mcp_servers: 0, mcp_tools: 0, tools: 4, skills: 0, plugins: 5, builtin_plugins: BUILTIN_PLUGINS, first_context: firstContext };
+  if (client === "Codex") return { diet: 1, first_context: firstContext };
+  return null;
+}
+
+const median = (v: number[]) => {
+  if (!v.length) return null;
+  const s = [...v].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : Math.round((s[m - 1] + s[m]) / 2);
+};
+const avg = (v: number[]) => (v.length ? Math.round(v.reduce((a, b) => a + b, 0) / v.length) : null);
 
 interface MockWork {
   project: string;
@@ -127,6 +159,9 @@ function mockTokens(a: MockAttempt): Tokens {
   };
 }
 const sumTokens = (t: Tokens) => t.input + t.cache_read + t.cache_write + t.output;
+const isLiveStatus = (s: string) => s === "running" || s === "initializing";
+/** A run from before the minimal launch: ~250K base context re-read by every call. */
+const legacyRun = (n: number) => ({ legacy: true, tokens: [5_200_000 + ((n * 733_000) % 1_900_000), 52_000] as [number, number] });
 
 const HOME = "/Users/demo/.aep";
 const REPOS = ["/Users/demo/code/quote-terminal", "/Users/demo/code/quote-gateway"];
@@ -173,6 +208,38 @@ class MockStore implements Api {
     return s;
   }
 
+  resumeLimit = new Map<string, number | null>();
+
+  /** The mock's `session_reuse::decide` for adjacent stages (design §3.2), simplified. */
+  decide(w: MockWork, stageIndex: number): SessionPreview | null {
+    const stage = this.stage(w, stageIndex);
+    const client = stage.profile.client;
+    if (client !== "Claude" && client !== "Codex") return null;
+    const prev = [...w.detail.stages.slice(0, stageIndex)].reverse().find((s) => s.current_attempt && s.state !== "skipped");
+    const run = prev?.current_attempt ? this.attempts.get(prev.current_attempt) : undefined;
+    if (!prev || !run) return { kind: "fresh", reason: "no_prior" };
+    const src = run.summary;
+    const base = { stage: prev.index, stage_name: prev.name, run: src.id };
+    if (!src.launch && !src.session) return { ...base, kind: "fresh", reason: "session_unavailable" };
+    if (src.client !== client) return { ...base, kind: "fresh", reason: "client_differs", prior: src.client };
+    if (src.model.trim() !== stage.profile.model.trim()) return { ...base, kind: "fresh", reason: "model_differs", prior: src.model };
+    if (prev.sandbox !== stage.sandbox) return { ...base, kind: "fresh", reason: "permission_differs", prior: prev.sandbox };
+    if (src.status === "budget_exhausted") return { ...base, kind: "fresh", reason: "prior_budget_stopped" };
+    if (src.status === "running") return { ...base, kind: "fresh", reason: "session_busy" };
+    if (src.status !== "succeeded") return { ...base, kind: "fresh", reason: "prior_not_passed" };
+    const threshold = this.resumeLimit.get(w.project) ?? DEFAULT_RESUME_LIMIT;
+    if (run.lastContext > threshold) return { ...base, kind: "fresh", reason: "context_over_threshold", context: run.lastContext, threshold };
+    return { ...base, kind: "reused", context: run.lastContext, threshold };
+  }
+
+  /** The label a new (non follow-up) run gets; no label for the first run, as the real one. */
+  session(w: MockWork, stageIndex: number): SessionLabel | null {
+    const d = this.decide(w, stageIndex);
+    if (!d) return null;
+    if (d.kind === "reused") return { kind: "reused", stage: d.stage, stage_name: d.stage_name ?? undefined, run: d.run };
+    return { kind: "fresh", reason: d.reason, context: d.context ?? null, threshold: d.threshold ?? null, prior: d.prior ?? null };
+  }
+
   addAttempt(
     w: MockWork,
     stageIndex: number,
@@ -187,6 +254,13 @@ class MockStore implements Api {
       result?: string | null;
       tokens?: [number, number];
       subtask?: string | null;
+      /** A run from before the minimal launch: no launch record, no session label. */
+      legacy?: boolean;
+      firstContext?: number | null;
+      lastContext?: number;
+      calls?: number;
+      noRollout?: boolean;
+      maybeHigh?: boolean;
     },
   ): MockAttempt {
     const stage = this.stage(w, stageIndex);
@@ -209,7 +283,15 @@ class MockStore implements Api {
       committed: false,
       head_sha: null,
       tokens: 0,
+      session: null,
+      launch: null,
+      continuable: stage.profile.client === "Claude" || stage.profile.client === "Codex",
+      count_maybe_high: !!opts.maybeHigh,
     };
+    const legacy = !!opts.legacy;
+    const firstContext = opts.firstContext !== undefined ? opts.firstContext : legacy ? 250_000 + Math.round(Math.random() * 12_000) : 8_000 + Math.round(Math.random() * 5_000);
+    summary.launch = mockLaunch(stage.profile.client, legacy, firstContext);
+    if (!legacy) summary.session = opts.followUp ? (stage.profile.client === "Claude" || stage.profile.client === "Codex" ? { kind: "continued", run: stage.current_attempt ?? undefined } : null) : this.session(w, stageIndex);
     const budget = this.budget(w, stageIndex);
     if (budget.exhausted) throw new Error(budget.exhausted);
     const attempt: MockAttempt = {
@@ -224,6 +306,10 @@ class MockStore implements Api {
       tokens: opts.tokens ?? [18000 + Math.round(Math.random() * 30000), 2400 + Math.round(Math.random() * 4000)],
       result: opts.result ?? null,
       limit: budget.remaining,
+      firstContext,
+      lastContext: opts.lastContext ?? (legacy ? 290_000 : 60_000 + Math.round(Math.random() * 40_000)),
+      calls: opts.calls ?? (legacy ? 38 : 21),
+      noRollout: !!opts.noRollout,
     };
     if (opts.done) {
       attempt.entries = [...opts.script];
@@ -461,7 +547,8 @@ class MockStore implements Api {
     const d = w.detail;
     const fallback = this.projectBudget.get(project) ?? null;
     d.stages.forEach((st, i) => {
-      st.budget = { limit: w.budgets?.[i] ?? fallback, own: w.budgets?.[i] ?? null, used: st.attempts.reduce((n, a) => n + (a.tokens ?? 0), 0) };
+      st.budget = { limit: w.budgets?.[i] ?? fallback, own: w.budgets?.[i] ?? null, used: st.attempts.reduce((n, a) => n + (a.tokens ?? 0), 0), suggested: this.suggested(project, st.name) };
+      st.session_preview = i === d.stage && !d.running ? this.preview(w, i) : null;
     });
     d.budget = {
       total_limit: w.budgetTotal ?? null,
@@ -472,6 +559,25 @@ class MockStore implements Api {
   }
 
   projectBudget = new Map<string, number | null>();
+
+  /** Median of passed runs after the diet × 1.5, rounded up to 10K (R9). */
+  suggested(project: string, stageName: string): StageDetail["budget"]["suggested"] {
+    const totals: number[] = [];
+    for (const a of this.attempts.values()) {
+      const w = this.works.get(a.work);
+      if (!w || w.project !== project || !a.summary.launch || a.summary.status !== "succeeded") continue;
+      if (w.detail.stages[a.stage]?.name !== stageName) continue;
+      totals.push(a.summary.tokens);
+    }
+    const m = median(totals);
+    if (m === null) return null;
+    return { value: Math.ceil((m * 1.5) / 10_000) * 10_000, runs: totals.length, median: m };
+  }
+
+  preview(w: MockWork, stageIndex: number): SessionPreview | null {
+    const d = this.decide(w, stageIndex);
+    return d && !(d.kind === "fresh" && d.reason === "no_prior") ? d : null;
+  }
 
   budget(w: MockWork, stage: number): { remaining: number | null; exhausted: string | null } {
     const used = (i: number | null) =>
@@ -501,6 +607,13 @@ class MockStore implements Api {
     this.projectBudget.set(project, tokens || null);
   }
 
+  setResumeLimit({ project, tokens }: { project: string; tokens: string }) {
+    const n = parseTokens(tokens);
+    if (n !== null && Number.isNaN(n)) throw new Error(`无法识别的 Token 数：${tokens}`);
+    if (n !== null && n < 20_000) throw new Error("续接上限至少 20K");
+    this.resumeLimit.set(project, n);
+  }
+
   extendBudget({ project, work, stage, extra, message }: { project: string; work: string; stage: number; extra: number; message: string }): string {
     const w = this.work(project, work);
     const st = this.stage(w, stage);
@@ -511,6 +624,9 @@ class MockStore implements Api {
       const total = w.detail.stages.reduce((n, s2) => n + s2.attempts.reduce((m, a) => m + (a.tokens ?? 0), 0), 0);
       if (total + extra > w.budgetTotal) w.budgetTotal = Math.max(w.budgetTotal, total) + extra;
     }
+    // A CLI that cannot continue the original task re-runs the stage (ZCode desktop, R7).
+    const last = st.current_attempt ? this.attempts.get(st.current_attempt) : undefined;
+    if (last && !last.summary.continuable) return this.runStage({ project, work, stage });
     return this.followUp({ project, work, stage, message: message.trim() || "预算已追加。请从中断的地方继续完成本阶段的任务。" });
   }
 
@@ -519,7 +635,8 @@ class MockStore implements Api {
     if (!a) throw new Error(`找不到运行记录 ${attempt}`);
     const t = mockTokens(a);
     const kinds = ["读取", "命令", "编辑", "回答"];
-    const calls = Array.from({ length: 12 }, (_, i) => ({ kind: kinds[i % 4], detail: i % 4 === 1 ? "cargo test --locked" : i % 4 === 0 ? "src/features/export/csv.ts" : "", context: 9000 + i * 2600, output: 300 + (i % 3) * 120 }));
+    const first = a.firstContext ?? 9000;
+    const calls = Array.from({ length: 12 }, (_, i) => ({ kind: kinds[i % 4], detail: i % 4 === 1 ? "cargo test --locked" : i % 4 === 0 ? "src/features/export/csv.ts" : "", context: first + i * 2600, output: 300 + (i % 3) * 120 }));
     const part = (f: number): Tokens => ({ input: Math.round(t.input * f), cache_read: Math.round(t.cache_read * f), cache_write: 0, output: Math.round(t.output * f), reasoning: 0 });
     const by = [0.42, 0.31, 0.17, 0.1].map((f, i) => ({ kind: kinds[i], calls: 3, tokens: part(f), total: sumTokens(part(f)), output_bytes: Math.round(f * 40000) }));
     return {
@@ -527,6 +644,9 @@ class MockStore implements Api {
       by_kind: by,
       calls,
       heaviest: [{ call: 1, kind: "命令", detail: "cargo test --locked", bytes: 18000, tokens: 4600, carried: 46000 }],
+      launch: a.summary.launch,
+      reused: a.summary.session?.kind === "reused",
+      window_calls: 12,
     };
   }
 
@@ -553,7 +673,11 @@ class MockStore implements Api {
       add("stages", stage, t, cost);
       add("models", `${a.summary.client} · ${a.summary.model || "默认"}`, t, cost);
       add("days", (a.summary.started_at ?? "").slice(0, 10), t, cost);
-      runs.push({ work: w.detail.id, work_name: w.detail.name, attempt: a.summary.id, stage, stage_index: a.stage, client: a.summary.client, model: a.summary.model, status: a.summary.status, started_at: a.summary.started_at ?? "", tokens: t, total: sumTokens(t), cost_usd: cost || null, calls: 12 });
+      runs.push({
+        work: w.detail.id, work_name: w.detail.name, attempt: a.summary.id, stage, stage_index: a.stage, client: a.summary.client, model: a.summary.model, status: a.summary.status,
+        started_at: a.summary.started_at ?? "", tokens: t, total: sumTokens(t), cost_usd: cost || null, calls: a.calls,
+        diet: !!a.summary.launch, reused_from: a.summary.session?.kind === "reused" ? a.summary.session.stage_name ?? null : null, count_maybe_high: a.summary.count_maybe_high, launch: a.summary.launch,
+      });
     }
     const list = (group: string) =>
       [...(rows.get(group) ?? new Map()).entries()]
@@ -570,6 +694,9 @@ class MockStore implements Api {
     return {
       total: { tokens: all.tokens, total: sumTokens(all.tokens), cost_usd: all.cost, runs: all.runs },
       stage_budget: this.projectBudget.get(project) ?? null,
+      resume_limit: this.resumeLimit.get(project) ?? null,
+      compare: this.compare(project),
+      maybe_high_runs: runs.filter((r) => r.count_maybe_high).length,
       items,
       stages: list("stages"),
       models: list("models"),
@@ -577,6 +704,44 @@ class MockStore implements Api {
       runs: runs.sort((x, y) => y.total - x.total).slice(0, 12),
       quota: [{ client: "Claude", at: new Date().toISOString(), windows: { five_hour: 0.41, seven_day: 0.33 } }],
     };
+  }
+
+  /** Before / after the minimal launch, Codex and Claude runs only (design §3.7). */
+  compare(project: string): ProjectUsage["compare"] {
+    const groups = { by_stage: new Map<string, MockAttempt[][]>(), by_model: new Map<string, MockAttempt[][]>() };
+    for (const a of this.attempts.values()) {
+      const w = this.works.get(a.work);
+      if (!w || w.project !== project || isLiveStatus(a.summary.status)) continue;
+      if (a.summary.client !== "Claude" && a.summary.client !== "Codex") continue;
+      const side = a.summary.launch ? 1 : 0;
+      const keys: [Map<string, MockAttempt[][]>, string][] = [
+        [groups.by_stage, w.detail.stages[a.stage]?.name ?? "?"],
+        [groups.by_model, `${a.summary.client} · ${a.summary.model || "默认模型"}`],
+      ];
+      for (const [g, key] of keys) {
+        const row = g.get(key) ?? [[], []];
+        row[side].push(a);
+        g.set(key, row);
+      }
+    }
+    const side = (runs: MockAttempt[]): CompareSide => {
+      const counted = runs.filter((r) => r.firstContext !== null);
+      return {
+        runs: runs.length,
+        first_context_median: median(counted.map((r) => r.firstContext!)),
+        avg_calls: avg(counted.map((r) => r.calls)),
+        avg_total: avg(counted.map((r) => sumTokens(mockTokens(r)))),
+      };
+    };
+    const rows = (g: Map<string, MockAttempt[][]>): CompareRow[] =>
+      [...g.entries()]
+        .map(([key, [before, after]]) => {
+          const b = side(before);
+          const a = side(after);
+          return { key, before: b, after: a, change: b.avg_total && a.avg_total !== null ? a.avg_total / b.avg_total - 1 : null };
+        })
+        .sort((x, y) => (y.before.avg_total ?? -1) - (x.before.avg_total ?? -1));
+    return { by_stage: rows(groups.by_stage), by_model: rows(groups.by_model) };
   }
 
   attemptView({ project, work, attempt }: { project: string; work: string; attempt: string }): AttemptView {
@@ -607,6 +772,9 @@ class MockStore implements Api {
           : null,
       dir: `${HOME}/runs/${work}/${a.summary.id}`,
       workspace: `${HOME}/worktrees/${work}`,
+      live_usage: !(a.summary.client === "Codex" && a.noRollout),
+      launch: a.summary.launch,
+      usage_window: a.summary.status === "running" ? null : { calls: a.calls },
     };
   }
 
@@ -1376,7 +1544,8 @@ function newWork(project: string, name: string, template: Template, kind: "Featu
       sandbox: s.role === "Build" || s.role === "Test" ? "Network" : "Standard",
       attempts: [],
       current_attempt: null,
-      budget: { limit: null, own: null, used: 0 },
+      budget: { limit: null, own: null, used: 0, suggested: null },
+      session_preview: null,
     };
   });
   const short = id.slice(1, 9).padEnd(8, "0");
@@ -1464,6 +1633,8 @@ function seed(store: MockStore) {
   const w1 = newWork("quote", "自选股分组支持拖拽排序", "Software", "Feature", REPOS, now - 3 * 60 * min);
   w1.detail.branch = "aep-stage/7f3a9c21";
   w1.detail.stages[0].note = "参考竞品的分组拖拽，重点是跨设备同步。";
+  // Same CLI, model and sandbox as 产品需求: 交互设计 and 技术方案 continue its session.
+  w1.detail.stages[1].profile = profile("Claude", "claude-opus-4-1");
   done(w1, 0, now - 170 * min);
   done(w1, 1, now - 150 * min);
   done(w1, 2, now - 120 * min);
@@ -1490,6 +1661,7 @@ function seed(store: MockStore) {
     tokens: [84213, 9120],
     result: "T1、T2 完成。",
     subtask: "T1–T2",
+    noRollout: true,
   });
   add(w1);
 
@@ -1498,7 +1670,8 @@ function seed(store: MockStore) {
   w2.detail.branch = "aep-stage/2b81e0d4";
   w2.detail.stages[1].state = "skipped";
   w2.detail.stages[1].skipped_reason = "复用现有指标面板，无新交互";
-  done(w2, 0, now - 25 * 60 * min);
+  // 产品需求 ended with a long session: 技术方案 starts a new one with the hand-off summary.
+  done(w2, 0, now - 25 * 60 * min, { lastContext: 182_000 });
   done(w2, 2, now - 24 * 60 * min);
   done(w2, 3, now - 22 * 60 * min);
   w2.detail.reworks.push({ from: 4, to: 3, reason: "MACD 柱状图颜色与涨跌约定相反", at: iso(now - 20 * 60 * min) });
@@ -1599,7 +1772,7 @@ function seed(store: MockStore) {
     if (i === 1) {
       s.state = "skipped";
       s.skipped_reason = "按钮放在现有工具栏，无需交互稿";
-    } else done(w5, i, now - (4 * 24 * 60 - i * 60) * min);
+    } else done(w5, i, now - (4 * 24 * 60 - i * 60) * min, s.role === "Build" ? { legacy: true, maybeHigh: true, tokens: [7_400_000, 61_000] } : legacyRun(i));
   });
   w5.detail.stage = w5.detail.stages.length;
   w5.detail.delivered = true;
@@ -1615,7 +1788,7 @@ function seed(store: MockStore) {
     if (s.skippable) {
       s.state = "skipped";
       s.skipped_reason = "发布事项无需此阶段";
-    } else done(w6, i, now - (6 * 24 * 60 - i * 30) * min);
+    } else done(w6, i, now - (6 * 24 * 60 - i * 30) * min, legacyRun(i + 2));
   });
   w6.detail.stage = w6.detail.stages.length;
   w6.detail.delivered = true;
@@ -1626,7 +1799,17 @@ function seed(store: MockStore) {
   // 7. Archived.
   const w7 = newWork("quote", "旧版分时图下线", "Legacy", "Feature", [REPOS[0]], now - 10 * 24 * 60 * min);
   w7.detail.branch = "aep-stage/0d1e2f3a";
-  w7.detail.stages.forEach((_, i) => done(w7, i, now - (9 * 24 * 60 - i * 90) * min));
+  w7.detail.stages.forEach((_, i) => done(w7, i, now - (9 * 24 * 60 - i * 90) * min, legacyRun(i + 5)));
+
+  // 8. Another project whose runs all predate the minimal launch.
+  const w9 = newWork("tools", "构建缓存清理脚本", "Software", "Feature", ["/Users/demo/code/devtools"], now - 12 * 24 * 60 * min);
+  w9.detail.branch = "aep-stage/6a7b8c9d";
+  [0, 2].forEach((i) => done(w9, i, now - (11 * 24 * 60 - i * 60) * min, legacyRun(i)));
+  w9.detail.stages[1].state = "skipped";
+  w9.detail.stages[1].skipped_reason = "命令行脚本，无界面";
+  w9.detail.stages[3].state = "current";
+  w9.detail.stage = 3;
+  add(w9);
   w7.detail.stage = w7.detail.stages.length;
   w7.detail.delivered = true;
   w7.detail.deliveries = [{ run: "r-0d1e", archived_at: iso(now - 3 * 24 * 60 * min), merged: { target: "main", sha: "77aa88bb99cc", at: iso(now - 3 * 24 * 60 * min) } }];

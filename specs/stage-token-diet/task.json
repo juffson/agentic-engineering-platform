@@ -1,0 +1,129 @@
+{
+  "title": "Token 优化 · 精简阶段基础上下文与重复读取",
+  "design": "specs/stage-token-diet/design.md",
+  "allowed_paths": [
+    "src/launch.rs",
+    "src/session_reuse.rs",
+    "src/lib.rs",
+    "src/main.rs",
+    "src/workflow_stage.rs",
+    "src/workflow.rs",
+    "src/project.rs",
+    "src/handoff.rs",
+    "src/usage.rs",
+    "src/memory_tidy.rs",
+    "src/agent.rs",
+    "src/zcode_stage.rs",
+    "tests/",
+    "studio/src-tauri/src/api.rs",
+    "studio/src-tauri/src/lib.rs",
+    "studio/src-tauri/tests/api.rs",
+    "studio/src/",
+    "studio/tests/ui.spec.ts"
+  ],
+  "forbidden_paths": [
+    "desktop/",
+    "src/zcode_desktop.rs",
+    "src/zcode_desktop_send.rs",
+    "specs/"
+  ],
+  "subtasks": [
+    {
+      "id": "T1",
+      "title": "Claude 最小启动：src/launch.rs（参数组合、--help 探测缓存、用户默认模型兜底、init 统计），接入阶段运行、memory_tidy::ask 和独立审查，evidence 写 launch",
+      "paths": [
+        "src/launch.rs",
+        "src/lib.rs",
+        "src/workflow_stage.rs",
+        "src/memory_tidy.rs",
+        "src/agent.rs"
+      ],
+      "criteria": ["AC-1", "AC-2", "E1", "E2", "E3"],
+      "check": ["cargo", "test", "--locked", "launch"]
+    },
+    {
+      "id": "T2",
+      "title": "提示词：handoff 拆 header / memory_body / rules，加入读取约定 READING，提供相邻复用短提示词和「上一轮答复 + 交接摘要」新会话提示词",
+      "paths": [
+        "src/handoff.rs"
+      ],
+      "criteria": ["AC-10", "AC-5"],
+      "check": ["cargo", "test", "--locked", "handoff"]
+    },
+    {
+      "id": "T3",
+      "title": "Codex 计数：rollout 窗口为准、无 rollout 时按 codex_session_total 做差、历史标 count_maybe_high；Summary 加 rev / first_context 并重算旧缓存",
+      "paths": [
+        "src/usage.rs",
+        "src/workflow_stage.rs"
+      ],
+      "criteria": ["AC-9", "AC-8", "E11", "E12"],
+      "check": ["cargo", "test", "--locked", "usage"]
+    },
+    {
+      "id": "T4",
+      "title": "会话复用与续接上限：src/session_reuse.rs 判定函数，Request / Project 的 resume_limit，perform 接入（Adjacent 用 --fork-session、Continue 超阈值改新会话、E4 回退），evidence 写 reused_session / fresh_session_reason / resume_context / last_context / usage_window",
+      "paths": [
+        "src/session_reuse.rs",
+        "src/lib.rs",
+        "src/workflow.rs",
+        "src/project.rs",
+        "src/workflow_stage.rs"
+      ],
+      "criteria": ["AC-4", "AC-6", "AC-7", "E4", "E5", "E6", "E7", "E8", "E9", "E10"],
+      "check": ["cargo", "test", "--locked", "session_reuse"]
+    },
+    {
+      "id": "T5",
+      "title": "ZCode 继续（R7）：zcode-stage --resume，app-server 走 session/resume + session/send，失败回退；桌面通道不变",
+      "paths": [
+        "src/zcode_stage.rs",
+        "src/main.rs",
+        "src/workflow_stage.rs"
+      ],
+      "criteria": ["AC-13"],
+      "check": ["cargo", "test", "--locked", "zcode_stage"]
+    },
+    {
+      "id": "T6",
+      "title": "运行器端到端：测试替身 claude 走 产品需求 → 交互设计 → 技术方案，断言复用 argv、短提示词、独立回执、窗口用量、模型不同与超阈值两种新会话",
+      "paths": [
+        "tests/stage_token_diet.rs"
+      ],
+      "criteria": ["AC-5", "AC-6", "AC-7", "AC-8", "AC-4"],
+      "check": ["cargo", "test", "--locked", "--test", "stage_token_diet"]
+    },
+    {
+      "id": "T7",
+      "title": "Studio API：attempt/stage/usage 新字段（session、launch、continuable、session_preview、budget.suggested、live_usage）、project_usage 对比统计、set_resume_limit 命令",
+      "paths": [
+        "studio/src-tauri/src/api.rs",
+        "studio/src-tauri/src/lib.rs",
+        "studio/src-tauri/tests/api.rs",
+        "studio/src/api/types.ts",
+        "studio/src/api/client.ts"
+      ],
+      "criteria": ["AC-11", "AC-12", "AC-13", "AC-14"],
+      "check": ["cargo", "test", "--locked", "--manifest-path", "studio/src-tauri/Cargo.toml"]
+    },
+    {
+      "id": "T8",
+      "title": "Studio 界面：Token 消耗页对比卡 / 续接上限 / 计数可能偏高，事项页会话标签 / 阶段条 / 预告 / 启动配置 / 预算建议 / Codex 与 ZCode 说明，mock 与 UI 测试",
+      "paths": [
+        "studio/src/lib/format.ts",
+        "studio/src/components/Usage.tsx",
+        "studio/src/components/Budget.tsx",
+        "studio/src/components/Transcript.tsx",
+        "studio/src/components/WorkPage.tsx",
+        "studio/src/components/StageConfig.tsx",
+        "studio/src/components/DecisionPanel.tsx",
+        "studio/src/components/AutopilotDrawer.tsx",
+        "studio/src/api/mock.ts",
+        "studio/src/styles/app.css",
+        "studio/tests/ui.spec.ts"
+      ],
+      "criteria": ["AC-6", "AC-11", "AC-12", "AC-13", "AC-14"],
+      "check": ["sh", "-c", "cd studio && npm run build && npx playwright test"]
+    }
+  ]
+}

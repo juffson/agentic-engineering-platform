@@ -6,7 +6,7 @@ import { useStudio } from "../state/store";
 import { StagePickers } from "./StageConfig";
 import { Button, Drawer } from "./ui";
 import { BudgetField, BudgetMeter, StageBudget } from "./Budget";
-import { tokens } from "../lib/format";
+import { sessionShort, stageSession, tokens } from "../lib/format";
 
 export function AutopilotDrawer({ detail, onClose }: { detail: WorkDetail; onClose(): void }) {
   const { act } = useStudio();
@@ -87,6 +87,12 @@ export function AutopilotDrawer({ detail, onClose }: { detail: WorkDetail; onClo
                   {chosen ? <Check size={13} strokeWidth={3} /> : <span className="ap-num">{s.index + 1}</span>}
                 </button>
                 <span className="ap-name">{s.name}</span>
+                {(() => {
+                  // Run: "↻ 复用" when the passed run reused a session; current: the preview's keyword.
+                  const passed = s.attempts.some((a) => a.id === s.current_attempt && a.status === "succeeded");
+                  const text = passed ? (stageSession(s)?.kind === "reused" ? "↻ 复用" : null) : s.index === detail.stage && !detail.running ? sessionShort(s.session_preview) : null;
+                  return text ? <span className={`ap-session${text.startsWith("↻") ? " reuse" : ""}`}>{text}</span> : null;
+                })()}
                 {s.index === detail.stage && <span className="tag">当前</span>}
                 {chosen && <span className="ap-stop">运行到这里</span>}
                 <span className="ap-spacer" />
