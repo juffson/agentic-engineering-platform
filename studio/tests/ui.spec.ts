@@ -877,3 +877,67 @@ test.describe("Studio plugins", () => {
     await revealed;
   });
 });
+
+test("产出 shows a stage's documents and the code each run committed", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  const sidebar = page.getByRole("navigation", { name: "事项" });
+  await sidebar.getByText("行情快照导出 CSV").click();
+  await page.getByRole("tab", { name: "产出" }).click();
+  const view = page.getByTestId("output-view");
+
+  // A planning stage: its document rendered, or as the source file.
+  await page.locator(".step").filter({ hasText: "技术方案" }).locator("button").click();
+  await expect(view.getByRole("tab", { name: "design.md" })).toHaveAttribute("aria-selected", "true");
+  await expect(view.locator(".md table")).toContainText("AC2");
+  await view.getByRole("button", { name: "查看源文件" }).click();
+  await expect(view.locator(".output-raw")).toContainText("| AC1 |");
+
+  // The build: each run's commits, files and diff, per file.
+  await page.locator(".step").filter({ hasText: "开发实现" }).locator("button").click();
+  const run = view.getByTestId("output-run").first();
+  await expect(run).toContainText("2 个文件");
+  await run.getByRole("button", { name: /个文件/ }).click();
+  await expect(run.locator(".output-file")).toHaveCount(2);
+  await run.locator(".output-file-head").filter({ hasText: "src/export.rs" }).click();
+  await expect(run.locator(".d-add").filter({ hasText: "pub fn export" })).toHaveCount(1);
+  await shot(page, "40-stage-output");
+
+  // Gates only check: the view says so instead of an empty list.
+  await page.locator(".step").filter({ hasText: "测试验证" }).locator("button").click();
+  await expect(view).toContainText("只核对、不改文件");
+  // The pipeline keeps the 产出 view while switching stages; 阶段 goes back to the session.
+  await page.getByRole("tab", { name: "阶段" }).click();
+  await expect(page.getByTestId("output-view")).toHaveCount(0);
+});
+
+test("a repository delivers by pushing a branch and opening a PR to its remote target", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.goto("/");
+  // Turn the remote on for the first repository: detected gitea/dev, deliver by PR.
+  await page.getByRole("button", { name: /^仓库/ }).click();
+  await page.getByRole("button", { name: /quote-terminal/ }).click();
+  const up = page.getByTestId("upstream");
+  await expect(up).toContainText("未启用");
+  await expect(up.getByLabel("远端", { exact: true })).toHaveValue("gitea");
+  await expect(up.getByLabel("目标分支")).toHaveValue("dev");
+  await up.getByRole("radio", { name: "推送并提 PR" }).click();
+  await up.getByRole("button", { name: "启用" }).click();
+  await expect(up).toContainText("事项从 gitea/dev 开启");
+
+  // A delivered item now offers to push and open a PR instead of a local merge.
+  await page.getByRole("navigation", { name: "事项" }).getByText("行情快照导出 CSV").click();
+  const card = page.getByTestId("pull-request");
+  await expect(card).toContainText("gitea/dev");
+  await expect(card).toContainText("前进了 3 个提交，没有冲突");
+  await expect(card.getByLabel("推送分支")).toHaveValue(/^aep\/export-csv-/);
+  await expect(card.getByLabel("PR 标题")).toHaveValue("行情快照导出 CSV");
+  await shot(page, "41-delivery-pull-request");
+  await card.getByRole("button", { name: "推送并提 PR 到 dev" }).click();
+  await expect(card.getByTestId("pr-recorded")).toContainText("PR #2101");
+
+  // Pushing again updates the same branch (its PR follows) instead of opening another.
+  await expect(card.getByRole("button", { name: /推送更新到 aep\/export-csv-/ })).toBeVisible();
+  await expect(card).toContainText("远端已有这个分支");
+  await expect(page.getByTestId("delivery")).toHaveCount(0);
+});

@@ -1301,8 +1301,17 @@ impl Store {
             .truncate(false)
             .write(true)
             .open(path.with_extension("lock"))?;
-        lock.try_lock()
-            .context("control state is already owned by a server")?;
+        // A child process forked elsewhere in this process (git, a stage CLI) can hold a copy
+        // of a just-closed lock descriptor until it execs, so a restart retries briefly.
+        let mut tries = 0;
+        while let Err(error) = lock.try_lock() {
+            tries += 1;
+            if tries >= 50 || !matches!(error, std::fs::TryLockError::WouldBlock) {
+                return Err(anyhow::Error::from(std::io::Error::from(error)))
+                    .context("control state is already owned by a server");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let mut state: State = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),

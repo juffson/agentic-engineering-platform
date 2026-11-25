@@ -269,6 +269,34 @@ export interface AttemptSummary {
 
 export type StageState = "done" | "current" | "upcoming" | "skipped";
 
+/** What a stage produced (产出 view): spec documents at the commit that wrote them, and per run its commits. */
+export interface StageOutput {
+  stage: number;
+  docs: { path: string; content: string; attempt: string; finished_at: string | null }[];
+  /** Runs with a pinned commit, newest first. */
+  runs: StageRunOutput[];
+}
+
+export interface StageRunOutput {
+  attempt: string;
+  status: RunStatus;
+  follow_up: boolean;
+  subtask: { id: string; title: string } | null;
+  finished_at: string | null;
+  head: string;
+  /** Commits this run made; the platform's own merges of the base branch are left out. */
+  commits: { sha: string; title: string; merge: boolean }[];
+  files: string[];
+  insertions: number;
+  deletions: number;
+}
+
+export interface StageDiff {
+  attempt: string;
+  diff: string;
+  truncated: boolean;
+}
+
 export interface StageDetail {
   index: number;
   name: string;
@@ -313,6 +341,56 @@ export interface DeliveryInfo {
   run: string;
   archived_at: string;
   merged: { target: string; sha: string; at: string } | null;
+  /** The push and PR when the repository delivers to its remote. */
+  pull_request?: PullRequestInfo | null;
+}
+
+export type Forge = "gitea" | "github" | "gitlab";
+
+/** Where a repository's items start from and follow, and how deliveries reach the remote. */
+export interface Upstream {
+  remote: string;
+  target: string;
+  delivery: "local" | "pull_request";
+  branch_prefix: string;
+  forge?: Forge | null;
+  web?: string | null;
+}
+
+export interface UpstreamView {
+  repository: string;
+  configured: Upstream | null;
+  detected: Upstream | null;
+}
+
+export interface PullRequestInfo {
+  remote: string;
+  target: string;
+  branch: string;
+  pushed_sha: string;
+  mode: "update" | "agit" | "gitlab" | "gh" | "manual";
+  url?: string | null;
+  number?: number | null;
+  title: string;
+  at: string;
+  operator: string;
+}
+
+export interface PrPreview {
+  repository: string;
+  upstream: Upstream;
+  candidate: string;
+  base_sha: string;
+  contains_base: boolean;
+  behind: number;
+  conflicts: string[];
+  branch: string;
+  /** The branch's commit on the remote; pushing then updates it (needs this as the lease). */
+  remote_sha: string | null;
+  title: string;
+  body: string;
+  commits: string[];
+  previous: PullRequestInfo | null;
 }
 
 export interface WorkDetail {
@@ -337,6 +415,8 @@ export interface WorkDetail {
   worktrees: string[];
   /** The item's local branches; `merged` = another non-item branch contains its tip. */
   branches: { name: string; merged: boolean }[];
+  /** The first repository's remote setting; delivery pushes and opens a PR when it says so. */
+  upstream?: Upstream | null;
   stages: StageDetail[];
   reworks: Rework[];
   running: string | null; // attempt id of the running agent
@@ -718,4 +798,19 @@ export interface Api {
   extendBudget(a: { project: string; work: string; stage: number; extra: number; message: string }): string;
   usageAnalysis(a: { project: string; work: string; attempt: string }): UsageAnalysis;
   projectUsage(a: { project: string }): ProjectUsage;
+  stageOutput(a: { project: string; work: string; stage: number }): StageOutput;
+  stageDiff(a: { project: string; work: string; attempt: string }): StageDiff;
+  upstream(a: { project: string; repository: string }): UpstreamView;
+  setUpstream(a: { project: string; repository: string; upstream: Upstream | null }): UpstreamView;
+  prPreview(a: { project: string; work: string; branch?: string | null }): PrPreview;
+  prSubmit(a: {
+    project: string;
+    work: string;
+    branch: string;
+    title: string;
+    body: string;
+    expect: string | null;
+    open: boolean;
+    number: number | null;
+  }): PullRequestInfo;
 }

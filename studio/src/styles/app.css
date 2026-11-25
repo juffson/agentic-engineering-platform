@@ -2713,7 +2713,7 @@ select.input {
   flex-direction: column;
   gap: 4px;
   font-size: 12px;
-  color: var(--text-2, inherit);
+  color: var(--text-2);
 }
 .cleanup-list li {
   display: flex;
@@ -4025,4 +4025,147 @@ select.input {
 .flow-save-error {
   margin-bottom: 8px;
   overflow-wrap: anywhere;
+}
+
+/* 产出 view: a stage's documents and committed changes */
+.output-docs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.output-doc-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.output-doc-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.output-doc-tabs button.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.output-doc {
+  gap: 6px;
+}
+.output-doc-path {
+  font-size: 11.5px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.output-raw {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.output-run {
+  gap: 6px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.output-run-head,
+.output-file-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.output-run-title {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.output-run-time {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.output-commits {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.output-commits li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.output-commits li span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.output-files {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 4px;
+}
+.output-file .diff {
+  max-height: 480px;
+  margin-top: 4px;
+}
+.output-file-head code {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.d-add-text {
+  color: var(--success);
+}
+.d-del-text {
+  color: var(--danger);
+}
+
+/* Delivery to a remote */
+.field-inline {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.field-inline .input {
+  flex: 1;
+  min-width: 0;
+}
+.notice-danger {
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+}
+.pr-link {
+  color: var(--accent);
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.upstream-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0 12px;
+}
+.upstream-form .field {
+  margin-bottom: 10px;
 }

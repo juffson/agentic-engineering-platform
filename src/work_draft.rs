@@ -2,7 +2,6 @@
 //! (read-only) and the project memory, and proposes items with a name, workflow and first-stage brief.
 use crate::{
     flow::{Flow, builtin},
-    memory::TEXT_LIMIT,
     workflow::{Profile, Template},
 };
 use anyhow::{Context, Result, ensure};
@@ -67,7 +66,7 @@ pub fn prompt(request: &str, notes: &[Value], existing: &[String], flows: &[Draf
          - name：简短的事项名，形如「模块 · 要做的事」，不超过 30 字。\n\
          - template：从下面的流程里选最合适的 id。\n\
          - release：只有发版、上线类事项为 true。\n\
-         - brief：给第一阶段的说明，写清目标、范围（做什么 / 不做什么）、相关代码位置和验收要点；只写你从描述和仓库里确认过的，不确定的写成待确认问题。不超过 900 字。\n\n",
+         - brief：给第一阶段的说明，写清目标、范围（做什么 / 不做什么）、相关代码位置和验收要点；只写你从描述和仓库里确认过的，不确定的写成待确认问题。写完整，不要省略验收要点；一般 1500 字以内。\n\n",
     );
     text.push_str("## 流程\n");
     for flow in flows {
@@ -112,7 +111,8 @@ pub fn parse(answer: &str, known: &[&str]) -> Result<Draft> {
         .retain(|i| !i.name.trim().is_empty() && !i.brief.trim().is_empty());
     for item in &mut draft.items {
         item.name = item.name.trim().chars().take(60).collect();
-        item.brief = item.brief.trim().chars().take(TEXT_LIMIT).collect();
+        // The brief is the first stage's whole input: never cut it.
+        item.brief = item.brief.trim().to_owned();
         item.fallback_from = (!known.contains(&item.template.as_str()))
             .then(|| std::mem::replace(&mut item.template, software()));
     }
@@ -192,6 +192,13 @@ mod tests {
         assert_eq!(d.items[2].template, "flow-backend");
         assert!(d.items[2].fallback_from.is_none());
         assert!(parse(r#"{"summary":"","items":[]}"#, &["Software"]).is_err());
+        // A long brief reaches the first stage whole (item 9f3d214b lost its last lines).
+        let long = format!(
+            "{}\n验收要点：AEP-SKIP 与 AEP-BACK",
+            "范围说明。".repeat(400)
+        );
+        let answer = json!({"summary":"","items":[{"name":"长","brief":long}]}).to_string();
+        assert_eq!(parse(&answer, &["Software"]).unwrap().items[0].brief, long);
         let p = prompt(
             "支持导出",
             &[json!({"id":1,"body":"金额用分"})],

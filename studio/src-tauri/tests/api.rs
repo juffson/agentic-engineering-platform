@@ -379,6 +379,30 @@ fn a_work_item_runs_chats_advances_delivers_merges_and_archives() -> Result<()> 
     assert_eq!(d["stages"][1]["state"], "skipped");
     assert!(d["branch"].as_str().unwrap().starts_with("aep-stage/"));
 
+    // Each stage's output: the requirements document and the build's own commit and diff.
+    let out = api::stage_output(&home, &pid, &wid, 0)?;
+    assert_eq!(out["docs"][0]["path"], "specs/demo/spec.md", "{out}");
+    assert_eq!(out["docs"][0]["content"], "prd\n");
+    let out = api::stage_output(&home, &pid, &wid, 3)?;
+    let build = &out["runs"][0];
+    assert_eq!(build["files"], serde_json::json!(["src/main.rs"]), "{out}");
+    assert_eq!(build["insertions"], 1);
+    assert!(
+        build["commits"][0]["title"]
+            .as_str()
+            .unwrap()
+            .contains("开发实现")
+    );
+    let diff = api::stage_diff(&home, &pid, &wid, build["attempt"].as_str().unwrap())?;
+    assert!(
+        diff["diff"].as_str().unwrap().contains("+fn main() {}"),
+        "{diff}"
+    );
+    assert_eq!(
+        api::stage_output(&home, &pid, &wid, 4)?["runs"][0]["files"],
+        serde_json::json!([])
+    );
+
     // The delivery merges the commit independent acceptance approved.
     let preview = api::merge_preview(&home, &pid, &wid, None)?;
     assert!(preview["error"].is_null(), "{preview}");
@@ -1457,5 +1481,168 @@ fn token_diet_fields_preview_comparison_and_resume_limit() -> Result<()> {
         .clone();
     assert_eq!(cx["count_maybe_high"], true);
     assert_eq!(cx["diet"], false);
+    Ok(())
+}
+
+#[test]
+fn an_item_starts_from_the_remote_target_and_delivers_by_pushing_a_branch() -> Result<()> {
+    let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/aep");
+    ensure!(
+        runner.is_file(),
+        "build the runner first: cargo build --bin aep"
+    );
+    let t = tempfile::tempdir()?;
+    let home = t.path().join("catalog");
+    // A bare "remote" with dev, and a clone whose checkout is an unpushed feature branch.
+    let remote = t.path().join("remote.git");
+    git(
+        t.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "dev",
+            remote.to_str().unwrap(),
+        ],
+    )?;
+    let seed = t.path().join("seed");
+    git(
+        t.path(),
+        &[
+            "clone",
+            "-q",
+            remote.to_str().unwrap(),
+            seed.to_str().unwrap(),
+        ],
+    )?;
+    git(&seed, &["config", "user.name", "t"])?;
+    git(&seed, &["config", "user.email", "t@example.com"])?;
+    fs::write(seed.join("README.md"), "demo\n")?;
+    git(&seed, &["add", "."])?;
+    git(&seed, &["commit", "-q", "-m", "init"])?;
+    git(&seed, &["push", "-q", "origin", "HEAD:dev"])?;
+    let repo = t.path().join("repo");
+    git(
+        t.path(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            "dev",
+            remote.to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ],
+    )?;
+    git(&repo, &["config", "user.name", "t"])?;
+    git(&repo, &["config", "user.email", "t@example.com"])?;
+    git(&repo, &["checkout", "-q", "-b", "feature/unpushed"])?;
+    fs::write(repo.join("unpushed.txt"), "not part of the item\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-q", "-m", "unpushed work"])?;
+    let claude = fake_claude(t.path())?;
+
+    api::create_project(&home, "remote", &[repo.display().to_string()])?;
+    let snap = api::snapshot(&home)?;
+    let pid = snap["active"].as_str().unwrap().to_owned();
+    let root = snap["projects"][0]["repositories"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The detected default is the remote's HEAD branch; delivery switches to a pull request.
+    let up = api::upstream(&home, &pid, &root)?;
+    assert_eq!(up["detected"]["remote"], "origin", "{up}");
+    assert_eq!(up["detected"]["target"], "dev", "{up}");
+    let mut config: aep::project::upstream::Upstream =
+        serde_json::from_value(up["detected"].clone())?;
+    config.delivery = aep::project::upstream::DeliveryMode::PullRequest;
+    api::set_upstream(&home, &pid, &root, Some(config))?;
+
+    let wid = api::create_work(
+        &home,
+        &pid,
+        "Export CSV",
+        "Software",
+        false,
+        std::slice::from_ref(&root),
+    )?;
+    let profile: aep::workflow::Profile = serde_json::from_value(serde_json::json!({
+        "client": "Claude", "executable": claude, "model": "", "check_command": ""
+    }))?;
+    for i in 0..7 {
+        api::update_stage(&home, &pid, &wid, i, None, Some(profile.clone()), None)?;
+    }
+    api::update_stage(&home, &pid, &wid, 0, Some("导出".into()), None, None)?;
+    api::skip(&home, &pid, &wid, 1, "无界面")?;
+    api::autopilot_start(&home, &pid, &wid, 6)?;
+    let d = wait_idle(&home, &pid, &wid)?;
+    assert_eq!(d["delivered"], true, "{}", d["autopilot"]);
+    let branch = d["branch"].as_str().unwrap().to_owned();
+    // Started from origin/dev: the unpushed feature commit is not on the item branch.
+    assert!(git(&repo, &["show", &format!("{branch}:unpushed.txt")]).is_err());
+    assert!(git(&repo, &["show", &format!("{branch}:src/main.rs")])?.contains("fn main"));
+
+    // dev moves on the remote (no conflict): the PR can still be opened.
+    fs::write(seed.join("NEWS.md"), "news\n")?;
+    git(&seed, &["add", "."])?;
+    git(&seed, &["commit", "-q", "-m", "news"])?;
+    git(&seed, &["push", "-q", "origin", "HEAD:dev"])?;
+    let pv = api::pr_preview(&home, &pid, &wid, None)?;
+    assert_eq!(pv["behind"], 1, "{pv}");
+    assert_eq!(pv["conflicts"], serde_json::json!([]));
+    assert!(pv["remote_sha"].is_null());
+    let name = pv["branch"].as_str().unwrap().to_owned();
+    assert!(name.starts_with("aep/export-csv-"), "{name}");
+    let pr = api::pr_submit(
+        &home,
+        &pid,
+        &wid,
+        &name,
+        "Export CSV",
+        pv["body"].as_str().unwrap(),
+        None,
+        true,
+        None,
+    )?;
+    assert_eq!(pr["mode"], "manual", "{pr}");
+    let pushed = git(&remote, &["rev-parse", &format!("refs/heads/{name}")])?;
+    assert_eq!(pushed.trim(), pr["pushed_sha"].as_str().unwrap());
+    let d = api::work_detail(&home, &pid, &wid)?;
+    assert_eq!(d["deliveries"][0]["pull_request"]["branch"], name.as_str());
+
+    // Updating the branch needs the commit the preview saw: a stale lease is refused.
+    assert!(
+        api::pr_submit(
+            &home,
+            &pid,
+            &wid,
+            &name,
+            "Export CSV",
+            "x",
+            None,
+            false,
+            None
+        )
+        .is_err()
+    );
+    let pv = api::pr_preview(&home, &pid, &wid, None)?;
+    assert_eq!(
+        pv["branch"],
+        name.as_str(),
+        "the previous branch is proposed again"
+    );
+    let again = api::pr_submit(
+        &home,
+        &pid,
+        &wid,
+        &name,
+        "Export CSV",
+        "x",
+        pv["remote_sha"].as_str().map(str::to_owned),
+        false,
+        Some(7),
+    )?;
+    assert_eq!(again["mode"], "update");
+    assert_eq!(again["number"], 7);
     Ok(())
 }

@@ -10,9 +10,10 @@ import { Session } from "./Session";
 import { DecisionPanel } from "./DecisionPanel";
 import { AutopilotDrawer } from "./AutopilotDrawer";
 import { HistoryView } from "./History";
+import { OutputView } from "./Output";
 import { Button, Spinner } from "./ui";
 
-type Tab = "stages" | "history";
+type Tab = "stages" | "output" | "history";
 
 export function WorkPage({ project, work }: { project: string; work: string }) {
   const { revision, notify } = useStudio();
@@ -130,15 +131,17 @@ export function WorkPage({ project, work }: { project: string; work: string }) {
       {!detail.flow_error && (
         <Pipeline
           detail={detail}
-          viewIndex={tab === "stages" ? viewIndex : -1}
+          viewIndex={tab === "history" ? -1 : viewIndex}
           onView={(i) => {
-            setTab("stages");
+            setTab((t) => (t === "history" ? "stages" : t));
             setViewed(i === detail.stage ? null : i);
           }}
         />
       )}
       {tab === "history" ? (
         <HistoryView detail={detail} handoffs={handoffs} onHandoffSent={() => setHandoffRev((r) => r + 1)} />
+      ) : tab === "output" && stage && !detail.flow_error ? (
+        <OutputView detail={detail} stage={stage} />
       ) : detail.flow_error ? (
         <section className="card work-flow-error" role="alert">
           <AlertTriangle size={16} />
@@ -228,6 +231,9 @@ function WorkHeader({
         <div className="view-tabs" role="tablist" aria-label="视图">
           <button type="button" role="tab" aria-selected={tab === "stages"} className={tab === "stages" ? "on" : ""} onClick={() => onTab("stages")}>
             阶段
+          </button>
+          <button type="button" role="tab" aria-selected={tab === "output"} className={tab === "output" ? "on" : ""} onClick={() => onTab("output")}>
+            产出
           </button>
           <button type="button" role="tab" aria-selected={tab === "history"} className={tab === "history" ? "on" : ""} onClick={() => onTab("history")}>
             历史

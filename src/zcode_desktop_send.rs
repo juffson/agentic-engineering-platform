@@ -379,10 +379,14 @@ mod tests {
         let job = json!({"requestId":id,"projectId":"project"});
         let client = thread::spawn(move || -> Result<()> {
             let deadline = Instant::now() + Duration::from_secs(3);
-            while !path.exists() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(5));
-            }
-            let mut socket = UnixStream::connect(path)?;
+            // The socket file appears at bind, just before listen: retry a refused connect.
+            let mut socket = loop {
+                match UnixStream::connect(&path) {
+                    Ok(socket) => break socket,
+                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                    Err(error) => return Err(error.into()),
+                }
+            };
             let mut line = String::new();
             BufReader::new(&socket).read_line(&mut line)?;
             let input: Value = serde_json::from_str(&line)?;

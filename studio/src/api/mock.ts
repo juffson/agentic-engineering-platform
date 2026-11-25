@@ -46,6 +46,12 @@ import type {
   RemoteErrorKind,
   RemoteStatus,
   TestResult,
+  StageOutput,
+  StageDiff,
+  Upstream,
+  UpstreamView,
+  PrPreview,
+  PullRequestInfo,
 } from "./types";
 import { parseTokens } from "../lib/format";
 import { defaultHost, normalizeHost, pluginBadge } from "../lib/remote";
@@ -158,6 +164,7 @@ interface MockWork {
   historyStages?: StageDetail[];
   budgets?: Record<number, number>;
   budgetTotal?: number | null;
+  pr?: PullRequestInfo | null;
 }
 
 /** A mock run's tokens so far, split the way the real CLIs report them (mostly cache reads). */
@@ -300,6 +307,7 @@ class MockStore implements Api {
   }
 
   resumeLimit = new Map<string, number | null>();
+  upstreams = new Map<string, Upstream>();
 
   /** The mock's `session_reuse::decide` for adjacent stages (design §3.2), simplified. */
   decide(w: MockWork, stageIndex: number): SessionPreview | null {
@@ -687,6 +695,7 @@ class MockStore implements Api {
     this.tick();
     const w = this.work(project, work);
     const d = w.detail;
+    d.upstream = this.upstreams.get(d.repositories[0] ?? "") ?? null;
     const fallback = this.projectBudget.get(project) ?? null;
     d.stages.forEach((st, i) => {
       st.budget = { limit: w.budgets?.[i] ?? fallback, own: w.budgets?.[i] ?? null, used: st.attempts.reduce((n, a) => n + (a.tokens ?? 0), 0), suggested: this.suggested(project, st.name) };
@@ -774,6 +783,108 @@ class MockStore implements Api {
     const last = st.current_attempt ? this.attempts.get(st.current_attempt) : undefined;
     if (last && !last.summary.continuable) return this.runStage({ project, work, stage });
     return this.followUp({ project, work, stage, message: message.trim() || "预算已追加。请从中断的地方继续完成本阶段的任务。" });
+  }
+
+  upstream({ repository }: { project: string; repository: string }): UpstreamView {
+    const detected: Upstream = { remote: "gitea", target: "dev", delivery: "local", branch_prefix: "aep/", forge: "gitea", web: null };
+    return { repository, configured: this.upstreams.get(repository) ?? null, detected };
+  }
+
+  setUpstream({ project, repository, upstream }: { project: string; repository: string; upstream: Upstream | null }): UpstreamView {
+    if (upstream) {
+      if (!upstream.remote.trim() || !upstream.target.trim()) throw new Error("远端和目标分支不能为空");
+      if (upstream.web && !/^https?:\/\//.test(upstream.web)) throw new Error("网页地址需以 http(s):// 开头");
+      this.upstreams.set(repository, { ...upstream, remote: upstream.remote.trim(), target: upstream.target.trim() });
+    } else this.upstreams.delete(repository);
+    return this.upstream({ project, repository });
+  }
+
+  prPreview({ project, work, branch }: { project: string; work: string; branch?: string | null }): PrPreview {
+    const w = this.work(project, work);
+    const up = this.upstreams.get(w.detail.repositories[0] ?? "");
+    if (!up) throw new Error("这个仓库还没有配置远端，请先在仓库页设置远端和目标分支");
+    const previous = w.pr ?? null;
+    const name = branch || previous?.branch || `${up.branch_prefix}export-csv-${w.detail.id.slice(0, 8)}`;
+    return {
+      repository: w.detail.repositories[0],
+      upstream: up,
+      candidate: "c0ffee1234567890c0ffee1234567890c0ffee12",
+      base_sha: "ba5e000000000000000000000000000000000000",
+      contains_base: false,
+      behind: 3,
+      conflicts: [],
+      branch: name,
+      remote_sha: previous && previous.branch === name ? previous.pushed_sha : null,
+      title: w.detail.name,
+      body: `由 AEP Studio 事项「${w.detail.name}」交付。\n\n## 交付结论\n导出 CSV 完成，测试与验收通过。\n\n验收提交：c0ffee123456\n`,
+      commits: ["c0ffee1 行情快照导出 CSV · 开发实现", "b0ba123 行情快照导出 CSV · 技术方案"],
+      previous,
+    };
+  }
+
+  prSubmit(a: { project: string; work: string; branch: string; title: string; body: string; expect: string | null; open: boolean; number: number | null }): PullRequestInfo {
+    const w = this.work(a.project, a.work);
+    const pv = this.prPreview({ project: a.project, work: a.work, branch: a.branch });
+    if ((pv.remote_sha ?? null) !== a.expect) throw new Error(`远端分支 ${a.branch} 在预览之后变了，请重新预览核对`);
+    const update = a.expect !== null || !a.open;
+    const pr: PullRequestInfo = {
+      remote: pv.upstream.remote,
+      target: pv.upstream.target,
+      branch: a.branch,
+      pushed_sha: pv.candidate,
+      mode: update ? "update" : "agit",
+      url: update ? (a.number ? `https://gitea.example.com/team/repo/pulls/${a.number}` : null) : "https://gitea.example.com/team/repo/pulls/2101",
+      number: update ? a.number : 2101,
+      title: a.title,
+      at: new Date().toISOString(),
+      operator: "demo",
+    };
+    w.pr = pr;
+    const last = w.detail.deliveries[w.detail.deliveries.length - 1];
+    if (last) last.pull_request = pr;
+    return pr;
+  }
+
+  stageOutput({ project, work, stage }: { project: string; work: string; stage: number }): StageOutput {
+    const w = this.work(project, work);
+    const st = this.stage(w, stage);
+    const passed = st.attempts.filter((a) => a.status === "succeeded").reverse();
+    const slug = "demo-feature";
+    const docs: StageOutput["docs"] =
+      st.role === "Plan" && passed[0]
+        ? [
+            {
+              path: `specs/${slug}/${stage === 0 ? "spec.md" : stage === 1 ? "interaction.md" : "design.md"}`,
+              content: `# ${st.name}\n\n## 目标\n\n${w.detail.name}：本阶段写清范围和验收要点。\n\n## 验收\n\n| 编号 | 内容 |\n|---|---|\n| AC1 | 导出按钮在列表页可用 |\n| AC2 | 导出的 CSV 与筛选条件一致 |\n`,
+              attempt: passed[0].id,
+              finished_at: passed[0].finished_at,
+            },
+          ]
+        : [];
+    const runs = st.role === "Plan" || st.role === "Build"
+      ? passed.map((a, i) => {
+          const files = st.role === "Plan" ? docs.map((d) => d.path) : [`src/export${i ? `_${i}` : ""}.rs`, "tests/export.rs"];
+          return {
+            attempt: a.id,
+            status: a.status,
+            follow_up: a.follow_up,
+            subtask: a.subtask ? { id: a.subtask.split(" ")[0], title: a.subtask.split(" ").slice(1).join(" ") } : null,
+            finished_at: a.finished_at,
+            head: (a.head_sha ?? "f00dcafe").padEnd(40, "0"),
+            commits: [{ sha: (a.head_sha ?? "f00dcafe").padEnd(40, "0"), title: `${w.detail.name} · ${st.name}${a.subtask ? ` · ${a.subtask}` : ""}`, merge: false }],
+            files,
+            insertions: 24 * files.length,
+            deletions: 3,
+          };
+        })
+      : [];
+    return { stage, docs, runs };
+  }
+
+  stageDiff({ attempt }: { project: string; work: string; attempt: string }): StageDiff {
+    const file = (path: string) =>
+      `diff --git a/${path} b/${path}\nindex 1111111..2222222 100644\n--- a/${path}\n+++ b/${path}\n@@ -1,3 +1,5 @@\n use std::fs;\n-fn old() {}\n+/// Export rows as CSV.\n+pub fn export(rows: &[Row]) -> String {\n+    rows.iter().map(Row::csv).collect()\n+}\n`;
+    return { attempt, diff: `commit ${attempt.slice(0, 7)} 开发实现\n\n${file("src/export.rs")}${file("tests/export.rs")}`, truncated: false };
   }
 
   usageAnalysis({ attempt }: { project: string; work: string; attempt: string }): UsageAnalysis {

@@ -306,7 +306,7 @@ fn host_name(input: &str) -> String {
 }
 
 enum SettingsFile {
-    Ready(Settings, bool),
+    Ready(Box<Settings>, bool),
     Corrupt(Vec<u8>),
 }
 
@@ -314,7 +314,7 @@ fn read_settings(ctx: &Ctx) -> Result<SettingsFile> {
     let bytes = match fs::read(ctx.dir().join(SETTINGS_FILE)) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == IoError::NotFound => {
-            return Ok(SettingsFile::Ready(Settings::default(), false));
+            return Ok(SettingsFile::Ready(Box::default(), false));
         }
         Err(err) => return Err(err).context("无法读取插件配置"),
     };
@@ -329,7 +329,7 @@ fn read_settings(ctx: &Ctx) -> Result<SettingsFile> {
                     connection.error = None;
                 }
             }
-            Ok(SettingsFile::Ready(settings, true))
+            Ok(SettingsFile::Ready(Box::new(settings), true))
         }
         Err(_) => Ok(SettingsFile::Corrupt(bytes)),
     }
@@ -337,7 +337,7 @@ fn read_settings(ctx: &Ctx) -> Result<SettingsFile> {
 
 fn settings(ctx: &Ctx) -> Result<(Settings, bool)> {
     match read_settings(ctx)? {
-        SettingsFile::Ready(settings, exists) => Ok((settings, exists)),
+        SettingsFile::Ready(settings, exists) => Ok((*settings, exists)),
         SettingsFile::Corrupt(_) => bail!("插件配置文件损坏"),
     }
 }
@@ -381,7 +381,7 @@ pub fn set_enabled(ctx: &Ctx, plugin: &str, enabled: bool) -> Result<Vec<Value>>
     };
     let mut revisions = settings_lock()?;
     let (mut current, recovered) = match read_settings(ctx)? {
-        SettingsFile::Ready(current, _) => (current, false),
+        SettingsFile::Ready(current, _) => (*current, false),
         SettingsFile::Corrupt(bytes) => {
             fs::write(ctx.dir().join("plugins.json.bad"), bytes)
                 .context("无法备份损坏的插件配置")?;

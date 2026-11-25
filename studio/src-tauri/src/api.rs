@@ -516,7 +516,7 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
                 .as_ref()
                 .filter(|r| r.status == merge::MergeStatus::Merged)
                 .map(|r| json!({"target": r.target_branch, "sha": r.merged_sha.clone().unwrap_or(r.candidate_sha.clone()), "at": r.merged_at}));
-            json!({"run": d.run, "archived_at": d.archived_at, "merged": merged})
+            json!({"run": d.run, "archived_at": d.archived_at, "merged": merged, "pull_request": d.pull_request})
         })
         .collect();
     let draft = (w.delivered() && w.shelved.is_none())
@@ -544,6 +544,7 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
         "flow_error": w.flow_error.as_ref().map(|broken| &broken.error),
         "stage": w.stage, "delivered": w.delivered(), "shelved": w.shelved,
         "repositories": w.repositories, "branch": branch, "worktrees": trees,
+        "upstream": w.repositories.first().and_then(|r| p.upstreams.get(r)),
         "branches": branches.iter().map(|b| json!({"name": b.name, "merged": b.merged})).collect::<Vec<_>>(),
         "stages": stages,
         "reworks": w.reworks.iter().map(|r| json!({"from": r.from, "to": r.to, "reason": r.reason, "at": r.at})).collect::<Vec<_>>(),
@@ -1027,6 +1028,92 @@ pub fn merge_preview(home: &Path, pid: &str, wid: &str, target: Option<String>) 
             Ok(v)
         }
     }
+}
+
+/// A repository's remote setting (`configured`) and what Studio detects for it (`detected`).
+pub fn upstream(home: &Path, pid: &str, repo: &str) -> Result<Value> {
+    let lib = Library::open(home)?;
+    let p = find(&lib, pid)?;
+    let path = PathBuf::from(repo);
+    ensure!(p.repositories.contains(&path), "仓库未关联到此项目");
+    Ok(json!({
+        "repository": path,
+        "configured": p.upstreams.get(&path),
+        "detected": aep::project::upstream::detect(&path),
+    }))
+}
+
+/// Save (or with None remove) a repository's remote setting.
+pub fn set_upstream(
+    home: &Path,
+    pid: &str,
+    repo: &str,
+    up: Option<aep::project::upstream::Upstream>,
+) -> Result<Value> {
+    let path = PathBuf::from(repo);
+    if let Some(up) = &up {
+        up.validate()?;
+        ensure!(
+            aep::workspace::git(&path, &["remote", "get-url", &up.remote]).is_ok(),
+            "仓库没有名为 {} 的远端",
+            up.remote
+        );
+    }
+    let mut lib = Library::open(home)?;
+    lib.change(home, |lib| {
+        let p = find_mut(lib, pid)?;
+        ensure!(p.repositories.contains(&path), "仓库未关联到此项目");
+        match up {
+            Some(up) => p.upstreams.insert(path.clone(), up),
+            None => p.upstreams.remove(&path),
+        };
+        Ok(())
+    })?;
+    upstream(home, pid, repo)
+}
+
+/// Read-only preview of pushing the delivery and its PR (fetches the target branch).
+pub fn pr_preview(home: &Path, pid: &str, wid: &str, branch: Option<String>) -> Result<Value> {
+    let lib = Library::open(home)?;
+    let w = item(find(&lib, pid)?, wid)?;
+    let d = w.deliveries.last().context("事项还没有交付记录")?;
+    Ok(serde_json::to_value(aep::project::upstream::preview(
+        home,
+        &lib,
+        d,
+        branch.as_deref(),
+    )?)?)
+}
+
+/// Push the accepted commit and open (or update) the PR, after the person confirmed.
+#[allow(clippy::too_many_arguments)]
+pub fn pr_submit(
+    home: &Path,
+    pid: &str,
+    wid: &str,
+    branch: &str,
+    title: &str,
+    body: &str,
+    expect: Option<String>,
+    open: bool,
+    number: Option<u64>,
+) -> Result<Value> {
+    let mut lib = Library::open(home)?;
+    let pr = aep::project::upstream::submit(
+        home,
+        &mut lib,
+        pid,
+        wid,
+        aep::project::upstream::Submit {
+            branch,
+            title,
+            body,
+            expect: expect.as_deref(),
+            open,
+            number,
+        },
+    )?;
+    Ok(serde_json::to_value(pr)?)
 }
 
 pub fn merge_confirm(home: &Path, pid: &str, wid: &str, target: &str, digest: &str) -> Result<()> {
@@ -1624,6 +1711,180 @@ pub fn usage_analysis(home: &Path, pid: &str, wid: &str, attempt: &str) -> Resul
             .unwrap_or(report.summary.calls as u64)
     );
     Ok(v)
+}
+
+/// What a stage produced (the 产出 view): per run with a pinned commit (newest first), the
+/// commits it made on the item branch and their size, and the spec documents those commits
+/// or its evidence name, read at that run's commit. Platform-only merges of the base branch
+/// are left out; a stage commit that also concluded such a merge shows only what was done on
+/// top of the automatic merge (`--remerge-diff`).
+pub fn stage_output(home: &Path, pid: &str, wid: &str, stage: usize) -> Result<Value> {
+    let lib = Library::open(home)?;
+    let p = find(&lib, pid)?;
+    let w = item(p, wid)?;
+    let mut docs: Vec<Value> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut runs = Vec::new();
+    for a in w.attempts.iter().rev().filter(|a| a.stage == stage) {
+        let dir = workflow::attempt_dir(home, pid, wid, &a.id);
+        let ev = read_evidence(&dir);
+        let req = read_request(&dir);
+        let (Some(head), Some(repo)) = (
+            ev["head_sha"].as_str(),
+            req.as_ref().and_then(|r| r.repository.clone()),
+        ) else {
+            continue;
+        };
+        let commits = run_commits(&repo, head, &a.id).unwrap_or_default();
+        let (mut files, mut insertions, mut deletions) = (Vec::<String>::new(), 0, 0);
+        for c in &commits {
+            for (path, add, del) in &c.files {
+                insertions += add;
+                deletions += del;
+                if !files.contains(path) {
+                    files.push(path.clone());
+                }
+            }
+        }
+        let specs = ev["spec_files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .chain(files.iter().filter(|f| f.starts_with("specs/")).cloned());
+        for path in specs {
+            if seen.insert(path.clone())
+                && let Ok(content) = git_text(&repo, &["show", &format!("{head}:{path}")])
+            {
+                docs.push(json!({"path":path,"content":content,"attempt":a.id,"finished_at":ev["finished_at"]}));
+            }
+        }
+        let subtask = req
+            .as_ref()
+            .and_then(|r| r.subtask.as_ref())
+            .map(|t| json!({"id":t.id,"title":t.title}));
+        runs.push(json!({
+            "attempt": a.id,
+            "status": ev["status"],
+            "follow_up": ev["follow_up"].is_object(),
+            "subtask": subtask,
+            "finished_at": ev["finished_at"],
+            "head": head,
+            "commits": commits.iter().map(|c| json!({"sha":c.sha,"title":c.title,"merge":c.merge})).collect::<Vec<_>>(),
+            "files": files,
+            "insertions": insertions,
+            "deletions": deletions,
+        }));
+    }
+    docs.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    Ok(json!({"stage":stage,"docs":docs,"runs":runs}))
+}
+
+/// The patch of one run's commits (see `stage_output`), capped like the merge preview.
+pub fn stage_diff(home: &Path, pid: &str, wid: &str, attempt: &str) -> Result<Value> {
+    aep::workspace::ident(attempt, 64)?;
+    let dir = workflow::attempt_dir(home, pid, wid, attempt);
+    ensure!(dir.is_dir(), "执行记录不存在");
+    let ev = read_evidence(&dir);
+    let head = ev["head_sha"].as_str().context("这次执行没有提交记录")?;
+    let repo = read_request(&dir)
+        .and_then(|r| r.repository)
+        .context("这次执行没有关联仓库")?;
+    const LIMIT: usize = 800_000;
+    let mut diff = String::new();
+    for c in run_commits(&repo, head, attempt)?.iter().rev() {
+        let mut args = vec!["show", "--no-color", "--format=commit %h %s%n"];
+        if c.merge {
+            args.push("--remerge-diff");
+        }
+        args.push(&c.sha);
+        diff.push_str(&git_text(&repo, &args)?);
+        if diff.len() > LIMIT {
+            break;
+        }
+    }
+    let truncated = diff.len() > LIMIT;
+    if truncated {
+        let mut end = LIMIT;
+        while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        diff.truncate(end);
+    }
+    Ok(json!({"attempt":attempt,"diff":diff,"truncated":truncated}))
+}
+
+struct RunCommit {
+    sha: String,
+    title: String,
+    merge: bool,
+    files: Vec<(String, u64, u64)>,
+}
+
+/// Commits a run made (they carry its `AEP-Run:` trailer), newest first, without the
+/// platform's own merges of the base branch.
+fn run_commits(repo: &Path, head: &str, attempt: &str) -> Result<Vec<RunCommit>> {
+    let log = git_text(
+        repo,
+        &[
+            "log",
+            "-n",
+            "40",
+            "--format=%H%x1f%P%x1f%s",
+            "--fixed-strings",
+            &format!("--grep=AEP-Run: {attempt}"),
+            head,
+        ],
+    )?;
+    let mut out = Vec::new();
+    for line in log.lines() {
+        let mut f = line.split('\u{1f}');
+        let (Some(sha), Some(parents), Some(title)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let merge = parents.split_whitespace().count() > 1;
+        // `合入 main（N 个新提交）`: the platform's merge before a stage, not the stage's work.
+        if merge && title.starts_with("合入 ") {
+            continue;
+        }
+        let mut args = vec!["show", "--numstat", "--format="];
+        if merge {
+            args.push("--remerge-diff");
+        }
+        args.push(sha);
+        let files = git_text(repo, &args)?
+            .lines()
+            .filter_map(|l| {
+                let mut p = l.splitn(3, '\t');
+                let add = p.next()?.parse().unwrap_or(0);
+                let del = p.next()?.parse().unwrap_or(0);
+                Some((p.next()?.to_owned(), add, del))
+            })
+            .collect();
+        out.push(RunCommit {
+            sha: sha.to_owned(),
+            title: title.to_owned(),
+            merge,
+            files,
+        });
+    }
+    Ok(out)
+}
+
+fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()?;
+    ensure!(
+        out.status.success(),
+        "git {}：{}",
+        args.first().unwrap_or(&""),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Token use across the project: totals, per item, per stage, per CLI/model, per day, the

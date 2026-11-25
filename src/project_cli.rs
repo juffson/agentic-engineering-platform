@@ -188,6 +188,51 @@ enum Action {
         #[arg(long)]
         target: String,
     },
+    /// Show or set the remote branch a repository's items start from and follow, and whether
+    /// deliveries merge locally or push and open a pull request.
+    Upstream {
+        #[arg(long)]
+        repository: PathBuf,
+        #[arg(long)]
+        remote: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        /// local or pull-request
+        #[arg(long)]
+        delivery: Option<String>,
+        #[arg(long)]
+        branch_prefix: Option<String>,
+        /// Repository web address, for SSH host aliases (https://host/owner/repo)
+        #[arg(long)]
+        web: Option<String>,
+        /// gitea, github or gitlab
+        #[arg(long)]
+        forge: Option<String>,
+        /// Remove the setting: items start from the local HEAD branch and merge locally.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Preview pushing the item's accepted commit and its PR; with --submit, push and open
+    /// (or, for an existing branch, update) the PR.
+    DeliverPr {
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// The remote branch commit seen in the preview; required to update an existing branch.
+        #[arg(long)]
+        expect: Option<String>,
+        /// The existing PR's number, recorded with the update.
+        #[arg(long)]
+        number: Option<u64>,
+        /// Only push; do not open a PR (an existing PR follows its branch).
+        #[arg(long)]
+        no_open: bool,
+        #[arg(long)]
+        submit: bool,
+    },
     /// Export the full binary patch to a new file.
     MergePatch {
         #[arg(long)]
@@ -1017,6 +1062,120 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             c.delivery(&delivery)?,
             &target,
         )?),
+        Action::Upstream {
+            repository,
+            remote,
+            target,
+            delivery,
+            branch_prefix,
+            web,
+            forge,
+            clear,
+        } => {
+            use project::upstream::{self, DeliveryMode, Forge};
+            let repo = root(&repository)?;
+            ensure!(
+                c.project()?.repositories.contains(&repo),
+                "仓库未关联到此项目"
+            );
+            let detected = upstream::detect(&repo);
+            let change = remote.is_some()
+                || target.is_some()
+                || delivery.is_some()
+                || branch_prefix.is_some()
+                || web.is_some()
+                || forge.is_some();
+            if clear {
+                c.edit_project(|p| Ok(p.upstreams.remove(&repo)))?;
+            } else if change {
+                let mut up = c
+                    .project()?
+                    .upstreams
+                    .get(&repo)
+                    .cloned()
+                    .or(detected.clone())
+                    .context("仓库没有远端，无法配置")?;
+                if let Some(v) = remote {
+                    up.remote = v;
+                }
+                if let Some(v) = target {
+                    up.target = v;
+                }
+                if let Some(v) = delivery {
+                    up.delivery = match v.as_str() {
+                        "local" => DeliveryMode::Local,
+                        "pull-request" | "pull_request" | "pr" => DeliveryMode::PullRequest,
+                        _ => anyhow::bail!("delivery 只能是 local 或 pull-request"),
+                    };
+                }
+                if let Some(v) = branch_prefix {
+                    up.branch_prefix = v;
+                }
+                if let Some(v) = web {
+                    up.web = (!v.is_empty()).then_some(v);
+                }
+                if let Some(v) = forge {
+                    up.forge = match v.as_str() {
+                        "gitea" => Some(Forge::Gitea),
+                        "github" => Some(Forge::GitHub),
+                        "gitlab" => Some(Forge::GitLab),
+                        "" => None,
+                        _ => anyhow::bail!("forge 只能是 gitea、github 或 gitlab"),
+                    };
+                }
+                up.validate()?;
+                ensure!(
+                    aep::workspace::git(&repo, &["remote", "get-url", &up.remote]).is_ok(),
+                    "仓库没有名为 {} 的远端",
+                    up.remote
+                );
+                c.edit_project(|p| Ok(p.upstreams.insert(repo.clone(), up)))?;
+            }
+            print(
+                &json!({"repository":repo,"configured":c.project()?.upstreams.get(&repo),"detected":detected}),
+            )
+        }
+        Action::DeliverPr {
+            branch,
+            title,
+            body_file,
+            expect,
+            number,
+            no_open,
+            submit,
+        } => {
+            let d = c.work()?.deliveries.last().context("事项还没有交付记录")?;
+            let preview = project::upstream::preview(&c.dir, &c.library, d, branch.as_deref())?;
+            if !submit {
+                return print(&preview);
+            }
+            let body = match body_file {
+                Some(f) if f.as_os_str() == "-" => {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                    text
+                }
+                Some(f) => fs::read_to_string(f)?,
+                None => preview.body.clone(),
+            };
+            let title = title.unwrap_or(preview.title.clone());
+            let project = c.project()?.id.clone();
+            let work = c.work()?.id.clone();
+            print(&project::upstream::submit(
+                &c.dir,
+                &mut c.library,
+                &project,
+                &work,
+                project::upstream::Submit {
+                    branch: &preview.branch,
+                    title: &title,
+                    body: &body,
+                    expect: expect.as_deref(),
+                    open: !no_open,
+                    number,
+                },
+            )?)
+        }
         Action::MergePatch {
             delivery,
             target,

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { Archive, ArchiveRestore, BookmarkPlus, ChevronDown, ChevronRight, GitBranch, GitMerge, Info, Trash2 } from "lucide-react";
-import type { MergePreview, WorkDetail } from "../api/types";
+import { Archive, ArchiveRestore, BookmarkPlus, ChevronDown, ChevronRight, GitBranch, GitMerge, GitPullRequest, Info, Trash2 } from "lucide-react";
+import type { MergePreview, PrPreview, WorkDetail } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio } from "../state/store";
 import { clock, relative } from "../lib/format";
@@ -110,7 +110,7 @@ export function DeliveryCard({ detail }: { detail: WorkDetail }) {
   );
 }
 
-function DiffView({ diff, truncated }: { diff: string; truncated: boolean }) {
+export function DiffView({ diff, truncated }: { diff: string; truncated: boolean }) {
   return (
     <div className="diff" role="region" aria-label="差异">
       <pre>
@@ -258,5 +258,184 @@ function Cleanup({ detail }: { detail: WorkDetail }) {
         </Button>
       )}
     </div>
+  );
+}
+
+/**
+ * Delivery to the repository's remote: push the accepted commit as a branch and open a PR to the
+ * target (or update an existing PR's branch). Nothing is pushed until the person confirms.
+ */
+export function PullRequestCard({ detail }: { detail: WorkDetail }) {
+  const { act } = useStudio();
+  const recorded = detail.deliveries[detail.deliveries.length - 1]?.pull_request ?? null;
+  const [branch, setBranch] = useState<string | null>(null);
+  const [preview, setPreview] = useState<PrPreview | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [number, setNumber] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [showCommits, setShowCommits] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const p = await api.prPreview({ project: detail.project, work: detail.id, branch });
+      setPreview(p);
+      setTitle((t) => t || p.title);
+      setBody((b) => b || p.body);
+      if (branch === null) setBranch(p.branch);
+      setError(null);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setLoading(false);
+    }
+    // Only an explicit refresh re-reads the remote (branch edits wait for 「重新检查」).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail.project, detail.id]);
+
+  useEffect(() => {
+    void load();
+  }, [load, recorded?.pushed_sha]);
+
+  const recheck = async () => {
+    setLoading(true);
+    try {
+      const p = await api.prPreview({ project: detail.project, work: detail.id, branch });
+      setPreview(p);
+      setError(null);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const stale = preview !== null && branch !== null && branch !== preview.branch;
+  const update = !!preview?.remote_sha;
+  const blocked = !preview || stale || preview.conflicts.length > 0 || !title.trim() || title.includes("\n");
+
+  const submit = async () => {
+    if (!preview || blocked) return;
+    setBusy(true);
+    const n = number.trim() ? Number(number.trim()) : (recorded?.branch === preview.branch ? recorded.number ?? null : null);
+    const pr = await act(
+      () =>
+        api.prSubmit({
+          project: detail.project,
+          work: detail.id,
+          branch: preview.branch,
+          title: title.trim(),
+          body,
+          expect: preview.remote_sha,
+          open: !update,
+          number: Number.isFinite(n) ? n : null,
+        }),
+      update ? `已推送到 ${preview.upstream.remote}/${preview.branch}` : `已推送并提交 PR 到 ${preview.upstream.target}`,
+    );
+    setBusy(false);
+    if (pr) void recheck();
+  };
+
+  return (
+    <section className="card card-decision" data-testid="pull-request">
+      <div className="card-head">
+        <span className="card-title">交付 · 推送并提 PR</span>
+        {loading && <Spinner size={12} />}
+      </div>
+      {recorded && (
+        <div className="merged-line" data-testid="pr-recorded">
+          <GitPullRequest size={13} />
+          <span>
+            {recorded.number ? `PR #${recorded.number}` : recorded.mode === "manual" ? "已推送分支，PR 待在网页上创建" : "已推送"}
+            {" · "}
+            <code>{recorded.branch}</code> → <code>{recorded.target}</code>
+            <span className="muted"> · {relative(recorded.at)}</span>
+            {recorded.url && (
+              <>
+                <br />
+                <button type="button" className="link-btn pr-link" onClick={() => act(() => api.openUrl({ url: recorded.url! }))}>
+                  {recorded.url}
+                </button>
+              </>
+            )}
+          </span>
+        </div>
+      )}
+      {error && <p className="inline-error">{error}</p>}
+      {preview && (
+        <>
+          <div className="merge-route">
+            <code className="branch-name" title={preview.candidate}>
+              {preview.candidate.slice(0, 8)}
+            </code>
+            <span className="muted">→</span>
+            <code>
+              {preview.upstream.remote}/{preview.upstream.target}
+            </code>
+          </div>
+          {preview.conflicts.length > 0 ? (
+            <div className="notice-box notice-danger" role="alert">
+              <Info size={14} />
+              <span>
+                和 {preview.upstream.remote}/{preview.upstream.target} 冲突：{preview.conflicts.join("、")}。请退回开发合入并解决冲突，重新验收后再提交。
+              </span>
+            </div>
+          ) : (
+            preview.behind > 0 && (
+              <div className="notice-box">
+                <Info size={14} />
+                <span>
+                  目标分支在验收之后前进了 {preview.behind} 个提交，没有冲突，可以直接提 PR。
+                </span>
+              </div>
+            )
+          )}
+          <label className="field">
+            <span className="field-label">推送到分支</span>
+            <div className="field-inline">
+              <input className="input input-sm" aria-label="推送分支" value={branch ?? ""} onChange={(e) => setBranch(e.target.value.trim())} />
+              <Button variant="secondary" size="sm" onClick={recheck} disabled={loading}>
+                重新检查
+              </Button>
+            </div>
+            <span className="field-hint">
+              {stale
+                ? "分支名改了，先「重新检查」远端。"
+                : update
+                  ? `远端已有这个分支（${preview.remote_sha?.slice(0, 8)}），将更新它，已有的 PR 会跟着更新。`
+                  : "远端还没有这个分支，将新建并提 PR。"}
+            </span>
+          </label>
+          {update ? (
+            <label className="field">
+              <span className="field-label">PR 编号（可选，用于记录）</span>
+              <input className="input input-sm" aria-label="PR 编号" inputMode="numeric" value={number} placeholder={recorded?.number ? String(recorded.number) : "如 1926"} onChange={(e) => setNumber(e.target.value.replace(/\D/g, ""))} />
+            </label>
+          ) : (
+            <>
+              <label className="field">
+                <span className="field-label">PR 标题</span>
+                <input className="input input-sm" aria-label="PR 标题" value={title} onChange={(e) => setTitle(e.target.value)} />
+              </label>
+              <label className="field">
+                <span className="field-label">PR 描述</span>
+                <textarea className="input" aria-label="PR 描述" rows={5} value={body} onChange={(e) => setBody(e.target.value)} />
+              </label>
+            </>
+          )}
+          <button type="button" className="link-btn" onClick={() => setShowCommits((s) => !s)} aria-expanded={showCommits}>
+            {showCommits ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            {preview.commits.length} 个提交
+          </button>
+          {showCommits && <pre className="stat-box">{preview.commits.join("\n")}</pre>}
+          <Button variant="primary" size="lg" className="block" icon={<GitPullRequest size={14} />} busy={busy} disabled={blocked} onClick={submit}>
+            {update ? `推送更新到 ${preview.branch}` : `推送并提 PR 到 ${preview.upstream.target}`}
+          </Button>
+        </>
+      )}
+    </section>
   );
 }

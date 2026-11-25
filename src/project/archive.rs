@@ -25,6 +25,9 @@ pub struct Delivery {
     pub merge: Option<super::merge::MergeReceipt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_history: Vec<super::merge::AbandonedIntent>,
+    /// The push and PR of a delivery to a remote (instead of a local merge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<super::upstream::PullRequest>,
 }
 impl Delivery {
     pub fn snapshot(&self, home: &Path) -> Result<timeline::Timeline> {
@@ -38,6 +41,8 @@ impl Delivery {
         let mut original = self.clone();
         original.merge = None;
         original.merge_history.clear();
+        // Like the merge, the push and PR happen after the archive was sealed.
+        original.pull_request = None;
         ensure!(
             manifest["delivery"] == serde_json::to_value(&original)?
                 && snapshot.work_id == self.work
@@ -161,6 +166,7 @@ pub(super) fn seal(
         attempts: history.rounds.len(),
         merge: None,
         merge_history: vec![],
+        pull_request: None,
     };
     let target = receipt.directory(home);
     if target.try_exists()? {

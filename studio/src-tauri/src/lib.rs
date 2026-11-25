@@ -385,6 +385,58 @@ fn usageAnalysis(project: String, work: String, attempt: String) -> Result<impl 
 }
 
 #[tauri::command(async)]
+fn upstream(project: String, repository: String) -> Result<impl Serialize, String> {
+    run(move |h| api::upstream(&h, &project, &repository))
+}
+
+#[tauri::command(async)]
+fn setUpstream(
+    project: String,
+    repository: String,
+    upstream: Option<aep::project::upstream::Upstream>,
+) -> Result<impl Serialize, String> {
+    run(move |h| api::set_upstream(&h, &project, &repository, upstream))
+}
+
+#[tauri::command(async)]
+fn prPreview(
+    project: String,
+    work: String,
+    branch: Option<String>,
+) -> Result<impl Serialize, String> {
+    run(move |h| api::pr_preview(&h, &project, &work, branch))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+fn prSubmit(
+    project: String,
+    work: String,
+    branch: String,
+    title: String,
+    body: String,
+    expect: Option<String>,
+    open: bool,
+    number: Option<u64>,
+) -> Result<impl Serialize, String> {
+    run(move |h| {
+        api::pr_submit(
+            &h, &project, &work, &branch, &title, &body, expect, open, number,
+        )
+    })
+}
+
+#[tauri::command(async)]
+fn stageOutput(project: String, work: String, stage: usize) -> Result<impl Serialize, String> {
+    run(move |h| api::stage_output(&h, &project, &work, stage))
+}
+
+#[tauri::command(async)]
+fn stageDiff(project: String, work: String, attempt: String) -> Result<impl Serialize, String> {
+    run(move |h| api::stage_diff(&h, &project, &work, &attempt))
+}
+
+#[tauri::command(async)]
 fn projectUsage(project: String) -> Result<impl Serialize, String> {
     run(move |h| api::project_usage(&h, &project))
 }
@@ -479,6 +531,12 @@ pub fn start() {
             extendBudget,
             usageAnalysis,
             projectUsage,
+            stageOutput,
+            upstream,
+            setUpstream,
+            prPreview,
+            prSubmit,
+            stageDiff,
             openProject,
             selectWork,
             createProject,

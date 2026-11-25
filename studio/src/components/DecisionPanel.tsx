@@ -6,7 +6,7 @@ import { useStudio } from "../state/store";
 import { relative } from "../lib/format";
 import { isGate, latestAttempt, needsRecheck, sendBackTarget } from "../lib/work";
 import { StageConfigCard } from "./StageConfig";
-import { ArchiveCard, DeliveryCard, ShelvedCard } from "./Delivery";
+import { ArchiveCard, DeliveryCard, PullRequestCard, ShelvedCard } from "./Delivery";
 import { Button, Spinner } from "./ui";
 import { ExtendBudget } from "./Budget";
 
@@ -21,7 +21,7 @@ export function DecisionPanel({ detail, viewed }: { detail: WorkDetail; viewed: 
   if (detail.delivered) {
     return (
       <aside className="decision" aria-label="交付">
-        <DeliveryCard detail={detail} />
+        {detail.upstream?.delivery === "pull_request" ? <PullRequestCard detail={detail} /> : <DeliveryCard detail={detail} />}
         <ArchiveCard detail={detail} />
       </aside>
     );

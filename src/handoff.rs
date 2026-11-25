@@ -285,12 +285,15 @@ pub fn packet(
 /// memory and earlier outputs, so only `header + rules + READING` and this run's archive are sent.
 pub fn adjacent(req: &Request, dir: &Path) -> Result<String> {
     Ok(format!(
-        "{}{}\n{READING}\n本次档案 {}。前序执行的 result.txt 和 evidence.json 位于同级执行目录。",
+        "{}{}\n{READING}\n本次档案 {}。前序执行的 result.txt 和 evidence.json 位于同级执行目录。{SCRATCH}",
         header(req)?,
         rules(req)?,
         dir.display()
     ))
 }
+/// Where a stage keeps scratch files and the evidence it cites (runs used /tmp: lost on
+/// reboot, and 20 GB of exported copies and build folders piled up there).
+pub const SCRATCH: &str = "\n临时文件和临时构建目录放在 $TMPDIR（本次档案下的 tmp/，阶段结束后由平台删除）；要留存的日志、截图等证据写到本次档案的 evidence/ 目录，答复里引用这里的路径，不要写到 /tmp。测试直接在事项工作区里运行，不用导出副本：被 .gitignore 忽略的构建产物（如 target/、dist/）不算改动，同一事项的后续阶段还能复用。";
 /// New-session prompt used instead of resuming (R2, E4, E5): the full fresh `base` prompt plus
 /// the previous answer (first 8000 chars) and a hand-off digest (its AEP-HANDOFF line and the
 /// source evidence file). `follow` is the operator's message when continuing the conversation.
@@ -331,6 +334,7 @@ impl Work {
             stage,
             profile: assignment.profile,
             repository: assignment.repository.clone(),
+            upstream: None,
             ticket: assignment.repository.as_ref().map(|p| self.ticket(p)),
             brief: assignment.brief,
             approved: flow
@@ -389,6 +393,9 @@ impl Project {
         let project = self.name.clone();
         let pid = self.id.clone();
         let resume_limit = crate::session_reuse::limit(self.resume_limit);
+        let upstream = repository
+            .as_ref()
+            .and_then(|r| self.upstreams.get(r).cloned());
         let budget = self
             .work
             .iter()
@@ -441,6 +448,7 @@ impl Project {
         )?;
         request.token_limit = budget.and_then(|b| b.remaining());
         request.resume_limit = Some(resume_limit);
+        request.upstream = upstream;
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)

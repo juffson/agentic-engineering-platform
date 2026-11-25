@@ -1,4 +1,4 @@
-use crate::{agent::logged, run::save};
+use crate::{agent::logged_in, run::save};
 use aep::{
     cancel::Cancellation,
     flow::Back,
@@ -39,6 +39,8 @@ fn workspace(
     repository: Option<&Path>,
     delivery: Option<&aep::project::transfer::Transfer>,
     attempt: &str,
+    upstream: Option<&aep::project::upstream::Upstream>,
+    record: &mut Value,
 ) -> Result<PathBuf> {
     let Some(repo) = repository else {
         let p = work.join("workspace");
@@ -102,16 +104,21 @@ fn workspace(
         if prepared {
             git(&repo.root, &["worktree", "add", target, &branch])?;
         } else {
+            // A new item starts from the configured remote branch, freshly fetched, never from
+            // whatever happens to be checked out (an unpushed feature branch would ride along).
+            let start = match (pinned, upstream) {
+                (Some(sha), _) => sha.to_owned(),
+                (None, Some(up)) => {
+                    aep::project::upstream::fetch(&repo.root, up)?;
+                    let sha = aep::project::upstream::base_sha(&repo.root, up)?;
+                    record["start"] = json!({"base":up.label(),"sha":sha});
+                    sha
+                }
+                (None, None) => "HEAD".to_owned(),
+            };
             git(
                 &repo.root,
-                &[
-                    "worktree",
-                    "add",
-                    "-b",
-                    &branch,
-                    target,
-                    pinned.unwrap_or("HEAD"),
-                ],
+                &["worktree", "add", "-b", &branch, target, &start],
             )?;
         }
     }
@@ -158,8 +165,9 @@ pub(crate) fn context(
     let mut packet = context_packet(req, work, cwd, since)?;
     if since.is_none() {
         packet.text.push_str(&format!(
-            "\n本次档案 {}。前序执行的 result.txt 和 evidence.json 位于同级执行目录。",
-            dir.display()
+            "\n本次档案 {}。前序执行的 result.txt 和 evidence.json 位于同级执行目录。{}",
+            dir.display(),
+            aep::handoff::SCRATCH
         ));
     }
     Ok(packet)
@@ -399,6 +407,8 @@ fn perform(
         req.repository.as_deref(),
         req.stage_transfer.as_ref(),
         id,
+        req.upstream.as_ref(),
+        record,
     )?;
     if let Some(note) = align_base(req, stage, &cwd, id, record)? {
         record["base"]["note"] = json!(note);
@@ -537,11 +547,46 @@ fn identity(cwd: &Path) -> Vec<&'static str> {
     }
 }
 
+/// Whether a merge is in progress in this worktree.
+fn merging(cwd: &Path) -> bool {
+    git(cwd, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok()
+}
+
+/// Files of an open merge that are still unmerged or still carry conflict markers.
+fn unresolved(cwd: &Path) -> Result<Vec<String>> {
+    let files = git(cwd, &["diff", "--name-only", "--diff-filter=U"])?;
+    Ok(files
+        .lines()
+        .filter(|f| {
+            fs::read(cwd.join(f)).is_ok_and(|bytes| {
+                String::from_utf8_lossy(&bytes).lines().any(|l| {
+                    l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ") || l == "======="
+                })
+            })
+        })
+        .map(str::to_owned)
+        .collect())
+}
+
+fn resolve_note(base: &str, files: &[String]) -> String {
+    let listed = files
+        .iter()
+        .take(12)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("、");
+    format!(
+        "平台已开始把 {base} 合入事项分支，这些文件有冲突标记：{listed}。请先解决冲突：直接编辑这些文件、删掉 <<<<<<< ======= >>>>>>> 标记并保留两边需要的改动，让相关测试通过，再继续本阶段。不要运行 git merge、git add 或 git commit，平台会在本阶段结束时把合并和本阶段改动一起提交；还留着冲突标记的话本阶段不会通过。"
+    )
+}
+
 /// Keep the item branch merged with its base (the branch checked out in the repository's main
 /// worktree, usually main), so a moved base shows up at the next stage, not at delivery.
 ///
 /// - Writing stages and the test stage merge a base that merges cleanly before they start.
-/// - A conflicting merge is left to the build: it is told which files conflict.
+/// - Writing stages first commit what an earlier round left uncommitted.
+/// - A conflicting merge is started by the platform at the build, which resolves the files;
+///   the plan stage is only told about it.
 /// - Acceptance and delivery check an exact tested commit, so they do not merge: a moved base
 ///   sends the item back to the test stage (clean) or the build (conflicts) without a model call.
 ///
@@ -560,14 +605,56 @@ fn align_base(
     if !stage_worktree(&root, cwd) {
         return Ok(None);
     }
-    let Some(base) = git(&root, &["symbolic-ref", "--short", "-q", "HEAD"])
-        .ok()
-        .map(|b| b.trim().to_owned())
-        .filter(|b| !b.is_empty() && !b.starts_with(aep::project::branches::STAGE_PREFIX))
-    else {
-        return Ok(None);
+    // The configured remote branch (fetched now; a failed fetch keeps the last one), else the
+    // branch checked out in the repository's main worktree.
+    let (base, base_sha) = if let Some(up) = &req.upstream {
+        if let Err(e) = aep::project::upstream::fetch(&root, up) {
+            record["base_fetch_error"] = json!(format!("{e:#}"));
+        }
+        (up.label(), aep::project::upstream::base_sha(&root, up)?)
+    } else {
+        let Some(base) = git(&root, &["symbolic-ref", "--short", "-q", "HEAD"])
+            .ok()
+            .map(|b| b.trim().to_owned())
+            .filter(|b| !b.is_empty() && !b.starts_with(aep::project::branches::STAGE_PREFIX))
+        else {
+            return Ok(None);
+        };
+        let sha = aep::workspace::commit(&root, &format!("refs/heads/{base}"))?;
+        (base, sha)
     };
-    let base_sha = aep::workspace::commit(&root, &format!("refs/heads/{base}"))?;
+    // A build that failed mid-merge left the merge open: the next build finishes it; any
+    // other stage starts from the item branch as committed.
+    if merging(cwd) {
+        if stage.role == Role::Build {
+            let files = unresolved(cwd)?;
+            record["base"] = json!({"branch":base,"sha":base_sha,"conflicts":files,"merging":true});
+            return Ok(Some(resolve_note(&base, &files)));
+        }
+        // Keep that round's edits (resolved or not) in a ref before abandoning the merge.
+        git(cwd, &["add", "-A"])?;
+        let tree = git(cwd, &["write-tree"])?;
+        let message = format!(
+            "未完成的合入 {base}（{} 开始前保存）\n\nAEP-Run: {id}",
+            stage.name
+        );
+        let mut args = identity(cwd);
+        args.extend([
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            "HEAD",
+            "-p",
+            "MERGE_HEAD",
+            "-m",
+            &message,
+        ]);
+        let parked = git(cwd, &args)?;
+        let name = format!("refs/aep/unfinished/{id}");
+        git(&root, &["update-ref", &name, parked.trim()])?;
+        git(cwd, &["merge", "--abort"])?;
+        record["base_unfinished"] = json!(name);
+    }
     let contained = std::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -610,10 +697,25 @@ fn align_base(
             String::from_utf8_lossy(&tree.stderr).trim()
         ),
     };
-    let dirty = !git(cwd, &["status", "--porcelain", "--untracked-files=no"])?
+    let mut dirty = !git(cwd, &["status", "--porcelain", "--untracked-files=no"])?
         .trim()
         .is_empty();
     record["base"] = json!({"branch":base,"sha":base_sha,"behind":behind,"conflicts":conflicts});
+    // Writing stages commit whatever an earlier round left uncommitted (the platform would
+    // commit it with this stage anyway), so the merge below never waits on the agent: a
+    // sandboxed CLI cannot run git merge itself.
+    if dirty && matches!(stage.role, Role::Plan | Role::Build) {
+        git(cwd, &["add", "-A"])?;
+        let message = format!(
+            "{} · {} · 保留上一轮未提交的改动\n\nAEP-Run: {id}",
+            req.work, stage.name
+        );
+        let mut args = identity(cwd);
+        args.extend(["commit", "--no-verify", "-q", "-m", &message]);
+        git(cwd, &args)?;
+        record["base"]["committed_leftovers"] = json!(true);
+        dirty = false;
+    }
     let listed = conflicts
         .iter()
         .take(12)
@@ -645,15 +747,30 @@ fn align_base(
                 "平台已把 {base} 的 {behind} 个新提交合入事项分支（没有冲突），本阶段基于合并后的代码。"
             )))
         }
-        Role::Plan | Role::Build => Ok(Some(if conflicts.is_empty() {
-            format!(
-                "事项分支落后 {base} {behind} 个提交，工作区有未提交改动，平台没有自动合并。完成本阶段改动前请运行 git merge {base} 并处理冲突（不要提交，平台会自动提交）。"
-            )
-        } else {
-            format!(
-                "事项分支落后 {base} {behind} 个提交，合并会在这些文件冲突：{listed}。请先运行 git merge {base}，解决冲突并让测试通过，再继续本阶段（不要提交，平台会把合并一起提交）。"
-            )
-        })),
+        // The platform starts the merge; the build only edits the conflicted files and the
+        // platform commits the merge with the stage (pin_worktree checks no marker is left).
+        Role::Build => {
+            let message = format!("合入 {base}（{behind} 个新提交）\n\nAEP-Run: {id}");
+            let mut args = identity(cwd);
+            args.extend([
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                "--no-verify",
+                "-q",
+                "-m",
+                &message,
+                &base_sha,
+            ]);
+            let _ = git(cwd, &args);
+            ensure!(merging(cwd), "无法开始合入 {base}");
+            let files = unresolved(cwd)?;
+            record["base"]["merging"] = json!(true);
+            Ok(Some(resolve_note(&base, &files)))
+        }
+        Role::Plan => Ok(Some(format!(
+            "事项分支落后 {base} {behind} 个提交，合入时这些文件会冲突：{listed}。冲突留给开发实现阶段（平台会在开发开始前合入并标出冲突），本阶段照常完成规格，不要运行 git merge。"
+        ))),
         Role::Test => match before(Role::Build) {
             Some(b) if !conflicts.is_empty() => back(
                 record,
@@ -664,6 +781,9 @@ fn align_base(
             ),
             _ => Ok(None),
         },
+        // A remote target moves all day and a PR that merges cleanly needs no re-test: only
+        // conflicts send the item back there.
+        Role::Accept | Role::Deliver if req.upstream.is_some() && conflicts.is_empty() => Ok(None),
         Role::Accept | Role::Deliver => {
             let target = if conflicts.is_empty() {
                 before(Role::Test).or(before(Role::Build))
@@ -1179,6 +1299,10 @@ fn invoke(
     let profile = &req.profile;
     let bin = profile.program(&std::env::var_os("PATH").unwrap_or_default())?;
     let mut args = vec![bin.display().to_string()];
+    // Scratch (deleted when the run ends) and kept evidence live in the run folder.
+    let scratch = dir.join("tmp");
+    fs::create_dir_all(&scratch)?;
+    fs::create_dir_all(dir.join("evidence"))?;
     let result_path = dir.join("result.txt");
     match profile.client {
         Client::Codex => {
@@ -1197,6 +1321,16 @@ fn invoke(
                 ]);
             } else {
                 args.extend(["--sandbox".into(), sandbox.into()]);
+            }
+            if sandbox == "workspace-write" {
+                // The run folder holds the stage's scratch ($TMPDIR) and evidence/.
+                args.extend([
+                    "-c".into(),
+                    format!(
+                        "sandbox_workspace_write.writable_roots={}",
+                        json!([dir.display().to_string()])
+                    ),
+                ]);
             }
             if req.sandbox == Sandbox::Network && sandbox == "workspace-write" {
                 // Test suites listen on local ports; the default workspace sandbox has no network.
@@ -1260,7 +1394,7 @@ fn invoke(
     let watch = req
         .token_limit
         .map(|limit| watch_budget(dir, work, id, limit));
-    let code = logged(
+    let code = logged_in(
         &args,
         &cwd,
         &stdout,
@@ -1269,6 +1403,7 @@ fn invoke(
         (profile.client != Client::ZCode).then_some(prompt.as_str()),
         Some(stderr.clone()),
         stop,
+        Some(&scratch),
     );
     if let Some((done, handle)) = watch {
         done.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1482,12 +1617,26 @@ fn pin_worktree(
         return Ok(());
     }
     let status = |cwd: &Path| git(cwd, &["status", "--porcelain", "--untracked-files=all"]);
-    if matches!(stage.role, Role::Plan | Role::Build) && !status(cwd)?.trim().is_empty() {
+    let merge = merging(cwd);
+    if merge {
+        let left = unresolved(cwd)?;
+        ensure!(
+            left.is_empty(),
+            "合入基线分支的冲突还没解决完，这些文件仍有冲突标记：{}",
+            left.join("、")
+        );
+    }
+    if matches!(stage.role, Role::Plan | Role::Build) && (merge || !status(cwd)?.trim().is_empty())
+    {
         git(cwd, &["add", "-A"])?;
         let title = match &req.subtask {
             Some(t) if t.title.trim().is_empty() => format!("{} · {}", stage.name, t.id),
             Some(t) => format!("{} · {} {}", stage.name, t.id, t.title.trim()),
             None => stage.name.to_owned(),
+        };
+        let title = match (merge, record["base"]["branch"].as_str()) {
+            (true, Some(base)) => format!("{title}（含合入 {base}）"),
+            _ => title,
         };
         let message = format!("{} · {title}\n\nAEP-Run: {id}", req.work);
         let mut args = identity(cwd);
@@ -1561,6 +1710,8 @@ pub fn execute(request: &Path) -> Result<()> {
             exclusive.try_lock().context("此事项已有 CLI 正在运行")?;
             perform(&req, stage, dir, work, id, &stop, &mut record)
         });
+    // Scratch folders of test runs reached gigabytes each; evidence/ stays.
+    let _ = fs::remove_dir_all(dir.join("tmp"));
     if let Err(e) = &result {
         let _guard = stop.lock()?;
         let budget = aep::workspace::read(&dir.join("budget.json")).ok();
@@ -1728,22 +1879,10 @@ mod tests {
     }
 
     #[test]
-    fn base_conflicts_are_handed_to_the_build_and_send_the_test_back() {
+    fn base_conflicts_are_opened_for_the_build_and_send_the_test_back() {
         let b = base_fixture();
         advance(&b, "a.txt");
         let head = aep::workspace::commit(&b.wt, "HEAD").unwrap();
-        let (r, record) = align(&b, 3);
-        let note = r.unwrap().unwrap();
-        assert!(
-            note.contains("a.txt") && note.contains("git merge main"),
-            "{note}"
-        );
-        assert_eq!(record["base"]["conflicts"], json!(["a.txt"]));
-        assert_eq!(
-            aep::workspace::commit(&b.wt, "HEAD").unwrap(),
-            head,
-            "nothing merged"
-        );
         // The test stage cannot resolve conflicts: back to the build, no model call.
         let (r, record) = align(&b, 4);
         assert!(r.is_err());
@@ -1753,6 +1892,93 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("a.txt")
+        );
+        assert!(!merging(&b.wt));
+        // The plan stage is told, nothing is merged and it is not asked to run git.
+        let (r, _) = align(&b, 2);
+        let note = r.unwrap().unwrap();
+        assert!(
+            note.contains("a.txt") && note.contains("不要运行 git merge"),
+            "{note}"
+        );
+        assert!(!merging(&b.wt));
+        assert_eq!(aep::workspace::commit(&b.wt, "HEAD").unwrap(), head);
+        // The build gets an open merge with the markers to resolve by editing files.
+        let (r, record) = align(&b, 3);
+        let note = r.unwrap().unwrap();
+        assert!(
+            note.contains("a.txt") && note.contains("不要运行 git merge"),
+            "{note}"
+        );
+        assert_eq!(record["base"]["merging"], true, "{record}");
+        assert!(merging(&b.wt));
+        assert_eq!(unresolved(&b.wt).unwrap(), ["a.txt"]);
+        // A rerun of the build finds the same open merge instead of starting another.
+        let (r, record) = align(&b, 3);
+        assert!(r.unwrap().unwrap().contains("a.txt"));
+        assert_eq!(record["base"]["merging"], true);
+
+        let req = base_request(&b, 3);
+        let st = &req.flow().stages[3];
+        let mut record = json!({"base":{"branch":"main"}});
+        let err = pin_worktree(&req, st, &b.wt, "run2", &mut record).unwrap_err();
+        assert!(err.to_string().contains("a.txt"), "{err}");
+        fs::write(b.wt.join("a.txt"), "item and main\n").unwrap();
+        pin_worktree(&req, st, &b.wt, "run2", &mut record).unwrap();
+        assert!(!merging(&b.wt));
+        let main = aep::workspace::commit(&b.root, "main").unwrap();
+        assert!(git(&b.wt, &["merge-base", "--is-ancestor", &main, "HEAD"]).is_ok());
+        let msg = git(&b.wt, &["log", "-1", "--format=%B"]).unwrap();
+        assert!(
+            msg.contains("含合入 main") && msg.contains("AEP-Run: run2"),
+            "{msg}"
+        );
+        assert_eq!(
+            git(&b.wt, &["rev-list", "--parents", "-n1", "HEAD"])
+                .unwrap()
+                .split_whitespace()
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn base_leftovers_are_committed_before_merging() {
+        for stage in [2, 3] {
+            let b = base_fixture();
+            advance(&b, "b.txt");
+            fs::write(b.wt.join("a.txt"), "unfinished\n").unwrap();
+            let (r, record) = align(&b, stage);
+            assert!(r.unwrap().unwrap().contains("没有冲突"));
+            assert_eq!(record["base"]["committed_leftovers"], true, "{record}");
+            assert_eq!(record["base"]["merged"], true, "{record}");
+            assert_eq!(
+                fs::read_to_string(b.wt.join("a.txt")).unwrap(),
+                "unfinished\n"
+            );
+            assert_eq!(fs::read_to_string(b.wt.join("b.txt")).unwrap(), "main\n");
+            assert!(
+                git(&b.wt, &["status", "--porcelain"])
+                    .unwrap()
+                    .trim()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn an_open_merge_is_kept_in_a_ref_when_another_stage_runs() {
+        let b = base_fixture();
+        advance(&b, "a.txt");
+        align(&b, 3).0.unwrap();
+        fs::write(b.wt.join("c.txt"), "build work\n").unwrap();
+        let (r, record) = align(&b, 2);
+        r.unwrap();
+        assert!(!merging(&b.wt));
+        let parked = record["base_unfinished"].as_str().unwrap().to_owned();
+        assert_eq!(
+            git(&b.root, &["show", &format!("{parked}:c.txt")]).unwrap(),
+            "build work\n"
         );
     }
 

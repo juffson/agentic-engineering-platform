@@ -85,6 +85,7 @@ pub fn create(root: &Path) -> Result<Fixture> {
         attempts: 4,
         merge: None,
         merge_history: vec![],
+        pull_request: None,
     };
     let d = &delivery;
     let transfers:Vec<_>=[(3,"relay-fixture-r2-a1",Some(candidate.clone())),(4,"test-fixture",None),(5,"accept-fixture",None)]

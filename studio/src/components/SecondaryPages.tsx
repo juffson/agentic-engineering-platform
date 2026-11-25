@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Check, ChevronDown, ChevronRight, Download, FolderGit2, FolderOpen, History, Pencil, Plus, RotateCcw, Sparkles } from "lucide-react";
 import { ImportDialog } from "./Dialogs";
-import type { MemoryNote, ProjectSummary, TidyStatus } from "../api/types";
+import type { MemoryNote, ProjectSummary, TidyStatus, Upstream, UpstreamView } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio } from "../state/store";
 import { clock } from "../lib/format";
@@ -532,6 +532,7 @@ function RepoRow({ path, project }: { path: string; project: string }) {
       {importing && <ImportDialog project={project} path={path} onClose={() => setImporting(false)} />}
       {open && (
         <div className="repo-body">
+          <UpstreamCard path={path} project={project} />
           <p className="card-text">在这个仓库上运行的所有阶段，除了项目记忆，也会读取这些笔记。</p>
           <div className="repo-add">
             <textarea
@@ -557,5 +558,114 @@ function RepoRow({ path, project }: { path: string; project: string }) {
         </div>
       )}
     </li>
+  );
+}
+
+/**
+ * Remote and delivery for one repository: items start from (and keep up with) the remote target
+ * branch, and delivery either merges locally or pushes the branch and opens a PR.
+ */
+function UpstreamCard({ path, project }: { path: string; project: string }) {
+  const { act } = useStudio();
+  const [view, setView] = useState<UpstreamView | null>(null);
+  const [draft, setDraft] = useState<Upstream | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    api
+      .upstream({ project, repository: path })
+      .then((v) => {
+        if (!live) return;
+        setView(v);
+        setDraft(v.configured ?? v.detected);
+      })
+      .catch((e) => live && setError(errorMessage(e)));
+    return () => {
+      live = false;
+    };
+  }, [project, path]);
+
+  const save = async (up: Upstream | null) => {
+    setBusy(true);
+    const v = await act(() => api.setUpstream({ project, repository: path, upstream: up }), up ? "已保存远端设置" : "已停用远端联动");
+    setBusy(false);
+    if (v) {
+      setView(v);
+      setDraft(v.configured ?? v.detected);
+    }
+  };
+
+  const set = (patch: Partial<Upstream>) => setDraft((d) => (d ? { ...d, ...patch } : d));
+  const on = !!view?.configured;
+  const changed = JSON.stringify(view?.configured) !== JSON.stringify(draft);
+
+  return (
+    <section className="card" data-testid="upstream">
+      <div className="card-head">
+        <span className="card-title">远端与交付</span>
+        <span className="muted">{on ? `事项从 ${view!.configured!.remote}/${view!.configured!.target} 开启` : "未启用：事项从当前检出的分支开启，交付合并到本地分支"}</span>
+      </div>
+      {error && <p className="inline-error">{error}</p>}
+      {!view && !error && <Spinner size={12} />}
+      {view && !draft && <p className="empty-text">这个仓库没有远端。</p>}
+      {draft && (
+        <>
+          <div className="upstream-form">
+            <label className="field">
+              <span className="field-label">远端</span>
+              <input className="input input-sm" aria-label="远端" value={draft.remote} onChange={(e) => set({ remote: e.target.value.trim() })} />
+            </label>
+            <label className="field">
+              <span className="field-label">目标分支</span>
+              <input className="input input-sm" aria-label="目标分支" value={draft.target} onChange={(e) => set({ target: e.target.value.trim() })} />
+            </label>
+            <label className="field">
+              <span className="field-label">推送分支前缀</span>
+              <input className="input input-sm" aria-label="推送分支前缀" value={draft.branch_prefix} onChange={(e) => set({ branch_prefix: e.target.value.trim() })} />
+            </label>
+            <label className="field">
+              <span className="field-label">代码平台</span>
+              <select className="input input-sm" aria-label="代码平台" value={draft.forge ?? ""} onChange={(e) => set({ forge: (e.target.value || null) as Upstream["forge"] })}>
+                <option value="">未知（只推送，网页上提 PR）</option>
+                <option value="gitea">Gitea（推送时直接建 PR）</option>
+                <option value="gitlab">GitLab（推送时直接建 MR）</option>
+                <option value="github">GitHub（用 gh 建 PR）</option>
+              </select>
+            </label>
+            <label className="field">
+              <span className="field-label">仓库网页地址</span>
+              <input className="input input-sm" aria-label="仓库网页地址" placeholder="https://host/owner/repo" value={draft.web ?? ""} onChange={(e) => set({ web: e.target.value.trim() || null })} />
+            </label>
+          </div>
+          <div className="field">
+            <span className="field-label">交付方式</span>
+            <Segmented
+              size="sm"
+              label="交付方式"
+              value={draft.delivery}
+              options={[
+                { value: "pull_request", label: "推送并提 PR" },
+                { value: "local", label: "合并到本地分支" },
+              ]}
+              onChange={(v) => set({ delivery: v })}
+            />
+          </div>
+          <div className="row-between">
+            {on ? (
+              <Button variant="ghost" size="sm" disabled={busy} onClick={() => save(null)}>
+                停用远端联动
+              </Button>
+            ) : (
+              <span className="field-hint">保存后，新事项从远端目标分支开启，阶段之间自动跟上它。</span>
+            )}
+            <Button variant="primary" size="sm" busy={busy} disabled={on && !changed} onClick={() => save(draft)}>
+              {on ? "保存" : "启用"}
+            </Button>
+          </div>
+        </>
+      )}
+    </section>
   );
 }

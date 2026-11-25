@@ -75,6 +75,21 @@ pub fn logged(
     err: Option<PathBuf>,
     cancellation: &Cancellation,
 ) -> Result<i32> {
+    logged_in(argv, work, log, timeout, prompt, err, cancellation, None)
+}
+
+/// `logged` with the child's TMPDIR pointed at `tmp` (a stage's own scratch folder).
+#[allow(clippy::too_many_arguments)]
+pub fn logged_in(
+    argv: &[String],
+    work: &Path,
+    log: &Path,
+    timeout: impl Into<CommandTimeout>,
+    prompt: Option<&str>,
+    err: Option<PathBuf>,
+    cancellation: &Cancellation,
+    tmp: Option<&Path>,
+) -> Result<i32> {
     cancellation.check()?;
     let stdout = File::create(log)?;
     let stderr = match err {
@@ -90,7 +105,11 @@ pub fn logged(
         }
         None => Stdio::null(),
     };
-    let mut child = Command::new(&argv[0])
+    let mut command = Command::new(&argv[0]);
+    if let Some(tmp) = tmp {
+        command.env("TMPDIR", tmp);
+    }
+    let mut child = command
         .args(&argv[1..])
         .current_dir(work)
         .process_group(0)

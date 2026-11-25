@@ -245,6 +245,9 @@ pub struct Request {
     pub stage: usize,
     pub profile: Profile,
     pub repository: Option<PathBuf>,
+    /// The repository's remote branch to start from and follow (None: the local HEAD branch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<crate::project::upstream::Upstream>,
     #[serde(default)]
     pub ticket: Option<String>,
     pub brief: String,

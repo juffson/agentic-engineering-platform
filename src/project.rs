@@ -9,6 +9,7 @@ pub mod secret;
 pub mod shelf;
 pub mod timeline;
 pub mod transfer;
+pub mod upstream;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -478,6 +479,9 @@ pub struct Project {
     /// Last-call context above which a stage session is not continued (R2); None = default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_limit: Option<u64>,
+    /// Remote branch items start from and follow, and how deliveries reach it, per repository.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub upstreams: BTreeMap<PathBuf, upstream::Upstream>,
 }
 impl Project {
     pub fn flow_choices(&self) -> Vec<&Flow> {
@@ -976,6 +980,7 @@ impl Library {
             dismissed_imports: vec![],
             stage_budget: None,
             resume_limit: None,
+            upstreams: BTreeMap::new(),
         });
         self.active = Some(id);
         Ok(())

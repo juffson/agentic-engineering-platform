@@ -796,6 +796,7 @@ mod tests {
                 attempts: 4,
                 merge: None,
                 merge_history: vec![],
+                pull_request: None,
             };
             let transfers: Vec<_> = [(3, "relay-demo-r2-a1", Some(candidate.clone())), (4, "test", None), (5, "accept", None)]
                 .into_iter().map(|(from, run, c)| json!({"project":d.project,"work":d.work,"from":from,"to":from+1,"run":run,

@@ -41,6 +41,8 @@ fi
 n=$(( $(cat "$LOG/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$LOG/count"
 printf '%s\n' "$@" > "$LOG/argv-$n"
+printf '%s' "$TMPDIR" > "$LOG/tmpdir-$n"
+mkdir -p "$TMPDIR/build" && echo scratch > "$TMPDIR/build/out"
 cat > "$LOG/stdin-$n"
 ctx=$(cat "$LOG/ctx" 2>/dev/null || echo 9000)
 rest=$((ctx - 10))
@@ -235,6 +237,16 @@ fn adjacent_stages_fork_the_previous_session_with_a_short_prompt() -> Result<()>
     assert!(req.ev["reused_session"].is_null(), "{}", req.ev);
     assert_eq!(req.ev["session"], "s-1");
     assert_eq!(req.ev["resumable"], true);
+    // Scratch goes to the run's own tmp/ (removed afterwards); evidence/ is kept and named.
+    let tmpdir = fs::read_to_string(item.log.join("tmpdir-1"))?;
+    assert_eq!(
+        Path::new(&tmpdir),
+        req.dir.canonicalize()?.join("tmp"),
+        "TMPDIR is the run's scratch"
+    );
+    assert!(!req.dir.join("tmp").exists());
+    assert!(req.dir.join("evidence").is_dir());
+    assert!(req.prompt.contains("evidence/") && req.prompt.contains("不要写到 /tmp"));
     assert!(req.prompt.contains("阶段：产品需求"));
     assert!(
         req.prompt.contains(READING),
