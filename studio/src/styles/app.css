@@ -2850,6 +2850,45 @@ select.input {
   font-size: 13px;
   margin-top: 4px;
 }
+.branch-remote {
+  display: grid;
+  gap: 4px;
+}
+.branch-remote-bar,
+.branch-remote-summary,
+.branch-remote-error {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  font-size: 12px;
+}
+.branch-remote-bar {
+  justify-content: space-between;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.branch-remote-summary code,
+.branch-remote-error span {
+  overflow-wrap: anywhere;
+}
+.branch-remote-error {
+  padding: 0 10px;
+}
+.branch-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.branch-remote-summary .branch-link {
+  margin-left: 6px;
+}
 .branches-body {
   flex: 1;
   min-height: 0;
@@ -2891,6 +2930,51 @@ select.input {
 }
 .branch-row.on {
   border-color: var(--accent, #7c83ff);
+}
+.branch-with-pull {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+.branch-with-pull .branch-row {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.branch-with-pull .src {
+  white-space: normal;
+}
+.branch-pull {
+  flex: none;
+  margin: 6px 4px 0 0;
+  padding: 0 6px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: var(--muted);
+  background: none;
+  font: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.branch-pull:hover {
+  text-decoration: underline;
+}
+.branch-pull-open {
+  color: var(--success);
+  background: var(--success-soft);
+}
+.branch-pull-merged {
+  color: light-dark(#6741a6, #ba9afb);
+  background: color-mix(in srgb, currentColor 9%, transparent);
+}
+.branch-pull-closed {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.branch-remote-only {
+  margin-top: 6px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
 }
 .branch-name {
   display: flex;
@@ -2938,6 +3022,32 @@ select.input {
   flex-wrap: wrap;
   gap: 8px;
   font-size: 12px;
+}
+.graph-remote {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.graph-remote-pull {
+  display: flex;
+  align-items: center;
+  flex: 1 1 240px;
+  gap: 8px;
+  min-width: 0;
+}
+.graph-remote-pull > :not(.graph-remote-title) {
+  flex-shrink: 0;
+}
+.graph-remote-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .graph-scroll {
   flex: 1;

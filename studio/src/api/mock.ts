@@ -175,6 +175,15 @@ const legacyRun = (n: number) => ({ legacy: true, tokens: [5_200_000 + ((n * 733
 const HOME = "/Users/demo/.aep";
 const REPOS = ["/Users/demo/code/quote-terminal", "/Users/demo/code/quote-gateway"];
 const FORGES = ["github", "gitlab"] as const;
+type ActiveRemote = Extract<RemoteStatus, { active: true }>;
+type MockRemoteCache = Pick<ActiveRemote, "refreshed_at" | "pulls" | "pulls_checked" | "fetch_error" | "api_error"> & { plugin: ForgePluginId | null };
+const MOCK_REMOTES = new Map<string, ActiveRemote["remotes"]>([
+  [REPOS[0], [
+    { name: "origin", url: "git@github.com:demo/quote-terminal.git", host: "github.com", path: "demo/quote-terminal" },
+    { name: "upstream", url: "https://github.com/acme/quote-terminal.git", host: "github.com", path: "acme/quote-terminal" },
+  ]],
+  [REPOS[1], [{ name: "origin", url: "ssh://git@gitlab.example.com:2222/g/sub/r.git", host: "gitlab.example.com", path: "g/sub/r" }]],
+]);
 
 const MOCK_ERRORS = new Map<string, RemoteErrorKind>([
   ["bad", "auth"], ["forbidden", "forbidden"], ["cert", "cert"], ["limit", "rate_limited"],
@@ -192,6 +201,20 @@ function mockCredential(token: string) {
 function mockError(kind: RemoteErrorKind, host: string, at = Math.floor(Date.now() / 1000)): RemoteError {
   const codes: Partial<Record<RemoteErrorKind, number>> = { auth: 401, forbidden: 403, rate_limited: 429, not_found: 404, other: 500 };
   return { kind, message: "示例服务错误", host, status: codes[kind] ?? null, reset_at: kind === "rate_limited" ? at + 600 : null, at };
+}
+
+function mockPulls(remote: NonNullable<ActiveRemote["remote"]>, at: number): Record<string, Pull> {
+  const pull = (number: number, state: Pull["state"], title: string, others = 0): Pull => ({
+    number, state, title, others, created_at: at,
+    url: `https://${remote.host}/${remote.path}/${remote.plugin === "gitlab" ? "-/merge_requests" : "pull"}/${number}`,
+  });
+  return {
+    "aep-stage/7f3a9c21": pull(123, "open", "自选股分组支持拖拽排序", 2),
+    "feat/export-statement": pull(124, "draft", "导出对账单"),
+    main: pull(120, "merged", "行情终端本周变更"),
+    "fix/snapshot-paging": pull(119, "closed", "修正快照分页"),
+    ...(remote.path === "demo/quote-terminal" ? { "feat/盘口优化": pull(125, "open", "盘口数据推送优化") } : {}),
+  };
 }
 
 function mockHost(input: string, plugin: ForgePluginId) {
@@ -229,7 +252,15 @@ class MockStore implements Api {
     gitlab: { enabled: false, host: `https://${defaultHost.gitlab}`, credential: null, error: null },
   };
   private mockRemoteAt = Math.floor(Date.now() / 1000) - 600;
-  private mockRefresh = new Map<string, number>();
+  private mockRefreshing = new Set<string>();
+  private mockRemoteCache = new Map<string, MockRemoteCache>([[REPOS[0], {
+    plugin: "github",
+    refreshed_at: this.mockRemoteAt,
+    pulls: mockPulls({ ...MOCK_REMOTES.get(REPOS[0])![0], plugin: "github", badge: "enabled" }, this.mockRemoteAt),
+    pulls_checked: true,
+    fetch_error: null,
+    api_error: null,
+  }]]);
 
   constructor() {
     seed(this);
@@ -1053,54 +1084,76 @@ class MockStore implements Api {
     if (!this.branchPluginEnabled || !FORGES.some((id) => this.forgePlugins[id].enabled)) return { active: false };
     if (!this.projects.some((p) => p.id === project && p.repositories.includes(path))) throw new Error("仓库不属于这个项目");
     const github = path === REPOS[0];
-    const remote = github
-      ? { name: "origin", url: "git@github.com:demo/quote-terminal.git", host: "github.com", path: "demo/quote-terminal" }
-      : path === REPOS[1]
-        ? { name: "origin", url: "ssh://git@gitlab.example.com:2222/g/sub/r.git", host: "gitlab.example.com", path: "g/sub/r" }
-        : null;
+    const remotes = MOCK_REMOTES.get(path) ?? [];
+    const remote = remotes[0] ?? null;
     const plugin = remote && FORGES.find((id) => this.forgePlugins[id].enabled && new URL(this.forgePlugins[id].host).hostname === remote.host);
     const credential = plugin ? this.forgePlugins[plugin].credential : null;
-    const deadline = this.mockRefresh.get(path);
-    const refreshing = deadline !== undefined && Date.now() < deadline;
-    const refreshedAt = deadline !== undefined && !refreshing ? Math.floor(deadline / 1000) : null;
-    const issue = refreshedAt && credential?.outcome && remote ? mockError(credential.outcome, remote.host, refreshedAt) : null;
-    const pull = (number: number, state: Pull["state"], title: string, others = 0): Pull => ({
-      number, state, title, others, created_at: this.mockRemoteAt,
-      url: `https://github.com/demo/quote-terminal/pull/${number}`,
-    });
+    const refreshing = this.mockRefreshing.has(path);
+    const cached = this.mockRemoteCache.get(path);
+    const cache = cached?.plugin === (plugin ?? null) ? cached : undefined;
     return {
-      active: true, repository: path, remotes: remote ? [remote] : [],
+      active: true, repository: path, remotes,
       remote: remote && { name: remote.name, host: remote.host, path: remote.path, plugin: plugin ?? null, badge: this.plugins().find((p) => p.id === plugin)?.badge ?? null },
-      refreshing, refreshed_at: refreshedAt ?? (github ? this.mockRemoteAt : null),
+      refreshing, refreshed_at: cache?.refreshed_at ?? null,
       branches: github ? [
         { name: "main", upstream: "origin/main", present: true, ahead: 0, behind: 0, same_name: null },
         { name: "aep-stage/7f3a9c21", upstream: "origin/aep-stage/7f3a9c21", present: true, ahead: 2, behind: 1, same_name: null },
         { name: "feat/export-statement", upstream: "origin/feat/export-statement", present: false, ahead: null, behind: null, same_name: null },
         { name: "fix/snapshot-paging", upstream: null, present: false, ahead: null, behind: null, same_name: "origin/fix/snapshot-paging" },
         { name: "feat/local-notes", upstream: null, present: false, ahead: null, behind: null, same_name: null },
+      ] : this.branchGraph({ project, path, limit: 400 }).branches.map(({ name }) => (
+        { name, upstream: null, present: false, ahead: null, behind: null, same_name: null }
+      )),
+      remote_only: github ? [
+        { name: "origin/release/2.4", sha: "m3".padEnd(40, "0") },
+        { name: "origin/feat/盘口优化", sha: "c1".padEnd(40, "0") },
+        { name: "origin/infra-metrics", sha: "c2".padEnd(40, "0") },
       ] : [],
-      remote_only: github ? ["origin/release/2.4", "origin/feat/盘口优化", "origin/infra-metrics"].map((name, i) => ({ name, sha: `c${i}`.padEnd(40, "0") })) : [],
-      pulls: github && credential ? {
-        "aep-stage/7f3a9c21": pull(123, "open", "自选股分组支持拖拽排序", 2),
-        "feat/export-statement": pull(124, "draft", "导出对账单"),
-        main: pull(120, "merged", "行情终端本周变更"),
-        "fix/snapshot-paging": pull(119, "closed", "修正快照分页"),
-      } : {},
-      pulls_checked: github && !!credential,
-      fetch_error: refreshedAt && credential?.fetchFailure ? { message: "示例：git fetch 失败", auth: false } : null,
-      api_error: issue,
+      pulls: credential ? cache?.pulls ?? {} : {},
+      pulls_checked: !!credential && !!cache?.pulls_checked,
+      fetch_error: refreshing ? null : cache?.fetch_error ?? null,
+      api_error: !credential || refreshing ? null : cache?.api_error ?? null,
     };
   }
 
   remoteRefresh(args: Parameters<Api["remoteRefresh"]>[0]): RemoteStatus {
     const status = this.remoteStatus(args);
     if (!status.active || !status.remote || status.refreshing) return status;
-    this.mockRefresh.set(args.path, Date.now() + 1000);
+    const remote = status.remote;
+    const config = remote.plugin ? this.forgePlugins[remote.plugin] : null;
+    const credential = config?.credential;
+    this.mockRefreshing.add(args.path);
+    setTimeout(() => {
+      const at = Math.floor(Date.now() / 1000);
+      const fetchError = credential?.fetchFailure ? { message: "示例：远端拒绝 git 凭据", auth: true } : null;
+      let apiError = status.api_error;
+      let pulls = status.pulls;
+      let pullsChecked = status.pulls_checked;
+      const limited = apiError?.kind === "rate_limited" && (apiError.reset_at === null || apiError.reset_at > at);
+      if (credential && config?.credential === credential && !limited) {
+        apiError = credential.outcome && remote.host ? mockError(credential.outcome, remote.host, at) : null;
+        if (!apiError) {
+          pulls = mockPulls(remote, at);
+          pullsChecked = true;
+        }
+        if (!apiError || ["auth", "forbidden", "cert"].includes(apiError.kind)) config.error = apiError;
+      }
+      this.mockRemoteCache.set(args.path, {
+        plugin: remote.plugin,
+        refreshed_at: fetchError ? status.refreshed_at : at,
+        fetch_error: fetchError,
+        api_error: apiError,
+        pulls,
+        pulls_checked: pullsChecked,
+      });
+      this.mockRefreshing.delete(args.path);
+    }, 1000);
     return this.remoteStatus(args);
   }
 
   openUrl({ url }: Parameters<Api["openUrl"]>[0]): null {
     if (!url.startsWith("https://") || !new URL(url).hostname) throw new Error("链接地址无效");
+    console.info("在浏览器打开", url);
     return null;
   }
 

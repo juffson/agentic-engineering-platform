@@ -1,4 +1,4 @@
-import type { ForgePluginId, PluginBadge, PluginInfo, Pull, PullState, RemoteBranchComparison, RemoteError, RemoteStatus } from "../api/types";
+import type { ForgePluginId, PluginBadge, PluginInfo, Pull, PullState, RemoteBranchComparison, RemoteError } from "../api/types";
 
 export const forgeName: Record<ForgePluginId, string> = { github: "GitHub", gitlab: "GitLab" };
 export const defaultHost: Record<ForgePluginId, string> = { github: "github.com", gitlab: "gitlab.com" };
@@ -61,20 +61,40 @@ export function normalizeHost(input: string, plugin: ForgePluginId): NormalizedH
   }
 }
 
-const pullStateText: Record<PullState, string> = { open: "打开", draft: "草稿", merged: "已合并", closed: "已关闭" };
+export const pullStateText: Record<PullState, string> = { open: "打开", draft: "草稿", merged: "已合并", closed: "已关闭" };
+
+export function pullNumber(pull: Pull, plugin: ForgePluginId | null): string {
+  return `${plugin === "gitlab" ? "!" : "#"}${pull.number}`;
+}
 
 export function pullLabel(pull: Pull, plugin: ForgePluginId | null): string {
-  return `${plugin === "gitlab" ? "!" : "#"}${pull.number} ${pullStateText[pull.state]}`;
+  return `${pullNumber(pull, plugin)} ${pullStateText[pull.state]}`;
 }
 
-export function upstreamText(branch: RemoteBranchComparison): string {
+export function pullMatches(pull: Pull | undefined, filter: string): boolean {
+  if (!pull) return false;
+  const query = filter.trim();
+  return !!query && (String(pull.number) === query.replace(/^[#!]/, "") || pull.title.toLowerCase().includes(query.toLowerCase()));
+}
+
+export function upstreamText(branch: RemoteBranchComparison, detail = false): string {
   const { upstream, present, ahead, behind, same_name: sameName } = branch;
   if (!upstream) return sameName ? `未跟踪 · 远端有同名分支 ${sameName}` : "仅本地";
-  if (!present || ahead === null || behind === null) return `相对 ${upstream} 未知 · 刷新远端后再看`;
-  if (ahead === 0 && behind === 0) return `与 ${upstream} 一致`;
-  return `↑${ahead} ↓${behind}（相对 ${upstream}）`;
+  const prefix = detail ? `上游 ${upstream} · ` : "";
+  if (!present || ahead === null || behind === null) {
+    return `${prefix || `相对 ${upstream} `}未知 · 刷新远端后再看`;
+  }
+  if (ahead === 0 && behind === 0) return `${prefix || `与 ${upstream} `}一致`;
+  const counts = `↑${ahead} ↓${behind}`;
+  return detail ? prefix + counts : `${counts}（相对 ${upstream}）`;
 }
 
-export function remoteFor(status: RemoteStatus | null, branchName: string) {
-  return status?.active ? status.branches.find((branch) => branch.name === branchName) ?? null : null;
+export function remoteAddress(remote: { name: string; host: string | null; path: string | null }): string {
+  return remote.host ? `${remote.name} · ${remote.host}${remote.path ? `/${remote.path}` : ""}` : remote.name;
+}
+
+export function fetchErrorLine(message: string): string {
+  return message.split(/\r?\n/, 1)[0].replace(/\b(?:https?|ssh|git):\/\/[^\s'"]+/gi, (address) => (
+    address.replace(/[?#].*$/, "").replace(/^([a-z]+:\/\/)[^/]*@/i, "$1")
+  ));
 }
