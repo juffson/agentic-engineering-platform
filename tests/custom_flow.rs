@@ -1,11 +1,17 @@
 use aep::{
-    flow::{Flow, builtin},
+    flow::{Flow, FlowStage, builtin},
+    handoff::{self, Assignment},
     project::{Kind, Library, Project, ProjectFlow},
-    workflow::{Client, Profile, Role, Sandbox, Template},
+    workflow::{Client, Profile, Request, Role, Sandbox, Template},
 };
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::fs;
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn project_flow<'a>(project: &'a Project, id: &str) -> &'a ProjectFlow {
     project
@@ -20,6 +26,174 @@ fn custom_legacy(label: &str) -> Flow {
     flow.id.clear();
     flow.label = label.into();
     flow
+}
+
+fn security_review() -> FlowStage {
+    FlowStage {
+        name: "安全审查".into(),
+        brief: "核对权限边界。".into(),
+        role: Role::Test,
+        skippable: false,
+        back_to: vec!["开发实现".into()],
+    }
+}
+
+fn reserve_request(
+    home: &Path,
+    flow: Flow,
+    stage: usize,
+    answer: &str,
+) -> Result<(Library, PathBuf)> {
+    let executable = home.join("stage-agent");
+    fs::write(
+        &executable,
+        format!("#!/bin/sh\ncat <<'AEP_TEST_RESULT'\n{answer}\nAEP_TEST_RESULT\n"),
+    )?;
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
+    let mut library = Library::open(home)?;
+    let dir = library.change(home, |library| {
+        library.create("流程执行", vec![])?;
+        let project = library.project_mut()?;
+        let (id, _) = project.save_flow(flow)?;
+        project.add_work_flow("执行自定义阶段", Kind::Feature, &id)?;
+        let work = project.selected_mut()?;
+        work.stage = stage;
+        work.notes[1] = "已确认接口".into();
+        let work_id = work.id.clone();
+        project.reserve(
+            home,
+            &work_id,
+            stage,
+            Assignment {
+                profile: Profile {
+                    client: Client::Custom,
+                    executable: executable.display().to_string(),
+                    model: String::new(),
+                    check_command: String::new(),
+                },
+                brief: "核对结果".into(),
+                repository: None,
+                external: None,
+            },
+        )
+    })?;
+    Ok((library, dir))
+}
+
+fn execute_request(dir: &Path, success: bool) -> Result<Value> {
+    let output = Command::new(env!("CARGO_BIN_EXE_aep"))
+        .args(["workflow-stage", "--request"])
+        .arg(dir.join("request.json"))
+        .output()?;
+    let evidence = aep::workflow::evidence(dir)?;
+    assert_eq!(
+        output.status.success(),
+        success,
+        "{evidence}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(evidence)
+}
+
+#[test]
+fn request_self_contained() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    let mut flow = builtin(Template::Software).clone();
+    flow.id.clear();
+    flow.label = "后端开发".into();
+    flow.stages[1].name = "接口设计".into();
+    let stage = flow.stages.len() - 1;
+    flow.stages.insert(stage, security_review());
+    let (mut library, run) = reserve_request(home, flow.clone(), stage, "审查通过\nAEP: PASS")?;
+    let raw: Value = aep::workspace::read(&run.join("request.json"))?;
+    assert_eq!(raw["template"], "Software");
+    assert!(raw["flow"].is_object());
+    let request: Request = serde_json::from_value(raw)?;
+    flow.id.clone_from(&request.flow().id);
+    assert_eq!(request.flow(), &flow);
+    assert_eq!(
+        request.approved[1],
+        ("接口设计".into(), "已确认接口".into())
+    );
+    assert_eq!(request.sandbox, Sandbox::Network);
+
+    let work_id = library.change(home, |library| {
+        let project = library.project_mut()?;
+        assert_eq!(project.delete_flow(&flow.id)?, 1);
+        Ok(project.selected().unwrap().id.clone())
+    })?;
+    let evidence = execute_request(&run, true)?;
+    assert_eq!(evidence["stage"], "安全审查");
+    assert_eq!(evidence["status"], "succeeded");
+    let prompt = fs::read_to_string(run.join("prompt.txt"))?;
+    assert!(prompt.contains("阶段：安全审查（后端开发）"));
+    assert!(prompt.contains("阶段职责：核对权限边界。"));
+
+    let follow = library.change(home, |library| {
+        library
+            .project_mut()?
+            .reserve_follow_up(home, &work_id, stage, "再核对权限边界")
+    })?;
+    let continued: Request = serde_json::from_slice(&fs::read(follow.join("request.json"))?)?;
+    assert_eq!(continued.flow(), &flow);
+    assert_eq!(continued.follow_up.unwrap().message, "再核对权限边界");
+    assert_eq!(execute_request(&follow, true)?["stage"], "安全审查");
+    Ok(())
+}
+
+#[test]
+fn back_rules() -> Result<()> {
+    let mut flow = builtin(Template::Software).clone();
+    flow.id.clear();
+    flow.label = "后端开发".into();
+    let stage = flow.stages.len() - 1;
+    flow.stages.insert(stage, security_review());
+    let answer = "AEP-BACK: 开发实现：修正权限边界";
+
+    let dir = tempfile::tempdir()?;
+    let (_, run) = reserve_request(
+        dir.path(),
+        flow.clone(),
+        stage,
+        &format!("{answer}\nAEP: PASS"),
+    )?;
+    let evidence = execute_request(&run, false)?;
+    assert_eq!(evidence["status"], "failed");
+    assert_eq!(
+        evidence["route_back"],
+        json!({"stage":3,"name":"开发实现","question":"修正权限边界"})
+    );
+    assert!(evidence["route_back_rejected"].is_null());
+
+    flow.stages[stage].back_to = vec!["产品需求".into()];
+    for pass in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let response = if pass {
+            format!("{answer}\nAEP: PASS")
+        } else {
+            answer.to_owned()
+        };
+        let (_, run) = reserve_request(dir.path(), flow.clone(), stage, &response)?;
+        let request: Request = serde_json::from_slice(&fs::read(run.join("request.json"))?)?;
+        let rules = handoff::rules(&request)?;
+        assert!(rules.contains("前序阶段（产品需求）"));
+        assert!(!rules.contains("前序阶段（开发实现）"));
+        let evidence = execute_request(&run, pass)?;
+        assert_eq!(
+            evidence["status"],
+            if pass { "succeeded" } else { "failed" }
+        );
+        assert!(evidence["route_back"].is_null());
+        assert_eq!(
+            evidence["route_back_rejected"],
+            json!({"name":"开发实现","question":"修正权限边界","allowed":["产品需求"]})
+        );
+        if !pass {
+            assert_eq!(evidence["error"], "验收尚未通过，请查看阶段答复并补齐证据");
+        }
+    }
+    Ok(())
 }
 
 #[test]

@@ -79,13 +79,14 @@ fn entries(
 pub const READING: &str = "读取约定：先用 rg 或 codegraph 定位，再按行范围读取（Read 的 offset/limit 或 sed -n 'a,bp'）；不要 cat 整个大文件；命令输出可能很长时用 head/tail 截断，或写到文件后按需读取。";
 /// Project / stage / duty / brief, plus the incoming stage transfer (it may carry human verdicts).
 pub fn header(req: &Request) -> Result<String> {
-    let stage = req.template.stages().get(req.stage).context("无效阶段")?;
+    let flow = req.flow();
+    let stage = flow.stages.get(req.stage).context("无效阶段")?;
     let mut text = format!(
         "AEP Studio 项目：{} / {}\n阶段：{}（{}）\n阶段职责：{}\n本次说明：{}",
         clip(&req.project, 160),
         clip(&req.work, 320),
         stage.name,
-        req.template.label(),
+        flow.label,
         stage.brief,
         // The person's own instructions for this run: keep them whole (the note size limit).
         clip(req.brief.trim(), 8000)
@@ -162,7 +163,9 @@ pub fn memory_body(req: &Request, header: &str, project: &str, repo: &str) -> St
 /// Stage rules: decision precedence, commit policy, AEP-HANDOFF, specs ownership, subtask scope,
 /// optional/send-back markers, gate verdict and the allowed check command.
 pub fn rules(req: &Request) -> Result<String> {
-    let stage = req.template.stages().get(req.stage).context("无效阶段")?;
+    let flow = req.flow();
+    let stages = &flow.stages;
+    let stage = stages.get(req.stage).context("无效阶段")?;
     let mut text = String::from("\n以当前决策和人工结论为准。完整说明存于 request.json。");
     if stage.role != Role::Build {
         text.push_str("保留已有实现。");
@@ -180,7 +183,6 @@ pub fn rules(req: &Request) -> Result<String> {
         "\n规格文档（specs/）由需求到技术方案阶段负责，本阶段不要新建或改写；报告、命令和证据写在答复里，Studio 会归档。方案需要调整时用 AEP-BACK 交回技术方案。"
     });
     // The last planning stage before the build splits the work into small, checkable subtasks.
-    let stages = req.template.stages();
     if stage.role == Role::Plan
         && stages[req.stage + 1..]
             .iter()
@@ -205,7 +207,7 @@ pub fn rules(req: &Request) -> Result<String> {
     let optional: Vec<_> = stages
         .iter()
         .enumerate()
-        .filter(|(i, _)| *i > req.stage && workflow::skippable(req.template, *i))
+        .filter(|(i, _)| *i > req.stage && flow.skippable(*i))
         .map(|(_, s)| s.name.as_str())
         .collect();
     if stage.role == Role::Plan && !optional.is_empty() {
@@ -214,9 +216,10 @@ pub fn rules(req: &Request) -> Result<String> {
             optional.join("、")
         ));
     }
-    let earlier: Vec<_> = stages[..req.stage.min(stages.len())]
-        .iter()
-        .map(|s| s.name.as_str())
+    let earlier: Vec<_> = flow
+        .back_targets(req.stage)
+        .into_iter()
+        .map(|i| stages[i].name.as_str())
         .collect();
     if !earlier.is_empty() {
         text.push_str(&format!(
@@ -310,8 +313,9 @@ pub struct Assignment {
     pub external: Option<ExternalSession>,
 }
 impl Work {
-    pub fn request(&self, project: &str, stage: usize, assignment: Assignment) -> Request {
-        Request {
+    pub fn request(&self, project: &str, stage: usize, assignment: Assignment) -> Result<Request> {
+        let flow = self.flow()?;
+        Ok(Request {
             subtask: None,
             subtasks_done: vec![],
             sandbox: self.sandbox(stage),
@@ -323,14 +327,14 @@ impl Work {
             project: project.to_owned(),
             work: self.name.clone(),
             template: self.template,
+            flow: Some(flow.clone()),
             stage,
             profile: assignment.profile,
             repository: assignment.repository.clone(),
             ticket: assignment.repository.as_ref().map(|p| self.ticket(p)),
             brief: assignment.brief,
-            approved: self
-                .template
-                .stages()
+            approved: flow
+                .stages
                 .iter()
                 .zip(&self.notes)
                 .take(stage)
@@ -342,7 +346,7 @@ impl Work {
                 .map(|(s, id)| (*s, id.clone()))
                 .collect(),
             external: assignment.external,
-        }
+        })
     }
 }
 impl Project {
@@ -395,8 +399,9 @@ impl Project {
             anyhow::bail!(reason);
         }
         let item = self.work_by_id_mut(work_id)?;
+        let stage_count = item.flow()?.stages.len();
         ensure!(
-            stage == item.stage && stage < item.template.stages().len(),
+            stage == item.stage && stage < stage_count,
             "当前阶段已改变或事项已完成"
         );
         if let Some(a) = item.attempts.last() {
@@ -433,7 +438,7 @@ impl Project {
                 brief: brief.clone(),
                 external,
             },
-        );
+        )?;
         request.token_limit = budget.and_then(|b| b.remaining());
         request.resume_limit = Some(resume_limit);
         fs::DirBuilder::new()
@@ -446,7 +451,7 @@ impl Project {
                 &dir,
                 "evidence.json",
                 &json!({"request":"request.json","run_id":id,"attempt":id,"status":"claimed","mode":"external","session":session.session,
-                "workspace":session.workspace,"profile":profile,"stage":item.template.stages()[stage].name,"started_at":chrono::Utc::now().to_rfc3339()}),
+                "workspace":session.workspace,"profile":profile,"stage":request.flow().stages[stage].name,"started_at":chrono::Utc::now().to_rfc3339()}),
             )?;
         }
         item.notes[stage] = brief;

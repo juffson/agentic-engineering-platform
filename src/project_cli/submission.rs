@@ -71,7 +71,7 @@ pub(super) fn finish(
     ensure!(session == binding.session, "会话与领取回执不符");
     let body = result(file)?;
     let gate = matches!(
-        req.template.stages()[req.stage].role,
+        req.flow().stages.get(req.stage).context("无效阶段")?.role,
         workflow::Role::Test | workflow::Role::Accept
     );
     ensure!(

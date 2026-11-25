@@ -284,13 +284,7 @@ pub fn run(binary: &Path, request: &Path, resume: Option<&str>) -> Result<()> {
     let selection = (!req.profile.model.is_empty())
         .then(|| req.profile.zcode_selection())
         .transpose()?;
-    let mode = match req
-        .template
-        .stages()
-        .get(req.stage)
-        .context("未知阶段")?
-        .role
-    {
+    let mode = match req.flow().stages.get(req.stage).context("未知阶段")?.role {
         Role::Build => "edit",
         Role::Test | Role::Accept => "guarded",
         _ => "plan",

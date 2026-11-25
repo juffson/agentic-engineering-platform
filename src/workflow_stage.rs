@@ -1,6 +1,7 @@
 use crate::{agent::logged, run::save};
 use aep::{
     cancel::Cancellation,
+    flow::Back,
     memory::{Key, Memory, TEXT_LIMIT},
     session_reuse::{self, Mode, Plan, Reason, Side},
     workflow::{Client, Profile, Request, Role, Sandbox, Stage, tail},
@@ -154,7 +155,7 @@ pub(crate) fn context(
         .parent()
         .and_then(Path::parent)
         .context("missing work")?;
-    let mut packet = preview(req, work, cwd, since)?;
+    let mut packet = context_packet(req, work, cwd, since)?;
     if since.is_none() {
         packet.text.push_str(&format!(
             "\n本次档案 {}。前序执行的 result.txt 和 evidence.json 位于同级执行目录。",
@@ -164,6 +165,16 @@ pub(crate) fn context(
     Ok(packet)
 }
 pub(crate) fn preview(
+    req: &Result<Request>,
+    work: &Path,
+    cwd: &Path,
+    since: Option<i64>,
+) -> Result<aep::handoff::Packet> {
+    let req = req.as_ref().map_err(|err| anyhow::anyhow!("{err:#}"))?;
+    context_packet(req, work, cwd, since)
+}
+
+fn context_packet(
     req: &Request,
     work: &Path,
     cwd: &Path,
@@ -405,11 +416,7 @@ fn perform(
             &done.run,
         )),
         _ => req.prior_runs.last().map(|(s, run)| {
-            let name = req
-                .template
-                .stages()
-                .get(*s)
-                .map_or("", |st| st.name.as_str());
+            let name = req.flow().stages.get(*s).map_or("", |st| st.name.as_str());
             session_reuse::source(runs, *s, name, run)
         }),
     };
@@ -613,7 +620,7 @@ fn align_base(
         .cloned()
         .collect::<Vec<_>>()
         .join("、");
-    let stages = req.template.stages();
+    let stages = &req.flow().stages;
     let before = |role: Role| (0..req.stage).rev().find(|&i| stages[i].role == role);
     let back = |record: &mut Value, to: usize, question: String| -> Result<Option<String>> {
         record["route_back"] = json!({"stage":to,"name":stages[to].name,"question":question});
@@ -1345,12 +1352,13 @@ fn invoke(
     };
     ensure!(!result.trim().is_empty(), "CLI 返回空结果");
     fs::write(&result_path, &result)?;
-    let skips = aep::workflow::skips(req.template, req.stage, &result);
+    let flow = req.flow();
+    let skips = flow.skips(req.stage, &result);
     if !skips.is_empty() {
         record["skip"] = json!(
             skips
                 .iter()
-                .map(|(s, r)| json!({"stage":s,"name":req.template.stages()[*s].name,"reason":r}))
+                .map(|(s, r)| json!({"stage":s,"name":flow.stages[*s].name,"reason":r}))
                 .collect::<Vec<_>>()
         );
     }
@@ -1364,11 +1372,24 @@ fn invoke(
                 .join("、")
         );
     }
-    // An earlier stage must act first: record where to and why, and do not let this pass.
-    if let Some((to, question)) = aep::workflow::route_back(req.template, req.stage, &result) {
-        let target = &req.template.stages()[to].name;
-        record["route_back"] = json!({"stage":to,"name":target,"question":question});
-        anyhow::bail!("需要「{target}」先解决：{question}");
+    match flow.route_back(req.stage, &result) {
+        Back::To {
+            stage: to,
+            question,
+        } => {
+            let target = &flow.stages[to].name;
+            record["route_back"] = json!({"stage":to,"name":target,"question":question});
+            anyhow::bail!("需要「{target}」先解决：{question}");
+        }
+        Back::Rejected {
+            name,
+            question,
+            allowed,
+        } => {
+            record["route_back_rejected"] =
+                json!({"name":name,"question":question,"allowed":allowed});
+        }
+        Back::None => {}
     }
     if gate {
         ensure!(
@@ -1473,8 +1494,8 @@ pub fn execute(request: &Path) -> Result<()> {
         "外部会话已领取此阶段，请用 project submit 交回结果"
     );
     let stage = req
-        .template
-        .stages()
+        .flow()
+        .stages
         .get(req.stage)
         .context("unknown workflow stage")?;
     let stop = Cancellation::new(work, id)?;
@@ -1628,7 +1649,7 @@ mod tests {
     }
     fn align(b: &Base, stage: usize) -> (Result<Option<String>>, Value) {
         let req = base_request(b, stage);
-        let st = &req.template.stages()[stage];
+        let st = &req.flow().stages[stage];
         let mut record = json!({});
         let r = align_base(&req, st, &b.wt, "run1", &mut record);
         (r, record)

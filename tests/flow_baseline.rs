@@ -1,4 +1,5 @@
 use aep::{
+    flow::builtin,
     handoff,
     project::{Library, Work},
     workflow::{Profile, Request, Sandbox, Template},
@@ -95,9 +96,11 @@ fn handoff_snapshot() -> Result<()> {
             let mut data = legacy_request_data();
             data["template"] = json!(id);
             data["stage"] = json!(i);
-            let req: Request = serde_json::from_value(data)?;
+            let mut req: Request = serde_json::from_value(data)?;
             let text = handoff::header(&req)? + &handoff::rules(&req)?;
             check_fixture(&format!("handoff/{id}-{i}.txt"), &text)?;
+            req.flow = Some(builtin(template).clone());
+            assert_eq!(handoff::header(&req)? + &handoff::rules(&req)?, text);
         }
     }
     Ok(())
@@ -180,6 +183,8 @@ fn legacy_request() -> Result<()> {
     let req: Request = serde_json::from_str(&fixture)?;
     assert_eq!(req.template, Template::Software);
     assert_eq!(req.stage, 2);
+    assert!(req.flow.is_none());
+    assert_eq!(req.flow(), builtin(Template::Software));
     let header = handoff::header(&req)?;
     assert!(
         header.contains("\n阶段：技术方案（软件开发）\n"),

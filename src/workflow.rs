@@ -1,6 +1,6 @@
 //! Project workflows and the durable contract between Studio and its CLI supervisor.
 pub use crate::flow::FlowStage as Stage;
-use crate::flow::{Back, builtin};
+use crate::flow::{Flow, builtin};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -240,6 +240,8 @@ pub struct Request {
     pub project: String,
     pub work: String,
     pub template: Template,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<Flow>,
     pub stage: usize,
     pub profile: Profile,
     pub repository: Option<PathBuf>,
@@ -248,20 +250,10 @@ pub struct Request {
     pub brief: String,
     pub approved: Vec<(String, String)>,
 }
-/// Optional planning stages (not the first) may be passed over; tests and gates may not.
-pub fn skippable(template: Template, stage: usize) -> bool {
-    builtin(template).skippable(stage)
-}
-/// `AEP-SKIP: <stage>：<reason>` lines naming later optional stages this one found unneeded.
-pub fn skips(template: Template, from: usize, result: &str) -> Vec<(usize, String)> {
-    builtin(template).skips(from, result)
-}
-/// The `AEP-BACK: <stage>：<question>` line a stage writes when an earlier stage must act.
-/// Returns the earlier stage's index and the question.
-pub fn route_back(template: Template, from: usize, result: &str) -> Option<(usize, String)> {
-    match builtin(template).route_back(from, result) {
-        Back::To { stage, question } => Some((stage, question)),
-        Back::None | Back::Rejected { .. } => None,
+impl Request {
+    /// Older execution requests identify their flow by template alone.
+    pub fn flow(&self) -> &Flow {
+        self.flow.as_ref().unwrap_or_else(|| builtin(self.template))
     }
 }
 pub fn attempt_dir(catalog: &Path, project: &str, work: &str, attempt: &str) -> PathBuf {
