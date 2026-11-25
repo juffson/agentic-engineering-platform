@@ -152,6 +152,7 @@ function ForgeConfig({ plugin, id, focusToken }: { plugin: PluginInfo; id: Forge
     ? normalized.error
     : !host.trim() ? `留空将使用 ${defaultHost[id]}`
     : hostChecked && normalized.url !== host ? `将保存为 ${normalized.url}` : null;
+  const showEnterpriseHint = id === "github" && hostChecked && normalized.url && new URL(normalized.url).hostname !== defaultHost.github;
 
   useEffect(() => {
     if ((focusToken || replacing) && showToken) tokenInput.current?.focus();
@@ -241,7 +242,7 @@ function ForgeConfig({ plugin, id, focusToken }: { plugin: PluginInfo; id: Forge
           spellCheck={false}
           autoComplete="off"
           aria-invalid={hostChecked && !!normalized.error}
-          aria-describedby={hostHint ? `${id}-host-hint` : undefined}
+          aria-describedby={hostHint || showEnterpriseHint ? `${id}-host-hint` : undefined}
           onChange={(e) => {
             setHostDraft(e.target.value);
             setHostChecked(false);
@@ -250,10 +251,6 @@ function ForgeConfig({ plugin, id, focusToken }: { plugin: PluginInfo; id: Forge
           }}
           onBlur={() => setHostChecked(true)}
         />
-        {hostHint && <span id={`${id}-host-hint`} className={normalized.error ? "inline-error" : "field-hint"}>{hostHint}</span>}
-        {id === "github" && hostChecked && normalized.url && new URL(normalized.url).hostname !== defaultHost.github && (
-          <span className="field-hint">GitHub Enterprise 会使用 <code>{normalized.url}/api/v3</code>。</span>
-        )}
       </div>
       <div className="field">
         <label className="field-label" htmlFor={showToken ? `${id}-token` : undefined}>访问令牌</label>
@@ -297,6 +294,14 @@ function ForgeConfig({ plugin, id, focusToken }: { plugin: PluginInfo; id: Forge
         </Button>
         {testResult && <span role="status" className={testResult.ok ? "plugin-test-ok" : "inline-error"}>{testResult.message}</span>}
       </div>
+      {(hostHint || showEnterpriseHint) && (
+        <div className="plugin-host-hints" id={`${id}-host-hint`}>
+          {hostHint && <span className={normalized.error ? "inline-error" : "field-hint"}>{hostHint}</span>}
+          {showEnterpriseHint && (
+            <span className="field-hint">GitHub Enterprise 会使用 <code>{normalized.url}/api/v3</code>。</span>
+          )}
+        </div>
+      )}
       {writeError && <p className="inline-error plugin-note" role="alert">{writeError}</p>}
     </>
   );

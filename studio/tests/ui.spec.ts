@@ -629,7 +629,7 @@ test.describe("Studio plugins", () => {
     await expect(github.getByRole("status")).toContainText("令牌无效或过期");
     await githubToken.fill("demo-test-1234");
     await githubHost.fill("github.invalid");
-    await githubHost.press("Tab");
+    await expect(githubHost).toBeFocused();
     await githubTest.click();
     await expect(github.getByRole("status")).toContainText("无法连接 github.invalid");
     await githubHost.fill("github.com");
@@ -671,6 +671,16 @@ test.describe("Studio plugins", () => {
     await gitlab.getByRole("button", { name: "取消", exact: true }).click();
     await expect(masked).toBeVisible();
     await shot(page, "31-plugin-config");
+
+    const gitlabConfig = gitlab.getByRole("button", { name: "配置", exact: true });
+    await gitlabConfig.click();
+    await gitlabConfig.click();
+    await host.fill("gitlab.company.example/");
+    await expect(host).toBeFocused();
+    await save.click();
+    await expect(host).toHaveValue("https://gitlab.company.example");
+    await expect(masked).toHaveCount(0);
+    await expect(gitlab.getByText("需要配置", { exact: true })).toBeVisible();
   });
 
   test("requests a new token for a changed forge host and clears the old mask on save", async ({ page }) => {
@@ -692,6 +702,7 @@ test.describe("Studio plugins", () => {
     await expect(mask).toHaveCount(0);
     await expect(testConnection).toBeDisabled();
 
+    await expect(host).toBeFocused();
     await github.getByRole("button", { name: "保存", exact: true }).click();
     await expect(github.getByText("需要配置", { exact: true })).toBeVisible();
     await expect(host).toHaveValue("https://ghe.example.com");
