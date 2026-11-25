@@ -3,12 +3,14 @@
 use crate::runner;
 use aep::{
     autopilot,
+    flow::{self, Flow},
     handoff::{self, Assignment, busy},
     memory::{Key, Memory, TEXT_LIMIT},
-    project::{Kind, Library, Project, Work, import, merge, shelf},
+    project::{Kind, Library, Project, Work, WorkFlow, import, merge, shelf},
     session_reuse,
     transcript::{self, Entry},
     usage,
+    work_draft::DraftFlow,
     workflow::{self, Client, Profile, Request, Role, Sandbox, Template},
     workspace::Workspace,
 };
@@ -20,13 +22,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn template_id(t: Template) -> &'static str {
-    match t {
-        Template::Software => "Software",
-        Template::Game => "Game",
-        Template::Legacy => "Legacy",
-    }
-}
 fn role_id(r: Role) -> &'static str {
     match r {
         Role::Plan => "Plan",
@@ -113,6 +108,34 @@ fn ensure_idle(home: &Path, pid: &str, w: &Work) -> Result<()> {
     Ok(())
 }
 
+fn flow_view(p: &Project, flow: &Flow) -> Value {
+    let revision = p
+        .flows
+        .iter()
+        .find(|entry| entry.flow.id == flow.id)
+        .map_or(0, |entry| entry.revision);
+    let stages: Vec<Value> = flow
+        .stages
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.name, "brief": s.brief, "role": s.role,
+                "skippable": s.skippable, "back_to": s.back_to,
+            })
+        })
+        .collect();
+    let warnings: Vec<_> = flow::validate(flow, &[])
+        .warnings
+        .into_iter()
+        .map(|issue| issue.message)
+        .collect();
+    json!({
+        "id": flow.id, "label": flow.label, "builtin": flow::builtin_by_id(&flow.id).is_some(),
+        "stages": stages, "in_use": p.flow_in_use(&flow.id), "revision": revision,
+        "warnings": warnings,
+    })
+}
+
 pub fn snapshot(home: &Path) -> Result<Value> {
     let lib = Library::open(home)?;
     let projects: Vec<Value> = lib
@@ -124,7 +147,7 @@ pub fn snapshot(home: &Path) -> Result<Value> {
                 .iter()
                 .rev()
                 .map(|w| {
-                    let stages = w.template.stages();
+                    let stages = w.stages();
                     let status = w
                         .current_attempt
                         .get(&w.stage)
@@ -138,13 +161,32 @@ pub fn snapshot(home: &Path) -> Result<Value> {
                     json!({
                         "id": w.id, "name": w.name, "kind": kind_id(w.kind), "group": group,
                         "stage": w.stage, "stage_count": stages.len(), "stage_name": w.stage_name(),
+                        "flow_error": w.flow_error.is_some(),
                         "status": status,
                         "running": running_attempt(home, &p.id, w).is_some(),
                         "autopilot": autopilot::running(&autopilot_dir(home, &p.id, &w.id)),
                     })
                 })
                 .collect();
-            json!({"id": p.id, "name": p.name, "repositories": p.repositories, "work": work})
+            let flows: Vec<_> = p
+                .flow_choices()
+                .into_iter()
+                .map(|f| flow_view(p, f))
+                .collect();
+            let broken_flows: Vec<_> = p
+                .broken_flows
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "id": entry.raw["id"].as_str(), "label": entry.raw["label"].as_str(),
+                        "error": entry.error,
+                    })
+                })
+                .collect();
+            json!({
+                "id": p.id, "name": p.name, "repositories": p.repositories, "work": work,
+                "flows": flows, "broken_flows": broken_flows,
+            })
         })
         .collect();
     let clients: Vec<Value> = Client::ALL
@@ -155,9 +197,9 @@ pub fn snapshot(home: &Path) -> Result<Value> {
         .iter()
         .map(|s| json!({"id": format!("{s:?}"), "label": s.label()}))
         .collect();
-    let templates: Vec<Value> = [Template::Software, Template::Game]
-        .iter()
-        .map(|t| json!({"id": template_id(*t), "label": t.label(), "stages": t.stages().iter().map(|s| s.name).collect::<Vec<_>>()}))
+    let templates: Vec<_> = [Template::Software, Template::Game]
+        .into_iter()
+        .map(|t| DraftFlow::from(flow::builtin(t)))
         .collect();
     Ok(json!({
         "home": home,
@@ -305,6 +347,24 @@ pub fn add_repository(home: &Path, pid: &str, path: &str) -> Result<()> {
     })
 }
 
+pub fn save_flow(home: &Path, pid: &str, mut flow: Value) -> Result<Value> {
+    if let Some(fields) = flow.as_object_mut() {
+        fields.entry("id").or_insert_with(|| json!(""));
+    }
+    let flow: Flow = serde_json::from_value(flow)?;
+    let (id, warnings) = change(home, |lib| find_mut(lib, pid)?.save_flow(flow.clone()))?;
+    let warnings: Vec<_> = warnings.into_iter().map(|issue| issue.message).collect();
+    Ok(json!({"id": id, "warnings": warnings}))
+}
+
+pub fn copy_flow(home: &Path, pid: &str, id: &str, label: Option<&str>) -> Result<String> {
+    change(home, |lib| find_mut(lib, pid)?.copy_flow(id, label))
+}
+
+pub fn delete_flow(home: &Path, pid: &str, id: &str) -> Result<usize> {
+    change(home, |lib| find_mut(lib, pid)?.delete_flow(id))
+}
+
 pub fn create_work(
     home: &Path,
     pid: &str,
@@ -313,10 +373,6 @@ pub fn create_work(
     release: bool,
     repositories: &[String],
 ) -> Result<String> {
-    let template = match template {
-        "Game" => Template::Game,
-        _ => Template::Software,
-    };
     let kind = if release {
         Kind::Release
     } else {
@@ -325,7 +381,7 @@ pub fn create_work(
     change(home, |lib| {
         lib.active = Some(pid.into());
         let p = find_mut(lib, pid)?;
-        p.add_work(name, kind, template)?;
+        p.add_work_flow(name, kind, template)?;
         let known = p.repositories.clone();
         let w = p.selected_mut()?;
         for r in repositories {
@@ -368,6 +424,7 @@ fn attempt_summary(home: &Path, pid: &str, wid: &str, id: &str) -> Value {
         "subtask": subtask,
         "error": ev["error"],
         "route_back": if ev["route_back"].is_object() { ev["route_back"].clone() } else { Value::Null },
+        "route_back_rejected": ev["route_back_rejected"],
         "committed": ev["committed"] == true,
         "head_sha": ev["head_sha"],
         "tokens": summary.tokens.total(),
@@ -396,7 +453,6 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
                 .total();
     }
     let stages: Vec<Value> = w
-        .template
         .stages()
         .iter()
         .enumerate()
@@ -429,7 +485,7 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
                     "limit": w.budgets.get(&i).copied().or(p.stage_budget),
                     "own": w.budgets.get(&i),
                     "used": budget_used.get(&i).copied().unwrap_or(0),
-                    "suggested": diet_totals.get(s.name).map_or(Value::Null, |t| suggested_budget(t)),
+                    "suggested": diet_totals.get(&s.name).map_or(Value::Null, |t| suggested_budget(t)),
                 },
                 "session_preview": if state == "current" && running.is_none() && !w.delivered() {
                     session_preview(home, p, w, i)
@@ -466,9 +522,26 @@ pub fn work_detail(home: &Path, pid: &str, wid: &str) -> Result<Value> {
     let draft = (w.delivered() && w.shelved.is_none())
         .then(|| w.memory_draft(home, pid).ok())
         .flatten();
+    let flow = w.flow().ok();
+    let flow_view = flow.map(|flow| {
+        let source_state = w.flow.as_ref().map(|snapshot| {
+            match p.flows.iter().find(|entry| entry.flow.id == flow.id) {
+                Some(source) if source.revision == snapshot.source_revision => "same",
+                Some(_) => "changed",
+                None => "deleted",
+            }
+        });
+        json!({
+            "id": flow.id, "label": flow.label, "builtin": w.flow.is_none(),
+            "source_state": source_state,
+        })
+    });
     Ok(json!({
         "project": pid, "id": w.id, "name": w.name, "kind": kind_id(w.kind),
-        "template": template_id(w.template), "template_label": w.template.label(),
+        "template": flow::template_id(w.template),
+        "template_label": flow.map_or("流程无法读取", |f| f.label.as_str()),
+        "flow": flow_view,
+        "flow_error": w.flow_error.as_ref().map(|broken| &broken.error),
         "stage": w.stage, "delivered": w.delivered(), "shelved": w.shelved,
         "repositories": w.repositories, "branch": branch, "worktrees": trees,
         "branches": branches.iter().map(|b| json!({"name": b.name, "merged": b.merged})).collect::<Vec<_>>(),
@@ -623,8 +696,11 @@ pub fn update_stage(
     change(home, |lib| {
         let p = find_mut(lib, pid)?;
         let w = p.work_by_id_mut(wid)?;
-        ensure!(stage < w.template.stages().len(), "阶段不存在");
+        ensure!(stage < w.flow()?.stages.len(), "阶段不存在");
         if let Some(n) = &note {
+            if stage >= w.notes.len() {
+                w.notes.resize_with(stage + 1, String::new);
+            }
             w.notes[stage] = n.clone();
         }
         if let Some(pr) = &profile {
@@ -664,6 +740,7 @@ pub fn run_stage(
 ) -> Result<String> {
     let lib = Library::open(home)?;
     let w = item(find(&lib, pid)?, wid)?;
+    ensure!(stage < w.flow()?.stages.len(), "阶段不存在");
     ensure!(stage == w.stage, "只能运行当前阶段");
     ensure_idle(home, pid, w)?;
     let profile = w.profile(stage);
@@ -686,7 +763,7 @@ pub fn run_stage(
         let w = p.work_by_id_mut(wid)?;
         let assignment = Assignment {
             profile: profile.clone(),
-            brief: w.notes[stage].clone(),
+            brief: w.notes.get(stage).cloned().unwrap_or_default(),
             repository: w.target(stage),
             external: None,
         };
@@ -740,7 +817,7 @@ pub fn send_back(
         to < from && from == w.stage,
         "只能从当前阶段退回到更早的阶段"
     );
-    let stages = w.template.stages();
+    let name = &w.flow()?.stages.get(from).context("阶段不存在")?.name;
     let report = w
         .current_attempt
         .get(&from)
@@ -758,13 +835,13 @@ pub fn send_back(
         .or(question.filter(|q| !q.trim().is_empty()))
         .unwrap_or_else(|| handoff::summary(&text));
     let reason = if reason.trim().is_empty() {
-        format!("「{}」未通过", stages[from].name)
+        format!("「{name}」未通过")
     } else {
         reason
     };
     let message = match &report {
-        Some(d) => autopilot::rework_message(stages[from].name, &reason, d),
-        None => format!("「{}」未通过，需要你先解决：\n{reason}", stages[from].name),
+        Some(d) => autopilot::rework_message(name, &reason, d),
+        None => format!("「{name}」未通过，需要你先解决：\n{reason}"),
     };
     runner::binary()?;
     let dir = change(home, |lib| {
@@ -791,7 +868,7 @@ pub fn skip(home: &Path, pid: &str, wid: &str, stage: usize, reason: &str) -> Re
             let w = p.work_by_id_mut(wid)?;
             // A later stage: mark it so it is passed over when reached; toggles off again.
             ensure!(
-                w.skippable(stage) && stage > w.stage,
+                w.flow()?.skippable(stage) && stage > w.stage,
                 "只有可选的规划阶段可以跳过"
             );
             if w.skipped.remove(&stage).is_none() {
@@ -812,6 +889,7 @@ pub fn reopen(home: &Path, pid: &str, wid: &str, stage: usize) -> Result<()> {
     ensure_idle(home, pid, item(find(&lib, pid)?, wid)?)?;
     change(home, |lib| {
         let w = find_mut(lib, pid)?.work_by_id_mut(wid)?;
+        ensure!(stage < w.flow()?.stages.len(), "阶段不存在");
         ensure!(stage < w.stage, "只能重新打开已完成的阶段");
         w.shelved = None;
         w.reopen_transfers(stage);
@@ -825,7 +903,7 @@ pub fn autopilot_start(home: &Path, pid: &str, wid: &str, until: usize) -> Resul
     let lib = Library::open(home)?;
     let w = item(find(&lib, pid)?, wid)?;
     ensure_idle(home, pid, w)?;
-    let stages = w.template.stages();
+    let stages = &w.flow()?.stages;
     ensure!(
         until >= w.stage && until < stages.len(),
         "请选择当前阶段之后的停止位置"
@@ -1291,13 +1369,17 @@ pub fn draft_start(
         .filter(|w| w.shelved.is_none())
         .map(|w| w.name.as_str())
         .collect();
+    let flows: Vec<_> = p.flow_choices().into_iter().map(DraftFlow::from).collect();
     let id = chrono_stamp().to_string();
     let job = dir.join(&id);
     fs::create_dir_all(&job)?;
     aep::project::save_json(
         &job,
         "job.json",
-        &json!({"profile": profile, "request": request.trim(), "repository": repo, "notes": notes, "existing": existing}),
+        &json!({
+            "profile": profile, "request": request.trim(), "repository": repo,
+            "notes": notes, "existing": existing, "flows": flows,
+        }),
     )?;
     aep::project::save_json(&job, "status.json", &json!({"status": "starting"}))?;
     runner::work_draft(&job)?;
@@ -1348,8 +1430,26 @@ fn history_note(n: &aep::project::timeline::Note) -> Value {
 pub fn history(home: &Path, pid: &str, wid: &str) -> Result<Value> {
     let lib = Library::open(home)?;
     let w = item(find(&lib, pid)?, wid)?;
+    // Run requests preserve the stage definitions needed to display a damaged item's history.
+    let historical_work = if w.flow_error.is_some() {
+        w.attempts.iter().rev().find_map(|attempt| {
+            aep::workspace::ident(&attempt.id, 64).ok()?;
+            let dir = workflow::attempt_dir(home, pid, wid, &attempt.id);
+            let request = read_request(&dir)?;
+            let mut view = w.clone();
+            view.flow_error = None;
+            view.flow = Some(WorkFlow {
+                flow: request.flow().clone(),
+                source_revision: 0,
+            });
+            Some(view)
+        })
+    } else {
+        None
+    };
+    let w = historical_work.as_ref().unwrap_or(w);
     let t = aep::project::timeline::load(home, pid, w)?;
-    let names = w.template.stages();
+    let names = w.stages();
     let rounds: Vec<Value> = t
         .rounds
         .iter()
@@ -1357,7 +1457,7 @@ pub fn history(home: &Path, pid: &str, wid: &str) -> Result<Value> {
             json!({
                 "run": r.run,
                 "stage": r.stage,
-                "stage_name": r.stage.and_then(|s| names.get(s)).map_or("", |s| s.name),
+                "stage_name": r.stage.and_then(|s| names.get(s)).map_or("", |s| s.name.as_str()),
                 "status": r.status,
                 "round": r.round,
                 "attempt": r.attempt,
@@ -1447,7 +1547,7 @@ pub fn set_budget(
         let w = find_mut(lib, pid)?.work_by_id_mut(wid)?;
         match stage {
             Some(i) => {
-                ensure!(i < w.template.stages().len(), "阶段不存在");
+                ensure!(i < w.flow()?.stages.len(), "阶段不存在");
                 match parse_tokens(tokens) {
                     Some(n) => w.budgets.insert(i, n),
                     None => w.budgets.remove(&i),
@@ -1563,7 +1663,7 @@ pub fn project_usage(home: &Path, pid: &str) -> Result<Value> {
             if s.tokens.total() == 0 {
                 continue;
             }
-            let stage = w.template.stages().get(a.stage).map_or("?", |s| s.name);
+            let stage = w.stages().get(a.stage).map_or("?", |s| s.name.as_str());
             let client = format!("{:?}", a.profile.client);
             let model = s
                 .models
@@ -1746,7 +1846,8 @@ fn effective_profile(p: &Project, w: &Work, stage: usize) -> Profile {
 /// custom CLIs. The workspace is assumed unchanged: a later change shows on the run's label.
 fn session_preview(home: &Path, p: &Project, w: &Work, stage: usize) -> Value {
     use session_reuse::{Mode, Plan, Reason, Side};
-    let Some(st) = w.template.stages().get(stage) else {
+    let stages = w.stages();
+    let Some(st) = stages.get(stage) else {
         return Value::Null;
     };
     let profile = effective_profile(p, w, stage);
@@ -1761,17 +1862,19 @@ fn session_preview(home: &Path, p: &Project, w: &Work, stage: usize) -> Value {
     };
     let threshold = session_reuse::limit(p.resume_limit);
     // The next build subtask continues from the last one that passed, as the runner does.
-    let subtask = (st.role == Role::Build
-        && !autopilot::subtasks(home, &p.id, w).is_empty())
-    .then(|| autopilot::finished_subtasks(home, &p.id, w, stage).pop())
-    .flatten()
-    .map(|d| (stage, format!("{} · {}", st.name, d.id), d.run));
+    let subtask = (st.role == Role::Build && !autopilot::subtasks(home, &p.id, w).is_empty())
+        .then(|| autopilot::finished_subtasks(home, &p.id, w, stage).pop())
+        .flatten()
+        .map(|d| (stage, format!("{} · {}", st.name, d.id), d.run));
     let source = subtask
         .or_else(|| {
-            w.current_attempt.range(..stage).next_back().map(|(s, run)| {
-                let name = w.template.stages().get(*s).map_or("", |x| x.name);
-                (*s, name.to_owned(), run.clone())
-            })
+            w.current_attempt
+                .range(..stage)
+                .next_back()
+                .map(|(s, run)| {
+                    let name = stages.get(*s).map_or("", |x| x.name.as_str());
+                    (*s, name.to_owned(), run.clone())
+                })
         })
         .map(|(s, name, run)| {
             let runs = workflow::attempt_dir(home, &p.id, &w.id, &run);
@@ -1855,7 +1958,7 @@ fn diet_totals(home: &Path, p: &Project) -> std::collections::BTreeMap<String, V
             if total == 0 {
                 continue;
             }
-            let name = w.template.stages().get(a.stage).map_or("?", |s| s.name);
+            let name = w.stages().get(a.stage).map_or("?", |s| s.name.as_str());
             out.entry(name.to_owned()).or_default().push(total);
         }
     }
