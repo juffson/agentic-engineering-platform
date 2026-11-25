@@ -15,12 +15,21 @@ use std::{
 /// Version of the "after" launch; evidence carrying `launch.diet` counts as optimised (R6).
 pub const DIET: u32 = 1;
 
+// The managed security plugin inherits Claude Code's policy.
+const MINIMAL_SETTINGS: &str = concat!(
+    r#"{"autoMemoryEnabled":false,"enabledPlugins":{"#,
+    r#""cc-plugin-agents-md@builtin":false,"#,
+    r#""cc-plugin-telemetry@builtin":false,"#,
+    r#""cc-plugin-privacy@builtin":false,"#,
+    r#""cc-plugin-plugin-authoring@builtin":false}}"#,
+);
+
 /// Flags the minimal launch adds, each with its value (if any).
 pub const MINIMAL_FLAGS: [(&str, Option<&str>); 4] = [
     ("--strict-mcp-config", None),
     ("--setting-sources", Some("project,local")),
     ("--disable-slash-commands", None),
-    ("--settings", Some(r#"{"autoMemoryEnabled":false}"#)),
+    ("--settings", Some(MINIMAL_SETTINGS)),
 ];
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -294,8 +303,21 @@ mod tests {
                 "project,local",
                 "--disable-slash-commands",
                 "--settings",
-                r#"{"autoMemoryEnabled":false}"#
+                MINIMAL_SETTINGS,
             ]
+        );
+        let settings: Value = serde_json::from_str(&l.args[5]).unwrap();
+        assert_eq!(
+            settings,
+            json!({
+                "autoMemoryEnabled": false,
+                "enabledPlugins": {
+                    "cc-plugin-agents-md@builtin": false,
+                    "cc-plugin-telemetry@builtin": false,
+                    "cc-plugin-privacy@builtin": false,
+                    "cc-plugin-plugin-authoring@builtin": false,
+                }
+            })
         );
         assert!(l.minimal && l.not_minimized.is_empty() && l.model_source.is_none());
         assert!(!l.args.iter().any(|a| a == "--mcp-config" || a == "--bare"));
@@ -309,7 +331,7 @@ mod tests {
         let old =
             "Usage: claude [options]\n  --settings <file-or-json>  x\n  --mcp-config <c>  y\n";
         let l = compose(Ok(old), "m", None);
-        assert_eq!(l.args, ["--settings", r#"{"autoMemoryEnabled":false}"#]);
+        assert_eq!(l.args, ["--settings", MINIMAL_SETTINGS]);
         assert!(!l.minimal);
         assert_eq!(
             l.not_minimized,

@@ -288,13 +288,12 @@ printf '%s\n' '{{"type":"result","result":"好","is_error":false}}'
         assert_eq!(ask(&profile, "整理", t.path(), t.path()).unwrap(), "好");
         let argv = fs::read_to_string(&log).unwrap();
         let argv: Vec<&str> = argv.lines().collect();
-        for flag in [
-            "--strict-mcp-config",
-            "--disable-slash-commands",
-            "project,local",
-            r#"{"autoMemoryEnabled":false}"#,
-        ] {
-            assert!(argv.contains(&flag), "{flag} missing in {argv:?}");
+        for (flag, value) in crate::launch::MINIMAL_FLAGS {
+            let present = match value {
+                Some(value) => argv.windows(2).any(|args| args == [flag, value]),
+                None => argv.contains(&flag),
+            };
+            assert!(present, "missing {flag} {value:?} in {argv:?}");
         }
         assert_eq!(argv.iter().filter(|a| **a == "--model").count(), 1);
         assert!(!argv.contains(&"--mcp-config"));

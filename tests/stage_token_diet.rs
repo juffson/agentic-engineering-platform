@@ -205,13 +205,12 @@ fn run_id(r: &Run) -> String {
 
 /// Every run, reused or not, starts Claude with the minimal launch (AC-1 carried through).
 fn assert_minimal(r: &Run) {
-    for pair in [
-        &["--strict-mcp-config"][..],
-        &["--setting-sources", "project,local"],
-        &["--disable-slash-commands"],
-        &["--settings", r#"{"autoMemoryEnabled":false}"#],
-    ] {
-        assert!(r.has(pair), "missing {pair:?} in {:?}", r.argv);
+    for (flag, value) in aep::launch::MINIMAL_FLAGS {
+        let present = match value {
+            Some(value) => r.has(&[flag, value]),
+            None => r.has(&[flag]),
+        };
+        assert!(present, "missing {flag} {value:?} in {:?}", r.argv);
     }
     assert_eq!(r.ev["launch"]["diet"], aep::launch::DIET, "{}", r.ev);
     assert_eq!(r.ev["launch"]["minimal"], true, "{}", r.ev);
