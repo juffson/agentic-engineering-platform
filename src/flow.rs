@@ -123,7 +123,8 @@ fn directive_target(line: &str) -> (&str, &str) {
     )
 }
 
-const BUILTIN_TEMPLATES: [Template; 3] = [Template::Legacy, Template::Software, Template::Game];
+pub(crate) const BUILTIN_TEMPLATES: [Template; 3] =
+    [Template::Legacy, Template::Software, Template::Game];
 
 pub const fn template_id(template: Template) -> &'static str {
     match template {
@@ -158,10 +159,13 @@ pub fn builtin(template: Template) -> &'static Flow {
 }
 
 pub fn builtin_by_id(id: &str) -> Option<&'static Flow> {
+    template_by_id(id).map(builtin)
+}
+
+pub(crate) fn template_by_id(id: &str) -> Option<Template> {
     BUILTIN_TEMPLATES
         .into_iter()
         .find(|&template| template_id(template) == id)
-        .map(builtin)
 }
 
 fn make_builtin(template: Template) -> Flow {

@@ -8,6 +8,7 @@ pub mod timeline;
 pub mod transfer;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use std::{
     fs,
     io::ErrorKind,
@@ -15,7 +16,10 @@ use std::{
 };
 use uuid::Uuid;
 
-use crate::workflow::{self, Client, Profile, Template};
+use crate::{
+    flow::{self, Flow, FlowStage, Issue},
+    workflow::{self, Client, Profile, Template},
+};
 use std::collections::BTreeMap;
 
 pub fn catalog_dir() -> Option<PathBuf> {
@@ -278,6 +282,20 @@ pub struct WorkHandoff {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct WorkFlow {
+    #[serde(flatten)]
+    pub flow: Flow,
+    pub source_revision: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BrokenWork {
+    pub error: String,
+    pub template: Value,
+    pub flow: Value,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Work {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deliveries: Vec<archive::Delivery>,
@@ -320,6 +338,10 @@ pub struct Work {
     pub notes: Vec<String>,
     #[serde(default)]
     pub template: Template,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<WorkFlow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_error: Option<BrokenWork>,
     #[serde(default)]
     pub profiles: BTreeMap<usize, Profile>,
     #[serde(default)]
@@ -331,6 +353,24 @@ pub struct Work {
     pub repositories: Vec<PathBuf>,
 }
 impl Work {
+    pub fn flow(&self) -> Result<&Flow> {
+        if let Some(broken) = &self.flow_error {
+            anyhow::bail!("这个事项的流程数据无法读取：{}", broken.error);
+        }
+        Ok(self
+            .flow
+            .as_ref()
+            .map_or_else(|| flow::builtin(self.template), |snapshot| &snapshot.flow))
+    }
+
+    pub fn stages(&self) -> &[FlowStage] {
+        self.flow().map_or(&[], |flow| flow.stages.as_slice())
+    }
+
+    pub fn flow_id(&self) -> &str {
+        self.flow().map_or("", |flow| flow.id.as_str())
+    }
+
     pub fn has_record(&self, repo: &Path, kind: RecordKind, id: &str) -> bool {
         self.records
             .iter()
@@ -344,27 +384,35 @@ impl Work {
     }
     /// Only optional planning stages after the first may be skipped; gates never are.
     pub fn skippable(&self, stage: usize) -> bool {
-        workflow::skippable(self.template, stage)
+        self.flow().is_ok_and(|flow| flow.skippable(stage))
     }
     pub fn sandbox(&self, stage: usize) -> workflow::Sandbox {
         self.sandboxes.get(&stage).copied().unwrap_or_else(|| {
-            self.template
-                .stages()
+            self.stages()
                 .get(stage)
                 .map_or_else(Default::default, |s| workflow::Sandbox::for_role(s.role))
         })
     }
     pub fn stage_name(&self) -> &str {
-        self.template
-            .stages()
-            .get(self.stage)
-            .map_or("已交付", |s| s.name.as_str())
+        self.flow().map_or("流程无法读取", |flow| {
+            flow.stages
+                .get(self.stage)
+                .map_or("已交付", |stage| stage.name.as_str())
+        })
     }
     pub fn profile(&self, stage: usize) -> Profile {
+        let Some(definition) = self.stages().get(stage) else {
+            return Profile {
+                client: Client::Codex,
+                executable: String::new(),
+                model: String::new(),
+                check_command: String::new(),
+            };
+        };
         self.profiles
             .get(&stage)
             .cloned()
-            .unwrap_or_else(|| Profile::for_stage(&self.template.stages()[stage]))
+            .unwrap_or_else(|| Profile::for_stage(definition))
     }
     pub fn target(&self, stage: usize) -> Option<PathBuf> {
         self.targets
@@ -388,6 +436,21 @@ impl Work {
             .unwrap_or_else(|| format!("work-{}", self.id))
     }
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProjectFlow {
+    #[serde(flatten)]
+    pub flow: Flow,
+    pub revision: u64,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Broken {
+    pub error: String,
+    pub raw: Value,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -397,6 +460,10 @@ pub struct Project {
     pub repositories: Vec<PathBuf>,
     pub work: Vec<Work>,
     pub selected: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flows: Vec<ProjectFlow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broken_flows: Vec<Broken>,
     #[serde(default)]
     pub cli_defaults: Vec<Profile>,
     /// Branches whose imported item a person deleted; sync does not bring them back.
@@ -410,6 +477,119 @@ pub struct Project {
     pub resume_limit: Option<u64>,
 }
 impl Project {
+    pub fn flow_choices(&self) -> Vec<&Flow> {
+        let mut custom: Vec<_> = self.flows.iter().map(|entry| &entry.flow).collect();
+        custom.sort_by(|a, b| a.label.cmp(&b.label));
+        [
+            flow::builtin(Template::Software),
+            flow::builtin(Template::Game),
+        ]
+        .into_iter()
+        .chain(custom)
+        .collect()
+    }
+
+    pub fn save_flow(&mut self, flow: Flow) -> Result<(String, Vec<Issue>)> {
+        let mut flow = flow.normalized();
+        ensure!(flow::builtin_by_id(&flow.id).is_none(), "内置流程不能修改");
+        let existing = if flow.id.is_empty() {
+            None
+        } else {
+            Some(
+                self.flows
+                    .iter()
+                    .position(|entry| entry.flow.id == flow.id)
+                    .context("这套流程已被删除")?,
+            )
+        };
+        let warnings = validate_flow(&flow, &taken_flow_labels(&self.flows, &flow.id))?;
+        let revision = if let Some(index) = existing {
+            self.flows[index]
+                .revision
+                .checked_add(1)
+                .context("流程版本号已达上限")?
+        } else {
+            flow.id = self.new_flow_id();
+            1
+        };
+        let id = flow.id.clone();
+        let saved = ProjectFlow {
+            flow,
+            revision,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Some(index) = existing {
+            self.flows[index] = saved;
+        } else {
+            self.flows.push(saved);
+        }
+        Ok((id, warnings))
+    }
+
+    pub fn copy_flow(&mut self, id: &str, label: Option<&str>) -> Result<String> {
+        let mut copy = flow::builtin_by_id(id)
+            .or_else(|| {
+                self.flows
+                    .iter()
+                    .find(|entry| entry.flow.id == id)
+                    .map(|entry| &entry.flow)
+            })
+            .context("这套流程已被删除")?
+            .clone();
+        copy.id.clear();
+        copy.label = match label {
+            Some(label) => label.into(),
+            None => {
+                let labels = taken_flow_labels(&self.flows, "");
+                let base = format!("{} 副本", copy.label);
+                let mut label = base.clone();
+                let mut suffix = 2;
+                while labels.iter().any(|taken| taken.trim() == label) {
+                    label = format!("{base} {suffix}");
+                    suffix += 1;
+                }
+                label
+            }
+        };
+        self.save_flow(copy).map(|(id, _)| id)
+    }
+
+    pub fn delete_flow(&mut self, id: &str) -> Result<usize> {
+        ensure!(flow::builtin_by_id(id).is_none(), "内置流程不能删除");
+        let count = self.flows.len() + self.broken_flows.len();
+        self.flows.retain(|entry| entry.flow.id != id);
+        self.broken_flows
+            .retain(|entry| entry.raw["id"].as_str() != Some(id));
+        ensure!(
+            self.flows.len() + self.broken_flows.len() < count,
+            "这套流程已被删除"
+        );
+        Ok(self.flow_in_use(id))
+    }
+
+    pub fn flow_in_use(&self, id: &str) -> usize {
+        self.work
+            .iter()
+            .filter(|work| work.shelved.is_none() && work.flow().is_ok_and(|flow| flow.id == id))
+            .count()
+    }
+
+    fn new_flow_id(&self) -> String {
+        loop {
+            let uuid = Uuid::new_v4().simple().to_string();
+            let id = format!("flow-{}", &uuid[..12]);
+            if !self.flows.iter().any(|entry| entry.flow.id == id)
+                && !self
+                    .broken_flows
+                    .iter()
+                    .any(|entry| entry.raw["id"].as_str() == Some(&id))
+                && !self.work.iter().any(|work| work.flow_id() == id)
+            {
+                return id;
+            }
+        }
+    }
+
     pub fn configure_site(&mut self, repo: &Path, site: Option<HttpsSite>) -> Result<()> {
         ensure!(
             self.repositories.iter().any(|r| r == repo),
@@ -454,10 +634,7 @@ impl Project {
             item.repositories.iter().any(|r| r == repo),
             "仓库未纳入当前事项"
         );
-        ensure!(
-            stage.is_none_or(|i| i < item.template.stages().len()),
-            "无效阶段"
-        );
+        ensure!(stage.is_none_or(|i| i < item.stages().len()), "无效阶段");
         if let Some(record) = item
             .records
             .iter_mut()
@@ -488,7 +665,7 @@ impl Project {
         stage: usize,
     ) -> Result<()> {
         let item = self.work_by_id_mut(work)?;
-        ensure!(stage < item.template.stages().len(), "无效阶段");
+        ensure!(stage < item.stages().len(), "无效阶段");
         self.link_record(work, repo, kind, record)?;
         let item = self.work_by_id_mut(work)?;
         let link = item
@@ -554,9 +731,29 @@ impl Project {
         self.cli_defaults.iter().find(|p| p.client == client)
     }
     pub fn add_work(&mut self, name: &str, kind: Kind, template: Template) -> Result<()> {
-        ensure!(!name.trim().is_empty(), "请填写事项名称");
+        self.add_work_flow(name, kind, flow::template_id(template))
+    }
+
+    pub fn add_work_flow(&mut self, name: &str, kind: Kind, flow_id: &str) -> Result<()> {
+        let name = name.trim();
+        ensure!(!name.is_empty(), "请填写事项名称");
+        let (template, flow) = if let Some(template) = flow::template_by_id(flow_id) {
+            (template, None)
+        } else {
+            let source = self
+                .flows
+                .iter()
+                .find(|entry| entry.flow.id == flow_id)
+                .with_context(|| format!("流程「{flow_id}」已被删除，请重新选择"))?;
+            (
+                Template::Software,
+                Some(WorkFlow {
+                    flow: source.flow.clone(),
+                    source_revision: source.revision,
+                }),
+            )
+        };
         let id = Uuid::new_v4().simple().to_string();
-        self.selected = Some(id.clone());
         let mut work = Work {
             skipped: BTreeMap::new(),
             imported: None,
@@ -572,29 +769,137 @@ impl Project {
             handoffs: vec![],
             tickets: Default::default(),
             id,
-            name: name.trim().into(),
+            name: name.into(),
             kind,
             stage: 0,
-            notes: vec![String::new(); template.stages().len()],
+            notes: Vec::new(),
             template,
+            flow,
+            flow_error: None,
             profiles: BTreeMap::new(),
             targets: BTreeMap::new(),
             attempts: vec![],
             current_attempt: BTreeMap::new(),
             repositories: Vec::new(),
         };
-        for (i, stage) in template.stages().iter().enumerate() {
-            if let Some(profile) = self.preset(Profile::for_stage(stage).client) {
-                work.profiles.insert(i, profile.clone());
-            }
-        }
+        work.notes.resize(work.stages().len(), String::new());
+        work.profiles = work
+            .stages()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, stage)| {
+                self.preset(Profile::for_stage(stage).client)
+                    .cloned()
+                    .map(|profile| (i, profile))
+            })
+            .collect();
         for path in &self.repositories {
             work.include(path);
         }
+        self.selected = Some(work.id.clone());
         self.work.push(work);
         Ok(())
     }
 }
+
+fn taken_flow_labels<'a>(flows: &'a [ProjectFlow], excluded_id: &str) -> Vec<&'a str> {
+    let mut labels: Vec<&'a str> = flow::BUILTIN_TEMPLATES.map(Template::label).to_vec();
+    labels.extend(
+        flows
+            .iter()
+            .filter(|entry| entry.flow.id != excluded_id)
+            .map(|entry| entry.flow.label.as_str()),
+    );
+    labels
+}
+
+fn validate_flow(flow: &Flow, taken_labels: &[&str]) -> Result<Vec<Issue>> {
+    let result = flow::validate(flow, taken_labels);
+    ensure!(
+        result.errors.is_empty(),
+        "{}",
+        result
+            .errors
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    Ok(result.warnings)
+}
+
+fn isolate_project_flows(project: &mut Map<String, Value>) -> Result<()> {
+    let Some(raw_flows) = project.remove("flows") else {
+        return Ok(());
+    };
+    let mut broken = Vec::new();
+    let entries = match raw_flows {
+        Value::Array(entries) => entries,
+        raw => {
+            broken.push(json!({"error": "项目流程列表无法读取", "raw": raw}));
+            Vec::new()
+        }
+    };
+    let mut parsed: Vec<ProjectFlow> = Vec::new();
+    let mut valid = Vec::new();
+    for raw in entries {
+        match read_project_flow(&raw, &parsed) {
+            Ok(entry) => {
+                parsed.push(entry);
+                valid.push(raw);
+            }
+            Err(error) => broken.push(json!({"error": format!("{error:#}"), "raw": raw})),
+        }
+    }
+    project.insert("flows".into(), Value::Array(valid));
+    if !broken.is_empty() {
+        project
+            .entry("broken_flows")
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .context("损坏的项目流程列表无法读取")?
+            .extend(broken);
+    }
+    Ok(())
+}
+
+fn read_project_flow(raw: &Value, existing: &[ProjectFlow]) -> Result<ProjectFlow> {
+    let entry = ProjectFlow::deserialize(raw).context("项目流程无法读取")?;
+    let id = &entry.flow.id;
+    ensure!(!id.is_empty(), "流程标识不能为空");
+    ensure!(flow::builtin_by_id(id).is_none(), "内置流程不能修改");
+    ensure!(
+        !existing.iter().any(|valid| valid.flow.id == *id),
+        "流程标识「{id}」重复"
+    );
+    validate_flow(&entry.flow, &taken_flow_labels(existing, ""))?;
+    Ok(entry)
+}
+
+fn isolate_work_flow(work: &mut Map<String, Value>) {
+    if let Err(error) = check_work_flow(work) {
+        let template = work
+            .insert("template".into(), json!(Template::Legacy))
+            .unwrap_or(Value::Null);
+        let flow = work.remove("flow").unwrap_or(Value::Null);
+        work.insert(
+            "flow_error".into(),
+            json!({"error": format!("{error:#}"), "template": template, "flow": flow}),
+        );
+    }
+}
+
+fn check_work_flow(work: &Map<String, Value>) -> Result<()> {
+    if let Some(template) = work.get("template") {
+        Template::deserialize(template).context("事项模板无法识别")?;
+    }
+    if let Some(flow) = work.get("flow") {
+        let snapshot = WorkFlow::deserialize(flow).context("事项流程快照无法读取")?;
+        validate_flow(&snapshot.flow, &[])?;
+    }
+    Ok(())
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Library {
     pub revision: u64,
@@ -605,8 +910,7 @@ impl Library {
     pub fn open(dir: &Path) -> Result<Self> {
         match fs::read(dir.join("projects.json")) {
             Ok(data) => {
-                let mut library: Self =
-                    serde_json::from_slice(&data).context("项目库文件无法读取")?;
+                let mut library = Self::decode(&data).context("项目库文件无法读取")?;
                 for project in &mut library.projects {
                     for work in &mut project.work {
                         for delivery in &mut work.deliveries {
@@ -621,6 +925,22 @@ impl Library {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn decode(data: &[u8]) -> Result<Self> {
+        let mut raw: Value = serde_json::from_slice(data)?;
+        if let Some(projects) = raw.get_mut("projects").and_then(Value::as_array_mut) {
+            for project in projects.iter_mut().filter_map(Value::as_object_mut) {
+                isolate_project_flows(project)?;
+                if let Some(work) = project.get_mut("work").and_then(Value::as_array_mut) {
+                    for item in work.iter_mut().filter_map(Value::as_object_mut) {
+                        isolate_work_flow(item);
+                    }
+                }
+            }
+        }
+        Ok(serde_json::from_value(raw)?)
+    }
+
     pub fn project(&self) -> Option<&Project> {
         self.projects
             .iter()
@@ -647,6 +967,8 @@ impl Library {
             repositories,
             work: vec![],
             selected: None,
+            flows: vec![],
+            broken_flows: vec![],
             cli_defaults: vec![],
             dismissed_imports: vec![],
             stage_budget: None,
