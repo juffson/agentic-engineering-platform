@@ -1,6 +1,7 @@
 //! AEP Studio: Tauri shell over the `aep` core. Commands keep their work off the UI thread.
 #![allow(non_snake_case)]
 pub mod api;
+pub mod plugins;
 pub mod runner;
 
 use aep::workflow::Profile;
@@ -217,6 +218,54 @@ fn gitTools() -> Result<impl Serialize, String> {
 #[tauri::command(async)]
 fn openGitTool(id: String, path: String) -> Result<impl Serialize, String> {
     run(move |h| api::open_git_tool(&h, &id, &path))
+}
+
+#[tauri::command(async)]
+fn plugins() -> Result<impl Serialize, String> {
+    run(move |h| plugins::list(&plugins::Ctx::real(h)))
+}
+
+#[tauri::command(async)]
+fn setPluginEnabled(plugin: String, enabled: bool) -> Result<impl Serialize, String> {
+    run(move |h| plugins::set_enabled(&plugins::Ctx::real(h), &plugin, enabled))
+}
+
+#[tauri::command(async)]
+fn savePlugin(
+    plugin: String,
+    host: String,
+    token: Option<String>,
+) -> Result<impl Serialize, String> {
+    run(move |h| plugins::save(&plugins::Ctx::real(h), &plugin, &host, token.as_deref()))
+}
+
+#[tauri::command(async)]
+fn clearPluginToken(plugin: String) -> Result<impl Serialize, String> {
+    run(move |h| plugins::clear_token(&plugins::Ctx::real(h), &plugin))
+}
+
+#[tauri::command(async)]
+fn testPlugin(
+    plugin: String,
+    host: String,
+    token: Option<String>,
+) -> Result<impl Serialize, String> {
+    run(move |h| plugins::test(&plugins::Ctx::real(h), &plugin, &host, token.as_deref()))
+}
+
+#[tauri::command(async)]
+fn remoteStatus(project: String, path: String) -> Result<impl Serialize, String> {
+    run(move |h| plugins::remote_status(&plugins::Ctx::real(h), &project, &path))
+}
+
+#[tauri::command(async)]
+fn remoteRefresh(project: String, path: String) -> Result<impl Serialize, String> {
+    run(move |h| plugins::refresh(&plugins::Ctx::real(h), &project, &path))
+}
+
+#[tauri::command(async)]
+fn openUrl(url: String) -> Result<impl Serialize, String> {
+    run(move |h| plugins::open_url(&plugins::Ctx::real(h), &url))
 }
 
 #[tauri::command(async)]
@@ -441,6 +490,14 @@ pub fn start() {
             branchGraph,
             gitTools,
             openGitTool,
+            plugins,
+            setPluginEnabled,
+            savePlugin,
+            clearPluginToken,
+            testPlugin,
+            remoteStatus,
+            remoteRefresh,
+            openUrl,
             reviseMemory,
             removeProject,
             importScan,
