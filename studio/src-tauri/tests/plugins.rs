@@ -719,7 +719,7 @@ impl Repo {
             &root,
             &["clone", "--quiet", "--bare", ".", bare.to_str().unwrap()],
         )?;
-        let project = api::create_project(&home, "demo", &[root.to_str().unwrap().into()])?;
+        let project = api::create_project(&home, "demo", &[root.to_str().unwrap().into()], None)?;
         Ok(Self {
             _temp: temp,
             home,

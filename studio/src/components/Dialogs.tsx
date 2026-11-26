@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Download, FolderOpen, Plus, RefreshCw, Sparkles } from "lucide-react";
-import type { DraftItem, DraftStatus, FlowDef, FlowId, ImportFound, SyncPlan } from "../api/types";
+import type { DraftItem, DraftStatus, FlowDef, FlowId, FolderResolved, ImportFound, SyncPlan } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { ROLE_HINT, ROLE_LABEL } from "../lib/flow";
 import { useStudio } from "../state/store";
 import { Button, Field, Modal, Segmented, Spinner } from "./ui";
+import { FolderScan } from "./FolderScan";
 
 const DEFAULT_FLOW: FlowId = "Software";
 
@@ -315,11 +316,39 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
   const [memories, setMemories] = useState<Record<string, Set<string>>>({});
   const [branches, setBranches] = useState<Record<string, Set<string>>>({});
   const [scanning, setScanning] = useState<string[]>([]);
+  const [resolved, setResolved] = useState<Record<string, FolderResolved>>({});
+  const [resolving, setResolving] = useState<string[]>([]);
+  const [folderSel, setFolderSel] = useState<Record<string, Set<string>>>({});
+  const [deepening, setDeepening] = useState<string | null>(null);
   const list = repos
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
 
+  /** Classify one path first: plain repositories keep today's import scan, workspace
+   *  folders get a checkbox list, anything else becomes an error row. */
+  const resolve1 = async (path: string, forget = false): Promise<FolderResolved | undefined> => {
+    if (!path || (!forget && resolved[path]) || resolving.includes(path)) return resolved[path];
+    setResolving((s) => [...s, path]);
+    let outcome: FolderResolved | undefined;
+    try {
+      const r = await api.resolveFolder({ path });
+      outcome = r;
+      setResolved((m) => ({ ...m, [path]: r }));
+      if (r.kind === "folder") {
+        setFolderSel((s) => (s[path] ? s : { ...s, [path]: new Set(r.repositories.map((x) => x.path)) }));
+      } else if (r.kind === "repository") {
+        void scan(path);
+      }
+    } catch (e) {
+      const fallback: FolderResolved = { kind: "missing", path, message: `无法读取这个文件夹：${errorMessage(e)}` };
+      outcome = fallback;
+      setResolved((m) => ({ ...m, [path]: fallback }));
+    } finally {
+      setResolving((s) => s.filter((p) => p !== path));
+    }
+    return outcome;
+  };
   /** Look at what the coding agents already have for a folder; all memory files start selected. */
   const scan = async (path: string) => {
     if (!path || found[path] || scanning.includes(path)) return;
@@ -335,20 +364,97 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
       setScanning((s) => s.filter((p) => p !== path));
     }
   };
+  /** Import scans for the folders' chosen repositories, at most 3 at a time (design §2). */
+  const scanChosen = useCallback(async (paths: string[]) => {
+    const queue = paths.filter((p) => p && !found[p] && !scanning.includes(p));
+    const worker = async () => {
+      for (;;) {
+        const path = queue.shift();
+        if (!path) return;
+        setScanning((s) => [...s, path]);
+        try {
+          const f = await api.importScan({ path });
+          setFound((m) => ({ ...m, [path]: f }));
+          setMemories((m) => ({ ...m, [path]: new Set(f.memories.map((x) => x.file)) }));
+          setBranches((m) => ({ ...m, [path]: new Set() }));
+        } catch {
+          // A single failing scan never blocks creating the project.
+        } finally {
+          setScanning((s) => s.filter((p) => p !== path));
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(3, Math.max(1, queue.length)) }, worker));
+  }, [found, scanning]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const pick = async () => {
-    const path = await act(() => api.pickFolder({ prompt: "选择项目的 git 仓库文件夹" }));
+    const path = await act(() => api.pickFolder({ prompt: "选择 git 仓库文件夹，或包含多个仓库的工作区文件夹" }));
     if (!path) return;
     setRepos((r) => (r.split("\n").map((x) => x.trim()).includes(path) ? r : r.trim() ? `${r.trim()}\n${path}` : path));
     if (!name.trim()) setName(path.split("/").pop() ?? "");
-    void scan(path);
+    await resolve1(path);
   };
+
+  const folderPaths = list.filter((p) => resolved[p]?.kind === "folder");
+  const plainPaths = list.filter((p) => resolved[p]?.kind === "repository");
+  const chosenFromFolders = folderPaths.flatMap((p) => {
+    const r = resolved[p] as Extract<FolderResolved, { kind: "folder" }>;
+    return r.repositories.filter((x) => folderSel[p]?.has(x.path)).map((x) => x.path);
+  });
+  const allRepos = [...new Set([...plainPaths, ...chosenFromFolders])];
+  const workspaceRoot = folderPaths.length
+    ? (resolved[folderPaths[0]] as Extract<FolderResolved, { kind: "folder" }>).root
+    : undefined;
+  const errorPaths = list.filter((p) => {
+    const r = resolved[p];
+    return r && r.kind !== "repository" && r.kind !== "folder";
+  });
+
+  // Scan what the folders' checkboxes chose (and only that); re-checks are free.
+  const chosenKey = chosenFromFolders.join("\n");
+  useEffect(() => {
+    if (chosenFromFolders.length) void scanChosen(chosenFromFolders);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chosenKey]);
+
+  /** 「再查一层」： replace the list, keep the deselections (by absolute path). */
+  const deeper = async (path: string) => {
+    const cur = resolved[path];
+    if (cur?.kind !== "folder" || deepening) return;
+    setDeepening(path);
+    const before = new Set(cur.repositories.map((r) => r.path));
+    const keep = folderSel[path] ?? new Set();
+    try {
+      const r = await api.resolveFolder({ path, depth: Math.min(cur.depth + 1, 4) });
+      setResolved((m) => ({ ...m, [path]: r }));
+      if (r.kind === "folder") {
+        const next = new Set(r.repositories.filter((x) => keep.has(x.path) || !before.has(x.path)).map((x) => x.path));
+        setFolderSel((s) => ({ ...s, [path]: next }));
+      }
+    } finally {
+      setDeepening(null);
+    }
+  };
+  const removeLine = (path: string) => {
+    setRepos((r) =>
+      r
+        .split("\n")
+        .map((x) => x.trim())
+        .filter((x) => x && x !== path)
+        .join("\n"),
+    );
+  };
+
+  const hasFolders = folderPaths.length > 0;
+  const noneChosen = hasFolders && allRepos.length === 0;
+  const working = resolving.length > 0 || scanning.length > 0;
   const create = async () => {
     setBusy(true);
-    const pid = await act(() => api.createProject({ name: name.trim(), repositories: list }), "项目已创建");
+    const pid = await act(() => api.createProject({ name: name.trim(), repositories: allRepos, workspaceRoot }), "项目已创建");
     if (pid !== undefined) {
       let notes = 0;
       let items = 0;
-      for (const path of list) {
+      for (const path of allRepos) {
         const f = found[path];
         if (!f) continue;
         const chosen = {
@@ -366,9 +472,16 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
       }
       if (notes || items) notify(`已导入 ${notes} 条记忆、${items} 个事项`, "info");
       onClose();
+    } else {
+      // Whole call failed (E14): re-resolve the workspace rows so the lists are current.
+      for (const p of folderPaths) void resolve1(p, true);
     }
     setBusy(false);
   };
+  const folderRepoPaths = new Set(chosenFromFolders);
+  const withImports = allRepos.filter((p) => found[p] && found[p].memories.length + found[p].worktrees.length > 0);
+  const withoutImports = allRepos.filter((p) => found[p] && found[p].memories.length + found[p].worktrees.length === 0 && folderRepoPaths.has(p));
+  const scanned = allRepos.filter((p) => found[p]).length;
   return (
     <Modal
       title="新建项目"
@@ -379,8 +492,15 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
           <Button variant="ghost" onClick={onClose}>
             取消
           </Button>
-          <Button variant="primary" icon={<Plus size={14} />} onClick={create} busy={busy} disabled={!name.trim() || scanning.length > 0}>
-            {scanning.length > 0 ? "正在查找可导入内容…" : "创建项目"}
+          <Button
+            variant="primary"
+            icon={<Plus size={14} />}
+            onClick={create}
+            busy={busy}
+            disabled={!name.trim() || working || errorPaths.length > 0 || noneChosen}
+            title={errorPaths.length > 0 ? "先处理上面标红的路径" : noneChosen ? "至少选择一个仓库" : undefined}
+          >
+            {working ? "正在查找可导入内容…" : hasFolders ? `创建项目（${allRepos.length} 个仓库）` : "创建项目"}
           </Button>
         </>
       }
@@ -388,13 +508,13 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
       <Field label="项目名称">
         <input className="input" autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：行情终端" aria-label="项目名称" />
       </Field>
-      <Field label="仓库路径" hint="选择本地 git 仓库文件夹，或每行填一个绝对路径；之后也可以在「仓库」页添加。">
+      <Field label="仓库路径" hint="选择本地 git 仓库文件夹，或包含多个仓库的工作区文件夹；每行一个绝对路径。之后也可以在「仓库」页添加。">
         <textarea
           className="input mono"
           rows={3}
           value={repos}
           onChange={(e) => setRepos(e.target.value)}
-          onBlur={() => list.forEach((p) => void scan(p))}
+          onBlur={() => list.forEach((p) => void resolve1(p))}
           placeholder="/Users/you/code/app"
           aria-label="仓库路径"
         />
@@ -402,12 +522,59 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
           选择文件夹…
         </Button>
       </Field>
-      {scanning.length > 0 && (
-        <p className="field-hint scan-hint">
-          <Spinner size={12} /> 正在查找 Claude / Codex / ZCode 里可导入的记忆和分支…
-        </p>
+      {folderPaths.length > 1 && (
+        <p className="field-hint">项目只记录一个工作区根：{folderPaths[0].split("/").filter(Boolean).pop()}；其他文件夹只添加其中的仓库</p>
       )}
       {list
+        .filter((p) => resolving.includes(p) && !resolved[p])
+        .map((p) => (
+          <p key={p} className="field-hint scan-hint">
+            <Spinner size={12} /> 正在查找 git 仓库…
+          </p>
+        ))}
+      {errorPaths.map((p) => {
+        const r = resolved[p]!;
+        return (
+          <div key={p} className="folder-error">
+            <p className="inline-error">{r.message}</p>
+            <span className="folder-error-actions">
+              {r.kind === "empty" && r.depth < 4 && (
+                <button type="button" className="link-btn" onClick={() => void deeper(p)}>
+                  再查一层
+                </button>
+              )}
+              <button type="button" className="link-btn" onClick={() => removeLine(p)}>
+                移除这一行
+              </button>
+            </span>
+          </div>
+        );
+      })}
+      {folderPaths.map((p) => {
+        const r = resolved[p] as Extract<FolderResolved, { kind: "folder" }>;
+        return (
+          <FolderScan
+            key={p}
+            resolved={r}
+            selected={folderSel[p] ?? new Set()}
+            onChange={(s) => setFolderSel((m) => ({ ...m, [p]: s }))}
+            onDeeper={() => void deeper(p)}
+            deepening={deepening === p}
+            hint={
+              <p className="field-hint">
+                将记录为项目工作区根
+                {r.notes.length > 0 && <>；顶层的 {r.notes.join("、")} 会提供给各阶段 Agent</>}
+              </p>
+            }
+          />
+        );
+      })}
+      {scanning.length > 0 && (
+        <p className="field-hint scan-hint">
+          <Spinner size={12} /> 正在查找 Claude / Codex / ZCode 里可导入的记忆和分支…（{scanned}/{allRepos.length}）
+        </p>
+      )}
+      {plainPaths
         .filter((p) => found[p])
         .map((p) => (
           <ImportSection
@@ -419,6 +586,27 @@ export function NewProjectDialog({ onClose }: { onClose(): void }) {
             setBranches={(s) => setBranches((m) => ({ ...m, [p]: s }))}
           />
         ))}
+      {withImports
+        .filter((p) => folderRepoPaths.has(p))
+        .map((p) => {
+          const f = found[p];
+          return (
+            <details key={p} className="import-fold">
+              <summary>
+                从 Claude / Codex / ZCode 导入 · {p.split("/").pop()} · 记忆 {f.memories.length} 条、分支{" "}
+                {f.worktrees.filter((w) => w.branch).length} 个
+              </summary>
+              <ImportSection
+                found={f}
+                memories={memories[p] ?? new Set()}
+                branches={branches[p] ?? new Set()}
+                setMemories={(s) => setMemories((m) => ({ ...m, [p]: s }))}
+                setBranches={(s) => setBranches((m) => ({ ...m, [p]: s }))}
+              />
+            </details>
+          );
+        })}
+      {withoutImports.length > 0 && <p className="field-hint">另外 {withoutImports.length} 个仓库没有可导入的记忆或分支</p>}
     </Modal>
   );
 }

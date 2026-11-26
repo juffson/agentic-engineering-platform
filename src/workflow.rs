@@ -248,6 +248,9 @@ pub struct Request {
     /// The repository's remote branch to start from and follow (None: the local HEAD branch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<crate::project::upstream::Upstream>,
+    /// The project's workspace folder; its top-level notes are listed in the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
     #[serde(default)]
     pub ticket: Option<String>,
     pub brief: String,

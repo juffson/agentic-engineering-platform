@@ -62,6 +62,12 @@ enum Action {
         name: String,
         #[arg(long)]
         repository: Vec<PathBuf>,
+        /// Add every repository found under a workspace folder path.
+        #[arg(long)]
+        all: bool,
+        /// How many levels of subdirectories to look into (1-4).
+        #[arg(long, default_value_t = aep::project::folder::DEFAULT_DEPTH, value_parser = depth_1_to_4)]
+        depth: u8,
     },
     /// List projects and their work items.
     List,
@@ -72,6 +78,12 @@ enum Action {
     /// Associate a repository with a project or explicitly selected item.
     AddRepo {
         path: PathBuf,
+        /// Add every repository found under a workspace folder path.
+        #[arg(long)]
+        all: bool,
+        /// How many levels of subdirectories to look into (1-4).
+        #[arg(long, default_value_t = aep::project::folder::DEFAULT_DEPTH, value_parser = depth_1_to_4)]
+        depth: u8,
     },
     /// Exclude a repository from the selected item, or unlink an unused project repository.
     RemoveRepo {
@@ -376,8 +388,52 @@ fn print(v: &impl serde::Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }
+/// clap value parser with the fixed message of interaction §6; clap's own range error is English.
+fn depth_1_to_4(s: &str) -> Result<u8, String> {
+    s.parse::<u8>()
+        .ok()
+        .filter(|d| (1..=aep::project::folder::MAX_DEPTH).contains(d))
+        .ok_or_else(|| "--depth 只能是 1 到 4".to_owned())
+}
 fn root(path: &Path) -> Result<PathBuf> {
-    Ok(aep::workspace::Workspace::open(path)?.root.canonicalize()?)
+    aep::workspace::Workspace::open(path)
+        .map_err(|_| aep::project::folder::unreadable(path))
+        .and_then(|ws| Ok(ws.root.canonicalize()?))
+}
+/// Expand one `--repository` / add-repo path against the folder scanner: a repository maps to
+/// itself, a workspace folder maps to all repositories it holds (with `--all`), anything else
+/// lists what was found so the operator can choose (interaction §6).
+fn expand(
+    path: &Path,
+    all: bool,
+    depth: u8,
+    per_repository_hint: bool,
+) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
+    let resolved = aep::project::folder::resolve(path, depth)?;
+    match resolved {
+        aep::project::folder::Resolved::Repository { root } => Ok((vec![root], None)),
+        aep::project::folder::Resolved::Folder { root, repositories, .. } if all => {
+            Ok((repositories.into_iter().map(|f| f.path).collect(), Some(root)))
+        }
+        aep::project::folder::Resolved::Folder { .. } => {
+            let text = aep::project::folder::message(&resolved);
+            let aep::project::folder::Resolved::Folder { repositories, .. } = resolved else {
+                unreachable!()
+            };
+            let width = repositories.iter().map(|f| f.name.len()).max().unwrap_or(0);
+            let hint = if per_repository_hint {
+                "加 --all 全部添加，或逐个 add-repo；更深的仓库用 --depth N。"
+            } else {
+                "加 --all 全部添加，或用 --repository 逐个指定；更深的仓库用 --depth N。"
+            };
+            let listing = repositories
+                .iter()
+                .map(|f| format!("  {:<width$}  {}\n", f.name, f.path.display()))
+                .collect::<String>();
+            anyhow::bail!("{text}：\n{listing}{hint}")
+        }
+        other => anyhow::bail!("{}", aep::project::folder::message(&other)),
+    }
 }
 fn find<'a, T>(items: &'a [T], key: &str, identity: impl Fn(&T) -> (&str, &str)) -> Result<&'a T> {
     if let Some(t) = items.iter().find(|x| identity(x).0 == key) {
@@ -781,16 +837,36 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             }
             print(&projects)
         }
-        Action::Create { name, repository } => {
-            let mut repos = vec![];
+        Action::Create {
+            name,
+            repository,
+            all,
+            depth,
+        } => {
+            let mut repos: Vec<PathBuf> = vec![];
+            let mut workspace_root = None;
             for path in repository {
-                let repo = root(&path)?;
-                if !repos.contains(&repo) {
-                    repos.push(repo);
+                let (expanded, root) = expand(&path, all, depth, false)?;
+                if workspace_root.is_none() {
+                    workspace_root = root;
+                }
+                for repo in expanded {
+                    if !repos.contains(&repo) {
+                        repos.push(repo);
+                    }
                 }
             }
-            c.library.change(&c.dir, |l| l.create(&name, repos))?;
-            print(&json!({"project":c.library.active}))
+            c.library.change(&c.dir, |l| {
+                l.create(&name, repos.clone())?;
+                l.project_mut()?.workspace_root = workspace_root.clone();
+                Ok(())
+            })?;
+            let mut out = json!({"project": c.library.active});
+            if let Some(root) = workspace_root {
+                out["workspace_root"] = json!(root);
+                out["repositories"] = json!(repos);
+            }
+            print(&out)
         }
         Action::Bind => {
             let file = file.context("请在 Git 工作区中绑定")?;
@@ -820,23 +896,60 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             })?;
             print(&json!({"project":pid}))
         }
-        Action::AddRepo { path } => {
-            let repo = root(&path)?;
+        Action::AddRepo { path, all, depth } => {
+            let (repos, workspace_root) = expand(&path, all, depth, true)?;
             let wid = c
                 .work
                 .as_deref()
                 .map(|_| c.work().map(|w| w.id.clone()))
                 .transpose()?;
-            c.edit_project(|p| {
-                if !p.repositories.contains(&repo) {
-                    p.repositories.push(repo.clone());
+            // A plain repository keeps today's output (the root path, nothing else).
+            if workspace_root.is_none() {
+                let repo = &repos[0];
+                c.edit_project(|p| {
+                    if !p.repositories.contains(repo) {
+                        p.repositories.push(repo.clone());
+                    }
+                    if let Some(wid) = wid {
+                        p.work_by_id_mut(&wid)?.include(repo);
+                    }
+                    Ok(())
+                })?;
+                return print(&repo);
+            }
+            let mut note = None;
+            let (added, existing): (Vec<PathBuf>, Vec<PathBuf>) = c.edit_project(|p| {
+                let (added, existing) = repos
+                    .iter()
+                    .cloned()
+                    .partition(|repo: &PathBuf| !p.repositories.contains(repo));
+                for repo in &repos {
+                    if !p.repositories.contains(repo) {
+                        p.repositories.push(repo.clone());
+                    }
+                    if let Some(wid) = wid.as_deref() {
+                        p.work_by_id_mut(&wid)?.include(repo);
+                    }
                 }
-                if let Some(wid) = wid {
-                    p.work_by_id_mut(&wid)?.include(&repo);
+                // Q3: the first workspace root wins; a different one only gets a note.
+                match &p.workspace_root {
+                    None => p.workspace_root = workspace_root.clone(),
+                    Some(kept) if Some(kept) != workspace_root.as_ref() => {
+                        note = Some(format!("项目工作区仍是 {}", kept.display()))
+                    }
+                    _ => {}
                 }
-                Ok(())
+                Ok((added, existing))
             })?;
-            print(&repo)
+            let mut out = json!({
+                "added": added,
+                "existing": existing,
+                "workspace_root": c.project()?.workspace_root,
+            });
+            if let Some(note) = note {
+                out["note"] = json!(note);
+            }
+            print(&out)
         }
         Action::RemoveRepo { path } => {
             let repo = root(&path)?;
@@ -1313,7 +1426,7 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
             );
             let p = c.project()?;
             let wd = c.dir.join("workflows").join(&p.id).join(&w.id);
-            let req = w.request(
+            let mut req = w.request(
                 &p.name,
                 i,
                 handoff::Assignment {
@@ -1323,6 +1436,9 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
                     external: None,
                 },
             );
+            if let Ok(r) = req.as_mut() {
+                r.workspace_root = p.workspace_root.clone();
+            }
             let packet = workflow_stage::preview(&req, &wd, cwd, since)?;
             print(
                 &json!({"project":p.id,"work":w.id,"stage":i+1,"context":packet.text,"read_memory":packet.project_ids,"read_repository_memory":packet.repo_ids,"has_more":packet.more,"next_since":packet.project_ids.iter().max().copied().or(since)}),

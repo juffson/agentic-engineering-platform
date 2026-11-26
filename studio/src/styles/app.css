@@ -4169,3 +4169,156 @@ select.input {
 .upstream-form .field {
   margin-bottom: 10px;
 }
+
+/* Workspace folder scan: the checkbox list of repositories found below a folder
+   (specs/multi-repo-folder-project interaction §2.2–§2.4) */
+.folder-scan {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 10px 0;
+}
+.folder-scan-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.folder-scan-title {
+  font-size: 13px;
+}
+.folder-scan-count {
+  color: var(--muted);
+  font-size: 12px;
+}
+.folder-scan-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 8px;
+}
+.folder-scan-list {
+  list-style: none;
+  margin: 8px 0 6px;
+  padding: 0;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.folder-scan-list li {
+  padding: 4px 2px;
+  border-bottom: 1px solid var(--line-soft, transparent);
+}
+.folder-scan-list li:last-child {
+  border-bottom: none;
+}
+.folder-scan-list .check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  cursor: pointer;
+}
+.folder-scan-list .check b {
+  flex-shrink: 0;
+  font-size: 12.5px;
+}
+.folder-scan-path {
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.folder-scan-list li.added .check {
+  color: var(--muted);
+  cursor: default;
+}
+.folder-scan-list li.added .check b {
+  font-weight: normal;
+}
+.folder-scan-foot {
+  margin: 4px 0 0;
+}
+.folder-scan-foot.warn {
+  color: var(--warning);
+}
+.folder-scan-foot .spinner {
+  vertical-align: -1px;
+}
+.folder-scan-actions-bar {
+  margin-top: 8px;
+  justify-content: flex-end;
+}
+.folder-error {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 8px 0;
+}
+.folder-error .inline-error {
+  margin: 0;
+  flex: 1;
+}
+.folder-error-actions {
+  display: inline-flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.import-fold {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin: 8px 0;
+  padding: 6px 12px;
+}
+.import-fold > summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--muted);
+  padding: 2px 0;
+  user-select: none;
+}
+.import-fold[open] > summary {
+  color: inherit;
+  margin-bottom: 6px;
+}
+.import-fold .import {
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+/* The project's workspace folder card (interaction §4.1) */
+.workspace-root {
+  margin-bottom: 16px;
+}
+.workspace-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.workspace-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.workspace-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.workspace-path {
+  display: block;
+  color: var(--muted);
+  font-size: 11.5px;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+.workspace-notes {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+}
+.workspace-notes code {
+  font-size: 11.5px;
+}
+.workspace-notes.warn {
+  color: var(--warning);
+}

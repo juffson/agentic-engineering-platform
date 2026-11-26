@@ -9,11 +9,14 @@ import type {
   SyncPlan,
   ImportFound,
   Api,
+  AddRepositoriesResult,
   AttemptSummary,
   AttemptView,
   Client,
   Entry,
   FlowDef,
+  FolderRepo,
+  FolderResolved,
   FlowId,
   FlowStage,
   MemoryNote,
@@ -186,6 +189,14 @@ const legacyRun = (n: number) => ({ legacy: true, tokens: [5_200_000 + ((n * 733
 
 const HOME = "/Users/demo/.aep";
 const REPOS = ["/Users/demo/code/quote-terminal", "/Users/demo/code/quote-gateway"];
+/** The sample workspace folder of interaction §8: not a repository itself, 11 below it. */
+const WORKSPACE_ROOT = "/Users/demo/Desktop/cowork/market-data/03-行情基础数据计算存储";
+const WORKSPACE_TOP = [
+  "genki", "genki-api", "genki-core", "genki-kline", "genki-snapshot", "genki-storage",
+  "history-loader", "quote-backup", "quote-data", "quote-trade",
+];
+const WORKSPACE_DEEP = ["services/quote-data-service"];
+const WORKSPACE_NOTE_NAMES = ["AGENTS.md"];
 const FORGES = ["github", "gitlab"] as const;
 type ActiveRemote = Extract<RemoteStatus, { active: true }>;
 type MockRemoteCache = Pick<ActiveRemote, "refreshed_at" | "pulls" | "pulls_checked" | "fetch_error" | "api_error"> & {
@@ -618,10 +629,17 @@ class MockStore implements Api {
     this.selected.set(project, work);
   }
 
-  createProject({ name, repositories }: { name: string; repositories: string[] }) {
+  createProject({ name, repositories, workspaceRoot }: { name: string; repositories: string[]; workspaceRoot?: string }) {
     if (!name.trim()) throw new Error("项目名称不能为空");
     const id = nextId("p");
-    this.projects.push({ id, name: name.trim(), repositories: repositories.filter(Boolean), flows: [], broken_flows: [] });
+    this.projects.push({
+      id,
+      name: name.trim(),
+      repositories: repositories.filter(Boolean),
+      workspace: workspaceRoot?.trim() ? { root: workspaceRoot.trim(), exists: true, notes: WORKSPACE_NOTE_NAMES } : null,
+      flows: [],
+      broken_flows: [],
+    });
     this.memoryNotes.set(id, []);
     this.active = id;
     return id;
@@ -634,6 +652,58 @@ class MockStore implements Api {
     if (!clean.startsWith("/")) throw new Error(`仓库路径需要是绝对路径：${clean || "(空)"}`);
     if (p.repositories.includes(clean)) throw new Error("该仓库已在项目中");
     p.repositories.push(clean);
+  }
+
+  /** Interaction §8: /mock/workspace (or a path naming the sample folder) is the folder of
+   *  11 repositories; /mock/empty and /mock/missing are the error cases; anything else is
+   *  a plain repository. `depth` decides whether the 2nd-level service is listed. */
+  resolveFolder({ path, depth }: { path: string; depth?: number }): FolderResolved {
+    const clean = path.trim().replace(/\/+$/, "");
+    const d = depth ?? 2;
+    if (clean === "/mock/missing" || /\/picked-missing/.test(clean)) {
+      return { kind: "missing", path: clean, message: `路径不存在：${clean}` };
+    }
+    if (clean === "/mock/empty") {
+      return { kind: "empty", root: clean, depth: d, truncated: false, message: `这个文件夹和它的子目录里没有 git 仓库（已查找 ${d} 层）` };
+    }
+    const workspace = clean === "/mock/workspace" || clean.includes("03-行情基础数据计算存储");
+    if (workspace) {
+      const relative = [...WORKSPACE_TOP, ...(d >= 2 ? WORKSPACE_DEEP : [])].sort();
+      const repositories: FolderRepo[] = relative.map((r) => ({
+        path: `${WORKSPACE_ROOT}/${r}`,
+        relative: r,
+        name: r.split("/").pop()!,
+      }));
+      return {
+        kind: "folder",
+        root: WORKSPACE_ROOT,
+        depth: d,
+        repositories,
+        truncated: false,
+        notes: [...WORKSPACE_NOTE_NAMES],
+        message: `${WORKSPACE_ROOT} 不是 git 仓库，在它下面找到 ${repositories.length} 个仓库（查找 ${d} 层）`,
+      };
+    }
+    return { kind: "repository", root: clean, message: "" };
+  }
+
+  addRepositories(a: { project: string; paths: string[]; workspaceRoot?: string }): AddRepositoriesResult {
+    const p = this.project(a.project);
+    const clean = a.paths.map((x) => x.trim()).filter(Boolean);
+    for (const path of clean) {
+      if (!path.startsWith("/")) throw new Error(`仓库路径需要是绝对路径：${path}`);
+    }
+    const added = clean.filter((x) => !p.repositories.includes(x));
+    const existing = clean.filter((x) => p.repositories.includes(x));
+    p.repositories.push(...added);
+    let kept_root: string | null = null;
+    const wanted = a.workspaceRoot?.trim() || null;
+    if (!p.workspace?.root && wanted) {
+      p.workspace = { root: wanted, exists: true, notes: [...WORKSPACE_NOTE_NAMES] };
+    } else if (p.workspace?.root && wanted && p.workspace.root !== wanted) {
+      kept_root = p.workspace.root;
+    }
+    return { added, existing, workspace_root: p.workspace?.root ?? null, kept_root };
   }
 
   saveFlow({ project, flow }: Parameters<Api["saveFlow"]>[0]) {
@@ -1992,8 +2062,16 @@ function seed(store: MockStore) {
   const now = Date.now();
   const min = 60_000;
   store.projects = [
-    { id: "quote", name: "行情终端", repositories: [...REPOS], flows: [], broken_flows: [] },
-    { id: "tools", name: "内部工具", repositories: ["/Users/demo/code/devtools"], flows: [], broken_flows: [] },
+    { id: "quote", name: "行情终端", repositories: [...REPOS], workspace: null, flows: [], broken_flows: [] },
+    // Holds 2 of the sample workspace's repositories (interaction §8), for the AC-5 flow.
+    {
+      id: "tools",
+      name: "内部工具",
+      repositories: [`${WORKSPACE_ROOT}/genki`, `${WORKSPACE_ROOT}/genki-api`],
+      workspace: { root: WORKSPACE_ROOT, exists: true, notes: [...WORKSPACE_NOTE_NAMES] },
+      flows: [],
+      broken_flows: [],
+    },
   ];
   store.active = "quote";
   store.memoryNotes.set("quote", [

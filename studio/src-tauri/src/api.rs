@@ -186,6 +186,14 @@ pub fn snapshot(home: &Path) -> Result<Value> {
             json!({
                 "id": p.id, "name": p.name, "repositories": p.repositories, "work": work,
                 "flows": flows, "broken_flows": broken_flows,
+                "workspace": p.workspace_root.as_ref().map(|root| json!({
+                    "root": root,
+                    "exists": root.is_dir(),
+                    "notes": aep::project::folder::notes(root)
+                        .into_iter()
+                        .map(|n| n.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                })),
             })
         })
         .collect();
@@ -264,24 +272,119 @@ pub fn select_work(home: &Path, pid: &str, wid: &str) -> Result<()> {
 }
 
 fn repository(path: &str) -> Result<PathBuf> {
-    let ws = Workspace::open(Path::new(path.trim())).context("不是 Git 仓库")?;
-    Ok(ws.root.canonicalize()?)
+    let trimmed = Path::new(path.trim());
+    match Workspace::open(trimmed) {
+        Ok(ws) => Ok(ws.root.canonicalize()?),
+        // The folder scanner explains what the path is instead of git's raw `fatal`.
+        Err(_) => Err(aep::project::folder::unreadable(trimmed)),
+    }
 }
 
-/// Create a project and return its ID.
-pub fn create_project(home: &Path, name: &str, repositories: &[String]) -> Result<String> {
+/// Classify a picked folder for the repository list UI: one repository, a folder of
+/// repositories, or a path that cannot be used. `depth` defaults to `DEFAULT_DEPTH`.
+pub fn resolve_folder(path: &str, depth: Option<u8>) -> Result<Value> {
+    let resolved = aep::project::folder::resolve(
+        Path::new(path.trim()),
+        depth.unwrap_or(aep::project::folder::DEFAULT_DEPTH),
+    )?;
+    let message = aep::project::folder::message(&resolved);
+    let mut value = serde_json::to_value(&resolved)?;
+    value["message"] = json!(message);
+    Ok(value)
+}
+
+/// Create a project and return its ID. All repositories are validated before anything is
+/// written, so a bad path fails the whole call and the error names the offending folder.
+pub fn create_project(
+    home: &Path,
+    name: &str,
+    repositories: &[String],
+    workspace_root: Option<&str>,
+) -> Result<String> {
     let repos = repositories
         .iter()
-        .map(|r| repository(r))
+        .map(|r| repository(r).map_err(|err| name_repository(r, err)))
         .collect::<Result<Vec<_>>>()?;
+    let root = workspace_root
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Path::new)
+        .map(|p| {
+            let root = p
+                .canonicalize()
+                .with_context(|| format!("工作区文件夹无法读取：{}", p.display()))?;
+            ensure!(root.is_dir(), "工作区根不是文件夹：{}", root.display());
+            Ok(root)
+        })
+        .transpose()?;
     change(home, |lib| {
         lib.create(name, repos.clone())?;
-        lib.projects
-            .iter()
+        let p = lib
+            .projects
+            .iter_mut()
             .find(|p| p.name == name.trim())
-            .map(|p| p.id.clone())
-            .context("项目创建失败")
+            .context("项目创建失败")?;
+        p.workspace_root = root.clone();
+        Ok(p.id.clone())
     })
+}
+
+/// Attach several repositories to a project in one all-or-nothing change. Repositories the
+/// project already has are reported as `existing`; the workspace root follows Q3 (the first
+/// one wins, a different one only yields `kept_root`).
+pub fn add_repositories(
+    home: &Path,
+    pid: &str,
+    paths: &[String],
+    workspace_root: Option<&str>,
+) -> Result<Value> {
+    let repos = paths
+        .iter()
+        .map(|r| repository(r).map_err(|err| name_repository(r, err)))
+        .collect::<Result<Vec<_>>>()?;
+    let root = workspace_root
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Path::new)
+        .map(|p| {
+            let root = p
+                .canonicalize()
+                .with_context(|| format!("工作区文件夹无法读取：{}", p.display()))?;
+            ensure!(root.is_dir(), "工作区根不是文件夹：{}", root.display());
+            Ok(root)
+        })
+        .transpose()?;
+    change(home, |lib| {
+        let p = find_mut(lib, pid)?;
+        let (added, existing): (Vec<PathBuf>, Vec<PathBuf>) = repos
+            .iter()
+            .cloned()
+            .partition(|repo| !p.repositories.contains(repo));
+        for repo in &repos {
+            if !p.repositories.contains(repo) {
+                p.repositories.push(repo.clone());
+            }
+        }
+        let mut kept_root = None;
+        match (&p.workspace_root, &root) {
+            (None, Some(new)) => p.workspace_root = Some(new.clone()),
+            (Some(kept), Some(new)) if kept != new => kept_root = Some(kept.clone()),
+            _ => {}
+        }
+        Ok(json!({
+            "added": added, "existing": existing,
+            "workspace_root": p.workspace_root, "kept_root": kept_root,
+        }))
+    })
+}
+
+/// Prefix a repository error with the folder's own name so the dialog can point at the row.
+fn name_repository(path: &str, err: anyhow::Error) -> anyhow::Error {
+    let name = Path::new(path.trim())
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.trim().to_owned());
+    anyhow::anyhow!("{name}：{err:#}")
 }
 
 /// What Claude Code, Codex and ZCode already hold for a repository folder.

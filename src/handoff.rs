@@ -238,6 +238,27 @@ pub fn rules(req: &Request) -> Result<String> {
     }
     Ok(text)
 }
+/// One prompt line pointing at the workspace folder's top-level notes. The files are checked
+/// at runtime, so a deleted note makes the line disappear; it never counts against the
+/// memory budget. Empty when the project has no workspace root or no notes.
+pub fn workspace_line(req: &Request) -> String {
+    let Some(root) = &req.workspace_root else {
+        return String::new();
+    };
+    let notes = crate::project::folder::notes(root);
+    if notes.is_empty() {
+        return String::new();
+    }
+    let files: Vec<String> = notes
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>();
+    format!(
+        "\n项目工作区说明：开始前先读 {}（工作区 {} 顶层的团队约定，适用于本项目的所有仓库；只读，不要修改）。",
+        files.join("、"),
+        root.display()
+    )
+}
 /// Fresh-session prompt: `header + memory_body + rules + READING`.
 pub fn packet(
     req: &Request,
@@ -271,6 +292,7 @@ pub fn packet(
     }
     let body = memory_body(req, &text, &project, &repo);
     text.push_str(&body);
+    text.push_str(&workspace_line(req));
     text.push_str(&rules(req)?);
     text.push('\n');
     text.push_str(READING);
@@ -335,6 +357,7 @@ impl Work {
             profile: assignment.profile,
             repository: assignment.repository.clone(),
             upstream: None,
+            workspace_root: None,
             ticket: assignment.repository.as_ref().map(|p| self.ticket(p)),
             brief: assignment.brief,
             approved: flow
@@ -405,6 +428,7 @@ impl Project {
         if let Some(reason) = budget.as_ref().and_then(|b| b.exhausted()) {
             anyhow::bail!(reason);
         }
+        let workspace_root = self.workspace_root.clone();
         let item = self.work_by_id_mut(work_id)?;
         let stage_count = item.flow()?.stages.len();
         ensure!(
@@ -449,6 +473,7 @@ impl Project {
         request.token_limit = budget.and_then(|b| b.remaining());
         request.resume_limit = Some(resume_limit);
         request.upstream = upstream;
+        request.workspace_root = workspace_root;
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -665,5 +690,57 @@ mod tests {
                 .unwrap()
                 .contains("AEP: PASS 或 AEP: BLOCKED")
         );
+    }
+
+    #[test]
+    fn workspace_line_names_the_notes_without_their_content() {
+        let t = tempfile::tempdir().unwrap();
+        let mut r = req(1);
+        r.workspace_root = Some(t.path().to_path_buf());
+        assert!(
+            workspace_line(&r).is_empty(),
+            "E12: no notes means no line"
+        );
+        fs::write(t.path().join("AGENTS.md"), "约定的正文 SECRET-TEAM-RULE").unwrap();
+        let line = workspace_line(&r);
+        assert!(
+            line.contains(&format!("先读 {}", t.path().join("AGENTS.md").display())),
+            "{line}"
+        );
+        assert!(line.contains("只读，不要修改"), "{line}");
+        assert!(!line.contains("SECRET-TEAM-RULE"), "AC-7: paths, not content");
+        // The line rides along in the fresh packet, after the memory body and before the rules.
+        let p = packet(&r, &memory(), &[], None).unwrap();
+        assert!(p.text.contains(line.trim()), "AC-7");
+        assert!(
+            p.text.find(line.trim()).unwrap() < p.text.find(&rules(&r).unwrap()).unwrap(),
+            "R14: after memory_body, before rules"
+        );
+        // Continuations return early: no line even with notes present (R14).
+        let cont = packet(
+            &r,
+            &[json!({"id": 8, "kind": "decision", "body": "后补记忆"})],
+            &[],
+            Some(7),
+        )
+        .unwrap();
+        assert!(!cont.text.contains("项目工作区说明"));
+        // Deleting the note makes the line disappear (runtime check).
+        fs::remove_file(t.path().join("AGENTS.md")).unwrap();
+        assert!(workspace_line(&r).is_empty());
+    }
+
+    #[test]
+    fn handoff_prompt_unchanged_without_workspace_root() {
+        // Byte-for-byte identical prompt when the project has no workspace root (AC-11 compat).
+        let r = req(1);
+        assert!(r.workspace_root.is_none());
+        assert_eq!(workspace_line(&r), "");
+        let p = packet(&r, &memory(), &[], None).unwrap();
+        assert!(!p.text.contains("项目工作区说明"));
+        let (project, _) = entries(&memory(), 1600, 720, None);
+        let h = header(&r).unwrap();
+        let body = memory_body(&r, &h, &project, "");
+        assert_eq!(p.text, format!("{h}{body}{}\n{READING}", rules(&r).unwrap()));
     }
 }

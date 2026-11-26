@@ -1216,6 +1216,7 @@ fn claude_stage_args(
     args: &mut Vec<String>,
     dir: &Path,
     receipt: Option<&Path>,
+    notes: &[PathBuf],
     sandbox: Sandbox,
     write: bool,
 ) {
@@ -1228,6 +1229,13 @@ fn claude_stage_args(
         args.extend([
             "--allowedTools".into(),
             format!("Read(/{}/**)", runs.display()),
+        ]);
+    }
+    // Workspace notes stay read-only: one Read rule per file, never an --add-dir.
+    for file in notes {
+        args.extend([
+            "--allowedTools".into(),
+            format!("Read(/{})", file.display()),
         ]);
     }
     args.extend(
@@ -1345,7 +1353,12 @@ fn invoke(
             args.push(result_path.display().to_string());
         }
         Client::Claude => {
-            claude_stage_args(&mut args, dir, receipt.as_deref(), req.sandbox, write);
+            let notes = req
+                .workspace_root
+                .as_deref()
+                .map(aep::project::folder::notes)
+                .unwrap_or_default();
+            claude_stage_args(&mut args, dir, receipt.as_deref(), &notes, req.sandbox, write);
             // No user MCP, settings, skills or auto memory: the stage starts from the project.
             let launch = aep::launch::claude_minimal(&bin, &profile.model);
             args.extend(launch.args.iter().cloned());
@@ -2180,7 +2193,7 @@ mod tests {
         let dir = Path::new("/home/user/Application Support/AEP Studio/runs/current");
         let receipt = dir.join("inputs/source-evidence.json");
         let mut args = Vec::new();
-        claude_stage_args(&mut args, dir, Some(&receipt), Sandbox::Standard, true);
+        claude_stage_args(&mut args, dir, Some(&receipt), &[], Sandbox::Standard, true);
 
         assert_eq!(
             &args[..6],
@@ -2200,7 +2213,7 @@ mod tests {
     fn claude_allowed_tools_keeps_network_bash_authorization() {
         let dir = Path::new("/work/runs/current");
         let mut args = Vec::new();
-        claude_stage_args(&mut args, dir, None, Sandbox::Network, false);
+        claude_stage_args(&mut args, dir, None, &[], Sandbox::Network, false);
 
         let allowed: Vec<_> = args
             .windows(2)
@@ -2208,6 +2221,31 @@ mod tests {
             .map(|pair| pair[1].as_str())
             .collect();
         assert_eq!(allowed, ["Read(//work/runs/**)", "Bash"]);
+    }
+
+    #[test]
+    fn claude_allowed_tools_grants_read_only_on_workspace_notes() {
+        let dir = Path::new("/work/runs/current");
+        let notes = [
+            PathBuf::from("/Users/共享/行情 数据/AGENTS.md"),
+            PathBuf::from("/Users/共享/行情 数据/CLAUDE.md"),
+        ];
+        let mut args = Vec::new();
+        claude_stage_args(&mut args, dir, None, &notes, Sandbox::Standard, true);
+
+        let add_dirs = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--add-dir")
+            .count();
+        assert_eq!(add_dirs, 1, "notes must not add an --add-dir: {args:?}");
+        let allowed: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--allowedTools")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert!(allowed.contains(&"Read(//Users/共享/行情 数据/AGENTS.md)"), "{allowed:?}");
+        assert!(allowed.contains(&"Read(//Users/共享/行情 数据/CLAUDE.md)"), "{allowed:?}");
+        assert_eq!(allowed.len(), 3, "runs rule plus one per note: {allowed:?}");
     }
 
     #[test]

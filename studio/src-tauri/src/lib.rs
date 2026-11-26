@@ -29,13 +29,31 @@ fn selectWork(project: String, work: String) -> Result<impl Serialize, String> {
 }
 
 #[tauri::command(async)]
-fn createProject(name: String, repositories: Vec<String>) -> Result<impl Serialize, String> {
-    run(move |h| api::create_project(&h, &name, &repositories))
+fn createProject(
+    name: String,
+    repositories: Vec<String>,
+    workspaceRoot: Option<String>,
+) -> Result<impl Serialize, String> {
+    run(move |h| api::create_project(&h, &name, &repositories, workspaceRoot.as_deref()))
 }
 
 #[tauri::command(async)]
 fn addRepository(project: String, path: String) -> Result<impl Serialize, String> {
     run(move |h| api::add_repository(&h, &project, &path))
+}
+
+#[tauri::command(async)]
+fn resolveFolder(path: String, depth: Option<u8>) -> Result<impl Serialize, String> {
+    run(move |_| api::resolve_folder(&path, depth))
+}
+
+#[tauri::command(async)]
+fn addRepositories(
+    project: String,
+    paths: Vec<String>,
+    workspaceRoot: Option<String>,
+) -> Result<impl Serialize, String> {
+    run(move |h| api::add_repositories(&h, &project, &paths, workspaceRoot.as_deref()))
 }
 
 #[tauri::command(async)]
@@ -541,6 +559,8 @@ pub fn start() {
             selectWork,
             createProject,
             addRepository,
+            resolveFolder,
+            addRepositories,
             saveFlow,
             copyFlow,
             deleteFlow,

@@ -62,7 +62,7 @@ fn wait_idle(home: &Path, pid: &str, wid: &str) -> Result<Value> {
 fn custom_flow_survives_edit_and_delete_in_work_snapshot() -> Result<()> {
     let t = tempfile::tempdir()?;
     let home = t.path();
-    let pid = api::create_project(home, "flows", &[])?;
+    let pid = api::create_project(home, "flows", &[], None)?;
     let id = api::copy_flow(home, &pid, "Software", Some("后端开发"))?;
     let snapshot = api::snapshot(home)?;
     let project = &snapshot["projects"][0];
@@ -183,7 +183,7 @@ fn custom_flow_survives_edit_and_delete_in_work_snapshot() -> Result<()> {
 fn save_flow_returns_validation_errors_and_persists_warnings() -> Result<()> {
     let t = tempfile::tempdir()?;
     let home = t.path();
-    let pid = api::create_project(home, "flows", &[])?;
+    let pid = api::create_project(home, "flows", &[], None)?;
     let mut flow = json!({
         "label": "",
         "stages": [
@@ -208,7 +208,7 @@ fn save_flow_returns_validation_errors_and_persists_warnings() -> Result<()> {
 fn a_broken_flow_keeps_its_item_and_attempts_readable() -> Result<()> {
     let t = tempfile::tempdir()?;
     let home = t.path();
-    let pid = api::create_project(home, "flows", &[])?;
+    let pid = api::create_project(home, "flows", &[], None)?;
     let healthy = api::create_work(home, &pid, "游戏事项", "Game", false, &[])?;
     let broken = api::create_work(home, &pid, "旧事项", "Software", false, &[])?;
     let damaged = api::create_work(home, &pid, "损坏快照", "Software", false, &[])?;
@@ -300,7 +300,7 @@ fn a_work_item_runs_chats_advances_delivers_merges_and_archives() -> Result<()> 
     git(&repo, &["commit", "-q", "-m", "init"])?;
     let claude = fake_claude(t.path())?;
 
-    api::create_project(&home, "demo", &[repo.display().to_string()])?;
+    api::create_project(&home, "demo", &[repo.display().to_string()], None)?;
     let snap = api::snapshot(&home)?;
     let pid = snap["active"].as_str().unwrap().to_owned();
     let root = snap["projects"][0]["repositories"][0]
@@ -518,7 +518,7 @@ printf '%s' "$answer" | python3 -c 'import json,sys; print(json.dumps({"type":"r
 "#,
     )?;
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
-    api::create_project(&home, "p", &[])?;
+    api::create_project(&home, "p", &[], None)?;
     let pid = api::snapshot(&home)?["active"].as_str().unwrap().to_owned();
     let wid = api::create_work(&home, &pid, "导出", "Software", false, &[])?;
     let profile: aep::workflow::Profile = serde_json::from_value(serde_json::json!({
@@ -664,7 +664,7 @@ fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
     );
     assert_eq!(w["source"], "Git");
 
-    let pid = api::create_project(&home, "demo", &[repo.display().to_string()])?;
+    let pid = api::create_project(&home, "demo", &[repo.display().to_string()], None)?;
     let wt_path = w["path"].as_str().unwrap().to_owned();
     let done = api::import_apply(
         &home,
@@ -969,7 +969,7 @@ fn a_new_project_imports_claude_memory_and_existing_branches() -> Result<()> {
 fn memory_is_tidied_by_a_cli_and_applied_by_choice() -> Result<()> {
     let t = tempfile::tempdir()?;
     let home = t.path().join("catalog");
-    let pid = api::create_project(&home, "tidy", &[])?;
+    let pid = api::create_project(&home, "tidy", &[], None)?;
     let a = api::add_memory(&home, &pid, "金额用分")?;
     let b = api::add_memory(&home, &pid, "金额统一用分存储")?;
     let c = api::add_memory(&home, &pid, "旧部署流程：手动 scp")?;
@@ -1128,7 +1128,7 @@ done
     )?;
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
 
-    api::create_project(&home, "demo", &[repo.display().to_string()])?;
+    api::create_project(&home, "demo", &[repo.display().to_string()], None)?;
     let snap = api::snapshot(&home)?;
     let pid = snap["active"].as_str().unwrap().to_owned();
     let root = snap["projects"][0]["repositories"][0]
@@ -1272,7 +1272,7 @@ fn token_diet_fields_preview_comparison_and_resume_limit() -> Result<()> {
     let home = t.path().join("catalog");
     let ws = t.path().join("ws");
     fs::create_dir_all(&ws)?;
-    api::create_project(&home, "diet", &[])?;
+    api::create_project(&home, "diet", &[], None)?;
     let pid = api::snapshot(&home)?["active"].as_str().unwrap().to_owned();
     let wid = api::create_work(&home, &pid, "精简", "Software", false, &[])?;
     let claude = |model: &str| serde_json::json!({"client":"Claude","executable":"claude","model":model,"check_command":""});
@@ -1542,7 +1542,7 @@ fn an_item_starts_from_the_remote_target_and_delivers_by_pushing_a_branch() -> R
     git(&repo, &["commit", "-q", "-m", "unpushed work"])?;
     let claude = fake_claude(t.path())?;
 
-    api::create_project(&home, "remote", &[repo.display().to_string()])?;
+    api::create_project(&home, "remote", &[repo.display().to_string()], None)?;
     let snap = api::snapshot(&home)?;
     let pid = snap["active"].as_str().unwrap().to_owned();
     let root = snap["projects"][0]["repositories"][0]
@@ -1644,5 +1644,263 @@ fn an_item_starts_from_the_remote_target_and_delivers_by_pushing_a_branch() -> R
     )?;
     assert_eq!(again["mode"], "update");
     assert_eq!(again["number"], 7);
+    Ok(())
+}
+
+// ---- 从多仓库文件夹创建项目（specs/multi-repo-folder-project）----
+
+fn init_repo(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    git(path, &["init", "-q", "-b", "main"])?;
+    git(path, &["config", "user.name", "t"])?;
+    git(path, &["config", "user.email", "t@example.com"])?;
+    fs::write(path.join("README.md"), "demo\n")?;
+    git(path, &["add", "."])?;
+    git(path, &["commit", "-q", "-m", "init"])?;
+    Ok(())
+}
+
+/// A workspace folder: two repositories plus a top-level AGENTS.md.
+fn workspace_fixture(t: &tempfile::TempDir) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let root = t.path().join("market");
+    let a = root.join("genki");
+    let b = root.join("genki-api");
+    init_repo(&a)?;
+    init_repo(&b)?;
+    fs::write(root.join("AGENTS.md"), "SECRET-TEAM-RULES\n")?;
+    Ok((root.canonicalize()?, a.canonicalize()?, b.canonicalize()?))
+}
+
+#[test]
+fn resolve_folder_classifies_workspace_empty_and_missing() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let (root, a, b) = workspace_fixture(&t)?;
+    let resolved = api::resolve_folder(root.to_str().unwrap(), None)?;
+    assert_eq!(resolved["kind"], "folder", "{resolved}");
+    assert_eq!(resolved["root"], json!(root));
+    assert_eq!(resolved["notes"], json!(["AGENTS.md"]));
+    let repos: Vec<&str> = resolved["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(repos, [a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert!(
+        resolved["message"].as_str().unwrap().contains("找到 2 个仓库"),
+        "{}",
+        resolved["message"]
+    );
+    let empty = t.path().join("empty");
+    fs::create_dir(&empty)?;
+    let resolved = api::resolve_folder(empty.to_str().unwrap(), Some(3))?;
+    assert_eq!(resolved["kind"], "empty");
+    assert!(
+        resolved["message"]
+            .as_str()
+            .unwrap()
+            .contains("已查找 3 层")
+    );
+    let missing = api::resolve_folder(t.path().join("nope").to_str().unwrap(), None)?;
+    assert_eq!(missing["kind"], "missing");
+    assert!(missing["message"].as_str().unwrap().contains("路径不存在"));
+    Ok(())
+}
+
+#[test]
+fn create_project_with_workspace_root_and_partial_selection() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let home = t.path().join("catalog");
+    let (root, a, _b) = workspace_fixture(&t)?;
+    let pid = api::create_project(
+        &home,
+        "行情",
+        &[a.display().to_string()],
+        Some(root.to_str().unwrap()),
+    )?;
+    let snap = api::snapshot(&home)?;
+    let project = &snap["projects"][0];
+    assert_eq!(project["id"], json!(pid));
+    assert_eq!(project["repositories"], json!([a]));
+    assert_eq!(
+        project["workspace"],
+        json!({"root": root, "exists": true, "notes": ["AGENTS.md"]})
+    );
+    Ok(())
+}
+
+#[test]
+fn create_project_fails_wholesale_when_a_repository_disappears() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let home = t.path().join("catalog");
+    let (root, a, b) = workspace_fixture(&t)?;
+    // The dialog resolved both, then the folder vanished before the operator confirmed.
+    fs::remove_dir_all(&b)?;
+    let err = api::create_project(
+        &home,
+        "行情",
+        &[a.display().to_string(), b.display().to_string()],
+        Some(root.to_str().unwrap()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("genki-api"), "E14: name the repository: {err}");
+    assert!(!err.contains("fatal"), "AC-3: no git output: {err}");
+    assert_eq!(
+        api::snapshot(&home)?["projects"],
+        json!([]),
+        "E14: nothing was written"
+    );
+    Ok(())
+}
+
+#[test]
+fn add_repositories_reports_existing_and_keeps_the_first_root() -> Result<()> {
+    let t = tempfile::tempdir()?;
+    let home = t.path().join("catalog");
+    let (root, a, b) = workspace_fixture(&t)?;
+    let pid = api::create_project(
+        &home,
+        "行情",
+        &[a.display().to_string()],
+        Some(root.to_str().unwrap()),
+    )?;
+    // A second, different workspace folder: Q3 keeps the project's original root.
+    let other = t.path().join("other");
+    init_repo(&other.join("x"))?;
+    let out = api::add_repositories(
+        &home,
+        &pid,
+        &[a.display().to_string(), b.display().to_string()],
+        Some(other.canonicalize()?.to_str().unwrap()),
+    )?;
+    assert_eq!(out["added"], json!([b]));
+    assert_eq!(out["existing"], json!([a]));
+    assert_eq!(out["workspace_root"], json!(root));
+    assert_eq!(out["kept_root"], json!(root));
+    Ok(())
+}
+
+/// Same fake Claude, but the prompt it received is kept for the assertions.
+fn recording_claude(dir: &Path, capture: &Path) -> Result<String> {
+    let bin = dir.join("claude-record");
+    let script = format!(
+        r#"#!/bin/sh
+input=$(cat)
+printf '%s' "$input" > {capture}
+stage=$(printf '%s' "$input" | sed -n 's/^阶段：\([^（]*\)（.*/\1/p' | head -1)
+[ -n "$stage" ] || stage=继续
+case "$stage" in
+  产品需求) mkdir -p specs/demo; echo prd > specs/demo/spec.md ;;
+esac
+echo '{{"type":"system","subtype":"init","session_id":"s-1","model":"sonnet"}}'
+printf '%s 完成\nAEP: PASS' "$stage" | python3 -c 'import json,sys; print(json.dumps({{"type":"result","result":sys.stdin.read(),"is_error":False,"session_id":"s-1"}}))'
+"#,
+        capture = capture.display()
+    );
+    fs::write(&bin, script)?;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
+    Ok(bin.display().to_string())
+}
+
+#[test]
+fn a_workspace_project_runs_a_stage_with_the_notes_in_the_prompt() -> Result<()> {
+    let runner = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/aep");
+    ensure!(
+        runner.is_file(),
+        "build the runner first: cargo build --bin aep"
+    );
+    let t = tempfile::tempdir()?;
+    let home = t.path().join("catalog");
+    let (root, a, b) = workspace_fixture(&t)?;
+    let prompt_file = t.path().join("prompt-seen.txt");
+    let claude = recording_claude(t.path(), &prompt_file)?;
+
+    api::create_project(
+        &home,
+        "行情",
+        &[a.display().to_string(), b.display().to_string()],
+        Some(root.to_str().unwrap()),
+    )?;
+    let snap = api::snapshot(&home)?;
+    let pid = snap["active"].as_str().unwrap().to_owned();
+    let wid = api::create_work(
+        &home,
+        &pid,
+        "基础数据",
+        "Software",
+        false,
+        &[a.display().to_string(), b.display().to_string()],
+    )?;
+    let profile: aep::workflow::Profile = serde_json::from_value(json!({
+        "client": "Claude", "executable": claude, "model": "", "check_command": ""
+    }))?;
+    api::update_stage(&home, &pid, &wid, 0, Some("先读约定".into()), Some(profile.clone()), None)?;
+    api::run_stage(&home, &pid, &wid, 0, None)?;
+    let d = wait_idle(&home, &pid, &wid)?;
+    assert_eq!(
+        d["stages"][0]["attempts"][0]["status"],
+        "succeeded",
+        "{d}"
+    );
+
+    // A stage runs in one repository; point the next one at the second repository so the
+    // item ends with a branch and worktree in both. `targets` is written the way `reserve`
+    // would have written it (stage -> repository root).
+    api::advance(&home, &pid, &wid, 0)?;
+    api::skip(&home, &pid, &wid, 1, "无界面改动")?;
+    // Stage 2 must also use the fake client: an unset executable resolves to the real one.
+    api::update_stage(&home, &pid, &wid, 2, None, Some(profile), None)?;
+    let mut saved: Value =
+        serde_json::from_str(&fs::read_to_string(home.join("projects.json"))?)?;
+    saved["projects"][0]["work"][0]["targets"]["2"] = json!(b);
+    fs::write(
+        home.join("projects.json"),
+        serde_json::to_string_pretty(&saved)?,
+    )?;
+    api::run_stage(&home, &pid, &wid, 2, None)?;
+    let d = wait_idle(&home, &pid, &wid)?;
+    assert_eq!(
+        d["stages"][2]["attempts"][0]["status"],
+        "succeeded",
+        "{d}"
+    );
+
+    // Both repositories got the stage branch and its worktree.
+    for repo in [&a, &b] {
+        let branch = format!("aep-stage/{wid}");
+        assert!(
+            git(repo, &["rev-parse", "--verify", &branch]).is_ok(),
+            "{} missing {branch}",
+            repo.display()
+        );
+        let checkouts: Vec<String> = git(repo, &["worktree", "list"])?
+            .lines()
+            .map(str::to_owned)
+            .filter(|l| l.contains(&wid))
+            .collect();
+        assert!(!checkouts.is_empty(), "no worktree for {wid} in {repo:?}");
+    }
+
+    // The workspace folder itself gained nothing and stayed a plain folder.
+    let mut entries: Vec<String> = fs::read_dir(&root)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["AGENTS.md", "genki", "genki-api"], "{entries:?}");
+    assert!(
+        !root.join(".git").exists(),
+        "the workspace root must not become a repository"
+    );
+
+    // Claude was pointed at the workspace notes and told to keep them read-only.
+    let prompt = fs::read_to_string(&prompt_file)?;
+    assert!(
+        prompt.contains(&format!("先读 {}", root.join("AGENTS.md").display())),
+        "AC-7: prompt names the note:\n{prompt}"
+    );
+    assert!(prompt.contains("只读，不要修改"), "{prompt}");
+    assert!(!prompt.contains("SECRET-TEAM-RULES"), "paths, not file content");
     Ok(())
 }

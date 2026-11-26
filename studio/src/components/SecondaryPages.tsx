@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { Check, ChevronDown, ChevronRight, Download, FolderGit2, FolderOpen, History, Pencil, Plus, RotateCcw, Sparkles } from "lucide-react";
 import { ImportDialog } from "./Dialogs";
-import type { MemoryNote, ProjectSummary, TidyStatus, Upstream, UpstreamView } from "../api/types";
+import type { FolderResolved, MemoryNote, ProjectSummary, TidyStatus, Upstream, UpstreamView } from "../api/types";
 import { api, errorMessage } from "../api/client";
 import { useStudio } from "../state/store";
 import { clock } from "../lib/format";
 import { Button, SectionLabel, Segmented, Spinner } from "./ui";
+import { FolderScan } from "./FolderScan";
 
 const KIND_LABEL: Record<string, string> = {
   note: "笔记",
@@ -428,19 +429,73 @@ function diffText(a: string, b: string): { kind: "same" | "add" | "del"; text: s
 }
 
 export function ReposPage({ project }: { project: ProjectSummary }) {
-  const { act } = useStudio();
+  const { act, notify } = useStudio();
   const [path, setPath] = useState("");
   const [busy, setBusy] = useState(false);
+  const [resolved, setResolved] = useState<Extract<FolderResolved, { kind: "folder" }> | null>(null);
+  const [sel, setSel] = useState<Set<string>>(new Set());
+  const [deepening, setDeepening] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const added = new Set(project.repositories);
+
+  /** 「添加仓库」: a plain repository is added at once; a workspace folder opens the list. */
   const add = async () => {
+    setError(null);
     setBusy(true);
-    const ok = await act(() => api.addRepository({ project: project.id, path: path.trim() }), "仓库已添加");
-    setBusy(false);
-    if (ok !== undefined) setPath("");
+    try {
+      const r = await api.resolveFolder({ path: path.trim() });
+      if (r.kind === "repository") {
+        const ok = await act(() => api.addRepository({ project: project.id, path: path.trim() }), "仓库已添加");
+        if (ok !== undefined) setPath("");
+      } else if (r.kind === "folder") {
+        setResolved(r);
+        setSel(new Set(r.repositories.map((x) => x.path)));
+      } else {
+        setError(r.message);
+      }
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
   };
   const pick = async () => {
-    const picked = await act(() => api.pickFolder({ prompt: "选择要添加的 git 仓库文件夹" }));
+    const picked = await act(() => api.pickFolder({ prompt: "选择 git 仓库文件夹，或包含多个仓库的工作区文件夹" }));
     if (picked) setPath(picked);
   };
+  const deeper = async () => {
+    if (!resolved || deepening) return;
+    setDeepening(true);
+    const before = new Set(resolved.repositories.map((r) => r.path));
+    try {
+      const r = await api.resolveFolder({ path: resolved.root, depth: Math.min(resolved.depth + 1, 4) });
+      if (r.kind === "folder") {
+        setResolved(r);
+        setSel(new Set(r.repositories.filter((x) => sel.has(x.path) || !before.has(x.path)).map((x) => x.path)));
+      }
+    } finally {
+      setDeepening(false);
+    }
+  };
+  const addChosen = async () => {
+    if (!resolved) return;
+    setAdding(true);
+    const chosen = resolved.repositories.filter((r) => sel.has(r.path)).map((r) => r.path);
+    const hadRoot = !!project.workspace?.root;
+    const out = await act(() => api.addRepositories({ project: project.id, paths: chosen, workspaceRoot: resolved.root }));
+    setAdding(false);
+    if (out) {
+      const k = out.added.length;
+      let text = `已添加 ${k} 个仓库`;
+      if (!hadRoot && out.workspace_root) text = `已添加 ${k} 个仓库，并记录为项目工作区`;
+      else if (out.kept_root) text = `已添加 ${k} 个仓库；项目工作区仍是 ${out.kept_root.split("/").filter(Boolean).pop()}`;
+      notify(text, "info");
+      setResolved(null);
+      setPath("");
+    }
+  };
+  const allAdded = !!resolved && resolved.repositories.every((r) => added.has(r.path));
   return (
     <div className="page">
       <div className="page-inner">
@@ -453,7 +508,10 @@ export function ReposPage({ project }: { project: ProjectSummary }) {
             <input
               className="input mono"
               value={path}
-              onChange={(e) => setPath(e.target.value)}
+              onChange={(e) => {
+                setPath(e.target.value);
+                setResolved(null);
+              }}
               onKeyDown={(e) => e.key === "Enter" && path.trim() && void add()}
               placeholder="/Users/you/code/repository"
               aria-label="仓库路径"
@@ -465,7 +523,30 @@ export function ReposPage({ project }: { project: ProjectSummary }) {
               添加仓库
             </Button>
           </div>
+          {error && <p className="inline-error">{error}</p>}
+          {resolved && !allAdded && (
+            <>
+              <FolderScan resolved={resolved} selected={sel} onChange={setSel} added={added} onDeeper={() => void deeper()} deepening={deepening} />
+              <div className="row-gap folder-scan-actions-bar">
+                <Button variant="ghost" size="sm" onClick={() => setResolved(null)}>
+                  取消
+                </Button>
+                <Button variant="primary" size="sm" busy={adding} disabled={resolved.repositories.filter((r) => sel.has(r.path) && !added.has(r.path)).length === 0} onClick={addChosen}>
+                  添加所选（{resolved.repositories.filter((r) => sel.has(r.path) && !added.has(r.path)).length}）
+                </Button>
+              </div>
+            </>
+          )}
+          {resolved && allAdded && (
+            <div className="row-between folder-scan-actions-bar">
+              <p className="field-hint">这些仓库都已在项目里</p>
+              <Button variant="ghost" size="sm" onClick={() => setResolved(null)}>
+                关闭
+              </Button>
+            </div>
+          )}
         </section>
+        {project.workspace?.root && <WorkspaceCard project={project} />}
         <SectionLabel right={<span className="muted">{project.repositories.length} 个</span>}>已添加</SectionLabel>
         {project.repositories.length === 0 && <p className="empty-text">还没有仓库。</p>}
         <ul className="repo-list">
@@ -475,6 +556,115 @@ export function ReposPage({ project }: { project: ProjectSummary }) {
         </ul>
       </div>
     </div>
+  );
+}
+
+/** Read-only view of the project's workspace folder with its shared notes, plus a rescan
+ *  that reuses the add-list (interaction §4.1, §4.3). */
+function WorkspaceCard({ project }: { project: ProjectSummary }) {
+  const ws = project.workspace!;
+  const { act, notify } = useStudio();
+  const [rescanning, setRescanning] = useState(false);
+  const [resolved, setResolved] = useState<Extract<FolderResolved, { kind: "folder" }> | null>(null);
+  const [sel, setSel] = useState<Set<string>>(new Set());
+  const [deepening, setDeepening] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [fresh, setFresh] = useState<string | null>(null);
+  const added = new Set(project.repositories);
+
+  const rescan = async () => {
+    setRescanning(true);
+    try {
+      const r = await api.resolveFolder({ path: ws.root });
+      if (r.kind === "folder") {
+        const fresh1 = r.repositories.filter((x) => !added.has(x.path));
+        if (fresh1.length === 0) {
+          setFresh(`没有新的仓库，${r.repositories.length} 个都已在项目里`);
+          window.setTimeout(() => setFresh(null), 3000);
+          setResolved(null);
+        } else {
+          setResolved(r);
+          setSel(new Set(fresh1.map((x) => x.path)));
+        }
+      } else {
+        notify(r.message || "重新扫描失败", "error");
+      }
+    } finally {
+      setRescanning(false);
+    }
+  };
+  const deeper = async () => {
+    if (!resolved || deepening) return;
+    setDeepening(true);
+    const before = new Set(resolved.repositories.map((r) => r.path));
+    try {
+      const r = await api.resolveFolder({ path: ws.root, depth: Math.min(resolved.depth + 1, 4) });
+      if (r.kind === "folder") {
+        setResolved(r);
+        setSel(new Set(r.repositories.filter((x) => sel.has(x.path) || !before.has(x.path)).map((x) => x.path)));
+      }
+    } finally {
+      setDeepening(false);
+    }
+  };
+  const addChosen = async () => {
+    if (!resolved) return;
+    setAdding(true);
+    const chosen = resolved.repositories.filter((r) => sel.has(r.path) && !added.has(r.path)).map((r) => r.path);
+    const out = await act(() => api.addRepositories({ project: project.id, paths: chosen, workspaceRoot: ws.root }));
+    setAdding(false);
+    if (out) {
+      notify(`已添加 ${out.added.length} 个仓库`, "info");
+      setResolved(null);
+    }
+  };
+  const name = ws.root.split("/").filter(Boolean).pop();
+  return (
+    <section className="card workspace-root" data-testid="workspace-root">
+      <div className="workspace-head">
+        <FolderGit2 size={16} className="muted" />
+        <span className="workspace-name">{name}</span>
+        <span className="workspace-actions">
+          <Button variant="secondary" size="sm" busy={rescanning} disabled={!ws.exists} onClick={rescan}>
+            重新扫描
+          </Button>
+          <button type="button" className="icon-btn" title="在访达中显示" aria-label="在访达中显示" onClick={() => act(() => api.reveal({ path: ws.root }))}>
+            <FolderOpen size={15} />
+          </button>
+        </span>
+      </div>
+      <code className="workspace-path">{ws.root}</code>
+      {!ws.exists ? (
+        <p className="workspace-notes warn">找不到这个文件夹，阶段不会读取工作区说明</p>
+      ) : ws.notes.length > 0 ? (
+        <p className="workspace-notes">
+          说明文件：
+          {ws.notes.map((n, i) => (
+            <span key={n}>
+              {i > 0 && "、"}
+              <code>{n}</code>
+            </span>
+          ))}{" "}
+          · 各阶段开始前会读取
+        </p>
+      ) : (
+        <p className="workspace-notes muted">顶层没有 AGENTS.md 或 CLAUDE.md，阶段不会额外读取说明</p>
+      )}
+      {fresh && <p className="field-hint">{fresh}</p>}
+      {resolved && (
+        <>
+          <FolderScan resolved={resolved} selected={sel} onChange={setSel} added={added} onDeeper={() => void deeper()} deepening={deepening} />
+          <div className="row-gap folder-scan-actions-bar">
+            <Button variant="ghost" size="sm" onClick={() => setResolved(null)}>
+              取消
+            </Button>
+            <Button variant="primary" size="sm" busy={adding} disabled={resolved.repositories.filter((r) => sel.has(r.path) && !added.has(r.path)).length === 0} onClick={addChosen}>
+              添加所选（{resolved.repositories.filter((r) => sel.has(r.path) && !added.has(r.path)).length}）
+            </Button>
+          </div>
+        </>
+      )}
+    </section>
   );
 }
 

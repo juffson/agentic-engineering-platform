@@ -228,9 +228,36 @@ export interface ProjectSummary {
   id: string;
   name: string;
   repositories: string[];
+  /** The project's workspace folder (holds several repositories, is not one itself). */
+  workspace?: { root: string; exists: boolean; notes: string[] } | null;
   work: WorkSummary[]; // newest first
   flows: FlowDef[];
   broken_flows: { id: FlowId | null; label: string | null; error: string }[];
+}
+
+/** A git repository discovered below a workspace folder. */
+export interface FolderRepo {
+  path: string;
+  relative: string;
+  name: string;
+}
+
+/** What `resolveFolder` found for a picked path. `message` holds the fixed text
+ *  of interaction §2.1 (empty for `repository`). */
+export type FolderResolved =
+  | { kind: "repository"; root: string; message: "" }
+  | { kind: "folder"; root: string; depth: number; repositories: FolderRepo[]; truncated: boolean; notes: string[]; message: string }
+  | { kind: "empty"; root: string; depth: number; truncated: boolean; message: string }
+  | { kind: "missing"; path: string; message: string }
+  | { kind: "not_dir"; path: string; message: string };
+
+/** Result of adding several repositories from a workspace folder at once. */
+export interface AddRepositoriesResult {
+  added: string[];
+  existing: string[];
+  workspace_root: string | null;
+  /** The workspace root that was kept when it differed from the requested one (Q3). */
+  kept_root: string | null;
 }
 
 export interface Snapshot {
@@ -684,8 +711,12 @@ export interface Api {
   snapshot(): Snapshot;
   openProject(a: { project: string }): void;
   selectWork(a: { project: string; work: string }): void;
-  createProject(a: { name: string; repositories: string[] }): string; // new project id
+  createProject(a: { name: string; repositories: string[]; workspaceRoot?: string }): string; // new project id
   addRepository(a: { project: string; path: string }): void;
+  /** Classify a picked path: one repository, a folder of repositories, or unusable. */
+  resolveFolder(a: { path: string; depth?: number }): FolderResolved;
+  /** Attach several repositories in one all-or-nothing change; `workspaceRoot` follows Q3. */
+  addRepositories(a: { project: string; paths: string[]; workspaceRoot?: string }): AddRepositoriesResult;
   saveFlow(a: { project: string; flow: FlowInput }): { id: FlowId; warnings: string[] };
   copyFlow(a: { project: string; id: FlowId; label?: string }): FlowId;
   deleteFlow(a: { project: string; id: FlowId }): number; // number of unarchived items using the flow
