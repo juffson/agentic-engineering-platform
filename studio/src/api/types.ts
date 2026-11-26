@@ -91,7 +91,8 @@ export type SessionReason =
   | "session_busy"
   | "chain_broken"
   | "prior_not_passed"
-  | "independent_review";
+  | "independent_review"
+  | "zcode_new_stage";
 
 /**
  * How a run's session was chosen. `reused`: continued an adjacent stage's session

@@ -101,6 +101,8 @@ export function freshReason(s: Pick<SessionLike, "reason" | "context" | "thresho
       return "前序阶段未通过";
     case "independent_review":
       return "独立验收不沿用测试的会话";
+    case "zcode_new_stage":
+      return "ZCode 每个阶段用新任务";
     default:
       return "";
   }

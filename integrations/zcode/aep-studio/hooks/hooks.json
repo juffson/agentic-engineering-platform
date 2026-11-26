@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/sh \"${ZCODE_PLUGIN_ROOT}/hooks/permission.sh\"",
+            "timeoutMs": 10000,
+            "statusMessage": "AEP 完全权限阶段自动批准"
+          }
+        ]
+      }
+    ]
+  }
+}

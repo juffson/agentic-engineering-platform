@@ -201,7 +201,7 @@ fn complete_with_db(
             && creation["session"]["workspacePath"] == workspace
             && creation["session"]["sessionId"] == session
             && creation["requestId"] == job["requestId"]
-            && job["mode"] == "edit"
+            && matches!(job["mode"].as_str(), Some("edit" | "yolo"))
             && format!(
                 "{}/{}",
                 model["providerId"].as_str().unwrap_or(""),
@@ -235,6 +235,7 @@ pub fn converse(
     model: &Value,
     prompt: &str,
     repository: Option<&Path>,
+    resume: Option<&Value>,
 ) -> Result<String> {
     let home = std::env::home_dir()
         .context("缺少 ZCode 用户目录")?
@@ -251,7 +252,7 @@ pub fn converse(
     lock.lock()?;
     let marker = uuid::Uuid::new_v4().simple().to_string();
     let role = match mode {
-        "edit" => "实现",
+        "edit" | "yolo" => "实现",
         "guarded" => "验收",
         _ => "审查",
     };
@@ -288,8 +289,11 @@ pub fn converse(
         saved
     } else {
         fs::write(&prompt_file, prompt)?;
-        let job = json!({"requestId":marker,"workspace":workspace,"dispatch":dispatch,"model":model,"mode":mode,
+        let mut job = json!({"requestId":marker,"workspace":workspace,"dispatch":dispatch,"model":model,"mode":mode,
             "since":chrono::Utc::now().timestamp_millis()});
+        if let Some(session) = resume {
+            job["session"] = session.clone();
+        }
         save_json(dir, "desktop-request.json", &job)?;
         job
     };
@@ -306,7 +310,8 @@ pub fn converse(
         "desktop-task.json",
         &json!({"session":task,"userMessage":message,"workspace":workspace}),
     )?;
-    if let Some(repo) = repository
+    // A continued task is already grouped under the item's ZCode project.
+    if let Some(repo) = repository.filter(|_| resume.is_none())
         && let Err(e) = crate::zcode_group::group(dir, repo)
     {
         eprintln!("ZCode 项目归组失败，可用 aep zcode-group 重试：{e:#}");

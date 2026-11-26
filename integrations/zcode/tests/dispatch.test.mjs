@@ -21,6 +21,7 @@ test("AEP desktop extension protocol", async t => {
   const session = { ...local, workspacePath: "/work/aep", sessionId: "test-session" };
   const operation = { commandId: "command-1", sessionId: session.sessionId, session };
   const opened = [];
+  const sent = [];
   const pending = { kind: "toolCall", turnId: "first", status: "pendingApproval" };
   ext.activate({ sessions: {
     async listSessions({project, cursor}) {
@@ -53,6 +54,11 @@ test("AEP desktop extension protocol", async t => {
       return { projects: [
         { project: { ...local, sourceServerId: "remote" } }, { project: local }
       ] };
+    },
+    async sendToSession(input) {
+      sent.push(input);
+      return { requestId: input.requestId, session: input.session, admission: "accepted", delivery: "start_now",
+        operation: { commandId: "command-2", sessionId: input.session.sessionId, session: input.session } };
     },
     async createSession(input) {
       calls.push(input);
@@ -98,6 +104,22 @@ test("AEP desktop extension protocol", async t => {
     permission = false;
     assert.equal((await dispatch("aep")).reply.code, "not-granted");
     assert.equal(calls.length, 1);
+  });
+  await t.test("passes the stage mode to a new task and refuses unknown modes", async () => {
+    permission = true;
+    const full = await dispatch("aep", { mode: "yolo" });
+    assert.equal(full.reply.firstInput, "accepted");
+    assert.equal(calls.at(-1).mode, "yolo");
+    const before = calls.length;
+    assert.match((await dispatch("aep", { mode: "edit" })).reply.error, /Invalid AEP mode/);
+    assert.equal(calls.length, before);
+  });
+  await t.test("continues an existing task with the next prompt instead of opening another", async () => {
+    const next = await dispatch("aep", { action: "send", session, prompt: "T2 next subtask" });
+    assert.equal(next.reply.admission, "accepted");
+    assert.deepEqual(sent, [{ session, prompt: "T2 next subtask", requestId: next.requestId }]);
+    assert.match((await dispatch("aep", { action: "send", session: { ...session, sourceServerId: "remote" } })).reply.error, /Invalid AEP send/);
+    assert.equal(sent.length, 1);
   });
   await t.test("reports only pending tools from the admitted turn and clears them after approval", async () => {
     const observed = await dispatch("aep", request);

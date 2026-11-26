@@ -7,6 +7,8 @@ import { createInterface } from "node:readline";
 const folder = join(homedir(), ".aep", "zcode");
 const socketName = /^([0-9a-f]{32})\.sock$/;
 const plans = new Set(["account:bigmodel-start-plan", "account:bigmodel-individual-coding-plan"]);
+// Session modes the desktop accepts for a new task: build (edits), guarded (checks), yolo (full access).
+const modes = new Set(["build", "guarded", "yolo"]);
 const active = new Map();
 let timer;
 
@@ -82,6 +84,17 @@ async function serve(ctx, name, id) {
         socket.end(JSON.stringify({ ...reply, sessionId: session.sessionId, requestId: id }) + "\n");
         return;
       }
+      if (job.action === "send") {
+        // Continue an AEP stage's existing task: the next subtask or a follow-up keeps the
+        // session's history, model, mode and permissions.
+        const session = job.session;
+        if (session?.kind !== "app" || session.sourceServerId !== "local" || typeof session.sessionId !== "string" ||
+            !session.sessionId || typeof job.prompt !== "string" || !job.prompt) throw new Error("Invalid AEP send");
+        if (socket.destroyed) return;
+        const reply = await ctx.sessions.sendToSession({ session, prompt: job.prompt, requestId: id });
+        socket.end(JSON.stringify(reply) + "\n");
+        return;
+      }
       if (!plans.has(job.providerId) ||
           typeof job.modelId !== "string" || !job.modelId || typeof job.prompt !== "string") {
         throw new Error("Invalid AEP dispatch");
@@ -91,9 +104,10 @@ async function serve(ctx, name, id) {
         row.project.sourceServerId === "local" && row.project.projectId === job.projectId)?.project;
       if (!project) throw new Error("AEP 项目未出现在 ZCode 本机项目列表");
       if (socket.destroyed) return;
+      if (job.mode !== undefined && !modes.has(job.mode)) throw new Error("Invalid AEP mode");
       const reply = await ctx.sessions.createSession({
         project, prompt: job.prompt, model: job.providerId + "/" + job.modelId,
-        requestId: id
+        requestId: id, ...(job.mode ? { mode: job.mode } : {})
       });
       socket.end(JSON.stringify(reply) + "\n");
       return;

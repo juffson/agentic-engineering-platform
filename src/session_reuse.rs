@@ -97,6 +97,9 @@ pub enum Reason {
     ClientNotReusable,
     PriorNotPassed,
     IndependentReview,
+    /// A ZCode task keeps the mode it was created with (plan / edit / guarded / yolo), so only
+    /// the rounds of one stage continue it; the next stage opens its own task.
+    ZCodeNewStage,
 }
 impl Reason {
     pub fn as_str(self) -> &'static str {
@@ -114,6 +117,7 @@ impl Reason {
             Self::ClientNotReusable => "client_not_reusable",
             Self::PriorNotPassed => "prior_not_passed",
             Self::IndependentReview => "independent_review",
+            Self::ZCodeNewStage => "zcode_new_stage",
         }
     }
     /// A new session that should still carry the source's answer and hand-off digest
@@ -150,12 +154,22 @@ fn same_dir(a: &Option<PathBuf>, b: &Option<PathBuf>) -> bool {
 /// Decide whether `current` continues `source`'s session. The first matching rule wins.
 pub fn decide(mode: Mode, current: &Side, source: Option<&Source>, threshold: u64) -> Plan {
     let fresh = |reason, context| Plan::Fresh { reason, context };
-    if !matches!(current.client, Client::Codex | Client::Claude) {
+    if !matches!(
+        current.client,
+        Client::Codex | Client::Claude | Client::ZCode
+    ) {
         return fresh(Reason::ClientNotReusable, None);
     }
     let Some(src) = source else {
         return fresh(Reason::NoPrior, None);
     };
+    if current.client == Client::ZCode
+        && mode == Mode::Adjacent
+        && src.side.client == Client::ZCode
+        && src.stage != current.stage
+    {
+        return fresh(Reason::ZCodeNewStage, None);
+    }
     if mode == Mode::Adjacent {
         // Independent acceptance starts clean, or it would only re-read the tester's view.
         if current.independent {
@@ -353,12 +367,34 @@ mod tests {
         assert_eq!(
             reason(decide(
                 Mode::Adjacent,
-                &side(Client::ZCode),
-                Some(&src(Client::ZCode)),
+                &side(Client::Custom),
+                Some(&src(Client::Custom)),
                 DEFAULT_LIMIT
             )),
             Reason::ClientNotReusable
         );
+        // ZCode: the next stage opens its own task (a task keeps its creation mode) …
+        assert_eq!(
+            reason(decide(
+                Mode::Adjacent,
+                &side(Client::ZCode),
+                Some(&src(Client::ZCode)),
+                DEFAULT_LIMIT
+            )),
+            Reason::ZCodeNewStage
+        );
+        // … while the next subtask of the same stage and a follow-up continue it, unforked.
+        let same = Source {
+            stage: 2,
+            side: side(Client::ZCode),
+            ..src(Client::ZCode)
+        };
+        for mode in [Mode::Adjacent, Mode::Continue] {
+            assert!(matches!(
+                decide(mode, &side(Client::ZCode), Some(&same), DEFAULT_LIMIT),
+                Plan::Resume { fork: false, .. }
+            ));
+        }
         check(&|s| s.side.client = Client::Codex, Reason::ClientDiffers);
         // E6: a skipped stage between, and the run before it used another CLI.
         check(

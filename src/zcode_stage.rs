@@ -34,12 +34,52 @@ pub fn converse(
             .is_some()
     {
         let selection = json!({"providerId":model["providerId"], "modelId":model["modelId"]});
-        // Desktop plan tasks cannot be continued (R7): let the runner resend full context.
-        if resume.is_some() {
-            eprintln!("{RESUME_FAILED}: 桌面任务不支持继续原会话");
-            bail!("{RESUME_FAILED}: 桌面任务不支持继续原会话");
-        }
-        crate::zcode_desktop::converse(dir, desktop_workspace, mode, &selection, prompt, repository)
+        // The next round of a stage continues its desktop task; without the task's receipt
+        // (an older run) the runner resends the full context in a new task.
+        let session = match resume {
+            Some(id) => match desktop_session(dir, id) {
+                Some(session) => Some(session),
+                None => {
+                    eprintln!("{RESUME_FAILED}: 找不到桌面任务 {id} 的回执");
+                    bail!("{RESUME_FAILED}: 找不到桌面任务 {id} 的回执");
+                }
+            },
+            None => None,
+        };
+        // ZCode starts every plugin-created task in "Ask before changes" and refuses to let a
+        // plugin pick another mode outside its own project. For a 完全权限 stage the AEP
+        // plugin's PermissionRequest hook approves the task's tool calls while this grant exists.
+        let _grant = if mode == "yolo" {
+            Some(FullAccessGrant::write(desktop_workspace, dir)?)
+        } else {
+            None
+        };
+        crate::zcode_desktop::converse(
+            dir,
+            desktop_workspace,
+            mode,
+            &selection,
+            prompt,
+            repository,
+            session.as_ref(),
+        )
+        .map_err(|e| {
+            let text = format!("{e:#}");
+            if text.contains(crate::zcode_desktop_send::CONTINUE_FAILED) {
+                // Nothing was admitted: let the fallback dispatch a new task from this folder.
+                for name in [
+                    "desktop-request.json",
+                    "desktop-prompt.txt",
+                    "desktop-create.json",
+                ] {
+                    let _ = fs::remove_file(dir.join(name));
+                }
+                eprintln!("{RESUME_FAILED}: {text}");
+                anyhow::anyhow!("{RESUME_FAILED}: {text}")
+            } else {
+                e
+            }
+        })
     } else {
         app_server(binary, dir, mode, model, prompt, resume)
     };
@@ -50,6 +90,71 @@ pub fn converse(
             &json!({"error":format!("{error:#}")}),
         );
     })
+}
+
+/// Marks `workspace` as running a 完全权限 stage for the AEP ZCode plugin's permission hook
+/// (`integrations/zcode/aep-studio/hooks/permission.mjs`). The hook also checks that `pid`
+/// is alive, so a grant left behind by a crash approves nothing. Removed on drop.
+struct FullAccessGrant(std::path::PathBuf);
+
+impl FullAccessGrant {
+    fn write(workspace: &Path, run: &Path) -> Result<Self> {
+        let root = std::env::home_dir().context("缺少用户目录")?.join(".aep/zcode/grants");
+        Self::write_in(&root, workspace, run)
+    }
+
+    fn write_in(root: &Path, workspace: &Path, run: &Path) -> Result<Self> {
+        use sha2::{Digest, Sha256};
+        let workspace = workspace.to_str().context("工作区路径不是 UTF-8")?;
+        fs::create_dir_all(root)?;
+        let name = format!("{:x}.json", Sha256::digest(workspace.as_bytes()));
+        let path = root.join(name);
+        aep::project::save_json(
+            root,
+            path.file_name().and_then(|n| n.to_str()).context("授权文件名")?,
+            &json!({"workspace":workspace,"run":run,"pid":std::process::id(),
+                "at":chrono::Utc::now().to_rfc3339()}),
+        )?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for FullAccessGrant {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// The desktop session object of the sibling run that holds task `id` (its create or send
+/// receipt), which the extension needs to continue that task.
+fn desktop_session(dir: &Path, id: &str) -> Option<Value> {
+    let runs = dir.parent()?;
+    for entry in fs::read_dir(runs).ok()?.flatten() {
+        let run = entry.path();
+        let native = aep::workspace::read(&run.join("session.json")).ok();
+        if native
+            .as_ref()
+            .is_some_and(|n| n["transport"] == "desktop" && n["session"] == id)
+            && let Ok(receipt) = aep::workspace::read(&run.join("desktop-create.json"))
+            && receipt["session"]["sessionId"] == id
+            && receipt["session"]["sourceServerId"] == "local"
+        {
+            return Some(receipt["session"].clone());
+        }
+    }
+    None
+}
+
+/// The ZCode mode for a stage: full access runs every role in yolo; otherwise the stages that
+/// write (planning writes specs/, the build writes code) edit, gates are guarded and delivery,
+/// which only reads, stays in plan mode.
+pub fn stage_mode(role: Role, sandbox: aep::workflow::Sandbox) -> &'static str {
+    match (sandbox, role) {
+        (aep::workflow::Sandbox::Full, _) => "yolo",
+        (_, Role::Plan | Role::Build) => "edit",
+        (_, Role::Test | Role::Accept) => "guarded",
+        (_, Role::Deliver) => "plan",
+    }
 }
 
 fn app_server(
@@ -284,11 +389,10 @@ pub fn run(binary: &Path, request: &Path, resume: Option<&str>) -> Result<()> {
     let selection = (!req.profile.model.is_empty())
         .then(|| req.profile.zcode_selection())
         .transpose()?;
-    let mode = match req.flow().stages.get(req.stage).context("未知阶段")?.role {
-        Role::Build => "edit",
-        Role::Test | Role::Accept => "guarded",
-        _ => "plan",
-    };
+    let mode = stage_mode(
+        req.flow().stages.get(req.stage).context("未知阶段")?.role,
+        req.sandbox,
+    );
     let prompt = fs::read_to_string(dir.join("prompt.txt"))?;
     let reply = converse(
         binary,
@@ -308,6 +412,26 @@ pub fn run(binary: &Path, request: &Path, resume: Option<&str>) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_full_access_grant_names_the_workspace_and_lasts_for_the_stage() {
+        use sha2::{Digest, Sha256};
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("grants");
+        let workspace = Path::new("/w/AEP Studio/worktrees/item");
+        let path = root.join(format!(
+            "{:x}.json",
+            Sha256::digest(workspace.to_str().unwrap().as_bytes())
+        ));
+        {
+            let _grant = FullAccessGrant::write_in(&root, workspace, Path::new("/runs/r1")).unwrap();
+            let saved = aep::workspace::read(&path).unwrap();
+            assert_eq!(saved["workspace"], "/w/AEP Studio/worktrees/item");
+            assert_eq!(saved["run"], "/runs/r1");
+            assert_eq!(saved["pid"], std::process::id());
+        }
+        assert!(!path.exists(), "the grant ends with the stage");
+    }
 
     /// A test double for `zcode app-server` that logs every request it reads.
     fn double(dir: &Path, resume_ok: bool) -> std::path::PathBuf {
@@ -413,5 +537,46 @@ printf '%s\n' '{{"id":4,"result":{{"messages":[{{"info":{{"role":"assistant"}},"
         let first = &calls(t.path())[0];
         assert_eq!(first["method"], "session/create");
         assert_eq!(first["params"]["mode"], "edit");
+    }
+
+    #[test]
+    fn full_access_runs_every_zcode_stage_in_yolo() {
+        use aep::workflow::Sandbox;
+        for role in [
+            Role::Plan,
+            Role::Build,
+            Role::Test,
+            Role::Accept,
+            Role::Deliver,
+        ] {
+            assert_eq!(stage_mode(role, Sandbox::Full), "yolo");
+        }
+        assert_eq!(stage_mode(Role::Build, Sandbox::Standard), "edit");
+        assert_eq!(stage_mode(Role::Test, Sandbox::Network), "guarded");
+        assert_eq!(stage_mode(Role::Plan, Sandbox::Standard), "edit");
+        assert_eq!(stage_mode(Role::Deliver, Sandbox::Standard), "plan");
+    }
+
+    #[test]
+    fn a_desktop_task_is_found_by_its_receipt_among_the_stage_runs() {
+        let t = tempfile::tempdir().unwrap();
+        let runs = t.path();
+        let session = json!({"kind":"app","sourceServerId":"local","sessionId":"sess_t1"});
+        let earlier = runs.join("r1");
+        fs::create_dir(&earlier).unwrap();
+        fs::write(
+            earlier.join("session.json"),
+            json!({"transport":"desktop","session":"sess_t1"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            earlier.join("desktop-create.json"),
+            json!({"session":session}).to_string(),
+        )
+        .unwrap();
+        let now = runs.join("r2");
+        fs::create_dir(&now).unwrap();
+        assert_eq!(desktop_session(&now, "sess_t1"), Some(session));
+        assert_eq!(desktop_session(&now, "sess_other"), None);
     }
 }
