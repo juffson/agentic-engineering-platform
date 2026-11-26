@@ -1018,10 +1018,12 @@ fn prior_turn(
     })
 }
 
-/// The ZCode app-server session a run saved (`native_session`); desktop tasks have none.
+/// The ZCode session a run saved (`native_session`): an app-server session, or a desktop task
+/// the AEP extension can send the next prompt to.
 fn zcode_app_session(ev: &Value) -> Option<String> {
     let native = &ev["native_session"];
-    (native["client"] == "ZCode" && native["transport"] == "app-server")
+    (native["client"] == "ZCode"
+        && (native["transport"] == "app-server" || native["transport"] == "desktop"))
         .then(|| native["session"].as_str().map(str::to_owned))
         .flatten()
         .filter(|s| !s.trim().is_empty())
@@ -1468,6 +1470,13 @@ fn invoke(
         match aep::workspace::read(&dir.join("session.json")) {
             Ok(native) => {
                 let actual = ActualModel::from_receipt(&native);
+                // The next round of this stage (a subtask or a follow-up) continues it.
+                if matches!(native["transport"].as_str(), Some("app-server" | "desktop"))
+                    && native["session"].as_str().is_some_and(|s| !s.is_empty())
+                {
+                    record["session"] = native["session"].clone();
+                    record["resumable"] = json!(true);
+                }
                 record["native_session"] = native;
                 actual
             }
@@ -2058,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn zcode_stage_desktop_tasks_are_not_continued() {
+    fn zcode_stage_desktop_tasks_are_continued() {
         let t = tempfile::tempdir().unwrap();
         let ws = t.path().join("ws");
         fs::create_dir(&ws).unwrap();
@@ -2075,13 +2084,10 @@ mod tests {
             message: "继续".into(),
         };
         let prior = prior_turn(&dir, &follow, None).unwrap();
-        assert_eq!(prior.session_run, None);
+        assert_eq!(prior.session_run.as_deref(), Some("r1"));
         assert!(matches!(
             zcode_continue(&t.path().join("runs"), 3, &prior),
-            Plan::Fresh {
-                reason: Reason::SessionUnavailable,
-                ..
-            }
+            Plan::Resume { ref session, fork: false, .. } if session == "task_1"
         ));
     }
 

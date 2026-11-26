@@ -159,6 +159,28 @@ fn create_session(root: &Path, request: &Value) -> Result<Value> {
     Ok(reply)
 }
 
+/// Marker for a continuation the installed extension or ZCode could not accept; the runner then
+/// starts a new task with the full context.
+pub const CONTINUE_FAILED: &str = "zcode desktop continue failed";
+
+/// Send the next prompt to an existing desktop task (extension 1.3: `sendToSession`).
+fn send_to_session(root: &Path, request: &Value) -> Result<Value> {
+    let reply = exchange(root, request).map_err(|e| anyhow::anyhow!("{CONTINUE_FAILED}: {e:#}"))?;
+    let session = &reply["session"];
+    ensure!(
+        reply["admission"] != "rejected",
+        "{CONTINUE_FAILED}: ZCode 没有接受继续本任务：{}",
+        reply["reason"]
+    );
+    ensure!(
+        reply["requestId"] == request["requestId"]
+            && session["sessionId"] == request["session"]["sessionId"]
+            && reply["operation"]["session"]["sessionId"] == request["session"]["sessionId"],
+        "{CONTINUE_FAILED}: ZCode 返回的继续回执不匹配"
+    );
+    Ok(reply)
+}
+
 fn session_action(receipt: &Value, action: &str) -> Result<Value> {
     let session = &receipt["session"];
     ensure!(
@@ -280,6 +302,19 @@ pub fn monitor(dir: &Path, task: &str) -> Option<std::sync::mpsc::Sender<()>> {
     Some(stop)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+/// The desktop task mode for a stage mode. The desktop's own modes are build ("Ask before
+/// changes", its default), guarded ("Autonomous mode", asks only when risky) and yolo ("Full
+/// access"). Like Claude and Codex in the default sandbox, writing stages and gates work without
+/// asking for each edit; a read-only stage keeps the default and is told not to edit.
+fn desktop_mode(mode: &str) -> Option<&'static str> {
+    match mode {
+        "yolo" => Some("yolo"),
+        "edit" | "build" | "guarded" => Some("guarded"),
+        _ => None,
+    }
+}
+
 pub fn dispatch(
     index: &Connection,
     db: &Connection,
@@ -303,6 +338,17 @@ pub fn dispatch(
     );
     let reply = if receipt.try_exists()? {
         aep::workspace::read(&receipt)?
+    } else if job["session"].is_object() {
+        // The next round of the same stage continues its task (history, model, mode kept).
+        let root = std::env::home_dir()
+            .context("缺少用户目录")?
+            .join(".aep/zcode");
+        let reply = send_to_session(
+            &root,
+            &json!({"action":"send","requestId":job["requestId"],"session":job["session"],"prompt":prompt}),
+        )?;
+        aep::project::save_json(dir, "desktop-create.json", &reply)?;
+        reply
     } else {
         let source = repository
             .map(|repo| crate::zcode_group::staging::prepare(dir, job, repo))
@@ -323,12 +369,12 @@ pub fn dispatch(
         let root = std::env::home_dir()
             .context("缺少用户目录")?
             .join(".aep/zcode");
-        let reply = create_session(
-            &root,
-            &json!({"requestId":job["requestId"],"projectId":project,
-            "providerId":model["providerId"],"modelId":model["modelId"],"prompt":prompt}),
-        )
-        .inspect_err(|err| {
+        // ZCode lets a plugin choose the permission mode only for sessions in the plugin's own
+        // project ("forbidden" otherwise), so an item task takes its ZCode project's mode, which
+        // the person sets once in ZCode. `desktop_mode` stays for the plugin's own project.
+        let request = json!({"requestId":job["requestId"],"projectId":project,
+            "providerId":model["providerId"],"modelId":model["modelId"],"prompt":prompt});
+        let reply = create_session(&root, &request).inspect_err(|err| {
             if err.is::<DispatchRejected>()
                 && let Some(repo) = repository
                 && dir.join("desktop-source-project.json").is_file()
@@ -405,5 +451,71 @@ mod tests {
         assert_eq!(result?["session"]["sessionId"], "sess-1");
         assert_eq!(fs::read_dir(folder)?.count(), 0);
         Ok(())
+    }
+
+    /// A stand-in extension: reads one request, answers with `reply(request)`.
+    fn extension(path: PathBuf, reply: fn(&Value) -> Value) -> thread::JoinHandle<Result<Value>> {
+        thread::spawn(move || -> Result<Value> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut socket = loop {
+                match UnixStream::connect(&path) {
+                    Ok(socket) => break socket,
+                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            let mut line = String::new();
+            BufReader::new(&socket).read_line(&mut line)?;
+            let input: Value = serde_json::from_str(&line)?;
+            writeln!(socket, "{}", reply(&input))?;
+            Ok(input)
+        })
+    }
+
+    #[test]
+    fn continuing_a_task_sends_to_its_session_and_checks_the_receipt() -> Result<()> {
+        let temp = tempfile::tempdir_in("/tmp")?;
+        let folder = temp.path().join("queue");
+        let session = json!({"kind":"app","sourceServerId":"local","sessionId":"sess_1"});
+        let request =
+            |id: &str| json!({"action":"send","requestId":id,"session":session,"prompt":"T2"});
+
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let ext = extension(folder.join(format!("{id}.sock")), |input| {
+            json!({"requestId":input["requestId"],"session":input["session"],"admission":"accepted",
+                   "operation":{"commandId":"c2","session":input["session"]}})
+        });
+        let reply = send_to_session(&folder, &request(&id))?;
+        let sent = ext.join().unwrap()?;
+        assert_eq!(sent["action"], "send");
+        assert_eq!(sent["session"]["sessionId"], "sess_1");
+        assert_eq!(reply["operation"]["commandId"], "c2");
+
+        // Rejected, or an older extension that does not know "send": the runner falls back.
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let ext = extension(
+            folder.join(format!("{id}.sock")),
+            |input| json!({"requestId":input["requestId"],"session":input["session"],"admission":"rejected","reason":"busy"}),
+        );
+        let err = send_to_session(&folder, &request(&id)).unwrap_err();
+        ext.join().unwrap()?;
+        assert!(err.to_string().contains(CONTINUE_FAILED), "{err}");
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let ext = extension(
+            folder.join(format!("{id}.sock")),
+            |_| json!({"error":"Invalid AEP dispatch","code":"extension-error"}),
+        );
+        let err = send_to_session(&folder, &request(&id)).unwrap_err();
+        ext.join().unwrap()?;
+        assert!(format!("{err:#}").contains(CONTINUE_FAILED), "{err:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_tasks_get_the_stage_mode() {
+        assert_eq!(desktop_mode("yolo"), Some("yolo"));
+        assert_eq!(desktop_mode("edit"), Some("guarded"));
+        assert_eq!(desktop_mode("guarded"), Some("guarded"));
+        assert_eq!(desktop_mode("plan"), None);
     }
 }
