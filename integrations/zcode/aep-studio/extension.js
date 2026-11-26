@@ -75,11 +75,13 @@ async function serve(ctx, name, id) {
         socket.end(JSON.stringify({ requestId: id, projectId: project.projectId, sessions: found }) + "\n");
         return;
       }
-      if (job.action === "open" || job.action === "approvals") {
+      if (job.action === "open" || job.action === "approvals" || job.action === "archive") {
         const session = job.session;
         if (session?.sourceServerId !== "local" || !session.sessionId ||
             session.sessionId !== job.operation?.sessionId) throw new Error("Invalid desktop session");
+        // An archived AEP item archives its tasks, so they leave the ZCode sidebar with it.
         const reply = job.action === "open" ? await ctx.sessions.openSession({ session })
+          : job.action === "archive" ? await ctx.sessions.setSessionArchived({ session, archived: true, requestId: id })
           : await approvalState(ctx, job);
         socket.end(JSON.stringify({ ...reply, sessionId: session.sessionId, requestId: id }) + "\n");
         return;

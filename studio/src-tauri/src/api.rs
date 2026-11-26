@@ -1057,7 +1057,51 @@ pub fn archive(
         find_mut(lib, pid)?
             .archive_work(home, wid, memory)
             .map(|_| ())
-    })
+    })?;
+    archive_zcode_tasks(home, pid, wid);
+    Ok(())
+}
+
+/// The ZCode desktop tasks an item's stages ran in leave the ZCode sidebar with the item.
+/// Best effort and in the background: ZCode may be closed, and the archive already holds.
+fn archive_zcode_tasks(home: &Path, pid: &str, wid: &str) {
+    let Some(runs) = workflow::attempt_dir(home, pid, wid, "_")
+        .parent()
+        .map(Path::to_path_buf)
+    else {
+        return;
+    };
+    let dirs: Vec<PathBuf> = fs::read_dir(&runs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|e| {
+            let d = e.path();
+            [d.clone(), d.join("zcode-edit"), d.join("zcode-plan")]
+        })
+        .filter(|d| d.join("desktop-create.json").is_file())
+        .collect();
+    let (Ok(binary), Ok(path)) = (runner::binary(), runner::path()) else {
+        return;
+    };
+    if dirs.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut command = std::process::Command::new(binary);
+        command.env("PATH", path).arg("zcode-archive");
+        for d in &dirs {
+            command.arg("--dir").arg(d);
+        }
+        match command.output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => eprintln!(
+                "归档 ZCode 任务失败：{}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => eprintln!("归档 ZCode 任务失败：{e}"),
+        }
+    });
 }
 
 /// Remove a delivered item's worktrees and merged branches; `force` also deletes

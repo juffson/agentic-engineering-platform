@@ -928,7 +928,7 @@ pub fn execute(opt: Options, cwd: &Path) -> Result<()> {
                         p.repositories.push(repo.clone());
                     }
                     if let Some(wid) = wid.as_deref() {
-                        p.work_by_id_mut(&wid)?.include(repo);
+                        p.work_by_id_mut(wid)?.include(repo);
                     }
                 }
                 // Q3: the first workspace root wins; a different one only gets a note.

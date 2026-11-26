@@ -222,6 +222,31 @@ fn desktop_action(session: &Value, operation: &Value, action: &str) -> Result<Va
     Ok(reply)
 }
 
+/// Archive the ZCode desktop tasks saved in these role or stage evidence directories, each
+/// task once. Used when an AEP item is archived; one task failing does not stop the rest.
+pub fn archive_tasks(dirs: &[std::path::PathBuf]) -> Vec<Value> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(receipt) = aep::workspace::read(&dir.join("desktop-create.json")) else {
+            continue;
+        };
+        let session = &receipt["session"];
+        let Some(id) = session["sessionId"].as_str() else {
+            continue;
+        };
+        if session["sourceServerId"] != "local" || !seen.insert(id.to_owned()) {
+            continue;
+        }
+        let row = match desktop_action(session, &json!({"sessionId":id}), "archive") {
+            Ok(reply) => json!({"session":id,"status":reply["status"]}),
+            Err(e) => json!({"session":id,"error":format!("{e:#}")}),
+        };
+        out.push(row);
+    }
+    out
+}
+
 pub fn open_task(dir: &Path) -> Result<Value> {
     // A saved session can be opened after both Studio and the extension host quit.
     let app = Path::new("/Applications/ZCode.app");

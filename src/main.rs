@@ -47,6 +47,11 @@ enum Action {
         #[arg(long)]
         dir: PathBuf,
     },
+    /// Archive the ZCode desktop tasks saved in these evidence directories (an archived item's runs).
+    ZcodeArchive {
+        #[arg(long, required = true)]
+        dir: Vec<PathBuf>,
+    },
     #[command(hide = true)]
     ZcodeStage {
         #[arg(long)]
@@ -260,6 +265,11 @@ fn app() -> Result<ExitCode> {
             println!("{}", zcode_desktop_send::open_task(&dir)?);
             return Ok(ExitCode::SUCCESS);
         }
+        Action::ZcodeArchive { dir } => {
+            let rows = zcode_desktop_send::archive_tasks(&dir);
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+            return Ok(ExitCode::SUCCESS);
+        }
         Action::ZcodeBridge {
             binary,
             mode,
@@ -326,6 +336,7 @@ fn app() -> Result<ExitCode> {
         | Action::ZcodeStage { .. }
         | Action::ZcodeGroup { .. }
         | Action::ZcodeOpen { .. }
+        | Action::ZcodeArchive { .. }
         | Action::ZcodeBridge { .. }
         | Action::WorkflowStage { .. }
         | Action::WorkflowAuto { .. }

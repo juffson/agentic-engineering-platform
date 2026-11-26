@@ -87,6 +87,10 @@ fn create_with_all_records_the_workspace_root() -> Result<()> {
         serde_json::json!([w.a, w.b]),
         "深度 2 不含第 3 层"
     );
+    assert!(
+        !created["repositories"].as_array().unwrap().contains(&serde_json::json!(w.deep)),
+        "第 3 层的仓库不在默认深度内"
+    );
     let list = call(&home, w.a.as_path(), &["list"])?;
     assert_eq!(list[0]["repositories"].as_array().unwrap().len(), 2);
     Ok(())

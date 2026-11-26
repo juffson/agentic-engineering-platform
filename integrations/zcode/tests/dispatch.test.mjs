@@ -21,6 +21,7 @@ test("AEP desktop extension protocol", async t => {
   const session = { ...local, workspacePath: "/work/aep", sessionId: "test-session" };
   const operation = { commandId: "command-1", sessionId: session.sessionId, session };
   const opened = [];
+  const archived = [];
   const sent = [];
   const pending = { kind: "toolCall", turnId: "first", status: "pendingApproval" };
   ext.activate({ sessions: {
@@ -31,6 +32,10 @@ test("AEP desktop extension protocol", async t => {
     async openSession(input) {
       opened.push(input);
       return { status: "opened" };
+    },
+    async setSessionArchived(input) {
+      archived.push(input);
+      return { requestId: input.requestId, status: "applied" };
     },
     async waitSessions(input) {
       assert.deepEqual(input.operations, [operation]);
@@ -138,5 +143,14 @@ test("AEP desktop extension protocol", async t => {
     const wrongSession = { ...session, sessionId: "another-session" };
     assert.match((await dispatch("aep", { ...request, action: "open", session: wrongSession })).reply.error, /Invalid desktop session/);
     assert.equal(opened.length, 1);
+  });
+  await t.test("archives the exact session of an archived AEP item", async () => {
+    const done = await dispatch("aep", { ...request, action: "archive" });
+    assert.equal(done.reply.status, "applied");
+    assert.equal(done.reply.sessionId, session.sessionId);
+    assert.deepEqual(archived, [{ session, archived: true, requestId: done.requestId }]);
+    const wrongSession = { ...session, sessionId: "another-session" };
+    assert.match((await dispatch("aep", { ...request, action: "archive", session: wrongSession })).reply.error, /Invalid desktop session/);
+    assert.equal(archived.length, 1);
   });
 });
