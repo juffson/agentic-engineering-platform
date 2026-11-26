@@ -27,21 +27,37 @@ open "studio/src-tauri/target/debug/bundle/macos/AEP Studio.app"
 
 脚本会先构建 `aep` 执行器并放进应用包；从源码运行时也可设置 `AEP_STUDIO_RUNNER` 指向执行器。
 
-| 模板 | 阶段 |
+| 内置流程 | 阶段 |
 | --- | --- |
 | 软件开发 | 产品需求 → 交互设计 → 技术方案 → 开发实现 → 测试验证 → 独立验收 → 交付归档 |
 | 游戏开发 | 玩法需求 → 影响分析 → 环境预检 → 游戏实现 → 运行验证 → 玩家验收 → 交付归档 |
 
+侧边栏的「流程」页可以新建和编辑自定义流程；内置流程只读，可复制一份再改。新建事项时从「内置 / 本项目」两组流程里选一套，事项保存的是创建时的流程快照，之后改动或删除流程不影响已创建的事项。CLI 同样可用：`aep project flows` 列出流程，`aep project flow-show <ID 或名称>` 查看一套流程，`aep project flow-save --file <文件>` 从 JSON 新建或更新，`aep project flow-copy <ID 或名称>` 复制，`aep project flow-delete <ID 或名称>` 删除；`aep project add-work <名称> --flow <ID 或名称>` 按指定流程新建事项（不选时默认软件开发流程）。
+
 界面围绕一条主线：左栏选事项（进行中 / 已交付 / 已归档），中间是当前阶段的会话，右侧是下一步决定。
 
-- **阶段会话**：Agent 输出按终端方式呈现，命令和文件改动折叠成一行，可展开看输出。底部输入框首次运行阶段，之后在同一会话里继续对话。
-- **执行配置**：每个阶段可选 Codex、Claude、ZCode 或自定义 CLI，模型（Codex 读取本机 CLI 可用模型，ZCode 读取本机模型目录）和权限（默认沙箱 / 允许网络 / 完全权限）。
+- **阶段会话**：Agent 输出按终端方式呈现，命令和文件改动折叠成一行，可展开看输出；每个阶段保留各自的输出和改动 Diff，可回看任一阶段。底部输入框首次运行阶段，之后在同一会话里继续对话。
+- **执行配置**：每个阶段可选 Codex、Claude、ZCode 或自定义 CLI，模型（Codex 读取本机 CLI 可用模型，ZCode 读取本机模型目录）和权限（默认沙箱 / 允许网络 / 完全权限）。默认沙箱下阶段可写本事项的工作树，工作树之外的写入会被拒绝，阶段失败。
 - **推进与退回**：通过后确认进入下一阶段；测试或验收不通过时，一键退回负责的前序阶段并立即开始修复，也可写明理由人工放行。可选的规划阶段可以跳过。
 - **自动运行**：选好各阶段的 CLI、模型和终点，剩余阶段自动执行；问题按 `AEP-BACK` 退回对应阶段，同一对阶段最多自动往返两次，`BLOCKED` 或 CLI 故障会停下等人。
 - **工作区与提交**：同一事项的所有阶段共用一个工作树（分支 `aep-stage/<事项ID>`）。规划和开发阶段通过后，平台自动把改动提交到该分支；测试和验收针对固定提交。
-- **交付**：交付后在右侧预览 Diff，合并到本地目标分支（合并的是独立验收确认的那个提交）；再把要点写入项目记忆并归档，可同时移除工作树（分支保留）。
+- **交付**：交付后在右侧预览 Diff，再按仓库的交付方式送达——「合并到本地分支」直接合并到本地目标分支，「推送并提 PR」把独立验收确认的那个提交推到远端并打开或更新 PR；之后把要点写入项目记忆并归档，可同时移除工作树（分支保留）。
+- **远端与交付**：仓库页可为每个仓库设置远端、目标分支和交付方式（合并到本地分支 / 推送并提 PR）。启用后新事项从 `<远端>/<目标>` 开分支，之后的阶段跟随目标分支的新提交，验收与交付固定使用验收时确认的提交。
+- **插件**：左下角「插件」页启用、停用和配置插件。分支管理插件提供「分支」页；GitHub、GitLab 插件为其补上远端能力，令牌按主机保存在 macOS 钥匙串。「用外部工具打开」的自定义命令在 `~/Library/Application Support/AEP Studio/plugins/git-tools.json` 里配置，插件页可「在访达中显示」该文件。
+- **分支**：「分支」页显示本地分支相对远端的领先 / 落后、只存在于远端的分支，以及对应 PR / MR 的链接和状态，可手动刷新远端。
 - **历史**：事项的每次执行、读写的记忆、阶段交接和合并记录；也可以给同项目的其他事项发送交接摘要。
 - **记忆**：「项目记忆」对项目内所有阶段生效；「仓库」页可查看和补充仓库记忆，阶段同样会读取。
+
+远端与交付也可以用 CLI 配置和执行：
+
+```sh
+aep project upstream --repository . --remote origin --target main --delivery pr
+aep project upstream --repository .
+aep project --work 对账单导出 deliver-pr
+aep project --work 对账单导出 deliver-pr --submit
+```
+
+`upstream` 只带 `--repository` 时查看当前配置和自动探测结果。`--delivery` 接受 `local` 或 `pr`。`deliver-pr` 先预览要推送的提交和 PR，`--submit` 才会推送并打开或更新 PR，推送始终发生在人工确认之后。开 PR 的方式按仓库托管方自动选择：GitHub 调用本机 `gh pr create`，GitLab 用推送选项创建合并请求，Gitea 走 AGit 引用；没有可用集成或失败时只推送分支，并给出网页上创建 PR 的链接。更新已有分支时用 `--expect` 传入预览看到的远端提交（推送带 `--force-with-lease`），`--number` 把已有 PR 的编号记入交付，`--no-open` 只推送不开 PR。
 
 #### 事项交接
 
@@ -89,7 +105,7 @@ aep project advance --stage 1
 
 默认共用本机 Studio 项目库。需要单独存储时，在启动 Studio 和 CLI 前设置相同的绝对目录 `AEP_PROJECT_HOME`，CLI 也接受 `--home`。在其他目录中可用 `--project` 和 `--work` 指定名称或 ID。上述本地交接要求参与方可访问同一份项目库和档案。
 
-项目库保存在本机的 `~/Library/Application Support/AEP Studio/projects.json`，阶段执行档案在同目录的 `workflows/` 下，事项工作树在仓库的 `.git/aep/workflow-worktrees/`。CLI 的 `aep memory` 命令可按任务、Spec 或候选提交范围读写仓库记忆。
+项目库保存在本机的 `~/Library/Application Support/AEP Studio/projects.json`，阶段执行档案在同目录的 `workflows/` 下，事项工作树在同目录的 `worktrees/<仓库路径>/<事项ID>` 下（仓库路径里的 `/` 等分隔符替换为 `-`，工作树位于仓库 `.git` 之外）。旧版本创建在仓库 `.git/aep/workflow-worktrees/` 的工作树仍会被识别。CLI 的 `aep memory` 命令可按任务、Spec 或候选提交范围读写仓库记忆。
 
 ### 重复派发与本地恢复
 
@@ -188,7 +204,7 @@ CLI 可用 `aep project zcode-models` 列出本机选项，`aep project zcode-de
 
 - Git 远端固定 Spec。也可启动 Rust 控制面和独立 Worker，在一个仓库中向独立 Worker 派发和恢复任务。HTTPS 控制面支持多 Worker 并行。Worker 主动连接，控制面持久化 Lease、执行事件和批准记录。[控制面启动与试点手册](docs/pilot.md)
 - 只在受信任的仓库运行。Worktree 隔开文件变更，测试命令和待测代码会以本机用户身份执行。选择外部模型客户端前，须确认其环境与数据权限。
-- 同一任务可以有多个 Run。每次都针对固定版本生成证据。事项交付时合并的是独立验收确认的提交，CI 在 PR 当前提交上独立复验。
+- 同一任务可以有多个 Run。每次都针对固定版本生成证据。事项交付的是独立验收确认的那个提交：合并到本地目标分支，或按仓库配置推送分支并提 PR；CI 在 PR 当前提交上独立复验。
 - 本仓库用作流程试点与基线。业务收益、费用和可靠性由后续真实需求测量。[AEP 架构提案与八周路线图](https://app.notion.com/p/41a9d9f6f60581d08560fa33ed8c4810)
 
 ## 开发验证
@@ -209,4 +225,4 @@ cargo test --locked --manifest-path studio/src-tauri/Cargo.toml   # 后端命令
 cd studio && npx -y pnpm@9 install && npx -y pnpm@9 build && npx -y pnpm@9 test:ui
 ```
 
-`test:ui` 用 Playwright 在浏览器里跑界面主流程（无 Tauri 时自动使用模拟后端），截图保存在 `studio/tests/screenshots/`。
+`test:ui` 用 Playwright 在浏览器里跑界面测试（无 Tauri 时自动使用模拟后端），用例覆盖布局、流程页和界面主流程（`studio/tests/` 下的 `layout.spec.ts`、`flows.spec.ts`、`ui.spec.ts`），截图保存在 `studio/tests/screenshots/`。
