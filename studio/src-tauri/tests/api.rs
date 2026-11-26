@@ -1787,7 +1787,7 @@ fn recording_claude(dir: &Path, capture: &Path) -> Result<String> {
     let script = format!(
         r#"#!/bin/sh
 input=$(cat)
-printf '%s' "$input" > {capture}
+printf '%s' "$input" > "{capture}"
 stage=$(printf '%s' "$input" | sed -n 's/^阶段：\([^（]*\)（.*/\1/p' | head -1)
 [ -n "$stage" ] || stage=继续
 case "$stage" in
